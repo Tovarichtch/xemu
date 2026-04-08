@@ -544,26 +544,28 @@ void xemu_input_update_sdl_kbd_controller_state(ControllerState *state)
         // (both return logical/window coordinates, not physical/drawable pixels)
         SDL_GetWindowSize(m_window, &windowWidth, &windowHeight);
 
-        // Calculate the position of the mouse coordinates in [-32768,32768]
         DPRINTF("[Lightgun] Window Coordinates: %.0f, %.0f\n", m_mouseX, m_mouseY);
 
-        // Check that the mouse position is within the window coordinates
-        if (m_mouseX >= 0 && m_mouseX <= windowWidth && m_mouseY >= 0 &&
-            m_mouseY <= windowHeight) {
-            if (viewport_coords[2] > 0 && viewport_coords[3] > 0) {
-                // viewport_coords are in drawable (pixel) space.
-                // Scale them to window (logical) space for HiDPI compat.
-                int32_t drawW, drawH;
-                SDL_GetWindowSizeInPixels(m_window, &drawW, &drawH);
-                float scaleW = (float)windowWidth / (float)drawW;
-                float scaleH = (float)windowHeight / (float)drawH;
+        // Adjust to viewport coordinates if available
+        if (viewport_coords[2] > 0 && viewport_coords[3] > 0) {
+            // viewport_coords are in drawable (pixel) space.
+            // Scale them to window (logical) space for HiDPI compat.
+            int32_t drawW, drawH;
+            SDL_GetWindowSizeInPixels(m_window, &drawW, &drawH);
+            float scaleW = (float)windowWidth / (float)drawW;
+            float scaleH = (float)windowHeight / (float)drawH;
 
-                // Switch from Window coordinates to Viewport Coordinates
-                m_mouseX -= (int)(viewport_coords[0] * scaleW);
-                m_mouseY -= (int)(viewport_coords[1] * scaleH);
-                windowWidth = (int)(viewport_coords[2] * scaleW);
-                windowHeight = (int)(viewport_coords[3] * scaleH);
-            }
+            // Switch from Window coordinates to Viewport Coordinates
+            m_mouseX -= viewport_coords[0] * scaleW;
+            m_mouseY -= viewport_coords[1] * scaleH;
+            windowWidth = (int)(viewport_coords[2] * scaleW);
+            windowHeight = (int)(viewport_coords[3] * scaleH);
+        }
+
+        // Check bounds AFTER viewport adjustment — mouse must be inside
+        // the actual game viewport, not just the window
+        if (m_mouseX >= 0 && m_mouseX <= windowWidth &&
+            m_mouseY >= 0 && m_mouseY <= windowHeight) {
 
             DPRINTF("[Lightgun] Viewport Coordinates: %.0f, %.0f\n", m_mouseX, m_mouseY);
             // Direct linear mapping - no scale/offset correction needed.
@@ -1090,4 +1092,15 @@ void xemu_input_reset_input_mapping(ControllerState *state)
     } else if (state->type == INPUT_DEVICE_SDL_KEYBOARD) {
         xemu_settings_reset_keyboard_mapping();
     }
+}
+
+int xemu_input_lightgun_active(void)
+{
+    for (int i = 0; i < 4; i++) {
+        if (bound_drivers[i] &&
+            strcmp(bound_drivers[i], DRIVER_LIGHT_GUN) == 0) {
+            return 1;
+        }
+    }
+    return 0;
 }
