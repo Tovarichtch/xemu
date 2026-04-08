@@ -95,8 +95,8 @@ const char *bound_drivers[4] = { DRIVER_DUKE, DRIVER_DUKE, DRIVER_DUKE,
                                  DRIVER_DUKE };
 int test_mode;
 
-static int m_mouseX;
-static int m_mouseY;
+static float m_mouseX;
+static float m_mouseY;
 
 static const char **port_index_to_settings_key_map[] = {
     &g_config.input.bindings.port1,
@@ -545,7 +545,7 @@ void xemu_input_update_sdl_kbd_controller_state(ControllerState *state)
         SDL_GetWindowSize(m_window, &windowWidth, &windowHeight);
 
         // Calculate the position of the mouse coordinates in [-32768,32768]
-        DPRINTF("[Lightgun] Window Coordinates: %d, %d\n", m_mouseX, m_mouseY);
+        DPRINTF("[Lightgun] Window Coordinates: %.0f, %.0f\n", m_mouseX, m_mouseY);
 
         // Check that the mouse position is within the window coordinates
         if (m_mouseX >= 0 && m_mouseX <= windowWidth && m_mouseY >= 0 &&
@@ -565,7 +565,7 @@ void xemu_input_update_sdl_kbd_controller_state(ControllerState *state)
                 windowHeight = (int)(viewport_coords[3] * scaleH);
             }
 
-            DPRINTF("[Lightgun] Viewport Coordinates: %d, %d\n", m_mouseX, m_mouseY);
+            DPRINTF("[Lightgun] Viewport Coordinates: %.0f, %.0f\n", m_mouseX, m_mouseY);
             // Direct linear mapping - no scale/offset correction needed.
             // Emulated gun provides pixel-perfect coordinates.
             int32_t x = (int32_t)((m_mouseX - (windowWidth / 2)) *
@@ -583,10 +583,10 @@ void xemu_input_update_sdl_kbd_controller_state(ControllerState *state)
         }
 
         // Left mouse button is the trigger (A), right mouse button is B
-        if (mouseBtn & SDL_BUTTON(SDL_BUTTON_LEFT)) {
+        if (mouseBtn & SDL_BUTTON_MASK(SDL_BUTTON_LEFT)) {
             state->lg.buttons |= CONTROLLER_BUTTON_A;
         }
-        if (mouseBtn & SDL_BUTTON(SDL_BUTTON_RIGHT)) {
+        if (mouseBtn & SDL_BUTTON_MASK(SDL_BUTTON_RIGHT)) {
             state->lg.buttons |= CONTROLLER_BUTTON_B;
         }
 
@@ -781,7 +781,7 @@ void xemu_input_update_rumble(ControllerState *state)
         return;
     }
 
-    SDL_RumbleGamepad(state->sdl_gamepad, state->rumble_l, state->rumble_r, 250);
+    SDL_RumbleGamepad(state->sdl_gamepad, state->gp.rumble_l, state->gp.rumble_r, 250);
     state->last_rumble_updated_ts = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
 }
 
