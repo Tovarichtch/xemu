@@ -3086,12 +3086,18 @@ void qemu_init(int argc, char **argv)
         }
     }
 
-    // Always populate DVD drive. If disc path is the empty string, drive is
-    // connected but no media present.
-    fake_argv[fake_argc++] = strdup("-drive");
+    // In Chihiro mode (128MB), mount as IDE disk (baseboard filesystem).
+    // In Xbox mode, mount as standard DVD/CD-ROM.
     char *escaped_dvd_path = strdup_double_commas(dvd_path);
-    fake_argv[fake_argc++] = g_strdup_printf("index=1,media=cdrom,file=%s",
-        escaped_dvd_path);
+    if (mem > 64 && strlen(escaped_dvd_path) > 0) {
+        fake_argv[fake_argc++] = strdup("-drive");
+        fake_argv[fake_argc++] = g_strdup_printf(
+            "index=1,media=disk,file=%s,format=raw", escaped_dvd_path);
+    } else {
+        fake_argv[fake_argc++] = strdup("-drive");
+        fake_argv[fake_argc++] = g_strdup_printf("index=1,media=cdrom,file=%s",
+            escaped_dvd_path);
+    }
     free(escaped_dvd_path);
 
     fake_argv[fake_argc++] = strdup("-display");
