@@ -365,6 +365,11 @@ void xbox_init_common(MachineState *machine,
     if (machine->ram_size > 64 * 1024 * 1024) {
         printf("Chihiro: 128MB RAM detected, enabling mediaboard LPC\n");
         isa_create_simple(isa_bus, "chihiro-lpc");
+
+        /* The Chihiro BIOS jamtable writes to SMBus device 0x6A (Focus
+         * FS454 video encoder) during early boot. Without this device,
+         * the SMBus transaction never completes and boot hangs. */
+        smbus_fs454_init(smbus, 0x6A);
     }
 }
 
