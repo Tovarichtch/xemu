@@ -72,6 +72,9 @@
 
 /* #define DEBUG_CHIHIRO */
 
+/* Always log LPC accesses during development */
+#define CHIHIRO_LOG 1
+
 typedef struct ChihiroLPCState {
     ISADevice dev;
     MemoryRegion ioport;
@@ -112,22 +115,20 @@ static uint64_t chihiro_lpc_io_read(void *opaque, hwaddr addr,
         break;
     }
 
-#ifdef DEBUG_CHIHIRO
-    printf("chihiro lpc read  [0x%04llx] -> 0x%04llx (size=%d)\n",
-           (unsigned long long)(addr + 0x4000),
-           (unsigned long long)r, size);
-#endif
+    if (CHIHIRO_LOG) {
+        printf("chihiro lpc read  [0x%04x] -> 0x%04x (size=%d)\n",
+               (unsigned)(addr + 0x4000), (unsigned)r, size);
+    }
     return r;
 }
 
 static void chihiro_lpc_io_write(void *opaque, hwaddr addr, uint64_t val,
                                  unsigned size)
 {
-#ifdef DEBUG_CHIHIRO
-    printf("chihiro lpc write [0x%04llx] = 0x%04llx (size=%d)\n",
-           (unsigned long long)(addr + 0x4000),
-           (unsigned long long)val, size);
-#endif
+    if (CHIHIRO_LOG) {
+        printf("chihiro lpc write [0x%04x] = 0x%04x (size=%d)\n",
+               (unsigned)(addr + 0x4000), (unsigned)val, size);
+    }
 
     switch (addr) {
     case SEGA_IRQ10_ACK:
