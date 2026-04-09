@@ -357,7 +357,15 @@ void xbox_smc_update_tray_state(void)
 
     const char *blk_name = "ide0-cd1";
     BlockBackend *blk = blk_by_name(blk_name);
-    assert(blk != NULL);
+
+    /* In Chihiro mode, there is no CD-ROM drive (ISO is mounted as IDE disk).
+     * Skip tray state update — Chihiro has no DVD tray. */
+    if (blk == NULL) {
+        smc->traystate_reg = SMC_REG_TRAYSTATE_NO_MEDIA_DETECTED;
+        smc->intstatus_reg |= SMC_REG_INTSTATUS_TRAYCLOSED;
+        xbox_assert_extsmi();
+        return;
+    }
 
     if (blk_dev_is_tray_open(blk)) {
         smc->traystate_reg = SMC_REG_TRAYSTATE_OPEN;

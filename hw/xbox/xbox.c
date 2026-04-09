@@ -345,6 +345,16 @@ void xbox_init_common(MachineState *machine,
     if (isa_bus_out) {
         *isa_bus_out = isa_bus;
     }
+
+    /* Auto-detect Chihiro mode: 128MB RAM = Chihiro baseboard present.
+     * A real Chihiro is an Xbox with add-on boards. We emulate this by
+     * adding the mediaboard LPC I/O device when 128MB is configured.
+     * This provides the XBAM identification string that SEGABOOT checks
+     * to detect the baseboard. */
+    if (machine->ram_size > 64 * 1024 * 1024) {
+        printf("Chihiro: 128MB RAM detected, enabling mediaboard LPC\n");
+        isa_create_simple(isa_bus, "chihiro-lpc");
+    }
 }
 
 static char *machine_get_bootrom(Object *obj, Error **errp)
