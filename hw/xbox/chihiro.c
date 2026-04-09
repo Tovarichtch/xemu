@@ -21,12 +21,14 @@
 
 #include "qemu/osdep.h"
 #include "hw/hw.h"
+#include "hw/irq.h"
 #include "hw/isa/isa.h"
 #include "hw/boards.h"
 #include "system/memory.h"
 #include "qemu/error-report.h"
 #include "qemu/timer.h"
 #include "system/address-spaces.h"
+#include "chihiro.h"
 
 /*
  * Chihiro Mediaboard LPC I/O
@@ -88,6 +90,10 @@ typedef struct ChihiroLPCState {
     /* EEPROM validation hack timer */
     QEMUTimer *eeprom_hack_timer;
     bool eeprom_hack_applied;
+
+    /* IRQ10 for baseboard → SEGABOOT communication */
+    qemu_irq irq10;
+    QEMUTimer *irq10_timer;
 } ChihiroLPCState;
 
 #define CHIHIRO_LPC_DEVICE(obj) \
@@ -139,7 +145,10 @@ static void chihiro_lpc_io_write(void *opaque, hwaddr addr, uint64_t val,
     switch (addr) {
     case SEGA_IRQ10_ACK:
         /* Clear IRQ10 — SEGABOOT writes here after handling baseboard IRQ */
-        /* TODO: wire to actual IRQ10 via MCPX LPC when mbcom is implemented */
+        {
+            ChihiroLPCState *s = opaque;
+            qemu_irq_lower(s->irq10);
+        }
         break;
     default:
         break;
@@ -155,6 +164,24 @@ static const MemoryRegionOps chihiro_lpc_io_ops = {
     },
     .endianness = DEVICE_LITTLE_ENDIAN,
 };
+
+/*
+ * IRQ10 periodic pulse — signals SEGABOOT that a baseboard response is ready.
+ * On real hardware, IRQ10 fires after each mbcom command is processed.
+ * We pulse it periodically since we pre-fill the response sector.
+ */
+static void chihiro_irq10_timer_cb(void *opaque)
+{
+    ChihiroLPCState *s = opaque;
+
+    if (s->eeprom_hack_applied) {
+        qemu_irq_raise(s->irq10);
+    }
+
+    /* Re-arm every 16ms (~60Hz) */
+    timer_mod(s->irq10_timer,
+              qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 16);
+}
 
 /*
  * Chihiro arcade kernel (arcdkrnl) EEPROM validation hack.
@@ -226,6 +253,13 @@ static void chihiro_lpc_realize(DeviceState *dev, Error **errp)
     timer_mod(s->eeprom_hack_timer,
               qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 100);
 
+    /* Initialize IRQ10 for baseboard communication */
+    s->irq10 = isa_get_irq(isa, 10);
+    s->irq10_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL,
+                                   chihiro_irq10_timer_cb, s);
+    timer_mod(s->irq10_timer,
+              qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 500);
+
     printf("Chihiro: Mediaboard LPC I/O initialized at 0x4000-0x40FF\n");
 }
 
@@ -249,3 +283,130 @@ static void chihiro_register_types(void)
 }
 
 type_init(chihiro_register_types)
+
+/*
+ * Chihiro MediaBoard IDE mbcom protocol handler
+ *
+ * The baseboard communicates with SEGABOOT via IDE sector read/write
+ * at specific LBAs within the mbcom partition:
+ *   - Response sector: mbcom_base + 0x4800 (read by SEGABOOT)
+ *   - Command sector:  mbcom_base + 0x4801 (written by SEGABOOT)
+ *
+ * For DIMM size 512MB (size_factor=2):
+ *   mbcom_base = (0x40000 << 2) - 0x8000 = 0xF8000
+ *   Response LBA = 0xFC800
+ *   Command LBA  = 0xFC801
+ */
+
+#define CHIHIRO_MBCOM_BASE      0xF8000
+#define CHIHIRO_MBCOM_RESPONSE  (CHIHIRO_MBCOM_BASE + 0x4800)  /* 0xFC800 */
+#define CHIHIRO_MBCOM_COMMAND   (CHIHIRO_MBCOM_BASE + 0x4801)  /* 0xFC801 */
+#define CHIHIRO_MBROM0          0x8000000
+#define CHIHIRO_MBROM1          0x8000800
+
+static uint8_t chihiro_mbcom_response[512];
+static bool chihiro_mbcom_enabled = false;
+
+void chihiro_mbcom_init(void)
+{
+    memset(chihiro_mbcom_response, 0, sizeof(chihiro_mbcom_response));
+    chihiro_mbcom_enabled = true;
+    printf("Chihiro: mbcom protocol handler initialized\n");
+}
+
+/* Process an mbcom command and generate response */
+static void chihiro_mbcom_process(const uint8_t *cmd_data)
+{
+    uint16_t cmd_echo = cmd_data[0] | (cmd_data[1] << 8);
+    uint16_t cmd_code = cmd_data[2] | (cmd_data[3] << 8);
+
+    memset(chihiro_mbcom_response, 0, sizeof(chihiro_mbcom_response));
+
+    /* Echo command ID + set response marker 0x8001 */
+    chihiro_mbcom_response[0] = cmd_data[0];
+    chihiro_mbcom_response[1] = cmd_data[1];
+    chihiro_mbcom_response[2] = 0x01;
+    chihiro_mbcom_response[3] = 0x80;
+
+    printf("Chihiro mbcom: cmd=0x%04X echo=0x%04X\n", cmd_code, cmd_echo);
+
+    switch (cmd_code) {
+    case 0x0001: /* DIMM_SIZE */
+        chihiro_mbcom_response[4] = 0x00;
+        chihiro_mbcom_response[5] = 0x00;
+        chihiro_mbcom_response[6] = 0xF0;
+        chihiro_mbcom_response[7] = 0x00;
+        break;
+    case 0x0100: /* STATUS → READY(5), completion 0% */
+        chihiro_mbcom_response[4] = 5;
+        chihiro_mbcom_response[5] = 0;
+        chihiro_mbcom_response[6] = 0;
+        chihiro_mbcom_response[7] = 0;
+        chihiro_mbcom_response[8] = 0;
+        chihiro_mbcom_response[9] = 0;
+        chihiro_mbcom_response[10] = 0;
+        chihiro_mbcom_response[11] = 0;
+        break;
+    case 0x0101: /* FIRMWARE_VERSION → 12.34 */
+        chihiro_mbcom_response[4] = 0x34;
+        chihiro_mbcom_response[5] = 0x12;
+        chihiro_mbcom_response[6] = 0x67;
+        chihiro_mbcom_response[7] = 0x45;
+        break;
+    case 0x0102: /* SYSTEM_TYPE → 0 (retail) */
+        chihiro_mbcom_response[4] = 0;
+        chihiro_mbcom_response[5] = 0;
+        chihiro_mbcom_response[6] = 0;
+        chihiro_mbcom_response[7] = 0;
+        break;
+    case 0x0103: /* SERIAL_NUMBER */
+        memcpy(chihiro_mbcom_response + 4, "-abc-abc12345678", 16);
+        break;
+    default:
+        printf("Chihiro mbcom: unknown command 0x%04X\n", cmd_code);
+        break;
+    }
+}
+
+/*
+ * Called from IDE DMA read path. Returns true if the sector was handled
+ * (mbcom response), false for normal disk read.
+ */
+bool chihiro_ide_read_sector(uint32_t lba, void *buffer)
+{
+    if (!chihiro_mbcom_enabled) return false;
+
+    if (lba == CHIHIRO_MBCOM_RESPONSE) {
+        memcpy(buffer, chihiro_mbcom_response, 512);
+        printf("Chihiro mbcom: read response @ LBA 0x%X\n", lba);
+        return true;
+    }
+    if (lba == CHIHIRO_MBCOM_COMMAND) {
+        memset(buffer, 0, 512);
+        return true;
+    }
+    return false;
+}
+
+/*
+ * Called from IDE DMA write path. Returns true if handled.
+ */
+bool chihiro_ide_write_sector(uint32_t lba, const void *buffer)
+{
+    if (!chihiro_mbcom_enabled) return false;
+
+    if (lba == CHIHIRO_MBCOM_COMMAND) {
+        const uint8_t *cmd = (const uint8_t *)buffer;
+        if (cmd[0] != 0 || cmd[1] != 0) {
+            chihiro_mbcom_process(cmd);
+            /* TODO: trigger IRQ10 via LPC */
+        }
+        printf("Chihiro mbcom: write command @ LBA 0x%X\n", lba);
+        return true;
+    }
+    if (lba == CHIHIRO_MBCOM_RESPONSE) {
+        memcpy(chihiro_mbcom_response, buffer, 512);
+        return true;
+    }
+    return false;
+}
