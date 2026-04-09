@@ -3086,18 +3086,23 @@ void qemu_init(int argc, char **argv)
         }
     }
 
-    // In Chihiro mode (128MB), mount as IDE disk (baseboard filesystem).
-    // In Xbox mode, mount as standard DVD/CD-ROM.
+    // In Chihiro mode (128MB), auto-detect media type:
+    // - .iso files = DVD/CD-ROM (game disc images)
+    // - other files = IDE disk (baseboard image)
+    // In Xbox mode, always mount as CD-ROM.
     char *escaped_dvd_path = strdup_double_commas(dvd_path);
-    if (mem > 64 && strlen(escaped_dvd_path) > 0) {
-        fake_argv[fake_argc++] = strdup("-drive");
-        fake_argv[fake_argc++] = g_strdup_printf(
-            "index=1,media=disk,file=%s,format=raw", escaped_dvd_path);
-    } else {
-        fake_argv[fake_argc++] = strdup("-drive");
-        fake_argv[fake_argc++] = g_strdup_printf("index=1,media=cdrom,file=%s",
-            escaped_dvd_path);
+    const char *dvd_media = "cdrom";
+    const char *format_suffix = "";
+    if (mem > 64 && strlen(dvd_path) > 4) {
+        const char *ext = dvd_path + strlen(dvd_path) - 4;
+        if (g_ascii_strcasecmp(ext, ".iso") != 0) {
+            dvd_media = "disk";
+            format_suffix = ",format=raw";
+        }
     }
+    fake_argv[fake_argc++] = strdup("-drive");
+    fake_argv[fake_argc++] = g_strdup_printf("index=1,media=%s,file=%s%s",
+        dvd_media, escaped_dvd_path, format_suffix);
     free(escaped_dvd_path);
 
     fake_argv[fake_argc++] = strdup("-display");
