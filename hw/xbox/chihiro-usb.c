@@ -128,6 +128,8 @@ static const USBDescIface desc_iface_chihiro_an2131qc = {
 static const USBDescDevice desc_device_chihiro_an2131qc = {
     .bcdUSB                        = 0x0100,
     .bMaxPacketSize0               = 0x40,
+    .bDeviceClass                  = 0x60,
+    .bDeviceSubClass               = 0x00,
     .bNumConfigurations            = 1,
     .confs = (USBDescConfig[]) {
         {
@@ -203,6 +205,8 @@ static const USBDescIface desc_iface_chihiro_an2131sc = {
 static const USBDescDevice desc_device_chihiro_an2131sc = {
     .bcdUSB                        = 0x0100,
     .bMaxPacketSize0               = 0x40,
+    .bDeviceClass                  = 0x60,
+    .bDeviceSubClass               = 0x01,
     .bNumConfigurations            = 1,
     .confs = (USBDescConfig[]) {
         {

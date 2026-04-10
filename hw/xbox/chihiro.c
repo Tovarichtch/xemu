@@ -177,6 +177,9 @@ static const MemoryRegionOps chihiro_lpc_io_ops = {
     .endianness = DEVICE_LITTLE_ENDIAN,
 };
 
+/* Global IRQ10 reference for mbcom DMA write trigger */
+static qemu_irq chihiro_irq10_global = NULL;
+
 /*
  * IRQ10 periodic pulse — signals SEGABOOT that a baseboard response is ready.
  * On real hardware, IRQ10 fires after each mbcom command is processed.
@@ -385,6 +388,7 @@ static void chihiro_lpc_realize(DeviceState *dev, Error **errp)
 
     /* Initialize IRQ10 for baseboard communication */
     s->irq10 = isa_get_irq(isa, 10);
+    chihiro_irq10_global = s->irq10;
     s->irq10_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL,
                                    chihiro_irq10_timer_cb, s);
     timer_mod(s->irq10_timer,
@@ -470,12 +474,12 @@ static void chihiro_mbcom_process(const uint8_t *cmd_data)
         chihiro_mbcom_response[6] = 0xF0;
         chihiro_mbcom_response[7] = 0x00;
         break;
-    case 0x0100: /* STATUS → READY(5), completion 0% */
+    case 0x0100: /* STATUS → READY(5), completion 100% */
         chihiro_mbcom_response[4] = 5;
         chihiro_mbcom_response[5] = 0;
         chihiro_mbcom_response[6] = 0;
         chihiro_mbcom_response[7] = 0;
-        chihiro_mbcom_response[8] = 0;
+        chihiro_mbcom_response[8] = 100;  /* completion % */
         chihiro_mbcom_response[9] = 0;
         chihiro_mbcom_response[10] = 0;
         chihiro_mbcom_response[11] = 0;
@@ -592,4 +596,9 @@ void chihiro_ide_dma_write_done(BlockBackend *blk, int64_t sector_num)
 
     printf("Chihiro mbcom: processed command, response written to LBA 0x%llX\n",
            (long long)resp_lba);
+
+    /* Signal SEGABOOT that response is ready */
+    if (chihiro_irq10_global) {
+        qemu_irq_raise(chihiro_irq10_global);
+    }
 }
