@@ -930,6 +930,16 @@ static void ide_dma_cb(void *opaque, int ret)
     if (s->nsector == 0) {
         s->status = READY_STAT | SEEK_STAT;
         ide_bus_set_irq(s->bus);
+
+        /* Chihiro mbcom hook: after a DMA write completes on unit 1,
+         * check if the sector is in the mbcom command range.
+         * If so, process the command and write the response. */
+        if (s->dma_cmd == IDE_DMA_WRITE && s->unit == 1) {
+            extern void chihiro_ide_dma_write_done(BlockBackend *blk,
+                                                    int64_t sector_num);
+            chihiro_ide_dma_write_done(s->blk, sector_num);
+        }
+
         goto eot;
     }
 

@@ -28,6 +28,7 @@
 #include "qemu/error-report.h"
 #include "qemu/timer.h"
 #include "system/address-spaces.h"
+#include "system/block-backend.h"
 #include "chihiro.h"
 
 /*
@@ -93,11 +94,13 @@ typedef struct ChihiroLPCState {
     bool error02_hack_applied;
     bool segaboot_hack_applied;
     bool checkbootid_hack_applied;
+    bool timeout_hack_applied;
 
     /* Persistent re-patching */
     uint32_t error02_patch_addr;
     uint32_t segaboot_patch_addr;
     uint32_t checkbootid_patch_addr;
+    uint32_t timeout_patch_addr;
     int repatch_count;
 
     /* IRQ10 for baseboard → SEGABOOT communication */
@@ -237,8 +240,8 @@ static void chihiro_eeprom_hack_cb(void *opaque)
     }
 
     if (!s->error02_hack_applied || !s->segaboot_hack_applied ||
-        !s->checkbootid_hack_applied) {
-        /* Phase 2+3+4: Scan RAM for three SEGABOOT patterns.
+        !s->checkbootid_hack_applied || !s->timeout_hack_applied) {
+        /* Phase 2+3+4+5: Scan RAM for four SEGABOOT patterns.
          *
          * #1 Error 02 USB presence (CLogo::Update state machine):
          *    85 C0 75 0F 39 6B 10 75 0A C7 43 10 02
@@ -249,11 +252,17 @@ static void chihiro_eeprom_hack_cb(void *opaque)
          *
          * #3 CheckBootId:  75 10 68 D0 1F 02 00
          *    Patch byte+0: 75 10→90 90 (NOP, always skip)
+         *
+         * #4 Timeout (40s → Error 22):
+         *    81 7B 18 60 09 00 00 72 0F 39 6B 10
+         *    Patch byte+7: 72→EB (JB→JMP, never timeout)
          */
         uint8_t pat_error02[] = { 0x85, 0xC0, 0x75, 0x0F, 0x39, 0x6B, 0x10,
                                   0x75, 0x0A, 0xC7, 0x43, 0x10, 0x02 };
         uint8_t pat_errors[]  = { 0x75, 0x0E, 0x68, 0xB0, 0x1F, 0x02, 0x00 };
         uint8_t pat_bootid[]  = { 0x75, 0x10, 0x68, 0xD0, 0x1F, 0x02, 0x00 };
+        uint8_t pat_timeout[] = { 0x81, 0x7B, 0x18, 0x60, 0x09, 0x00, 0x00,
+                                  0x72, 0x0F, 0x39, 0x6B, 0x10 };
 
         uint8_t *block = g_malloc(0x400000);
         for (uint32_t base = 0; base < 0x8000000; base += 0x400000) {
@@ -294,16 +303,27 @@ static void chihiro_eeprom_hack_cb(void *opaque)
                     printf("Chihiro: Applied CheckBootId skip hack "
                            "(phys @ 0x%08X)\n", s->checkbootid_patch_addr);
                 }
+                if (!s->timeout_hack_applied &&
+                    memcmp(block + off, pat_timeout, 12) == 0) {
+                    s->timeout_patch_addr = base + off + 7; /* the JB byte */
+                    uint8_t jmp = 0xEB;
+                    address_space_write(&address_space_memory,
+                                        s->timeout_patch_addr,
+                                        MEMTXATTRS_UNSPECIFIED, &jmp, 1);
+                    s->timeout_hack_applied = true;
+                    printf("Chihiro: Applied timeout bypass "
+                           "(phys @ 0x%08X)\n", s->timeout_patch_addr);
+                }
             }
             if (s->error02_hack_applied && s->segaboot_hack_applied &&
-                s->checkbootid_hack_applied) {
+                s->checkbootid_hack_applied && s->timeout_hack_applied) {
                 break;
             }
         }
         g_free(block);
 
         if (!s->error02_hack_applied || !s->segaboot_hack_applied ||
-            !s->checkbootid_hack_applied) {
+            !s->checkbootid_hack_applied || !s->timeout_hack_applied) {
             timer_mod(s->eeprom_hack_timer,
                       qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 10);
         } else {
@@ -324,6 +344,8 @@ static void chihiro_eeprom_hack_cb(void *opaque)
                             MEMTXATTRS_UNSPECIFIED, nop2, 2);
         address_space_write(&address_space_memory, s->checkbootid_patch_addr,
                             MEMTXATTRS_UNSPECIFIED, nop2, 2);
+        address_space_write(&address_space_memory, s->timeout_patch_addr,
+                            MEMTXATTRS_UNSPECIFIED, &jmp, 1);
         s->repatch_count++;
         timer_mod(s->eeprom_hack_timer,
                   qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 10);
@@ -350,9 +372,11 @@ static void chihiro_lpc_realize(DeviceState *dev, Error **errp)
     s->error02_hack_applied = false;
     s->segaboot_hack_applied = false;
     s->checkbootid_hack_applied = false;
+    s->timeout_hack_applied = false;
     s->error02_patch_addr = 0;
     s->segaboot_patch_addr = 0;
     s->checkbootid_patch_addr = 0;
+    s->timeout_patch_addr = 0;
     s->repatch_count = 0;
     s->eeprom_hack_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL,
                                          chihiro_eeprom_hack_cb, s);
@@ -518,4 +542,54 @@ bool chihiro_ide_write_sector(uint32_t lba, const void *buffer)
         return true;
     }
     return false;
+}
+
+/*
+ * Called from ide_dma_cb() when a DMA WRITE completes on IDE unit 1.
+ * Checks if the write was to the mbcom command sector (LBA 0xFC801).
+ * If so, reads back the command, processes it, and writes the response
+ * to the response sector (LBA 0xFC800). The IRQ10 periodic timer
+ * signals SEGABOOT that the response is ready.
+ */
+void chihiro_ide_dma_write_done(BlockBackend *blk, int64_t sector_num)
+{
+    if (!chihiro_mbcom_enabled) return;
+
+    /* sector_num is the sector AFTER the last written sector.
+     * For a 1-sector write to LBA 0xFC801, sector_num = 0xFC802.
+     * Check if the write range included the command sector. */
+    int64_t cmd_lba = CHIHIRO_MBCOM_COMMAND;
+    int64_t resp_lba = CHIHIRO_MBCOM_RESPONSE;
+
+    /* Check range: the write could span multiple sectors */
+    if (sector_num <= cmd_lba) return;
+    if (sector_num > cmd_lba + 256) return; /* sanity */
+
+    /* Read back the command sector from the block device */
+    uint8_t cmd_data[512];
+    int ret = blk_pread(blk, cmd_lba * 512, 512, cmd_data, 0);
+    if (ret < 0) {
+        printf("Chihiro mbcom: failed to read command sector (ret=%d)\n", ret);
+        return;
+    }
+
+    /* Check if it's a valid command (first two bytes non-zero) */
+    if (cmd_data[0] == 0 && cmd_data[1] == 0) return;
+
+    /* Process the mbcom command */
+    chihiro_mbcom_process(cmd_data);
+
+    /* Write the response to the response sector */
+    ret = blk_pwrite(blk, resp_lba * 512, 512, chihiro_mbcom_response, 0);
+    if (ret < 0) {
+        printf("Chihiro mbcom: failed to write response sector (ret=%d)\n", ret);
+        return;
+    }
+
+    /* Clear the command sector so we don't re-process it */
+    memset(cmd_data, 0, 512);
+    blk_pwrite(blk, cmd_lba * 512, 512, cmd_data, 0);
+
+    printf("Chihiro mbcom: processed command, response written to LBA 0x%llX\n",
+           (long long)resp_lba);
 }

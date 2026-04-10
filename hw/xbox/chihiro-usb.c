@@ -32,6 +32,15 @@
 
 typedef struct ChihiroUSBState {
     USBDevice dev;
+
+    /* ic10 EEPROM data (8KB, read via vendor request 0x16) */
+    uint8_t ic10_eeprom[8192];
+
+    /* Pending bulk transfer (queued by vendor request 0x16/0x17) */
+    uint8_t bulk_buf[256];
+    int bulk_pending;      /* bytes pending for bulk IN */
+    int bulk_offset;       /* current read offset in bulk_buf */
+    int bulk_ep;           /* which EP the data is queued for */
 } ChihiroUSBState;
 
 enum chihiro_usb_strings {
@@ -222,12 +231,15 @@ static const USBDesc desc_chihiro_an2131sc = {
 
 static void handle_reset(USBDevice *dev)
 {
-    DPRINTF("usb reset\n");
+    printf("chihiro-usb: device reset\n");
+    fflush(stdout);
 }
 
 static void handle_control(USBDevice *dev, USBPacket *p,
                int request, int value, int index, int length, uint8_t *data)
 {
+    ChihiroUSBState *s = (ChihiroUSBState *)dev;
+
     printf("chihiro-usb: control req=0x%04X val=0x%04X idx=0x%04X len=%d\n",
            request, value, index, length);
     fflush(stdout);
@@ -238,40 +250,150 @@ static void handle_control(USBDevice *dev, USBPacket *p,
         return;
     }
 
-    /* Vendor requests — return stub response (from MAME AN2131 defaults).
-     * buffer[0] = 0x00 (success), [1] = PINSA, [2] = PINSB, [3] = OUTB */
-    printf("chihiro-usb: vendor request 0x%04X → stub response\n", request);
-    if (length >= 4) {
-        data[0] = 0x00;  /* success */
-        data[1] = 0x4B;  /* PINSA register (DIP switches) */
-        data[2] = 0x52;  /* PINSB register (JVS sense = 0) */
-        data[3] = 0x53;  /* OUTB register */
-        memset(data + 4, 0, length - 4);
+    /* Vendor request — extract bRequest from combined field.
+     * QEMU encodes: request = (bmRequestType << 8) | bRequest */
+    int bRequest = request & 0xFF;
+
+    /* Default response (MAME: every vendor request gets this) */
+    for (int n = 0; n < length && n < 6; n++) {
+        data[n] = 0x50 ^ n;
     }
+    data[0] = 0x00;  /* success */
+    data[1] = 0x4B;  /* PINSA: DIP switches */
+    data[2] = 0x52;  /* PINSB: JVS sense = all addressed */
+    data[3] = 0x53;  /* OUTB register */
+
+    switch (bRequest) {
+    case 0x16: /* Read ic10 EEPROM #1 — queue for bulk EP1 IN */
+    {
+        int addr = value;     /* wValue = start address in ic10 */
+        int count = index;    /* wIndex = byte count */
+        if (count > 256) count = 256;
+        if (addr + count > 8192) count = 8192 - addr;
+        if (addr >= 0 && count > 0) {
+            memcpy(s->bulk_buf, s->ic10_eeprom + addr, count);
+        } else {
+            memset(s->bulk_buf, 0xFF, count);
+        }
+        s->bulk_pending = count;
+        s->bulk_offset = 0;
+        s->bulk_ep = 1;
+        printf("chihiro-usb: READ EEPROM1 addr=0x%04X count=%d → queued for EP1\n",
+               addr, count);
+        break;
+    }
+    case 0x17: /* Read ic10 EEPROM #2 (offset +0x2000) */
+    {
+        int addr = 0x2000 + value;
+        int count = index;
+        if (count > 256) count = 256;
+        if (addr + count > 8192) count = 8192 - addr;
+        if (addr >= 0 && addr < 8192 && count > 0) {
+            memcpy(s->bulk_buf, s->ic10_eeprom + addr, count);
+        } else {
+            memset(s->bulk_buf, 0xFF, count);
+        }
+        s->bulk_pending = count;
+        s->bulk_offset = 0;
+        s->bulk_ep = 2;
+        printf("chihiro-usb: READ EEPROM2 addr=0x%04X count=%d\n", addr, count);
+        break;
+    }
+    case 0x19: /* Get JVS responses — no JVS data pending */
+        data[0] = 0x00;  /* not busy */
+        data[4] = 0;     /* 0 bytes of JVS response */
+        data[5] = 0;
+        break;
+    case 0x20: /* Send JVS packets — accept and discard */
+        printf("chihiro-usb: JVS SEND count=%d (stub)\n", index);
+        break;
+    case 0x30: /* External interrupt control */
+        data[4] = (value & 0xFF) > 0 ? 1 : 0;  /* enabled? */
+        data[5] = 0;  /* IRQ counter */
+        printf("chihiro-usb: EXT IRQ control val=%d\n", value);
+        break;
+    case 0x1C: /* Read RTC — stub */
+        break;
+    case 0x1D: /* Write ic10 EEPROM #1 — accept */
+    case 0x1E: /* Write ic10 EEPROM #2 — accept */
+    case 0x1F: /* Write external memory — accept */
+    case 0x24: /* Write RTC — accept */
+        break;
+    case 0x18: /* Read external memory — return zeros */
+    {
+        int count = index;
+        if (count > 256) count = 256;
+        memset(s->bulk_buf, 0, count);
+        s->bulk_pending = count;
+        s->bulk_offset = 0;
+        s->bulk_ep = 3;
+        break;
+    }
+    default:
+        printf("chihiro-usb: unknown vendor req 0x%02X val=0x%04X idx=0x%04X\n",
+               bRequest, value, index);
+        break;
+    }
+
     p->actual_length = length;
 }
 
 static void handle_data(USBDevice *dev, USBPacket *p)
 {
-    printf("chihiro-usb: data ep=%d pid=0x%x size=%zd\n",
-           p->ep->nr, p->pid, p->iov.size);
-    fflush(stdout);
+    ChihiroUSBState *s = (ChihiroUSBState *)dev;
+    int ep = p->ep->nr;
 
-    /* Return zeros for now — bulk transfers need proper implementation */
     if (p->pid == USB_TOKEN_IN) {
-        uint8_t buf[64];
-        memset(buf, 0, sizeof(buf));
-        int len = MIN(p->iov.size, sizeof(buf));
-        usb_packet_copy(p, buf, len);
+        /* Bulk IN — return queued data */
+        if (ep == s->bulk_ep && s->bulk_pending > 0) {
+            int len = MIN(p->iov.size, s->bulk_pending);
+            usb_packet_copy(p, s->bulk_buf + s->bulk_offset, len);
+            s->bulk_offset += len;
+            s->bulk_pending -= len;
+            printf("chihiro-usb: bulk IN ep%d %d bytes (%d remaining)\n",
+                   ep, len, s->bulk_pending);
+        } else {
+            /* No data pending — return NAK (not ready, try later) */
+            p->status = USB_RET_NAK;
+        }
     } else {
-        p->status = USB_RET_NAK;
+        /* Bulk OUT — accept and discard for now */
+        int len = p->iov.size;
+        uint8_t discard[64];
+        while (len > 0) {
+            int chunk = MIN(len, (int)sizeof(discard));
+            usb_packet_copy(p, discard, chunk);
+            len -= chunk;
+        }
+        printf("chihiro-usb: bulk OUT ep%d %zd bytes (discarded)\n",
+               ep, p->iov.size);
     }
 }
 
 static void chihiro_an2131qc_realize(USBDevice *dev, Error **errp)
 {
-    // ChihiroUSBState *s = DO_UPCAST(ChihiroUSBState, dev, dev);
+    ChihiroUSBState *s = (ChihiroUSBState *)dev;
     usb_desc_init(dev);
+
+    /* Initialize ic10 EEPROM with default data.
+     * TODO: load from ic10_g24lc64.bin file instead of hardcoding. */
+    memset(s->ic10_eeprom, 0xFF, sizeof(s->ic10_eeprom));
+
+    /* Region + flags at 0x1F00 */
+    s->ic10_eeprom[0x1F00] = 0x01;  /* Region: 01=JPN, 02=USA, 03=EXP */
+    s->ic10_eeprom[0x1F01] = 0xFE;  /* Flags */
+
+    /* Baseboard serial at 0x1F10 — "AAEE-01D44744715"
+     * Validated against mask "%%%@-##@########" */
+    memcpy(&s->ic10_eeprom[0x1F10], "AAEE-01D44744715", 16);
+
+    /* Initialize bulk transfer state */
+    s->bulk_pending = 0;
+    s->bulk_offset = 0;
+    s->bulk_ep = 0;
+
+    printf("Chihiro: AN2131QC USB device initialized "
+           "(serial=AAEE-01D44744715, region=JPN)\n");
 }
 
 static void chihiro_an2131qc_unrealize(USBDevice *dev)
