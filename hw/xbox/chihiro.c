@@ -93,6 +93,12 @@ typedef struct ChihiroLPCState {
     bool segaboot_hack_applied;
     bool checkbootid_hack_applied;
 
+    /* Persistent re-patching: kernel may overwrite patches when
+     * loading mbrom0 after mbrom1. Keep re-applying for 2 seconds. */
+    uint32_t segaboot_patch_addr;
+    uint32_t checkbootid_patch_addr;
+    int repatch_count;
+
     /* IRQ10 for baseboard → SEGABOOT communication */
     qemu_irq irq10;
     QEMUTimer *irq10_timer;
@@ -230,13 +236,7 @@ static void chihiro_eeprom_hack_cb(void *opaque)
     }
 
     if (!s->segaboot_hack_applied || !s->checkbootid_hack_applied) {
-        /* Phase 2+3: Patch SEGABOOT CLogo::CheckErrors and CheckBootId.
-         * Both have a JNZ that skips the "skipped" debug path.
-         * Scan RAM for both signatures in one pass.
-         *
-         * CheckErrors:  75 0E 68 B0 1F 02 00
-         * CheckBootId:  75 10 68 D0 1F 02 00
-         */
+        /* Phase 2+3: Find SEGABOOT patterns in RAM */
         uint8_t pat_errors[]  = { 0x75, 0x0E, 0x68, 0xB0, 0x1F, 0x02, 0x00 };
         uint8_t pat_bootid[]  = { 0x75, 0x10, 0x68, 0xD0, 0x1F, 0x02, 0x00 };
         uint8_t nop2[] = { 0x90, 0x90 };
@@ -248,21 +248,24 @@ static void chihiro_eeprom_hack_cb(void *opaque)
             for (uint32_t off = 0; off < 0x400000 - 7; off++) {
                 if (!s->segaboot_hack_applied &&
                     memcmp(block + off, pat_errors, 7) == 0) {
-                    uint32_t phys = base + off;
-                    address_space_write(&address_space_memory, phys,
+                    s->segaboot_patch_addr = base + off;
+                    address_space_write(&address_space_memory,
+                                        s->segaboot_patch_addr,
                                         MEMTXATTRS_UNSPECIFIED, nop2, 2);
                     s->segaboot_hack_applied = true;
+                    s->repatch_count = 0;
                     printf("Chihiro: Applied CheckErrors skip hack "
-                           "(phys @ 0x%08X)\n", phys);
+                           "(phys @ 0x%08X)\n", s->segaboot_patch_addr);
                 }
                 if (!s->checkbootid_hack_applied &&
                     memcmp(block + off, pat_bootid, 7) == 0) {
-                    uint32_t phys = base + off;
-                    address_space_write(&address_space_memory, phys,
+                    s->checkbootid_patch_addr = base + off;
+                    address_space_write(&address_space_memory,
+                                        s->checkbootid_patch_addr,
                                         MEMTXATTRS_UNSPECIFIED, nop2, 2);
                     s->checkbootid_hack_applied = true;
                     printf("Chihiro: Applied CheckBootId skip hack "
-                           "(phys @ 0x%08X)\n", phys);
+                           "(phys @ 0x%08X)\n", s->checkbootid_patch_addr);
                 }
             }
             if (s->segaboot_hack_applied && s->checkbootid_hack_applied) {
@@ -271,10 +274,29 @@ static void chihiro_eeprom_hack_cb(void *opaque)
         }
         g_free(block);
 
+        /* Keep polling until both found */
         if (!s->segaboot_hack_applied || !s->checkbootid_hack_applied) {
             timer_mod(s->eeprom_hack_timer,
                       qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 10);
+        } else {
+            /* Both found — start re-patch loop */
+            timer_mod(s->eeprom_hack_timer,
+                      qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 5);
         }
+        return;
+    }
+
+    /* Phase 4: Re-patch loop — kernel may overwrite patches when loading
+     * mbrom0 after mbrom1. Keep hammering NOPs for 2 seconds. */
+    if (s->repatch_count < 200) {
+        uint8_t nop2[] = { 0x90, 0x90 };
+        address_space_write(&address_space_memory, s->segaboot_patch_addr,
+                            MEMTXATTRS_UNSPECIFIED, nop2, 2);
+        address_space_write(&address_space_memory, s->checkbootid_patch_addr,
+                            MEMTXATTRS_UNSPECIFIED, nop2, 2);
+        s->repatch_count++;
+        timer_mod(s->eeprom_hack_timer,
+                  qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 10);
     }
 }
 
@@ -297,6 +319,9 @@ static void chihiro_lpc_realize(DeviceState *dev, Error **errp)
     s->eeprom_hack_applied = false;
     s->segaboot_hack_applied = false;
     s->checkbootid_hack_applied = false;
+    s->segaboot_patch_addr = 0;
+    s->checkbootid_patch_addr = 0;
+    s->repatch_count = 0;
     s->eeprom_hack_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL,
                                          chihiro_eeprom_hack_cb, s);
     timer_mod(s->eeprom_hack_timer,
