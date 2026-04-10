@@ -91,6 +91,7 @@ typedef struct ChihiroLPCState {
     QEMUTimer *eeprom_hack_timer;
     bool eeprom_hack_applied;
     bool segaboot_hack_applied;
+    bool checkbootid_hack_applied;
 
     /* IRQ10 for baseboard → SEGABOOT communication */
     qemu_irq irq10;
@@ -180,8 +181,8 @@ static void chihiro_irq10_timer_cb(void *opaque)
     }
 
     /* Re-arm every 16ms (~60Hz) */
-    // timer_mod(s->irq10_timer,
-//               qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 16);
+    timer_mod(s->irq10_timer,
+              qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 16);
 }
 
 /*
@@ -228,37 +229,49 @@ static void chihiro_eeprom_hack_cb(void *opaque)
         return;
     }
 
-    if (!s->segaboot_hack_applied) {
-        /* Phase 2: Patch SEGABOOT CLogo::CheckErrors to always skip.
-         * SEGABOOT is loaded by the kernel with paging, so we can't
-         * predict its physical address. Scan RAM for the signature:
-         * 75 0E 68 B0 1F 02 00 (JNZ +14; PUSH "CLogo::CheckErrors: skipped.")
+    if (!s->segaboot_hack_applied || !s->checkbootid_hack_applied) {
+        /* Phase 2+3: Patch SEGABOOT CLogo::CheckErrors and CheckBootId.
+         * Both have a JNZ that skips the "skipped" debug path.
+         * Scan RAM for both signatures in one pass.
+         *
+         * CheckErrors:  75 0E 68 B0 1F 02 00
+         * CheckBootId:  75 10 68 D0 1F 02 00
          */
-        uint8_t pattern[] = { 0x75, 0x0E, 0x68, 0xB0, 0x1F, 0x02, 0x00 };
-        bool found = false;
+        uint8_t pat_errors[]  = { 0x75, 0x0E, 0x68, 0xB0, 0x1F, 0x02, 0x00 };
+        uint8_t pat_bootid[]  = { 0x75, 0x10, 0x68, 0xD0, 0x1F, 0x02, 0x00 };
+        uint8_t nop2[] = { 0x90, 0x90 };
 
-        /* Read 4MB chunk and search */
         uint8_t *block = g_malloc(0x400000);
-        for (uint32_t base = 0; base < 0x8000000 && !found; base += 0x400000) {
+        for (uint32_t base = 0; base < 0x8000000; base += 0x400000) {
             address_space_read(&address_space_memory, base,
                                MEMTXATTRS_UNSPECIFIED, block, 0x400000);
             for (uint32_t off = 0; off < 0x400000 - 7; off++) {
-                if (memcmp(block + off, pattern, 7) == 0) {
+                if (!s->segaboot_hack_applied &&
+                    memcmp(block + off, pat_errors, 7) == 0) {
                     uint32_t phys = base + off;
-                    uint8_t nop2[] = { 0x90, 0x90 };
                     address_space_write(&address_space_memory, phys,
                                         MEMTXATTRS_UNSPECIFIED, nop2, 2);
                     s->segaboot_hack_applied = true;
-                    printf("Chihiro: Applied SEGABOOT CheckErrors skip hack "
+                    printf("Chihiro: Applied CheckErrors skip hack "
                            "(phys @ 0x%08X)\n", phys);
-                    found = true;
-                    break;
                 }
+                if (!s->checkbootid_hack_applied &&
+                    memcmp(block + off, pat_bootid, 7) == 0) {
+                    uint32_t phys = base + off;
+                    address_space_write(&address_space_memory, phys,
+                                        MEMTXATTRS_UNSPECIFIED, nop2, 2);
+                    s->checkbootid_hack_applied = true;
+                    printf("Chihiro: Applied CheckBootId skip hack "
+                           "(phys @ 0x%08X)\n", phys);
+                }
+            }
+            if (s->segaboot_hack_applied && s->checkbootid_hack_applied) {
+                break;
             }
         }
         g_free(block);
 
-        if (!found) {
+        if (!s->segaboot_hack_applied || !s->checkbootid_hack_applied) {
             timer_mod(s->eeprom_hack_timer,
                       qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 10);
         }
@@ -283,6 +296,7 @@ static void chihiro_lpc_realize(DeviceState *dev, Error **errp)
      * at runtime. We poll until the expected bytes appear in RAM. */
     s->eeprom_hack_applied = false;
     s->segaboot_hack_applied = false;
+    s->checkbootid_hack_applied = false;
     s->eeprom_hack_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL,
                                          chihiro_eeprom_hack_cb, s);
     timer_mod(s->eeprom_hack_timer,
@@ -292,8 +306,11 @@ static void chihiro_lpc_realize(DeviceState *dev, Error **errp)
     s->irq10 = isa_get_irq(isa, 10);
     s->irq10_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL,
                                    chihiro_irq10_timer_cb, s);
-    // timer_mod(s->irq10_timer,
-//               qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 500);
+    timer_mod(s->irq10_timer,
+              qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 500);
+
+    /* Initialize mbcom protocol handler */
+    chihiro_mbcom_init();
 
     printf("Chihiro: Mediaboard LPC I/O initialized at 0x4000-0x40FF\n");
 }
