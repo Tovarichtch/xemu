@@ -90,11 +90,12 @@ typedef struct ChihiroLPCState {
     /* EEPROM validation hack timer */
     QEMUTimer *eeprom_hack_timer;
     bool eeprom_hack_applied;
+    bool error02_hack_applied;
     bool segaboot_hack_applied;
     bool checkbootid_hack_applied;
 
-    /* Persistent re-patching: kernel may overwrite patches when
-     * loading mbrom0 after mbrom1. Keep re-applying for 2 seconds. */
+    /* Persistent re-patching */
+    uint32_t error02_patch_addr;
     uint32_t segaboot_patch_addr;
     uint32_t checkbootid_patch_addr;
     int repatch_count;
@@ -235,31 +236,57 @@ static void chihiro_eeprom_hack_cb(void *opaque)
         return;
     }
 
-    if (!s->segaboot_hack_applied || !s->checkbootid_hack_applied) {
-        /* Phase 2+3: Find SEGABOOT patterns in RAM */
+    if (!s->error02_hack_applied || !s->segaboot_hack_applied ||
+        !s->checkbootid_hack_applied) {
+        /* Phase 2+3+4: Scan RAM for three SEGABOOT patterns.
+         *
+         * #1 Error 02 USB presence (CLogo::Update state machine):
+         *    85 C0 75 0F 39 6B 10 75 0A C7 43 10 02
+         *    Patch byte+2: 75→EB (JNE→JMP, skip USB AN2131QC check)
+         *
+         * #2 CheckErrors:  75 0E 68 B0 1F 02 00
+         *    Patch byte+0: 75 0E→90 90 (NOP, always skip)
+         *
+         * #3 CheckBootId:  75 10 68 D0 1F 02 00
+         *    Patch byte+0: 75 10→90 90 (NOP, always skip)
+         */
+        uint8_t pat_error02[] = { 0x85, 0xC0, 0x75, 0x0F, 0x39, 0x6B, 0x10,
+                                  0x75, 0x0A, 0xC7, 0x43, 0x10, 0x02 };
         uint8_t pat_errors[]  = { 0x75, 0x0E, 0x68, 0xB0, 0x1F, 0x02, 0x00 };
         uint8_t pat_bootid[]  = { 0x75, 0x10, 0x68, 0xD0, 0x1F, 0x02, 0x00 };
-        uint8_t nop2[] = { 0x90, 0x90 };
 
         uint8_t *block = g_malloc(0x400000);
         for (uint32_t base = 0; base < 0x8000000; base += 0x400000) {
             address_space_read(&address_space_memory, base,
                                MEMTXATTRS_UNSPECIFIED, block, 0x400000);
-            for (uint32_t off = 0; off < 0x400000 - 7; off++) {
+            for (uint32_t off = 0; off < 0x400000 - 13; off++) {
+                if (!s->error02_hack_applied &&
+                    memcmp(block + off, pat_error02, 13) == 0) {
+                    s->error02_patch_addr = base + off + 2; /* the JNE byte */
+                    uint8_t jmp = 0xEB;
+                    address_space_write(&address_space_memory,
+                                        s->error02_patch_addr,
+                                        MEMTXATTRS_UNSPECIFIED, &jmp, 1);
+                    s->error02_hack_applied = true;
+                    s->repatch_count = 0;
+                    printf("Chihiro: Applied Error 02 USB bypass "
+                           "(phys @ 0x%08X)\n", s->error02_patch_addr);
+                }
                 if (!s->segaboot_hack_applied &&
                     memcmp(block + off, pat_errors, 7) == 0) {
                     s->segaboot_patch_addr = base + off;
+                    uint8_t nop2[] = { 0x90, 0x90 };
                     address_space_write(&address_space_memory,
                                         s->segaboot_patch_addr,
                                         MEMTXATTRS_UNSPECIFIED, nop2, 2);
                     s->segaboot_hack_applied = true;
-                    s->repatch_count = 0;
                     printf("Chihiro: Applied CheckErrors skip hack "
                            "(phys @ 0x%08X)\n", s->segaboot_patch_addr);
                 }
                 if (!s->checkbootid_hack_applied &&
                     memcmp(block + off, pat_bootid, 7) == 0) {
                     s->checkbootid_patch_addr = base + off;
+                    uint8_t nop2[] = { 0x90, 0x90 };
                     address_space_write(&address_space_memory,
                                         s->checkbootid_patch_addr,
                                         MEMTXATTRS_UNSPECIFIED, nop2, 2);
@@ -268,28 +295,31 @@ static void chihiro_eeprom_hack_cb(void *opaque)
                            "(phys @ 0x%08X)\n", s->checkbootid_patch_addr);
                 }
             }
-            if (s->segaboot_hack_applied && s->checkbootid_hack_applied) {
+            if (s->error02_hack_applied && s->segaboot_hack_applied &&
+                s->checkbootid_hack_applied) {
                 break;
             }
         }
         g_free(block);
 
-        /* Keep polling until both found */
-        if (!s->segaboot_hack_applied || !s->checkbootid_hack_applied) {
+        if (!s->error02_hack_applied || !s->segaboot_hack_applied ||
+            !s->checkbootid_hack_applied) {
             timer_mod(s->eeprom_hack_timer,
                       qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 10);
         } else {
-            /* Both found — start re-patch loop */
+            /* All found — start re-patch loop */
             timer_mod(s->eeprom_hack_timer,
                       qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 5);
         }
         return;
     }
 
-    /* Phase 4: Re-patch loop — kernel may overwrite patches when loading
-     * mbrom0 after mbrom1. Keep hammering NOPs for 2 seconds. */
+    /* Re-patch loop — keep hammering for 2 seconds */
     if (s->repatch_count < 200) {
+        uint8_t jmp = 0xEB;
         uint8_t nop2[] = { 0x90, 0x90 };
+        address_space_write(&address_space_memory, s->error02_patch_addr,
+                            MEMTXATTRS_UNSPECIFIED, &jmp, 1);
         address_space_write(&address_space_memory, s->segaboot_patch_addr,
                             MEMTXATTRS_UNSPECIFIED, nop2, 2);
         address_space_write(&address_space_memory, s->checkbootid_patch_addr,
@@ -317,8 +347,10 @@ static void chihiro_lpc_realize(DeviceState *dev, Error **errp)
      * The kernel is encrypted in the BIOS and gets decrypted by the 2BL
      * at runtime. We poll until the expected bytes appear in RAM. */
     s->eeprom_hack_applied = false;
+    s->error02_hack_applied = false;
     s->segaboot_hack_applied = false;
     s->checkbootid_hack_applied = false;
+    s->error02_patch_addr = 0;
     s->segaboot_patch_addr = 0;
     s->checkbootid_patch_addr = 0;
     s->repatch_count = 0;
