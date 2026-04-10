@@ -90,6 +90,7 @@ typedef struct ChihiroLPCState {
     /* EEPROM validation hack timer */
     QEMUTimer *eeprom_hack_timer;
     bool eeprom_hack_applied;
+    bool segaboot_hack_applied;
 
     /* IRQ10 for baseboard → SEGABOOT communication */
     qemu_irq irq10;
@@ -179,8 +180,8 @@ static void chihiro_irq10_timer_cb(void *opaque)
     }
 
     /* Re-arm every 16ms (~60Hz) */
-    timer_mod(s->irq10_timer,
-              qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 16);
+    // timer_mod(s->irq10_timer,
+//               qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 16);
 }
 
 /*
@@ -202,32 +203,65 @@ static void chihiro_eeprom_hack_cb(void *opaque)
 {
     ChihiroLPCState *s = opaque;
 
-    if (s->eeprom_hack_applied) {
+    if (!s->eeprom_hack_applied) {
+        /* Phase 1: Patch kernel EEPROM validation */
+        uint8_t check[2];
+        address_space_read(&address_space_memory, 0x3B744,
+                           MEMTXATTRS_UNSPECIFIED, check, 2);
+
+        if (check[0] == 0x75 && check[1] == 0x22) {
+            uint8_t nop2[] = { 0x90, 0x90 };
+            uint8_t leave_ret[] = { 0xC9, 0xC3 };
+
+            address_space_write(&address_space_memory, 0x3B744,
+                                MEMTXATTRS_UNSPECIFIED, nop2, 2);
+            address_space_write(&address_space_memory, 0x3B766,
+                                MEMTXATTRS_UNSPECIFIED, leave_ret, 2);
+
+            s->eeprom_hack_applied = true;
+            printf("Chihiro: Applied EEPROM validation hack "
+                   "(arcdkrnl @ 0x8003B744)\n");
+        }
+        /* Retry until kernel is decrypted */
+        timer_mod(s->eeprom_hack_timer,
+                  qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 1);
         return;
     }
 
-    /* Physical addresses = virtual - 0x80000000 for kernel space */
-    uint8_t check[2];
-    address_space_read(&address_space_memory, 0x3B744,
-                       MEMTXATTRS_UNSPECIFIED, check, 2);
+    if (!s->segaboot_hack_applied) {
+        /* Phase 2: Patch SEGABOOT CLogo::CheckErrors to always skip.
+         * SEGABOOT is loaded by the kernel with paging, so we can't
+         * predict its physical address. Scan RAM for the signature:
+         * 75 0E 68 B0 1F 02 00 (JNZ +14; PUSH "CLogo::CheckErrors: skipped.")
+         */
+        uint8_t pattern[] = { 0x75, 0x0E, 0x68, 0xB0, 0x1F, 0x02, 0x00 };
+        bool found = false;
 
-    if (check[0] == 0x75 && check[1] == 0x22) {
-        /* Found the EEPROM validation JNZ — apply hack */
-        uint8_t nop2[] = { 0x90, 0x90 };
-        uint8_t leave_ret[] = { 0xC9, 0xC3 };
+        /* Read 4MB chunk and search */
+        uint8_t *block = g_malloc(0x400000);
+        for (uint32_t base = 0; base < 0x8000000 && !found; base += 0x400000) {
+            address_space_read(&address_space_memory, base,
+                               MEMTXATTRS_UNSPECIFIED, block, 0x400000);
+            for (uint32_t off = 0; off < 0x400000 - 7; off++) {
+                if (memcmp(block + off, pattern, 7) == 0) {
+                    uint32_t phys = base + off;
+                    uint8_t nop2[] = { 0x90, 0x90 };
+                    address_space_write(&address_space_memory, phys,
+                                        MEMTXATTRS_UNSPECIFIED, nop2, 2);
+                    s->segaboot_hack_applied = true;
+                    printf("Chihiro: Applied SEGABOOT CheckErrors skip hack "
+                           "(phys @ 0x%08X)\n", phys);
+                    found = true;
+                    break;
+                }
+            }
+        }
+        g_free(block);
 
-        address_space_write(&address_space_memory, 0x3B744,
-                            MEMTXATTRS_UNSPECIFIED, nop2, 2);
-        address_space_write(&address_space_memory, 0x3B766,
-                            MEMTXATTRS_UNSPECIFIED, leave_ret, 2);
-
-        s->eeprom_hack_applied = true;
-        printf("Chihiro: Applied EEPROM validation hack "
-               "(arcdkrnl @ 0x8003B744)\n");
-    } else {
-        /* Kernel not yet decrypted, retry in 50ms */
-        timer_mod(s->eeprom_hack_timer,
-                  qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 50);
+        if (!found) {
+            timer_mod(s->eeprom_hack_timer,
+                      qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 10);
+        }
     }
 }
 
@@ -248,17 +282,18 @@ static void chihiro_lpc_realize(DeviceState *dev, Error **errp)
      * The kernel is encrypted in the BIOS and gets decrypted by the 2BL
      * at runtime. We poll until the expected bytes appear in RAM. */
     s->eeprom_hack_applied = false;
+    s->segaboot_hack_applied = false;
     s->eeprom_hack_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL,
                                          chihiro_eeprom_hack_cb, s);
     timer_mod(s->eeprom_hack_timer,
-              qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 100);
+              qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 10);
 
     /* Initialize IRQ10 for baseboard communication */
     s->irq10 = isa_get_irq(isa, 10);
     s->irq10_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL,
                                    chihiro_irq10_timer_cb, s);
-    timer_mod(s->irq10_timer,
-              qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 500);
+    // timer_mod(s->irq10_timer,
+//               qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 500);
 
     printf("Chihiro: Mediaboard LPC I/O initialized at 0x4000-0x40FF\n");
 }
