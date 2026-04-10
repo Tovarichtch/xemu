@@ -850,6 +850,13 @@ void xemu_input_bind(int index, ControllerState *state, int save)
         bound_controllers[index] = state;
         bound_controllers[index]->bound = index;
 
+        /* In Chihiro mode, USB ports are used by baseboard AN2131 devices.
+         * Skip gamepad hub/controller creation — input comes via JVS I/O. */
+        int mem_chk = ((int)g_config.sys.mem_limit + 1) * 64;
+        if (mem_chk > 64) {
+            return;
+        }
+
         char *tmp;
         QDict *usbhub_qdict = NULL;
         DeviceState *usbhub_dev = NULL;

@@ -3109,8 +3109,11 @@ void qemu_init(int argc, char **argv)
     fake_argv[fake_argc++] = strdup("xemu");
 
     // Create USB Daughterboard for 1.0 Xbox. This is connected to Port 1 of the Root hub.
-    fake_argv[fake_argc++] = strdup("-device");
-    fake_argv[fake_argc++] = strdup("usb-hub,port=1,ports=4");
+    // In Chihiro mode (128MB), skip — baseboard USB devices use these ports instead.
+    if (mem <= 64) {
+        fake_argv[fake_argc++] = strdup("-device");
+        fake_argv[fake_argc++] = strdup("usb-hub,port=1,ports=4");
+    }
 
     for (int i = 1; i < argc; i++) {
         if (argv[i] != NULL) {

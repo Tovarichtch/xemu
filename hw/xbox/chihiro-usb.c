@@ -228,19 +228,44 @@ static void handle_reset(USBDevice *dev)
 static void handle_control(USBDevice *dev, USBPacket *p,
                int request, int value, int index, int length, uint8_t *data)
 {
-    DPRINTF("handle control %d %d %d %d\n", request, value, index, length);
+    printf("chihiro-usb: control req=0x%04X val=0x%04X idx=0x%04X len=%d\n",
+           request, value, index, length);
+    fflush(stdout);
 
     int ret = usb_desc_handle_control(dev, p, request, value, index,
                                       length, data);
     if (ret >= 0) {
-        DPRINTF("handled by usb_desc_handle_control: %d\n", ret);
         return;
     }
+
+    /* Vendor requests — return stub response (from MAME AN2131 defaults).
+     * buffer[0] = 0x00 (success), [1] = PINSA, [2] = PINSB, [3] = OUTB */
+    printf("chihiro-usb: vendor request 0x%04X → stub response\n", request);
+    if (length >= 4) {
+        data[0] = 0x00;  /* success */
+        data[1] = 0x4B;  /* PINSA register (DIP switches) */
+        data[2] = 0x52;  /* PINSB register (JVS sense = 0) */
+        data[3] = 0x53;  /* OUTB register */
+        memset(data + 4, 0, length - 4);
+    }
+    p->actual_length = length;
 }
 
 static void handle_data(USBDevice *dev, USBPacket *p)
 {
-    DPRINTF("handle_data 0x%x %d 0x%zx\n", p->pid, p->ep->nr, p->iov.size);
+    printf("chihiro-usb: data ep=%d pid=0x%x size=%zd\n",
+           p->ep->nr, p->pid, p->iov.size);
+    fflush(stdout);
+
+    /* Return zeros for now — bulk transfers need proper implementation */
+    if (p->pid == USB_TOKEN_IN) {
+        uint8_t buf[64];
+        memset(buf, 0, sizeof(buf));
+        int len = MIN(p->iov.size, sizeof(buf));
+        usb_packet_copy(p, buf, len);
+    } else {
+        p->status = USB_RET_NAK;
+    }
 }
 
 static void chihiro_an2131qc_realize(USBDevice *dev, Error **errp)

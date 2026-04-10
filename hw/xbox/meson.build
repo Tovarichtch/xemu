@@ -1,7 +1,7 @@
 specific_ss.add(files(
 	'acpi_xbox.c',
 	'amd_smbus.c',
-	# 'chihiro-usb.c',
+	'chihiro-usb.c',
 	'chihiro.c',
 	'eeprom_generation.c',
 	'lpc47m157.c',
