@@ -39,6 +39,9 @@
 #include "hw/qdev-properties.h"
 #include "block/block_int-io.h"
 
+/* Chihiro: intercept QuickReboot to load game XBE */
+extern bool chihiro_intercept_reset(void);
+
 #define TYPE_XBOX_SMC "smbus-xbox-smc"
 #define XBOX_SMC(obj) OBJECT_CHECK(SMBusSMCDevice, (obj), TYPE_XBOX_SMC)
 
@@ -135,6 +138,9 @@ static int smc_write_data(SMBusDevice *dev, uint8_t *buf, uint8_t len)
 
     case SMC_REG_POWER:
         if (buf[0] & (SMC_REG_POWER_RESET | SMC_REG_POWER_CYCLE)) {
+            if (chihiro_intercept_reset()) {
+                break; /* Chihiro: loaded game XBE, skip reset */
+            }
             qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
         } else if (buf[0] & SMC_REG_POWER_SHUTDOWN) {
             qemu_system_shutdown_request(SHUTDOWN_CAUSE_GUEST_SHUTDOWN);

@@ -30,6 +30,11 @@
 #include "system/address-spaces.h"
 #include "system/block-backend.h"
 #include "chihiro.h"
+#include "cpu.h"
+#include "system/cpus.h"
+#include "system/hw_accel.h"
+#include "exec/cputlb.h"
+#include "system/blockdev.h"
 
 /*
  * Chihiro Mediaboard LPC I/O
@@ -95,12 +100,30 @@ typedef struct ChihiroLPCState {
     bool segaboot_hack_applied;
     bool checkbootid_hack_applied;
     bool timeout_hack_applied;
+    bool fwskip_hack_applied;
+    bool fwret_hack_applied;     /* hack 7: OpenUSBDevice return 1 */
+    bool usbenum_hack_applied;   /* hack 8: USBEnumerate return 0 */
+    bool bbready_hack_applied;   /* hack 9: IsBaseboardReady = TRUE */
+    bool systype_hack_applied;   /* hack 10: MbcomQuerySysType bypass */
+    bool nuclear_hack_applied;   /* hack 11: ALL errors fall-through */
+    bool launchinfo_hack_applied; /* hack 12: GetLaunchInfo bypass */
+    bool drivepath_hack_applied;  /* hack 13: d:%s → mbfs:%s */
+    bool xbepath_hack_applied;    /* hack 14: inject XBE path */
+    bool vtable_hack_applied;     /* hack 15: NOP vtable cleanup call */
+    bool appcreate_hack_applied;  /* hack 16: theApp.Create bypass */
+    uint32_t appcreate_patch_addr;
+    bool xbeloader_hack_applied;  /* hack 17: XBE loader trampoline */
+    uint32_t lpc_reg_addr;        /* MediaBoard register address (set via port 0x4004) */
+    uint32_t lpc_reg_data;        /* MediaBoard register data (read via port 0x4000) */
 
     /* Persistent re-patching */
     uint32_t error02_patch_addr;
     uint32_t segaboot_patch_addr;
     uint32_t checkbootid_patch_addr;
     uint32_t timeout_patch_addr;
+    uint32_t systype_patch_addr;
+    uint32_t nuclear_patch_addr;
+    uint32_t launchinfo_patch_addr;
     int repatch_count;
 
     /* IRQ10 for baseboard → SEGABOOT communication */
@@ -111,12 +134,43 @@ typedef struct ChihiroLPCState {
 #define CHIHIRO_LPC_DEVICE(obj) \
     OBJECT_CHECK(ChihiroLPCState, (obj), "chihiro-lpc")
 
+/* Forward declarations for XBE loader */
+static bool chihiro_active;
+static bool chihiro_xbe_loaded;
+static void chihiro_load_game_xbe(void);
+
+/* Called from SMC handler when QuickReboot is triggered */
+bool chihiro_intercept_reset(void)
+{
+    if (chihiro_active && !chihiro_xbe_loaded) {
+        printf("Chihiro: Intercepting QuickReboot — loading game XBE\n");
+        chihiro_load_game_xbe();
+        return chihiro_xbe_loaded;
+    }
+    return false;
+}
+
 static uint64_t chihiro_lpc_io_read(void *opaque, hwaddr addr,
                                     unsigned size)
 {
     uint64_t r = 0;
 
+    ChihiroLPCState *s = CHIHIRO_LPC_DEVICE(opaque);
+
     switch (addr) {
+    case 0x00: /* Port 0x4000: read register data */
+        switch (s->lpc_reg_addr) {
+        case 0x80000140: r = 0x01; break;       /* CPU ready */
+        case 0x80000160: r = 0x01; break;       /* PCI status */
+        case 0xA0001E60: r = 0x00000020; break; /* DMA mode 6 */
+        case 0xA0000000: r = s->lpc_reg_data; break; /* indirect read data */
+        default: r = 0; break;
+        }
+        if (CHIHIRO_LOG) {
+            printf("chihiro lpc reg read  [0x%08X] -> 0x%08X\n",
+                   s->lpc_reg_addr, (unsigned)r);
+        }
+        return r;
     case SEGA_FIRMWARE_VERSION:
         r = 0x0317;     /* Firmware v3.17 */
         break;
@@ -130,7 +184,7 @@ static uint64_t chihiro_lpc_io_read(void *opaque, hwaddr addr,
         r = 0x4D41;     /* "MA" → full string reads as "XBAM" */
         break;
     case SEGA_CHIP_REVISION:
-        r = SEGA_CHIP_REVISION_TYPE1;   /* Type-1 baseboard */
+        r = 0x0001;  /* Type-1 transformed = 0x21, matches table */   /* Type-1 baseboard */
         break;
     case SEGA_DIMM_SIZE:
         r = SEGA_DIMM_SIZE_512M;        /* 512MB DIMM (matches MAME default) */
@@ -149,6 +203,33 @@ static uint64_t chihiro_lpc_io_read(void *opaque, hwaddr addr,
 static void chihiro_lpc_io_write(void *opaque, hwaddr addr, uint64_t val,
                                  unsigned size)
 {
+
+    ChihiroLPCState *s = CHIHIRO_LPC_DEVICE(opaque);
+
+    switch (addr) {
+    case 0x00: /* Port 0x4000: write register data */
+        s->lpc_reg_data = (uint32_t)val;
+        if (CHIHIRO_LOG) {
+            printf("chihiro lpc reg write [0x%08X] <- 0x%08X\n",
+                   s->lpc_reg_addr, (unsigned)val);
+        }
+        return;
+    case 0x04: /* Port 0x4004: set register address */
+        s->lpc_reg_addr = (uint32_t)val;
+        return;
+    case 0x08: /* Port 0x4008: command/clear */
+        return;
+    case 0xE0: /* Port 0x40E0: IRQ ack */
+        return;
+    }
+
+    /* Port 0x40FE: XBE loader trigger from SEGABOOT trampoline */
+    if (addr == 0xFE && !chihiro_xbe_loaded) {
+        printf("Chihiro: XBE load triggered by trampoline OUT 0x40FE\n");
+        chihiro_load_game_xbe();
+        return;
+    }
+
     if (CHIHIRO_LOG) {
         printf("chihiro lpc write [0x%04x] = 0x%04x (size=%d)\n",
                (unsigned)(addr + 0x4000), (unsigned)val, size);
@@ -185,12 +266,516 @@ static qemu_irq chihiro_irq10_global = NULL;
  * On real hardware, IRQ10 fires after each mbcom command is processed.
  * We pulse it periodically since we pre-fill the response sector.
  */
+
+/*
+ * Chihiro XBE Loader — loads game XBE directly into guest RAM
+ * Bypasses SEGABOOT's broken XBE loading path entirely.
+ * Reads from baseboard.img FATX, parses XBE, maps sections.
+ */
+
+#define XBE_MAGIC       0x48454258  /* "XBEH" */
+#define XBE_ENTRY_KEY   0x94859D4B  /* debug XOR key */
+#define FATX_MAGIC      0x58544146  /* "FATX" */
+
+
+/* Chihiro kernel (arcdkrnl) export table — 158 ordinals
+ * Extracted from SEGABOOT's patched thunk table at PA 0x5C000 */
+static const uint32_t chihiro_kernel_exports[380] = {
+    [  1] = 0x8002EFC8, [  2] = 0x8002F826, [  3] = 0x8002FF1D,
+    [  4] = 0x8002EFCE, [  8] = 0x800220B4, [ 14] = 0x800132A4,
+    [ 15] = 0x80012F71, [ 16] = 0x800108AC, [ 17] = 0x80013128,
+    [ 22] = 0x800108C8, [ 24] = 0x80014302, [ 29] = 0x8001448C,
+    [ 23] = 0x8001415F,
+    [ 30] = 0x800108F4, [ 31] = 0x8001091C, [ 40] = 0x8003B370,
+    [ 41] = 0x8003B398, [ 42] = 0x8003B378, [ 44] = 0x800153A8,
+    [ 46] = 0x800154DC, [ 47] = 0x80015555, [ 49] = 0x800155FD,
+    [ 67] = 0x80016182, [ 69] = 0x800161FB, [ 95] = 0x800197F0,
+    [ 97] = 0x8001982D, [ 98] = 0x80019930, [ 99] = 0x80019BD7,
+    [100] = 0x800199B0, [107] = 0x8001A748, [108] = 0x8001A7FF,
+    [109] = 0x80019A9B, [112] = 0x8001ADD7, [113] = 0x80019800,
+    [119] = 0x8001A787, [124] = 0x800193FB, [125] = 0x8001A314,
+    [126] = 0x80015678, [127] = 0x800156B4, [128] = 0x8001A32C,
+    [129] = 0x80013ED4, [132] = 0x8001ADFB, [137] = 0x8001A766,
+    [139] = 0x8001BBC4,
+    [142] = 0x80019470,
+    [143] = 0x80019487, [144] = 0x80019555, [145] = 0x8001A8DC,
+    [149] = 0x80019916, [150] = 0x8001985C, [151] = 0x80015700,
+    [153] = 0x8001BBC4,
+    [156] = 0x8003A95C, [157] = 0x80010C78, [158] = 0x80019DA8,
+    [159] = 0x8001A0A9, [160] = 0x80013EC4, [161] = 0x80013EF4,
+    [164] = 0x8003B3D8, [165] = 0x8001E6A0, [166] = 0x8001DFF2,
+    [167] = 0x8001EBB2, [168] = 0x8001E5E7, [171] = 0x8001E6B4,
+    [172] = 0x8001EBD0, [173] = 0x8001DFA4, [175] = 0x8001E36D,
+    [176] = 0x8001E3FC, [178] = 0x8001E1F1, [179] = 0x8001E86B,
+    [180] = 0x8001E1B4, [181] = 0x8001E8CC, [182] = 0x8001EB2F,
+    [184] = 0x8001F261, [185] = 0x800138BD, [186] = 0x800132B5,
+    [187] = 0x80020A68, [189] = 0x800132E6, [190] = 0x80016C9C,
+    [191] = 0x80016ABA, [192] = 0x800134B5, [193] = 0x80013706,
+    [194] = 0x80013854, [196] = 0x80016ED0, [197] = 0x80020AF0,
+    [198] = 0x80016DF3, [199] = 0x8001F695, [200] = 0x80016EFC,
+    [202] = 0x80016CC5, [203] = 0x8002117B, [205] = 0x80013351,
+    [206] = 0x80021B4A, [211] = 0x8001706F, [215] = 0x80021192,
+    [207] = 0x8001B504,
+    [217] = 0x8001EEDA, [218] = 0x8001765E, [219] = 0x800177AA,
+    [220] = 0x80017976, [221] = 0x800134EF, [222] = 0x80013797,
+    [223] = 0x80016B36, [224] = 0x80021BC4, [225] = 0x800133D0,
+    [226] = 0x800172AA, [227] = 0x80016C5C, [228] = 0x80013C34,
+    [229] = 0x80013AC6, [230] = 0x80021217, [231] = 0x80021BFF,
+    [232] = 0x80016DC5, [233] = 0x80021502, [234] = 0x8002132C,
+    [235] = 0x800213A1, [236] = 0x80017B6B, [237] = 0x80017D4D,
+    [238] = 0x8001B2B3, [243] = 0x8002096D, [246] = 0x800208F6,
+    [250] = 0x80020868, [252] = 0x8002CEAC, [253] = 0x8002CD05,
+    [255] = 0x80021CCE, [258] = 0x80021F38, [259] = 0x80010DD4,
+    [260] = 0x8002214D, [268] = 0x80023370, [269] = 0x800233C0,
+    [277] = 0x800234F0, [279] = 0x80022A4C, [285] = 0x80023430,
+    [286] = 0x800224DB, [289] = 0x800237FC, [290] = 0x80023828,
+    [291] = 0x80023857, [294] = 0x800235A0, [301] = 0x80023A23,
+    [302] = 0x80023AFC, [304] = 0x80023D9C, [305] = 0x80023C66,
+    [306] = 0x800235D8, [308] = 0x800221EB, [312] = 0x80024022,
+    [322] = 0x8003B1D0, [323] = 0x8003B088, [324] = 0x800109E8,
+    [327] = 0x8002E0FE, [328] = 0x8002E16D, [335] = 0x8002EE50,
+    [336] = 0x8002EE56, [337] = 0x8002EE5C, [338] = 0x8002EE62,
+    [339] = 0x8002EE68, [340] = 0x8002EE6E, [344] = 0x8002EE8A,
+    [345] = 0x8002EE90, [346] = 0x8002EE9A, [347] = 0x8002EEA0,
+    [349] = 0x8002EEB0, [353] = 0x8003B1A8, [355] = 0x800126E0,
+    [356] = 0x8003B06C, [360] = 0x80015195,
+};
+
+static int  chihiro_xbe_countdown = -1;
+
+static void chihiro_load_game_xbe(void)
+{
+    printf("Chihiro: === XBE LOADER START ===\n");
+
+    /* Get baseboard IDE block backend (drive index 1) */
+    DriveInfo *dinfo = drive_get_by_index(IF_IDE, 1);
+    if (!dinfo) {
+        printf("Chihiro XBE: No baseboard drive found\n");
+        return;
+    }
+    BlockBackend *blk = blk_by_legacy_dinfo(dinfo);
+    if (!blk) {
+        printf("Chihiro XBE: No block backend for baseboard\n");
+        return;
+    }
+    printf("Chihiro XBE: Got baseboard block backend\n");
+
+    /* Step 1: Find hod3xb.xbe in FATX root directory */
+    uint8_t sector[512];
+
+    /* Read FATX superblock (LBA 0) */
+    if (blk_pread(blk, 0, 512, sector, 0) < 0) {
+        printf("Chihiro XBE: Failed to read FATX superblock\n");
+        return;
+    }
+    uint32_t fatx_magic = *(uint32_t *)sector;
+    if (fatx_magic != FATX_MAGIC) {
+        printf("Chihiro XBE: Bad FATX magic: 0x%08X\n", fatx_magic);
+        return;
+    }
+    uint32_t spc = *(uint32_t *)(sector + 8);  /* sectors per cluster */
+    uint32_t root_cluster = *(uint32_t *)(sector + 12);
+    printf("Chihiro XBE: FATX OK, spc=%u, root_cluster=%u\n", spc, root_cluster);
+
+    /* Calculate data area start */
+    /* FAT at 0x1000, estimate FAT size, data starts after */
+    uint32_t partition_sectors = 0xF8000;  /* 496MB */
+    uint32_t cluster_size = spc * 512;
+    uint32_t est_clusters = (partition_sectors * 512) / cluster_size;
+    uint32_t fat_entry_size = (est_clusters < 65525) ? 2 : 4;
+    uint32_t fat_bytes = est_clusters * fat_entry_size;
+    uint32_t fat_aligned = ((fat_bytes + cluster_size - 1) / cluster_size) * cluster_size;
+    uint32_t data_offset = 0x1000 + fat_aligned;  /* byte offset */
+    uint32_t data_lba = data_offset / 512;
+    printf("Chihiro XBE: data_lba=0x%X, fat_entry_size=%u\n", data_lba, fat_entry_size);
+
+    /* Read root directory (cluster 1 = first data cluster) */
+    uint32_t root_lba = data_lba;  /* cluster 1 starts at data_lba */
+    printf("Chihiro XBE: Reading root dir at LBA 0x%X\n", root_lba);
+
+    uint32_t xbe_cluster = 0, xbe_size = 0;
+    for (uint32_t s = 0; s < spc; s++) {
+        if (blk_pread(blk, (root_lba + s) * 512, 512, sector, 0) < 0) break;
+        for (int e = 0; e < 512; e += 64) {
+            uint8_t namelen = sector[e];
+            if (namelen == 0xFF || namelen == 0x00) continue;
+            if (namelen == 0xE5) continue;  /* deleted */
+            if (namelen > 42) continue;
+            char name[43] = {0};
+            memcpy(name, sector + e + 2, namelen);
+            uint32_t clust = *(uint32_t *)(sector + e + 0x2C);
+            uint32_t size = *(uint32_t *)(sector + e + 0x30);
+            if (strcasecmp(name, "hod3xb.xbe") == 0) {
+                xbe_cluster = clust;
+                xbe_size = size;
+                printf("Chihiro XBE: Found '%s' cluster=%u size=%u\n",
+                       name, clust, size);
+            }
+        }
+    }
+
+    if (xbe_cluster == 0) {
+        printf("Chihiro XBE: hod3xb.xbe NOT FOUND in root directory!\n");
+        return;
+    }
+
+    /* Step 2: Read XBE file from FATX */
+    uint32_t xbe_lba = data_lba + (xbe_cluster - 1) * spc;
+    uint32_t xbe_sectors = (xbe_size + 511) / 512;
+    uint8_t *xbe_data = g_malloc(xbe_size);
+    printf("Chihiro XBE: Reading %u bytes from LBA 0x%X (%u sectors)\n",
+           xbe_size, xbe_lba, xbe_sectors);
+
+    for (uint32_t s = 0; s < xbe_sectors; s++) {
+        if (blk_pread(blk, (int64_t)(xbe_lba + s) * 512, 512, xbe_data + s * 512, 0) < 0) {
+            printf("Chihiro XBE: Read error at sector %u\n", s);
+            g_free(xbe_data);
+            return;
+        }
+    }
+
+    /* Step 3: Parse XBE header */
+    uint32_t magic = *(uint32_t *)xbe_data;
+    if (magic != XBE_MAGIC) {
+        printf("Chihiro XBE: Bad XBE magic: 0x%08X\n", magic);
+        g_free(xbe_data);
+        return;
+    }
+
+    uint32_t base_addr = *(uint32_t *)(xbe_data + 0x104);
+    uint32_t entry_enc = *(uint32_t *)(xbe_data + 0x128);
+    uint32_t entry_dec = entry_enc ^ XBE_ENTRY_KEY;
+    uint32_t num_sections = *(uint32_t *)(xbe_data + 0x11C);
+    uint32_t sect_hdr_addr = *(uint32_t *)(xbe_data + 0x120);
+    uint32_t sect_hdr_off = sect_hdr_addr - base_addr;
+
+    printf("Chihiro XBE: base=0x%08X entry_enc=0x%08X entry_dec=0x%08X\n",
+           base_addr, entry_enc, entry_dec);
+    printf("Chihiro XBE: %u sections at file offset 0x%X\n",
+           num_sections, sect_hdr_off);
+
+    /* Step 4: Write sections to guest physical RAM */
+    for (uint32_t i = 0; i < num_sections && i < 20; i++) {
+        uint32_t s_off = sect_hdr_off + i * 56;
+        uint32_t s_va = *(uint32_t *)(xbe_data + s_off + 4);
+        uint32_t s_vsize = *(uint32_t *)(xbe_data + s_off + 8);
+        uint32_t s_raw = *(uint32_t *)(xbe_data + s_off + 12);
+        uint32_t s_rsize = *(uint32_t *)(xbe_data + s_off + 16);
+        uint32_t s_name_addr = *(uint32_t *)(xbe_data + s_off + 20);
+        uint32_t s_name_off = s_name_addr - base_addr;
+        char sname[16] = {0};
+        if (s_name_off < xbe_size - 16) {
+            memcpy(sname, xbe_data + s_name_off, 15);
+        }
+
+        /* Write to HIGH physical RAM to avoid overwriting kernel.
+         * Offset: PA = 0x4000000 + (VA - base) */
+        uint32_t pa = 0x1000000 + (s_va - base_addr);
+        printf("Chihiro XBE:   [%u] '%s' VA=0x%08X PA=0x%08X "
+               "raw=0x%X rsize=0x%X\n",
+               i, sname, s_va, pa, s_raw, s_rsize);
+
+        if (s_raw + s_rsize <= xbe_size && pa < 0x08000000) {
+            address_space_write(&address_space_memory, pa,
+                                MEMTXATTRS_UNSPECIFIED,
+                                xbe_data + s_raw, s_rsize);
+            /* Zero-fill remaining virtual size */
+            if (s_vsize > s_rsize) {
+                uint32_t zero_size = s_vsize - s_rsize;
+                uint8_t *zeros = g_malloc0(zero_size);
+                address_space_write(&address_space_memory, pa + s_rsize,
+                                    MEMTXATTRS_UNSPECIFIED, zeros, zero_size);
+                g_free(zeros);
+            }
+        }
+    }
+
+    /* Write XBE header to high memory too */
+    uint32_t hdr_size = *(uint32_t *)(xbe_data + 0x108);
+    if (hdr_size > xbe_size) hdr_size = xbe_size;
+    if (hdr_size > 0x10000) hdr_size = 0x10000;
+    uint32_t hdr_pa = 0x1000000;
+    address_space_write(&address_space_memory, hdr_pa,
+                        MEMTXATTRS_UNSPECIFIED, xbe_data, hdr_size);
+    printf("Chihiro XBE: Wrote %u byte header at PA 0x%08X\n",
+           hdr_size, hdr_pa);
+
+
+    /* Step 4b: Resolve kernel thunks */
+    uint32_t kt_enc = *(uint32_t *)(xbe_data + 0x158);
+    uint32_t kt_va = kt_enc ^ 0xEFB1F152;  /* debug thunk XOR key */
+    uint32_t kt_off = kt_va - base_addr;
+    uint32_t kt_pa = 0x1000000 + kt_off;
+    printf("Chihiro XBE: Thunk table at VA 0x%08X PA 0x%08X\n", kt_va, kt_pa);
+
+    int thunks_resolved = 0, thunks_missing = 0;
+    for (int i = 0; i < 400; i++) {
+        uint32_t raw;
+        address_space_read(&address_space_memory, kt_pa + i * 4,
+                           MEMTXATTRS_UNSPECIFIED, &raw, 4);
+        if (raw == 0) break;
+        if (raw & 0x80000000) {
+            uint32_t ordinal = raw & 0x1FF;
+            uint32_t resolved = (ordinal < 380) ? chihiro_kernel_exports[ordinal] : 0;
+            if (resolved) {
+                address_space_write(&address_space_memory, kt_pa + i * 4,
+                                    MEMTXATTRS_UNSPECIFIED, &resolved, 4);
+                thunks_resolved++;
+            } else {
+                printf("Chihiro XBE:   MISSING ordinal #%u\n", ordinal);
+                thunks_missing++;
+            }
+        }
+    }
+    printf("Chihiro XBE: Thunks resolved=%d missing=%d\n",
+           thunks_resolved, thunks_missing);
+
+    /* Step 4b: Initialize LaunchDataPage (required by game CRT) */
+    {
+        uint32_t ldp_pa = 0x0F00000;
+        uint8_t zeros[4096];
+        memset(zeros, 0, 4096);
+        address_space_write(&address_space_memory, ldp_pa,
+                            MEMTXATTRS_UNSPECIFIED, zeros, 4096);
+        /* Write pointer to kernel global LaunchDataPage (PA 0x3B3D8) */
+        uint32_t ldp_va = 0x80F00000;
+        address_space_write(&address_space_memory, 0x3B3D8,
+                            MEMTXATTRS_UNSPECIFIED, &ldp_va, 4);
+        printf("Chihiro XBE: LaunchDataPage at VA 0x%08X\n", ldp_va);
+    }
+
+        /* Step 5: Set up page tables (EIP change done by trampoline JMP) */
+    CPUState *cs = first_cpu;
+    if (cs) {
+        cpu_synchronize_state(cs);
+        X86CPU *cpu = X86_CPU(cs);
+        CPUX86State *env = &cpu->env;
+        uint32_t cr3 = (uint32_t)env->cr[3];
+        printf("Chihiro XBE: CPU EIP=0x%08X CR3=0x%08X\n",
+               (uint32_t)env->eip, cr3);
+
+        /* Read page directory from CR3 */
+        uint32_t pd[1024];
+        address_space_read(&address_space_memory, cr3,
+                           MEMTXATTRS_UNSPECIFIED, pd, 4096);
+
+        uint32_t pt_alloc_pa = 0x0F00000;
+
+        /* PDE 0: VA 0x00000000-0x003FFFFF */
+        uint32_t pt0_pa;
+        if (pd[0] & 1) {
+            pt0_pa = pd[0] & 0xFFFFF000;
+            printf("Chihiro XBE: PDE[0] exists at PA 0x%08X\n", pt0_pa);
+        } else {
+            pt0_pa = pt_alloc_pa;
+            pt_alloc_pa += 0x1000;
+            uint8_t zeros[4096] = {0};
+            address_space_write(&address_space_memory, pt0_pa,
+                                MEMTXATTRS_UNSPECIFIED, zeros, 4096);
+            pd[0] = pt0_pa | 0x67;
+            printf("Chihiro XBE: Allocated PDE[0] at PA 0x%08X\n", pt0_pa);
+        }
+
+        uint32_t pt0[1024];
+        address_space_read(&address_space_memory, pt0_pa,
+                           MEMTXATTRS_UNSPECIFIED, pt0, 4096);
+
+        /* Calculate max VA from section virtual sizes (covers BSS) */
+        uint32_t max_va = base_addr + 0x1000;
+        for (uint32_t i = 0; i < num_sections && i < 20; i++) {
+            uint32_t s_off = sect_hdr_off + i * 56;
+            uint32_t s_va = *(uint32_t *)(xbe_data + s_off + 4);
+            uint32_t s_vsize = *(uint32_t *)(xbe_data + s_off + 8);
+            uint32_t end_va = s_va + s_vsize;
+            if (end_va > max_va) max_va = end_va;
+        }
+        max_va = (max_va + 0xFFF) & ~0xFFF;
+        printf("Chihiro XBE: Image spans VA 0x%08X-0x%08X\n", base_addr, max_va);
+
+        int pages_mapped = 0;
+        for (uint32_t va = base_addr; va < max_va && va < 0x400000; va += 0x1000) {
+            uint32_t pte_idx = (va >> 12) & 0x3FF;
+            uint32_t pa = 0x1000000 + (va - base_addr);
+            pt0[pte_idx] = pa | 0x67;
+            pages_mapped++;
+        }
+        address_space_write(&address_space_memory, pt0_pa,
+                            MEMTXATTRS_UNSPECIFIED, pt0, 4096);
+        printf("Chihiro XBE: Mapped %d pages in PDE[0]\n", pages_mapped);
+
+        /* PDE 1: DOLBY at VA 0x501580 */
+        uint32_t pt1_pa;
+        if (pd[1] & 1) {
+            pt1_pa = pd[1] & 0xFFFFF000;
+        } else {
+            pt1_pa = pt_alloc_pa;
+            pt_alloc_pa += 0x1000;
+            uint8_t zeros[4096] = {0};
+            address_space_write(&address_space_memory, pt1_pa,
+                                MEMTXATTRS_UNSPECIFIED, zeros, 4096);
+            pd[1] = pt1_pa | 0x67;
+        }
+        uint32_t pt1[1024];
+        address_space_read(&address_space_memory, pt1_pa,
+                           MEMTXATTRS_UNSPECIFIED, pt1, 4096);
+        int dolby_mapped = 0;
+        for (uint32_t va = 0x501000; va < 0x509000; va += 0x1000) {
+            uint32_t pte_idx = (va >> 12) & 0x3FF;
+            uint32_t pa = 0x1000000 + (va - base_addr);
+            pt1[pte_idx] = pa | 0x67;
+            dolby_mapped++;
+        }
+        address_space_write(&address_space_memory, pt1_pa,
+                            MEMTXATTRS_UNSPECIFIED, pt1, 4096);
+        printf("Chihiro XBE: Mapped %d DOLBY pages\n", dolby_mapped);
+
+        address_space_write(&address_space_memory, cr3,
+                            MEMTXATTRS_UNSPECIFIED, pd, 4096);
+        tlb_flush(cs);
+
+        /* Map LaunchDataPage: VA 0x80F00000 → PA 0x0F00000 */
+        uint32_t ldp_pte = 0x0F00063;
+        address_space_write(&address_space_memory,
+                            0x7FD3000 + 0x300 * 4,
+                            MEMTXATTRS_UNSPECIFIED, &ldp_pte, 4);
+
+        /* Set EIP to game entry point (we are in vCPU context via SMBus) */
+        env->eip = entry_dec;
+        tlb_flush(cs);
+        printf("Chihiro XBE: EIP set to 0x%08X\n", entry_dec);
+    }
+
+    printf("Chihiro: === XBE LOADER DONE ===\n");
+    chihiro_xbe_loaded = true;
+    g_free(xbe_data);
+}
+
 static void chihiro_irq10_timer_cb(void *opaque)
 {
     ChihiroLPCState *s = opaque;
 
     if (s->eeprom_hack_applied) {
         qemu_irq_raise(s->irq10);
+
+        /* Force baseboard state variables in SEGABOOT RAM.
+         * Physical addresses from gva2gpa: VA 0x89C38→PA 0xD4C38,
+         * VA 0x89C48→PA 0xD4C48. */
+        uint32_t usb_present = 1;
+        uint32_t bb_ready = 3;
+        address_space_write(&address_space_memory, 0xD4C38,
+                            MEMTXATTRS_UNSPECIFIED,
+                            &usb_present, sizeof(usb_present));
+        address_space_write(&address_space_memory, 0xD4C48,
+                            MEMTXATTRS_UNSPECIFIED,
+                            &bb_ready, sizeof(bb_ready));
+
+        /* Persistent re-patching at 60Hz — keep ALL hacks alive.
+         * The state machine re-executes each frame and some code paths
+         * may overwrite our patches. Hammer them continuously. */
+        if (s->error02_patch_addr) {
+            uint8_t jmp = 0xEB;
+            address_space_write(&address_space_memory, s->error02_patch_addr,
+                                MEMTXATTRS_UNSPECIFIED, &jmp, 1);
+        }
+        if (s->segaboot_patch_addr) {
+            uint8_t nop2[] = { 0x90, 0x90 };
+            address_space_write(&address_space_memory, s->segaboot_patch_addr,
+                                MEMTXATTRS_UNSPECIFIED, nop2, 2);
+        }
+        if (s->checkbootid_patch_addr) {
+            uint8_t nop2[] = { 0x90, 0x90 };
+            address_space_write(&address_space_memory, s->checkbootid_patch_addr,
+                                MEMTXATTRS_UNSPECIFIED, nop2, 2);
+        }
+        if (s->timeout_patch_addr) {
+            uint8_t jmp = 0xEB;
+            address_space_write(&address_space_memory, s->timeout_patch_addr,
+                                MEMTXATTRS_UNSPECIFIED, &jmp, 1);
+        }
+        if (s->systype_patch_addr) {
+            uint8_t nop5[] = { 0x90, 0x90, 0x90, 0x90, 0x90 };
+            address_space_write(&address_space_memory, s->systype_patch_addr,
+                                MEMTXATTRS_UNSPECIFIED, nop5, 5);
+        }
+        if (s->nuclear_patch_addr) {
+            uint8_t nop6[] = { 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 };
+            address_space_write(&address_space_memory, s->nuclear_patch_addr,
+                                MEMTXATTRS_UNSPECIFIED, nop6, 6);
+        }
+        if (s->launchinfo_patch_addr) {
+            uint8_t jmp = 0xEB;
+            address_space_write(&address_space_memory, s->launchinfo_patch_addr,
+                                MEMTXATTRS_UNSPECIFIED, &jmp, 1);
+        }
+        if (s->appcreate_patch_addr) {
+            uint8_t jmp = 0xEB;
+            address_space_write(&address_space_memory, s->appcreate_patch_addr,
+                                MEMTXATTRS_UNSPECIFIED, &jmp, 1);
+        }
+
+        /* Periodic state logging (every ~1s) */
+            }
+
+
+    /* XBE load is triggered by SEGABOOT trampoline OUT to port 0x40FE */
+
+
+    /* Post-XBE-load diagnostics: log EIP every second */
+    if (chihiro_xbe_loaded) {
+        static int eip_log_count = 0;
+        static int eip_log_ticks = 0;
+        eip_log_ticks++;
+        if (eip_log_ticks >= 60 && eip_log_count < 5) {
+            eip_log_ticks = 0;
+            eip_log_count++;
+            CPUState *diag_cs = first_cpu;
+            if (diag_cs) {
+                cpu_synchronize_state(diag_cs);
+                X86CPU *diag_cpu = X86_CPU(diag_cs);
+                CPUX86State *diag_env = &diag_cpu->env;
+                uint32_t eip = (uint32_t)diag_env->eip;
+                const char *region = "UNKNOWN";
+                if (eip >= 0x80010000 && eip < 0x80090000) region = "KERNEL";
+                else if (eip >= 0x11000 && eip < 0x135A00) region = "GAME .text";
+                else if (eip >= 0x10000 && eip < 0x220000) region = "GAME other";
+                else if (eip < 0x10000) region = "LOW MEM";
+                /* Read bytes at EIP from guest RAM */
+                uint32_t eip_pa = eip;
+                if (eip >= 0x80000000) eip_pa = eip - 0x80000000;
+                uint8_t eip_bytes[8];
+                address_space_read(&address_space_memory, eip_pa,
+                                   MEMTXATTRS_UNSPECIFIED, eip_bytes, 8);
+                if (eip_log_count == 1) {
+                    /* Read KiBugCheckData (5 DWORDs at PA 0x3ABE0) */
+                    uint32_t bugcheck[5];
+                    address_space_read(&address_space_memory, 0x3ABE0,
+                                       MEMTXATTRS_UNSPECIFIED, bugcheck, 20);
+                    printf("Chihiro DIAG: KiBugCheckData: code=0x%08X "
+                           "p1=0x%08X p2=0x%08X p3=0x%08X p4=0x%08X\n",
+                           bugcheck[0], bugcheck[1], bugcheck[2],
+                           bugcheck[3], bugcheck[4]);
+                    uint32_t esp_pa = (uint32_t)diag_env->regs[R_ESP];
+                    if (esp_pa >= 0xD0000000) esp_pa -= 0xD0000000;
+                    else if (esp_pa >= 0x80000000) esp_pa -= 0x80000000;
+                    uint32_t stack[32];
+                    address_space_read(&address_space_memory, esp_pa,
+                                       MEMTXATTRS_UNSPECIFIED, stack, 128);
+                    printf("Chihiro DIAG: Stack at ESP PA 0x%08X:\n", esp_pa);
+                    for (int s = 0; s < 32; s++) {
+                        const char *tag = "";
+                        if (stack[s] >= 0x80010000 && stack[s] < 0x80090000) tag = " [KERNEL]";
+                        else if (stack[s] >= 0x11000 && stack[s] < 0x220000) tag = " [GAME]";
+                        printf("  +%02X: 0x%08X%s\n", s*4, stack[s], tag);
+                    }
+                }
+                printf("Chihiro DIAG[%d]: EIP=0x%08X [%s] ESP=0x%08X"
+                       " code=%02X%02X%02X%02X%02X%02X%02X%02X\n",
+                       eip_log_count, eip, region,
+                       (uint32_t)diag_env->regs[R_ESP],
+                       eip_bytes[0], eip_bytes[1], eip_bytes[2], eip_bytes[3],
+                       eip_bytes[4], eip_bytes[5], eip_bytes[6], eip_bytes[7]);
+            }
+        }
     }
 
     /* Re-arm every 16ms (~60Hz) */
@@ -243,8 +828,10 @@ static void chihiro_eeprom_hack_cb(void *opaque)
     }
 
     if (!s->error02_hack_applied || !s->segaboot_hack_applied ||
-        !s->checkbootid_hack_applied || !s->timeout_hack_applied) {
-        /* Phase 2+3+4+5: Scan RAM for four SEGABOOT patterns.
+        !s->checkbootid_hack_applied || !s->timeout_hack_applied ||
+        !s->fwskip_hack_applied || !s->fwret_hack_applied ||
+        !s->usbenum_hack_applied) {
+        /* Phase 2-6: Scan RAM for five SEGABOOT patterns.
          *
          * #1 Error 02 USB presence (CLogo::Update state machine):
          *    85 C0 75 0F 39 6B 10 75 0A C7 43 10 02
@@ -259,6 +846,11 @@ static void chihiro_eeprom_hack_cb(void *opaque)
          * #4 Timeout (40s → Error 22):
          *    81 7B 18 60 09 00 00 72 0F 39 6B 10
          *    Patch byte+7: 72→EB (JB→JMP, never timeout)
+         *
+         * #5 Firmware upload skip (OpenUSBDevice):
+         *    8A 86 AC 14 01 00 84 C0 0F 85
+         *    Patch byte+6-7: 84 C0→B0 01 (test al,al → mov al,1)
+         *    Forces the "firmware already cached" path
          */
         uint8_t pat_error02[] = { 0x85, 0xC0, 0x75, 0x0F, 0x39, 0x6B, 0x10,
                                   0x75, 0x0A, 0xC7, 0x43, 0x10, 0x02 };
@@ -266,12 +858,41 @@ static void chihiro_eeprom_hack_cb(void *opaque)
         uint8_t pat_bootid[]  = { 0x75, 0x10, 0x68, 0xD0, 0x1F, 0x02, 0x00 };
         uint8_t pat_timeout[] = { 0x81, 0x7B, 0x18, 0x60, 0x09, 0x00, 0x00,
                                   0x72, 0x0F, 0x39, 0x6B, 0x10 };
+        uint8_t pat_fwskip[]  = { 0x8A, 0x86, 0xAC, 0x14, 0x01, 0x00,
+                                  0x84, 0xC0, 0x0F, 0x85 };
+        uint8_t pat_fwret[]   = { 0x83, 0xC4, 0x08, 0x33, 0xC0, 0x5F, 0x5E,
+                                  0x5B, 0x8B, 0xE5, 0x5D, 0xC2, 0x10, 0x00 };
+        uint8_t pat_usbenum[] = { 0xFD, 0xFF, 0x85, 0xC0, 0x75, 0x10, 0x5F,
+                                  0x5E, 0x5D, 0xB8, 0x01, 0x00, 0x00, 0x00,
+                                  0x5B, 0xC2, 0x08, 0x00 };
+        uint8_t pat_bbready[] = { 0x8B, 0x0D, 0x48, 0x9C, 0x08, 0x00,
+                                  0x33, 0xC0, 0x83, 0xF9, 0x03, 0x0F,
+                                  0x94, 0xC0, 0xC3 };
+        uint8_t pat_systype[] = { 0x25, 0xFF, 0x00, 0x00, 0x00, 0x2B, 0xC5,
+                                  0x74, 0x0E, 0x48, 0x74, 0x04 };
+        uint8_t pat_nuclear[] = { 0x8B, 0x4B, 0x18, 0x8B, 0x43, 0x10,
+                                  0x41, 0x3B, 0xC5, 0x89, 0x4B, 0x18,
+                                  0x0F, 0x87 };
+        uint8_t pat_launch[]  = { 0x85, 0xC0, 0x7D, 0x07, 0x68, 0x4C,
+                                  0x20, 0x02, 0x00 };
+        uint8_t pat_dpath[]   = { 0x64, 0x3A, 0x25, 0x73, 0x00, 0x00,
+                                  0x00, 0x00 };
+        uint8_t pat_xbepath[] = { 0x74, 0x07, 0x8D, 0x84, 0x24, 0x68,
+                                  0x04, 0x00, 0x00 };
+        uint8_t pat_vtable[]  = { 0x8D, 0x4C, 0x24, 0x08, 0xE8, 0xD7,
+                                  0x51, 0xFF, 0xFF, 0x68, 0x38, 0x20,
+                                  0x02, 0x00 };
+        uint8_t pat_create[]  = { 0x85, 0xC0, 0x7D, 0x07, 0x68, 0x74,
+                                  0x20, 0x02, 0x00, 0xEB, 0x6E };
+        uint8_t pat_stub[]    = { 0x33, 0xC0, 0xC2, 0x1C, 0x00,
+                                  0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
+                                  0x90, 0x90, 0x90, 0x90, 0x90 };
 
         uint8_t *block = g_malloc(0x400000);
         for (uint32_t base = 0; base < 0x8000000; base += 0x400000) {
             address_space_read(&address_space_memory, base,
                                MEMTXATTRS_UNSPECIFIED, block, 0x400000);
-            for (uint32_t off = 0; off < 0x400000 - 13; off++) {
+            for (uint32_t off = 0; off < 0x400000 - 18; off++) {
                 if (!s->error02_hack_applied &&
                     memcmp(block + off, pat_error02, 13) == 0) {
                     s->error02_patch_addr = base + off + 2; /* the JNE byte */
@@ -317,16 +938,171 @@ static void chihiro_eeprom_hack_cb(void *opaque)
                     printf("Chihiro: Applied timeout bypass "
                            "(phys @ 0x%08X)\n", s->timeout_patch_addr);
                 }
+                if (!s->fwskip_hack_applied &&
+                    memcmp(block + off, pat_fwskip, 10) == 0) {
+                    uint32_t phys = base + off + 6;
+                    uint8_t mov_al_1[] = { 0xB0, 0x01 };
+                    address_space_write(&address_space_memory, phys,
+                                        MEMTXATTRS_UNSPECIFIED, mov_al_1, 2);
+                    s->fwskip_hack_applied = true;
+                    printf("Chihiro: Applied firmware upload skip "
+                           "(phys @ 0x%08X)\n", phys);
+                }
+                if (!s->fwret_hack_applied &&
+                    memcmp(block + off, pat_fwret, 14) == 0) {
+                    uint32_t phys = base + off + 3;
+                    uint8_t mov_al_1[] = { 0xB0, 0x01 };
+                    address_space_write(&address_space_memory, phys,
+                                        MEMTXATTRS_UNSPECIFIED, mov_al_1, 2);
+                    s->fwret_hack_applied = true;
+                    printf("Chihiro: Applied OpenUSBDevice ret 1 "
+                           "(phys @ 0x%08X)\n", phys);
+                }
+                if (!s->usbenum_hack_applied &&
+                    memcmp(block + off, pat_usbenum, 18) == 0) {
+                    uint32_t phys = base + off + 10;
+                    uint8_t zero = 0x00;
+                    address_space_write(&address_space_memory, phys,
+                                        MEMTXATTRS_UNSPECIFIED, &zero, 1);
+                    s->usbenum_hack_applied = true;
+                    printf("Chihiro: Applied USBEnumerate ret 0 "
+                           "(phys @ 0x%08X)\n", phys);
+                }
+                if (!s->bbready_hack_applied &&
+                    memcmp(block + off, pat_bbready, 15) == 0) {
+                    uint32_t phys = base + off + 6;
+                    uint8_t mov_al_1[] = { 0xB0, 0x01 };
+                    address_space_write(&address_space_memory, phys,
+                                        MEMTXATTRS_UNSPECIFIED, mov_al_1, 2);
+                    s->bbready_hack_applied = true;
+                    printf("Chihiro: Applied IsBaseboardReady=TRUE "
+                           "(phys @ 0x%08X)\n", phys);
+                }
+                if (!s->systype_hack_applied &&
+                    memcmp(block + off, pat_systype, 12) == 0) {
+                    s->systype_patch_addr = base + off + 7;
+                    uint32_t phys = s->systype_patch_addr;
+                    uint8_t nop4[] = { 0x90, 0x90, 0x90, 0x90, 0x90 };
+                    /* NOP both je 0x0E and je 0x04 */
+                    address_space_write(&address_space_memory, phys,
+                                        MEMTXATTRS_UNSPECIFIED, nop4, 5);
+                    s->systype_hack_applied = true;
+                    printf("Chihiro: Applied SysType/Error31 bypass "
+                           "(phys @ 0x%08X)\n", phys);
+                }
+                if (!s->nuclear_hack_applied &&
+                    memcmp(block + off, pat_nuclear, 14) == 0) {
+                    s->nuclear_patch_addr = base + off + 12;
+                    uint8_t nop6[] = { 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 };
+                    address_space_write(&address_space_memory,
+                                        s->nuclear_patch_addr,
+                                        MEMTXATTRS_UNSPECIFIED, nop6, 6);
+                    s->nuclear_hack_applied = true;
+                    printf("Chihiro: Applied NUCLEAR error bypass "
+                           "(phys @ 0x%08X)\n", s->nuclear_patch_addr);
+                }
+                if (!s->launchinfo_hack_applied &&
+                    memcmp(block + off, pat_launch, 9) == 0) {
+                    s->launchinfo_patch_addr = base + off + 2;
+                    uint8_t jmp = 0xEB;
+                    address_space_write(&address_space_memory,
+                                        s->launchinfo_patch_addr,
+                                        MEMTXATTRS_UNSPECIFIED, &jmp, 1);
+                    s->launchinfo_hack_applied = true;
+                    printf("Chihiro: Applied GetLaunchInfo bypass "
+                           "(phys @ 0x%08X)\n", s->launchinfo_patch_addr);
+                }
+                if (!s->drivepath_hack_applied &&
+                    memcmp(block + off, pat_dpath, 8) == 0) {
+                    uint32_t phys = base + off;
+                    /* "mbfs:%s\0" = 6D 62 66 73 3A 25 73 00 */
+                    uint8_t mbfs[] = {0x6D,0x62,0x66,0x73,0x3A,0x25,0x73,0x00};
+                    address_space_write(&address_space_memory, phys,
+                                        MEMTXATTRS_UNSPECIFIED, mbfs, 8);
+                    s->drivepath_hack_applied = true;
+                    printf("Chihiro: Applied d:->mbfs: path redirect "
+                           "(phys @ 0x%08X)\n", phys);
+                }
+                if (!s->xbepath_hack_applied &&
+                    memcmp(block + off, pat_xbepath, 9) == 0) {
+                    /* Write "\\hod3xb.xbe\0" at PA 0x47B09 (VA 0x1CB09) */
+                    uint8_t xbe_str[] = "\\hod3xb.xbe";
+                    address_space_write(&address_space_memory, 0x47B09,
+                                        MEMTXATTRS_UNSPECIFIED, xbe_str, 13);
+                    /* Patch demo LEA at off-5 (PA 0x7A34B):
+                     * 8D 84 24 88 04 00 00 → B8 09 CB 01 00 90 90 */
+                    uint32_t lea_demo = base + off - 7;
+                    uint8_t mov_demo[] = {0xB8, 0x09, 0xCB, 0x01, 0x00, 0x90, 0x90};
+                    address_space_write(&address_space_memory, lea_demo,
+                                        MEMTXATTRS_UNSPECIFIED, mov_demo, 7);
+                    /* Patch game LEA at off+2 (PA 0x7A354):
+                     * 8D 84 24 68 04 00 00 → B8 09 CB 01 00 90 90 */
+                    uint32_t lea_game = base + off + 2;
+                    uint8_t mov_game[] = {0xB8, 0x09, 0xCB, 0x01, 0x00, 0x90, 0x90};
+                    address_space_write(&address_space_memory, lea_game,
+                                        MEMTXATTRS_UNSPECIFIED, mov_game, 7);
+                    s->xbepath_hack_applied = true;
+                    printf("Chihiro: Applied XBE path inject "
+                           "(phys @ 0x%08X)\n", lea_demo);
+                }
+                if (!s->vtable_hack_applied &&
+                    memcmp(block + off, pat_vtable, 14) == 0) {
+                    uint32_t phys = base + off + 4;
+                    uint8_t nop5[] = {0x90, 0x90, 0x90, 0x90, 0x90};
+                    address_space_write(&address_space_memory, phys,
+                                        MEMTXATTRS_UNSPECIFIED, nop5, 5);
+                    s->vtable_hack_applied = true;
+                    printf("Chihiro: Applied vtable cleanup NOP "
+                           "(phys @ 0x%08X)\n", phys);
+                }
+                if (!s->appcreate_hack_applied &&
+                    memcmp(block + off, pat_create, 11) == 0) {
+                    s->appcreate_patch_addr = base + off + 2;
+                    uint32_t phys = s->appcreate_patch_addr;
+                    uint8_t jmp = 0xEB;
+                    address_space_write(&address_space_memory, phys,
+                                        MEMTXATTRS_UNSPECIFIED, &jmp, 1);
+                    s->appcreate_hack_applied = true;
+                    printf("Chihiro: Applied theApp.Create bypass "
+                           "(phys @ 0x%08X)\n", phys);
+                }
+                if (!s->xbeloader_hack_applied &&
+                    memcmp(block + off, pat_stub, 16) == 0) {
+                    uint32_t stub_pa = base + off;
+                    /* Write path string at PA 0x47B20 */
+                    uint8_t path[] = "\\??\\mbfs:\\hod3xb.xbe";
+                    address_space_write(&address_space_memory, 0x47B20,
+                                        MEMTXATTRS_UNSPECIFIED, path, 21);
+                    /* Write trampoline: OUT triggers XBE load, then JMP to entry
+                     * All in SEGABOOT's thread context (64KB stack) */
+                    uint8_t tramp[] = {
+                        0xB0, 0x01,                            /* mov al, 1 */
+                        0xBA, 0xFE, 0x40, 0x00, 0x00,         /* mov edx, 0x40FE */
+                        0xEF,                                  /* out dx, eax */
+                        0xA1, 0x00, 0x00, 0xF1, 0x80,         /* mov eax, [0x80F10000] */
+                        0xFF, 0xE0,                            /* jmp eax */
+                        0x90                                   /* nop padding */
+                    };
+                    address_space_write(&address_space_memory, stub_pa,
+                                        MEMTXATTRS_UNSPECIFIED, tramp, 16);
+                    s->xbeloader_hack_applied = true;
+                    printf("Chihiro: Applied XBE loader trampoline "
+                           "(phys @ 0x%08X)\n", stub_pa);
+                }
             }
             if (s->error02_hack_applied && s->segaboot_hack_applied &&
-                s->checkbootid_hack_applied && s->timeout_hack_applied) {
+                s->checkbootid_hack_applied && s->timeout_hack_applied &&
+                s->fwskip_hack_applied && s->fwret_hack_applied &&
+                s->usbenum_hack_applied && s->bbready_hack_applied && s->systype_hack_applied && s->nuclear_hack_applied && s->launchinfo_hack_applied && s->drivepath_hack_applied && s->xbepath_hack_applied && s->vtable_hack_applied && s->appcreate_hack_applied && s->xbeloader_hack_applied ) {
                 break;
             }
         }
         g_free(block);
 
         if (!s->error02_hack_applied || !s->segaboot_hack_applied ||
-            !s->checkbootid_hack_applied || !s->timeout_hack_applied) {
+            !s->checkbootid_hack_applied || !s->timeout_hack_applied ||
+            !s->fwskip_hack_applied || !s->fwret_hack_applied ||
+            !s->usbenum_hack_applied || !s->bbready_hack_applied || !s->systype_hack_applied || !s->nuclear_hack_applied || !s->launchinfo_hack_applied || !s->drivepath_hack_applied || !s->xbepath_hack_applied || !s->vtable_hack_applied || !s->appcreate_hack_applied || !s->xbeloader_hack_applied ) {
             timer_mod(s->eeprom_hack_timer,
                       qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 10);
         } else {
@@ -360,6 +1136,7 @@ static void chihiro_lpc_realize(DeviceState *dev, Error **errp)
     ChihiroLPCState *s = CHIHIRO_LPC_DEVICE(dev);
     ISADevice *isa = ISA_DEVICE(dev);
 
+    chihiro_active = true;
     memory_region_init_io(&s->ioport, OBJECT(dev), &chihiro_lpc_io_ops, s,
                           "chihiro-lpc-io", 0x100);
     isa_register_ioport(isa, &s->ioport, 0x4000);
@@ -376,6 +1153,22 @@ static void chihiro_lpc_realize(DeviceState *dev, Error **errp)
     s->segaboot_hack_applied = false;
     s->checkbootid_hack_applied = false;
     s->timeout_hack_applied = false;
+    s->fwskip_hack_applied = false;
+    s->fwret_hack_applied = false;
+    s->usbenum_hack_applied = false;
+    s->bbready_hack_applied = false;
+    s->systype_hack_applied = false;
+    s->systype_patch_addr = 0;
+    s->nuclear_hack_applied = false;
+    s->nuclear_patch_addr = 0;
+    s->launchinfo_hack_applied = false;
+    s->launchinfo_patch_addr = 0;
+    s->drivepath_hack_applied = false;
+    s->xbepath_hack_applied = false;
+    s->vtable_hack_applied = false;
+    s->appcreate_hack_applied = false;
+    s->appcreate_patch_addr = 0;
+    s->xbeloader_hack_applied = false;
     s->error02_patch_addr = 0;
     s->segaboot_patch_addr = 0;
     s->checkbootid_patch_addr = 0;

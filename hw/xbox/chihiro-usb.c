@@ -128,8 +128,6 @@ static const USBDescIface desc_iface_chihiro_an2131qc = {
 static const USBDescDevice desc_device_chihiro_an2131qc = {
     .bcdUSB                        = 0x0100,
     .bMaxPacketSize0               = 0x40,
-    .bDeviceClass                  = 0x60,
-    .bDeviceSubClass               = 0x00,
     .bNumConfigurations            = 1,
     .confs = (USBDescConfig[]) {
         {
@@ -205,8 +203,6 @@ static const USBDescIface desc_iface_chihiro_an2131sc = {
 static const USBDescDevice desc_device_chihiro_an2131sc = {
     .bcdUSB                        = 0x0100,
     .bMaxPacketSize0               = 0x40,
-    .bDeviceClass                  = 0x60,
-    .bDeviceSubClass               = 0x01,
     .bNumConfigurations            = 1,
     .confs = (USBDescConfig[]) {
         {
@@ -384,7 +380,7 @@ static void chihiro_an2131qc_realize(USBDevice *dev, Error **errp)
     memset(s->ic10_eeprom, 0xFF, sizeof(s->ic10_eeprom));
 
     /* Region + flags at 0x1F00 */
-    s->ic10_eeprom[0x1F00] = 0x01;  /* Region: 01=JPN, 02=USA, 03=EXP */
+    s->ic10_eeprom[0x1F00] = 0x02;  /* Region: 01=JPN, 02=USA, 03=EXP */
     s->ic10_eeprom[0x1F01] = 0xFE;  /* Flags */
 
     /* Baseboard serial at 0x1F10 — "AAEE-01D44744715"
