@@ -23,7 +23,7 @@
 #include "hw/usb.h"
 #include "hw/usb/desc.h"
 
-// #define DEBUG_CUSB
+#define DEBUG_CUSB
 #ifdef DEBUG_CUSB
 #define DPRINTF(s, ...) printf("chihiro-usb: " s, ## __VA_ARGS__)
 #else
