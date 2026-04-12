@@ -385,8 +385,12 @@ void xbox_init_common(MachineState *machine,
             }
         }
         if (chihiro_usb_bus) {
-            usb_create_simple(chihiro_usb_bus, "chihiro-an2131qc");
-            usb_create_simple(chihiro_usb_bus, "chihiro-an2131sc");
+            USBDevice *qc = usb_create_simple(chihiro_usb_bus, "chihiro-an2131qc");
+            printf("Chihiro: QC created, port=%d, addr=%d\n",
+                   qc->port ? qc->port->index : -1, qc->addr);
+            USBDevice *sc = usb_create_simple(chihiro_usb_bus, "chihiro-an2131sc");
+            printf("Chihiro: SC created, port=%d, addr=%d\n",
+                   sc->port ? sc->port->index : -1, sc->addr);
             printf("Chihiro: Attached AN2131QC + AN2131SC USB baseboard devices\n");
         } else {
             printf("Chihiro: WARNING — could not find USB bus on OHCI\n");

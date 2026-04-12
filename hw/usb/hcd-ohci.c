@@ -1476,6 +1476,9 @@ static void ohci_port_set_status(OHCIState *ohci, int portnum, uint32_t val)
     port = &ohci->rhport[portnum];
     old_state = port->ctrl;
 
+    printf("OHCI: port%d WRITE val=0x%08X (before: 0x%08X)\n",
+           portnum, val, old_state);
+
     /* Write to clear CSC, PESC, PSSC, OCIC, PRSC */
     if (val & OHCI_PORT_WTC) {
         port->ctrl &= ~(val & OHCI_PORT_WTC);
@@ -1523,6 +1526,8 @@ static uint64_t ohci_mem_read(void *opaque,
     } else if (addr >= 0x54 && addr < 0x54 + ohci->num_ports * 4) {
         /* HcRhPortStatus */
         retval = ohci->rhport[(addr - 0x54) >> 2].ctrl | OHCI_PORT_PPS;
+        printf("OHCI: port%d READ ctrl=0x%08X\n",
+               (int)((addr - 0x54) >> 2), retval);
         trace_usb_ohci_mem_port_read(size, "HcRhPortStatus", (addr - 0x50) >> 2,
                                      addr, addr >> 2, retval);
     } else {
