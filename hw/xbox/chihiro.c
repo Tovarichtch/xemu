@@ -223,6 +223,119 @@ static void chihiro_lpc_io_write(void *opaque, hwaddr addr, uint64_t val,
         return;
     }
 
+    /* Port 0x40F8: Function trace — logs game init call sequence */
+    if (addr == 0xF8 && chihiro_xbe_loaded) {
+        static const char *trace_names[] = {
+            "???",                  /* 0 */
+            "crt_version_check",    /* 1 - VA 0xB973C */
+            "XapiInitProcess",      /* 2 - VA 0xB8B38 */
+            "_initterm",            /* 3 - VA 0xB96BB */
+            "main",                 /* 4 - VA 0xB9713 */
+            "game_init_1",          /* 5 - VA 0x84B90 */
+            "game_init_2",          /* 6 - VA 0xFCCB0 */
+            "game_init_3",          /* 7 - VA 0xB7D20 */
+        };
+        uint32_t id = (uint32_t)val;
+        const char *name = (id < 8) ? trace_names[id] : "unknown";
+        static int trace_seq = 0;
+        printf("Chihiro TRACE[%02d]: %s (id=%d)\n", ++trace_seq, name, id);
+        return;
+    }
+
+    /* Port 0x40FC: File I/O instrumentation — logs NtCreateFile/NtReadFile/NtClose/NtOpenFile */
+    if (addr == 0xFC && chihiro_xbe_loaded) {
+        uint32_t ordinal = (uint32_t)val;
+        CPUState *log_cs = first_cpu;
+        if (log_cs) {
+            cpu_synchronize_state(log_cs);
+            X86CPU *log_cpu = X86_CPU(log_cs);
+            CPUX86State *log_env = &log_cpu->env;
+            uint32_t esp = (uint32_t)log_env->regs[R_ESP];
+
+            if (ordinal == 190) {
+                /* NtCreateFile(ord 190): ESP+12=pObjAttrs */
+                uint32_t obj_attrs_ptr = 0;
+                cpu_memory_rw_debug(log_cs, esp + 12, (uint8_t *)&obj_attrs_ptr, 4, false);
+                if (obj_attrs_ptr) {
+                    uint32_t obj_name_ptr = 0, root_dir = 0;
+                    cpu_memory_rw_debug(log_cs, obj_attrs_ptr, (uint8_t *)&root_dir, 4, false);
+                    cpu_memory_rw_debug(log_cs, obj_attrs_ptr + 4, (uint8_t *)&obj_name_ptr, 4, false);
+                    if (obj_name_ptr) {
+                        uint16_t str_len = 0;
+                        uint32_t str_buf = 0;
+                        cpu_memory_rw_debug(log_cs, obj_name_ptr, (uint8_t *)&str_len, 2, false);
+                        cpu_memory_rw_debug(log_cs, obj_name_ptr + 4, (uint8_t *)&str_buf, 4, false);
+                        if (str_buf && str_len > 0 && str_len < 512) {
+                            char path[256] = {0};
+                            uint16_t read_len = (str_len > 255) ? 255 : str_len;
+                            cpu_memory_rw_debug(log_cs, str_buf, (uint8_t *)path, read_len, false);
+                            uint32_t access = 0, create_disp = 0;
+                            cpu_memory_rw_debug(log_cs, esp + 8, (uint8_t *)&access, 4, false);
+                            cpu_memory_rw_debug(log_cs, esp + 32, (uint8_t *)&create_disp, 4, false);
+                            printf("Chihiro FILE: NtCreateFile(\"%s\") access=0x%X disp=0x%X root=0x%X\n",
+                                   path, access, create_disp, root_dir);
+                        }
+                    }
+                }
+            } else if (ordinal == 202) {
+                /* NtOpenFile(ord 202): ESP+12=pObjAttrs */
+                uint32_t obj_attrs_ptr = 0;
+                cpu_memory_rw_debug(log_cs, esp + 12, (uint8_t *)&obj_attrs_ptr, 4, false);
+                if (obj_attrs_ptr) {
+                    uint32_t obj_name_ptr = 0, root_dir = 0;
+                    cpu_memory_rw_debug(log_cs, obj_attrs_ptr, (uint8_t *)&root_dir, 4, false);
+                    cpu_memory_rw_debug(log_cs, obj_attrs_ptr + 4, (uint8_t *)&obj_name_ptr, 4, false);
+                    if (obj_name_ptr) {
+                        uint16_t str_len = 0;
+                        uint32_t str_buf = 0;
+                        cpu_memory_rw_debug(log_cs, obj_name_ptr, (uint8_t *)&str_len, 2, false);
+                        cpu_memory_rw_debug(log_cs, obj_name_ptr + 4, (uint8_t *)&str_buf, 4, false);
+                        if (str_buf && str_len > 0 && str_len < 512) {
+                            char path[256] = {0};
+                            uint16_t read_len = (str_len > 255) ? 255 : str_len;
+                            cpu_memory_rw_debug(log_cs, str_buf, (uint8_t *)path, read_len, false);
+                            uint32_t access = 0;
+                            cpu_memory_rw_debug(log_cs, esp + 8, (uint8_t *)&access, 4, false);
+                            printf("Chihiro FILE: NtOpenFile(\"%s\") access=0x%X root=0x%X\n",
+                                   path, access, root_dir);
+                        }
+                    }
+                }
+            } else if (ordinal == 219) {
+                /* NtReadFile(ord 219): ESP+4=Handle, ESP+24=Buffer, ESP+28=Len, ESP+32=pOffset */
+                uint32_t handle = 0, length = 0, buf_ptr = 0;
+                cpu_memory_rw_debug(log_cs, esp + 4, (uint8_t *)&handle, 4, false);
+                cpu_memory_rw_debug(log_cs, esp + 24, (uint8_t *)&buf_ptr, 4, false);
+                cpu_memory_rw_debug(log_cs, esp + 28, (uint8_t *)&length, 4, false);
+                uint64_t offset = 0;
+                uint32_t off_ptr = 0;
+                cpu_memory_rw_debug(log_cs, esp + 32, (uint8_t *)&off_ptr, 4, false);
+                if (off_ptr)
+                    cpu_memory_rw_debug(log_cs, off_ptr, (uint8_t *)&offset, 8, false);
+                printf("Chihiro FILE: NtReadFile(handle=0x%X buf=0x%X len=0x%X off=0x%llX)\n",
+                       handle, buf_ptr, length, (unsigned long long)offset);
+            } else if (ordinal == 187) {
+                /* NtClose(ord 187): ESP+4=Handle */
+                uint32_t handle = 0;
+                cpu_memory_rw_debug(log_cs, esp + 4, (uint8_t *)&handle, 4, false);
+                printf("Chihiro FILE: NtClose(handle=0x%X)\n", handle);
+            } else if (ordinal == 0xBC) {
+                /* KeBugCheckEx detour: pushad adds 32 bytes to stack.
+                 * Original ESP+0=retaddr, +4=code, +8=p1, +12=p2, +16=p3, +20=p4 */
+                uint32_t code = 0, p1 = 0, p2 = 0, p3 = 0, p4 = 0, ret = 0;
+                cpu_memory_rw_debug(log_cs, esp + 32,     (uint8_t *)&ret,  4, false);
+                cpu_memory_rw_debug(log_cs, esp + 32 + 4, (uint8_t *)&code, 4, false);
+                cpu_memory_rw_debug(log_cs, esp + 32 + 8, (uint8_t *)&p1,   4, false);
+                cpu_memory_rw_debug(log_cs, esp + 32 + 12,(uint8_t *)&p2,   4, false);
+                cpu_memory_rw_debug(log_cs, esp + 32 + 16,(uint8_t *)&p3,   4, false);
+                cpu_memory_rw_debug(log_cs, esp + 32 + 20,(uint8_t *)&p4,   4, false);
+                printf("Chihiro BUGCHECK: KeBugCheckEx(0x%X, 0x%X, 0x%X, 0x%X, 0x%X) from 0x%X\n",
+                       code, p1, p2, p3, p4, ret);
+            }
+        }
+        return;
+    }
+
     /* Port 0x40FE: XBE loader trigger from SEGABOOT trampoline */
     if (addr == 0xFE && !chihiro_xbe_loaded) {
         printf("Chihiro: XBE load triggered by trampoline OUT 0x40FE\n");
@@ -530,6 +643,69 @@ static void chihiro_load_game_xbe(void)
     printf("Chihiro XBE: Thunks resolved=%d missing=%d\n",
            thunks_resolved, thunks_missing);
 
+    /* Step 4c: File I/O instrumentation trampolines at PA 0x0E80000
+     * (VA 0x80E80000, kernel identity map). Each stub: OUT 0x40FC
+     * then JMP to original kernel function. Temporary — for measuring. */
+    {
+        uint32_t tramp_pa = 0x0E80000;
+        /* NtCreateFile (ord 190 → VA 0x80016C9C) */
+        uint8_t t0[] = {
+            0xBA,0xFC,0x40,0x00,0x00, 0xB8,0xBE,0x00,0x00,0x00, 0xEF,
+            0xB8,0x9C,0x6C,0x01,0x80, 0xFF,0xE0,
+        };
+        /* NtReadFile (ord 219 → VA 0x800177AA) */
+        uint8_t t1[] = {
+            0xBA,0xFC,0x40,0x00,0x00, 0xB8,0xDB,0x00,0x00,0x00, 0xEF,
+            0xB8,0xAA,0x77,0x01,0x80, 0xFF,0xE0,
+        };
+        /* NtClose (ord 187 → VA 0x80020A68) */
+        uint8_t t2[] = {
+            0xBA,0xFC,0x40,0x00,0x00, 0xB8,0xBB,0x00,0x00,0x00, 0xEF,
+            0xB8,0x68,0x0A,0x02,0x80, 0xFF,0xE0,
+        };
+        /* NtOpenFile (ord 202 → VA 0x80016CC5) */
+        uint8_t t3[] = {
+            0xBA,0xFC,0x40,0x00,0x00, 0xB8,0xCA,0x00,0x00,0x00, 0xEF,
+            0xB8,0xC5,0x6C,0x01,0x80, 0xFF,0xE0,
+        };
+        address_space_write(&address_space_memory, tramp_pa,      MEMTXATTRS_UNSPECIFIED, t0, sizeof(t0));
+        address_space_write(&address_space_memory, tramp_pa + 32, MEMTXATTRS_UNSPECIFIED, t1, sizeof(t1));
+        address_space_write(&address_space_memory, tramp_pa + 64, MEMTXATTRS_UNSPECIFIED, t2, sizeof(t2));
+        address_space_write(&address_space_memory, tramp_pa + 96, MEMTXATTRS_UNSPECIFIED, t3, sizeof(t3));
+
+        /* Map trampoline page: VA 0x80E80000 → PA 0x0E80000
+         * PDE[0x203] PT is at PA 0x7FD3000, PTE index = 0x280 */
+        uint32_t tramp_pte = 0x0E80063; /* present, rw, accessed, dirty */
+        address_space_write(&address_space_memory,
+                            0x7FD3000 + 0x280 * 4,
+                            MEMTXATTRS_UNSPECIFIED, &tramp_pte, 4);
+        CPUState *tramp_cs = first_cpu;
+        if (tramp_cs) tlb_flush(tramp_cs);
+
+        struct { uint32_t orig_va; uint32_t tramp_va; const char *name; } patches[] = {
+            { 0x80016C9C, 0x80E80000, "NtCreateFile" },
+            { 0x800177AA, 0x80E80020, "NtReadFile"   },
+            { 0x80020A68, 0x80E80040, "NtClose"      },
+            { 0x80016CC5, 0x80E80060, "NtOpenFile"   },
+        };
+        for (int p = 0; p < 4; p++) {
+            for (int i = 0; i < 400; i++) {
+                uint32_t v;
+                address_space_read(&address_space_memory, kt_pa + i * 4,
+                                   MEMTXATTRS_UNSPECIFIED, &v, 4);
+                if (v == 0) break;
+                if (v == patches[p].orig_va) {
+                    address_space_write(&address_space_memory, kt_pa + i * 4,
+                                        MEMTXATTRS_UNSPECIFIED, &patches[p].tramp_va, 4);
+                    printf("Chihiro XBE: Instrumented %s thunk[%d] -> 0x%08X\n",
+                           patches[p].name, i, patches[p].tramp_va);
+                    break;
+                }
+            }
+        }
+        printf("Chihiro XBE: File I/O instrumentation installed\n");
+    }
+
     /* Step 4b: Initialize LaunchDataPage (required by game CRT) */
     {
         uint32_t ldp_pa = 0x0F00000;
@@ -542,6 +718,19 @@ static void chihiro_load_game_xbe(void)
         address_space_write(&address_space_memory, 0x3B3D8,
                             MEMTXATTRS_UNSPECIFIED, &ldp_va, 4);
         printf("Chihiro XBE: LaunchDataPage at VA 0x%08X\n", ldp_va);
+    }
+
+    /* Step 4d: Initialize TLS AddressOfIndex.
+     * XBE TLS directory at VA 0x1BCD60, AddressOfIndex = VA 0x1FAAD8.
+     * PA = 0x1000000 + (0x1FAAD8 - 0x10000) = 0x10EAAD8.
+     * XepSetupTLS is a section loader, NOT TLS init — it never writes this.
+     * The game CRT _tls_init reads this index; if unset, TLS-dependent
+     * constructors fail silently → scene graph nodes never created → NULL. */
+    {
+        uint32_t tls_index = 0;
+        address_space_write(&address_space_memory, 0x10EAAD8,
+                            MEMTXATTRS_UNSPECIFIED, &tls_index, 4);
+        printf("Chihiro XBE: TLS AddressOfIndex written (PA 0x10EAAD8 = 0)\n");
     }
 
         /* Step 5: Set up page tables (EIP change done by trampoline JMP) */
@@ -618,16 +807,16 @@ static void chihiro_load_game_xbe(void)
         uint32_t pt1[1024];
         address_space_read(&address_space_memory, pt1_pa,
                            MEMTXATTRS_UNSPECIFIED, pt1, 4096);
-        int dolby_mapped = 0;
-        for (uint32_t va = 0x501000; va < 0x509000; va += 0x1000) {
+        int pde1_mapped = 0;
+        for (uint32_t va = 0x400000; va < max_va; va += 0x1000) {
             uint32_t pte_idx = (va >> 12) & 0x3FF;
             uint32_t pa = 0x1000000 + (va - base_addr);
             pt1[pte_idx] = pa | 0x67;
-            dolby_mapped++;
+            pde1_mapped++;
         }
         address_space_write(&address_space_memory, pt1_pa,
                             MEMTXATTRS_UNSPECIFIED, pt1, 4096);
-        printf("Chihiro XBE: Mapped %d DOLBY pages\n", dolby_mapped);
+        printf("Chihiro XBE: Mapped %d pages in PDE[1] (BSS+DOLBY)\n", pde1_mapped);
 
         address_space_write(&address_space_memory, cr3,
                             MEMTXATTRS_UNSPECIFIED, pd, 4096);
@@ -639,10 +828,139 @@ static void chihiro_load_game_xbe(void)
                             0x7FD3000 + 0x300 * 4,
                             MEMTXATTRS_UNSPECIFIED, &ldp_pte, 4);
 
+        /* Reset IRQL to PASSIVE_LEVEL (0).
+         * We're in the SMBus handler context which runs at elevated IRQL.
+         * Game code expects PASSIVE_LEVEL — any page fault at IRQL >= 2
+         * triggers BugCheck 0x0A. IRQL is stored at PA 0x36170. */
+        uint8_t current_irql = 0;
+        address_space_read(&address_space_memory, 0x36170,
+                           MEMTXATTRS_UNSPECIFIED, &current_irql, 1);
+        printf("Chihiro XBE: IRQL at intercept = %d (0x%02X)\n",
+               current_irql, current_irql);
+        uint8_t irql_passive = 0;
+        address_space_write(&address_space_memory, 0x36170,
+                            MEMTXATTRS_UNSPECIFIED, &irql_passive, 1);
+
         /* Set EIP to game entry point (we are in vCPU context via SMBus) */
         env->eip = entry_dec;
         tlb_flush(cs);
         printf("Chihiro XBE: EIP set to 0x%08X\n", entry_dec);
+    }
+
+    /* Step 6: Instrument KeBugCheckEx (VA 0x80019782, PA 0x19782).
+     * Write a JMP detour to our trampoline at VA 0x80E80080.
+     * Trampoline: pushad → OUT 0x40FC (ordinal 0xBC) → popad →
+     * execute saved original bytes → JMP back to KeBugCheckEx+5. */
+    {
+        uint32_t bugchk_pa = 0x19782;
+        uint32_t tramp_pa = 0x0E80080;
+        uint32_t tramp_va = 0x80E80080;
+        uint32_t bugchk_va = 0x80019782;
+
+        /* Read and save original 5 bytes */
+        uint8_t orig[5];
+        address_space_read(&address_space_memory, bugchk_pa,
+                           MEMTXATTRS_UNSPECIFIED, orig, 5);
+
+        /* Build trampoline: pushad, OUT, popad, orig bytes, JMP back */
+        uint8_t tramp[32] = {
+            0x60,                               /* pushad              */
+            0xBA, 0xFC, 0x40, 0x00, 0x00,       /* mov edx, 0x40FC    */
+            0xB8, 0xBC, 0x00, 0x00, 0x00,       /* mov eax, 0xBC      */
+            0xEF,                               /* out dx, eax         */
+            0x61,                               /* popad               */
+            /* orig[0..4] copied below at offset 13 */
+            0, 0, 0, 0, 0,
+            /* JMP back to KeBugCheckEx+5 */
+            0x68, 0, 0, 0, 0,                   /* push imm32          */
+            0xC3,                               /* ret (= jmp [esp])   */
+        };
+        memcpy(tramp + 13, orig, 5);
+        uint32_t ret_va = bugchk_va + 5;
+        memcpy(tramp + 19, &ret_va, 4);
+
+        address_space_write(&address_space_memory, tramp_pa,
+                            MEMTXATTRS_UNSPECIFIED, tramp, sizeof(tramp));
+
+        /* Write JMP detour at KeBugCheckEx entry */
+        uint8_t jmp[5];
+        jmp[0] = 0xE9;
+        int32_t rel = (int32_t)(tramp_va - (bugchk_va + 5));
+        memcpy(jmp + 1, &rel, 4);
+        address_space_write(&address_space_memory, bugchk_pa,
+                            MEMTXATTRS_UNSPECIFIED, jmp, 5);
+
+        printf("Chihiro XBE: KeBugCheckEx detour installed "
+               "(PA 0x%X → VA 0x%08X, orig=%02X%02X%02X%02X%02X)\n",
+               bugchk_pa, tramp_va, orig[0], orig[1], orig[2], orig[3], orig[4]);
+    }
+
+    /* Step 7: Install function trace detours at key game init points.
+     * Each detour: read original bytes, write trampoline (pushad/OUT 0x40F8/
+     * popad/saved bytes/JMP back), overwrite function entry with JMP. */
+    {
+        struct {
+            uint32_t va;
+            int detour_len;
+            uint8_t trace_id;
+            const char *name;
+        } traces[] = {
+            { 0x0B973C, 5, 1, "crt_version_check" },
+            { 0x0B96BB, 5, 3, "_initterm"          },
+            { 0x0B9713, 5, 4, "main"               },
+            { 0x084B90, 6, 5, "game_init_1"        },
+            { 0x0FCCB0, 5, 6, "game_init_2"        },
+            { 0x0B7D20, 5, 7, "game_init_3"        },
+        };
+        int n_traces = sizeof(traces) / sizeof(traces[0]);
+
+        for (int t = 0; t < n_traces; t++) {
+            uint32_t func_va = traces[t].va;
+            uint32_t func_pa = 0x1000000 + (func_va - 0x10000);
+            int dlen = traces[t].detour_len;
+            uint32_t tramp_pa = 0x0E80100 + traces[t].trace_id * 32;
+            uint32_t tramp_va = 0x80E80100 + traces[t].trace_id * 32;
+
+            /* Read original bytes */
+            uint8_t orig[8] = {0};
+            address_space_read(&address_space_memory, func_pa,
+                               MEMTXATTRS_UNSPECIFIED, orig, dlen);
+
+            /* Build trampoline */
+            uint8_t tramp[32] = {0};
+            int p = 0;
+            tramp[p++] = 0x60;                         /* pushad */
+            tramp[p++] = 0xBA; tramp[p++] = 0xF8;
+            tramp[p++] = 0x40; tramp[p++] = 0x00;
+            tramp[p++] = 0x00;                         /* mov edx, 0x40F8 */
+            tramp[p++] = 0xB8; tramp[p++] = traces[t].trace_id;
+            tramp[p++] = 0x00; tramp[p++] = 0x00;
+            tramp[p++] = 0x00;                         /* mov eax, id */
+            tramp[p++] = 0xEF;                         /* out dx, eax */
+            tramp[p++] = 0x61;                         /* popad */
+            memcpy(tramp + p, orig, dlen); p += dlen;  /* saved bytes */
+            tramp[p++] = 0x68;                         /* push imm32 */
+            uint32_t ret_va = func_va + dlen;
+            memcpy(tramp + p, &ret_va, 4); p += 4;
+            tramp[p++] = 0xC3;                         /* ret */
+
+            /* PTE for trampoline page (0x80E80000 already has one from Step 4c) */
+            address_space_write(&address_space_memory, tramp_pa,
+                                MEMTXATTRS_UNSPECIFIED, tramp, p);
+
+            /* Write JMP detour + NOP padding */
+            uint8_t jmp[8];
+            jmp[0] = 0xE9;
+            int32_t rel = (int32_t)(tramp_va - (func_va + 5));
+            memcpy(jmp + 1, &rel, 4);
+            for (int i = 5; i < dlen; i++) jmp[i] = 0x90;
+            address_space_write(&address_space_memory, func_pa,
+                                MEMTXATTRS_UNSPECIFIED, jmp, dlen);
+
+            printf("Chihiro XBE: Trace[%d] %s (VA 0x%X, %d bytes, orig=%02X%02X%02X%02X%02X)\n",
+                   traces[t].trace_id, traces[t].name, func_va, dlen,
+                   orig[0], orig[1], orig[2], orig[3], orig[4]);
+        }
     }
 
     printf("Chihiro: === XBE LOADER DONE ===\n");
