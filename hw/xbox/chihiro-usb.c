@@ -338,7 +338,8 @@ static void handle_control(USBDevice *dev, USBPacket *p,
     default:
         printf("chihiro-usb [%s]: unknown vendor req 0x%02X val=0x%04X idx=0x%04X\n",
                id, bRequest, value, index);
-        break;
+        p->status = USB_RET_STALL;
+        return;
     }
 
     p->actual_length = length;

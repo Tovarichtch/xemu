@@ -246,11 +246,15 @@ static const char *ohci_reg_names[] = {
 
 static const char *ohci_reg_name(hwaddr addr)
 {
+    if (addr >= 0x54) {
+        static char buf[32];
+        snprintf(buf, sizeof(buf), "HcRhPort%d", (int)((addr - 0x54) >> 2));
+        return buf;
+    }
     if (addr >> 2 < ARRAY_SIZE(ohci_reg_names)) {
         return ohci_reg_names[addr >> 2];
-    } else {
-        return "<unknown>";
     }
+    return "<unknown>";
 }
 
 static void ohci_die(OHCIState *ohci)
@@ -274,24 +278,32 @@ static inline void ohci_intr_update(OHCIState *ohci)
 static inline void ohci_set_interrupt(OHCIState *ohci, uint32_t intr)
 {
     ohci->intr_status |= intr;
+    if (intr & ~OHCI_INTR_SF) {
+        printf("OHCI IRQ: set 0x%08X (status=0x%08X enable=0x%08X)\n",
+               intr, ohci->intr_status, ohci->intr);
+    }
     ohci_intr_update(ohci);
 }
 
 static USBDevice *ohci_find_device(OHCIState *ohci, uint8_t addr)
 {
     USBDevice *dev;
+    USBDevice *fallback = NULL;
     int i;
 
     for (i = 0; i < ohci->num_ports; i++) {
-        if ((ohci->rhport[i].ctrl & OHCI_PORT_PES) == 0) {
-            continue;
-        }
         dev = usb_find_device(&ohci->rhport[i].port, addr);
         if (dev != NULL) {
-            return dev;
+            int pes = (ohci->rhport[i].ctrl & OHCI_PORT_PES) ? 1 : 0;
+            printf("OHCI ROUTE: addr=%d -> port%d PES=%d %s\n",
+                   addr, i, pes, pes ? "MATCH" : "fallback");
+            if (pes) return dev;
+            if (!fallback) fallback = dev;
         }
     }
-    return NULL;
+    if (!fallback)
+        printf("OHCI ROUTE: addr=%d -> NOT FOUND\n", addr);
+    return fallback;
 }
 
 void ohci_stop_endpoints(OHCIState *ohci)
@@ -904,6 +916,12 @@ static int ohci_service_td(OHCIState *ohci, struct ohci_ed *ed)
         return 1;
     }
 
+    printf("OHCI TD: ed_addr=0x%08X td_addr=0x%08X FA=%d EN=%d "
+           "cbp=0x%08X be=0x%08X flags=0x%08X next=0x%08X\n",
+           ed->head & OHCI_DPTR_MASK, addr,
+           OHCI_BM(ed->flags, ED_FA), OHCI_BM(ed->flags, ED_EN),
+           td.cbp, td.be, td.flags, td.next);
+
     dir = OHCI_BM(ed->flags, ED_D);
     switch (dir) {
     case OHCI_TD_DIR_OUT:
@@ -997,6 +1015,10 @@ static int ohci_service_td(OHCIState *ohci, struct ohci_ed *ed)
                          OHCI_BM(td.flags, TD_DI) == 0);
         usb_packet_addbuf(&ohci->usb_packet, ohci->usb_buf, pktlen);
         usb_handle_packet(dev, &ohci->usb_packet);
+        printf("OHCI TD RESULT: FA=%d EN=%d dir=%s status=%d len=%zd\n",
+               OHCI_BM(ed->flags, ED_FA), OHCI_BM(ed->flags, ED_EN),
+               str, ohci->usb_packet.status,
+               ohci->usb_packet.actual_length);
         trace_usb_ohci_td_packet_status(ohci->usb_packet.status);
 
         if (ohci->usb_packet.status == USB_RET_ASYNC) {
@@ -1145,6 +1167,15 @@ static int ohci_service_ed_list(OHCIState *ohci, uint32_t head)
         }
 
         while ((ed.head & OHCI_DPTR_MASK) != ed.tail) {
+            printf("OHCI ED: @0x%08X FA=%d EN=%d D=%d K=%d F=%d MPS=%d "
+                   "head=0x%08X tail=0x%08X\n",
+                   cur,
+                   OHCI_BM(ed.flags, ED_FA), OHCI_BM(ed.flags, ED_EN),
+                   OHCI_BM(ed.flags, ED_D),
+                   (ed.flags & OHCI_ED_K) ? 1 : 0,
+                   (ed.flags & OHCI_ED_F) ? 1 : 0,
+                   OHCI_BM(ed.flags, ED_MPS),
+                   ed.head, ed.tail);
             trace_usb_ohci_ed_pkt(cur, (ed.head & OHCI_ED_H) != 0,
                     (ed.head & OHCI_ED_C) != 0, ed.head & OHCI_DPTR_MASK,
                     ed.tail & OHCI_DPTR_MASK, ed.next & OHCI_DPTR_MASK);
@@ -1194,6 +1225,7 @@ static void ohci_sof(OHCIState *ohci)
 static void ohci_process_lists(OHCIState *ohci)
 {
     if ((ohci->ctl & OHCI_CTL_CLE) && (ohci->status & OHCI_STATUS_CLF)) {
+        printf("OHCI: === Processing CONTROL list head=0x%08X ===\n", ohci->ctrl_head);
         if (ohci->ctrl_cur && ohci->ctrl_cur != ohci->ctrl_head) {
             trace_usb_ohci_process_lists(ohci->ctrl_head, ohci->ctrl_cur);
         }
@@ -1204,6 +1236,7 @@ static void ohci_process_lists(OHCIState *ohci)
     }
 
     if ((ohci->ctl & OHCI_CTL_BLE) && (ohci->status & OHCI_STATUS_BLF)) {
+        printf("OHCI: === Processing BULK list head=0x%08X ===\n", ohci->bulk_head);
         if (!ohci_service_ed_list(ohci, ohci->bulk_head)) {
             ohci->bulk_cur = 0;
             ohci->status &= ~OHCI_STATUS_BLF;
@@ -1216,6 +1249,18 @@ static void ohci_frame_boundary(void *opaque)
 {
     OHCIState *ohci = opaque;
     struct ohci_hcca hcca;
+
+    /* Log HcControl changes */
+    static uint32_t prev_ctl = 0xFFFFFFFF;
+    if (ohci->ctl != prev_ctl) {
+        printf("OHCI STATE: ctl=0x%08X (CBSR=%d PLE=%d IE=%d CLE=%d BLE=%d HCFS=%d)\n",
+               ohci->ctl,
+               ohci->ctl & 3,
+               (ohci->ctl >> 2) & 1, (ohci->ctl >> 3) & 1,
+               (ohci->ctl >> 4) & 1, (ohci->ctl >> 5) & 1,
+               (ohci->ctl >> 6) & 3);
+        prev_ctl = ohci->ctl;
+    }
 
     if (ohci_read_hcca(ohci, ohci->hcca, &hcca)) {
         trace_usb_ohci_hcca_read_error(ohci->hcca);
@@ -1283,6 +1328,7 @@ static void ohci_frame_boundary(void *opaque)
  */
 static int ohci_bus_start(OHCIState *ohci)
 {
+    printf("OHCI BUS START (HCFS -> OPERATIONAL)\n");
     trace_usb_ohci_start(ohci->name);
     /*
      * Delay the first SOF event by one frame time as linux driver is
@@ -1297,6 +1343,7 @@ static int ohci_bus_start(OHCIState *ohci)
 /* Stop sending SOF tokens on the bus */
 void ohci_bus_stop(OHCIState *ohci)
 {
+    printf("OHCI BUS STOP\n");
     trace_usb_ohci_stop(ohci->name);
     timer_del(ohci->eof_timer);
 }
@@ -1476,8 +1523,13 @@ static void ohci_port_set_status(OHCIState *ohci, int portnum, uint32_t val)
     port = &ohci->rhport[portnum];
     old_state = port->ctrl;
 
-    printf("OHCI: port%d WRITE val=0x%08X (before: 0x%08X)\n",
-           portnum, val, old_state);
+    printf("OHCI PORT%d WRITE: val=0x%08X before=0x%08X [%s%s%s%s%s]\n",
+           portnum, val, old_state,
+           (val & (1<<0))  ? "ClearPortEnable " : "",
+           (val & (1<<1))  ? "SetPortEnable " : "",
+           (val & (1<<4))  ? "SetPortReset " : "",
+           (val & (1<<8))  ? "SetPortPower " : "",
+           (val & (1<<16)) ? "ClearCSC " : "");
 
     /* Write to clear CSC, PESC, PSSC, OCIC, PRSC */
     if (val & OHCI_PORT_WTC) {
@@ -1526,8 +1578,6 @@ static uint64_t ohci_mem_read(void *opaque,
     } else if (addr >= 0x54 && addr < 0x54 + ohci->num_ports * 4) {
         /* HcRhPortStatus */
         retval = ohci->rhport[(addr - 0x54) >> 2].ctrl | OHCI_PORT_PPS;
-        printf("OHCI: port%d READ ctrl=0x%08X\n",
-               (int)((addr - 0x54) >> 2), retval);
         trace_usb_ohci_mem_port_read(size, "HcRhPortStatus", (addr - 0x50) >> 2,
                                      addr, addr >> 2, retval);
     } else {
@@ -1640,6 +1690,12 @@ static uint64_t ohci_mem_read(void *opaque,
         }
     }
 
+    /* Log all reads except HcFmRemaining(0x38) and HcFmNumber(0x3C) */
+    if (addr != 0x38 && addr != 0x3C) {
+        printf("OHCI READ  [0x%03X] %-20s = 0x%08X\n",
+               (uint32_t)addr, ohci_reg_name(addr), retval);
+    }
+
     return retval;
 }
 
@@ -1655,6 +1711,9 @@ static void ohci_mem_write(void *opaque,
         trace_usb_ohci_mem_write_unaligned(addr);
         return;
     }
+
+    printf("OHCI WRITE [0x%03X] %-20s = 0x%08X\n",
+           (uint32_t)addr, ohci_reg_name(addr), (uint32_t)val);
 
     if (addr >= 0x54 && addr < 0x54 + ohci->num_ports * 4) {
         /* HcRhPortStatus */
@@ -1789,6 +1848,10 @@ static void ohci_attach(USBPort *port1)
     OHCIPort *port = &s->rhport[port1->index];
     uint32_t old_state = port->ctrl;
 
+    printf("OHCI ATTACH: port%d device=%s\n",
+           port1->index,
+           port1->dev ? port1->dev->product_desc : "NULL");
+
     /* set connect status */
     port->ctrl |= OHCI_PORT_CCS | OHCI_PORT_CSC;
 
@@ -1828,6 +1891,8 @@ static void ohci_detach(USBPort *port1)
     OHCIState *s = port1->opaque;
     OHCIPort *port = &s->rhport[port1->index];
     uint32_t old_state = port->ctrl;
+
+    printf("OHCI DETACH: port%d\n", port1->index);
 
     ohci_child_detach(port1, port1->dev);
 

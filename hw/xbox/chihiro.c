@@ -175,31 +175,24 @@ static void chihiro_lpc_io_write(void *opaque, hwaddr addr, uint64_t val,
 
     ChihiroLPCState *s = CHIHIRO_LPC_DEVICE(opaque);
 
+    /* Log ALL writes */
+    printf("chihiro lpc write [0x%04x] <- 0x%04x (size=%d)\n",
+           (unsigned)(addr + 0x4000), (unsigned)val, size);
+
     switch (addr) {
     case 0x00: /* Port 0x4000: write register data */
         s->lpc_reg_data = (uint32_t)val;
-        if (CHIHIRO_LOG) {
-            printf("chihiro lpc reg write [0x%08X] <- 0x%08X\n",
-                   s->lpc_reg_addr, (unsigned)val);
-        }
+        printf("chihiro lpc reg write [0x%08X] <- 0x%08X\n",
+               s->lpc_reg_addr, (unsigned)val);
         return;
     case 0x04: /* Port 0x4004: set register address */
         s->lpc_reg_addr = (uint32_t)val;
         return;
     case 0x08: /* Port 0x4008: command/clear */
         return;
-    case 0xE0: /* Port 0x40E0: IRQ ack */
-        return;
-    }
-
-    if (CHIHIRO_LOG) {
-        printf("chihiro lpc write [0x%04x] = 0x%04x (size=%d)\n",
-               (unsigned)(addr + 0x4000), (unsigned)val, size);
-    }
-
-    switch (addr) {
     case SEGA_IRQ10_ACK:
         /* Clear IRQ10 — SEGABOOT writes here after handling baseboard IRQ */
+        printf("chihiro IRQ10 LOWER (ack from SEGABOOT)\n");
         qemu_irq_lower(s->irq10);
         break;
     default:
@@ -438,7 +431,11 @@ bool chihiro_ide_read_sector(uint32_t lba, void *buffer)
 
     if (lba == CHIHIRO_MBCOM_RESPONSE) {
         memcpy(buffer, chihiro_mbcom_response, 512);
-        printf("Chihiro mbcom: read response @ LBA 0x%X\n", lba);
+        const uint8_t *d = (const uint8_t *)buffer;
+        printf("Chihiro mbcom: read response @ LBA 0x%X data=%02X%02X%02X%02X "
+               "%02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X\n",
+               lba, d[0],d[1],d[2],d[3],d[4],d[5],d[6],d[7],
+               d[8],d[9],d[10],d[11],d[12],d[13],d[14],d[15]);
         return true;
     }
     if (lba == CHIHIRO_MBCOM_COMMAND) {
@@ -457,11 +454,13 @@ bool chihiro_ide_write_sector(uint32_t lba, const void *buffer)
 
     if (lba == CHIHIRO_MBCOM_COMMAND) {
         const uint8_t *cmd = (const uint8_t *)buffer;
+        printf("Chihiro mbcom: write command @ LBA 0x%X data=%02X%02X%02X%02X "
+               "%02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X\n",
+               lba, cmd[0],cmd[1],cmd[2],cmd[3],cmd[4],cmd[5],cmd[6],cmd[7],
+               cmd[8],cmd[9],cmd[10],cmd[11],cmd[12],cmd[13],cmd[14],cmd[15]);
         if (cmd[0] != 0 || cmd[1] != 0) {
             chihiro_mbcom_process(cmd);
-            /* TODO: trigger IRQ10 via LPC */
         }
-        printf("Chihiro mbcom: write command @ LBA 0x%X\n", lba);
         return true;
     }
     if (lba == CHIHIRO_MBCOM_RESPONSE) {
@@ -522,6 +521,7 @@ void chihiro_ide_dma_write_done(BlockBackend *blk, int64_t sector_num)
 
     /* Signal SEGABOOT that response is ready */
     if (chihiro_irq10_global) {
+        printf("chihiro IRQ10 RAISE (mbcom response ready)\n");
         qemu_irq_raise(chihiro_irq10_global);
     }
 }

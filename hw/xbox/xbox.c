@@ -371,27 +371,23 @@ void xbox_init_common(MachineState *machine,
          * the SMBus transaction never completes and boot hangs. */
         smbus_fs454_init(smbus, 0x6A);
 
-        /* Attach Chihiro baseboard USB devices to OHCI controller PCI 02:0.
-         * MAME: pci:02.0:port1 = AN2131QC, pci:02.0:port2 = AN2131SC.
-         * usb0 = PCI_DEVFN(2,0), created second → bus name usb-bus.1 */
-        USBBus *chihiro_usb_bus = NULL;
-        for (int i = 0; i < 4 && !chihiro_usb_bus; i++) {
-            char busname[16];
-            snprintf(busname, sizeof(busname), "usb-bus.%d", i);
-            BusState *bs = qdev_get_child_bus(DEVICE(usb0), busname);
-            if (bs) {
-                chihiro_usb_bus = USB_BUS(bs);
-                printf("Chihiro: Found USB bus '%s' on PCI 02:0\n", busname);
-            }
+        /* Chihiro baseboard: both QC+SC on USB0 (PCI 02:0).
+         * The kernel enumerates USB0. OHCI uses prefer-PES routing
+         * to handle address collision during enumeration. */
+        USBBus *usb0_bus = NULL;
+        for (int i = 0; i < 4 && !usb0_bus; i++) {
+            char bn[16]; snprintf(bn, sizeof(bn), "usb-bus.%d", i);
+            BusState *bs = qdev_get_child_bus(DEVICE(usb0), bn);
+            if (bs) usb0_bus = USB_BUS(bs);
         }
-        if (chihiro_usb_bus) {
-            USBDevice *qc = usb_create_simple(chihiro_usb_bus, "chihiro-an2131qc");
-            printf("Chihiro: QC created, port=%d, addr=%d\n",
+
+        if (usb0_bus) {
+            USBDevice *qc = usb_create_simple(usb0_bus, "chihiro-an2131qc");
+            printf("Chihiro: QC on USB0 port=%d addr=%d\n",
                    qc->port ? qc->port->index : -1, qc->addr);
-            USBDevice *sc = usb_create_simple(chihiro_usb_bus, "chihiro-an2131sc");
-            printf("Chihiro: SC created, port=%d, addr=%d\n",
+            USBDevice *sc = usb_create_simple(usb0_bus, "chihiro-an2131sc");
+            printf("Chihiro: SC on USB0 port=%d addr=%d\n",
                    sc->port ? sc->port->index : -1, sc->addr);
-            printf("Chihiro: Attached AN2131QC + AN2131SC USB baseboard devices\n");
         } else {
             printf("Chihiro: WARNING — could not find USB bus on OHCI\n");
         }
