@@ -57,6 +57,7 @@
 
 #include "hw/xbox/xbox.h"
 #include "smbus.h"
+#include "chihiro.h"
 
 #define MAX_IDE_BUS 2
 
@@ -371,9 +372,16 @@ void xbox_init_common(MachineState *machine,
          * the SMBus transaction never completes and boot hangs. */
         smbus_fs454_init(smbus, 0x6A);
 
-        /* Chihiro baseboard: both QC+SC on USB0 (PCI 02:0).
-         * The kernel enumerates USB0. OHCI uses prefer-PES routing
-         * to handle address collision during enumeration. */
+        /* Chihiro baseboard USB: AN2131 QC + SC
+         *
+         * On real hardware, the AN2131 chips load firmware from their
+         * I2C EEPROMs (ic10/pc20) at power-up (~200-500ms).
+         * The kernel boots and does its initial USB scan before the
+         * AN2131 chips are ready. They appear as hot-plug devices
+         * AFTER the kernel has started.
+         *
+         * We create the devices with auto_attach=0 (set in realize),
+         * then attach them via a timer 1.5s after boot. */
         USBBus *usb0_bus = NULL;
         for (int i = 0; i < 4 && !usb0_bus; i++) {
             char bn[16]; snprintf(bn, sizeof(bn), "usb-bus.%d", i);
@@ -382,12 +390,16 @@ void xbox_init_common(MachineState *machine,
         }
 
         if (usb0_bus) {
+            /* Create but don't attach (auto_attach=0 in realize) */
             USBDevice *qc = usb_create_simple(usb0_bus, "chihiro-an2131qc");
-            printf("Chihiro: QC on USB0 port=%d addr=%d\n",
-                   qc->port ? qc->port->index : -1, qc->addr);
             USBDevice *sc = usb_create_simple(usb0_bus, "chihiro-an2131sc");
-            printf("Chihiro: SC on USB0 port=%d addr=%d\n",
-                   sc->port ? sc->port->index : -1, sc->addr);
+            printf("Chihiro: QC created port=%d (not attached yet)\n",
+                   qc->port ? qc->port->index : -1);
+            printf("Chihiro: SC created port=%d (not attached yet)\n",
+                   sc->port ? sc->port->index : -1);
+
+            /* Store globally for the hotplug timer */
+            chihiro_usb_set_devices(qc, sc);
         } else {
             printf("Chihiro: WARNING — could not find USB bus on OHCI\n");
         }

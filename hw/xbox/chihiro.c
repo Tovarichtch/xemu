@@ -31,6 +31,7 @@
 #include "system/block-backend.h"
 #include "chihiro.h"
 #include "system/blockdev.h"
+#include "hw/usb.h"
 
 /*
  * Chihiro Mediaboard LPC I/O
@@ -98,6 +99,9 @@ typedef struct ChihiroLPCState {
     /* IRQ10 for baseboard → SEGABOOT communication */
     qemu_irq irq10;
     QEMUTimer *irq10_timer;
+
+    /* USB hotplug timer (simulates AN2131 I2C firmware boot delay) */
+    QEMUTimer *usb_hotplug_timer;
 } ChihiroLPCState;
 
 #define CHIHIRO_LPC_DEVICE(obj) \
@@ -105,6 +109,40 @@ typedef struct ChihiroLPCState {
 
 static bool chihiro_active;
 static ChihiroLPCState *chihiro_lpc_global;
+
+/* USB devices for delayed hotplug (simulates AN2131 I2C firmware boot) */
+static USBDevice *chihiro_usb_qc = NULL;
+static USBDevice *chihiro_usb_sc = NULL;
+
+void chihiro_usb_set_devices(USBDevice *qc, USBDevice *sc)
+{
+    chihiro_usb_qc = qc;
+    chihiro_usb_sc = sc;
+}
+
+/*
+ * Simulates AN2131 firmware boot from I2C EEPROM.
+ * On real hardware, the AN2131 chips take ~200-500ms to load firmware
+ * from ic10/pc20 EEPROMs before appearing on the USB bus.
+ * This timer fires after the kernel's initial USB scan is complete,
+ * causing a hot-plug event that triggers re-enumeration.
+ */
+static void chihiro_usb_hotplug_cb(void *opaque)
+{
+    printf("Chihiro USB HOTPLUG: AN2131 firmware boot complete, attaching devices\n");
+
+    if (chihiro_usb_qc && !chihiro_usb_qc->attached) {
+        usb_device_attach(chihiro_usb_qc, &error_abort);
+        printf("Chihiro USB HOTPLUG: QC attached to port %d\n",
+               chihiro_usb_qc->port ? chihiro_usb_qc->port->index : -1);
+    }
+
+    if (chihiro_usb_sc && !chihiro_usb_sc->attached) {
+        usb_device_attach(chihiro_usb_sc, &error_abort);
+        printf("Chihiro USB HOTPLUG: SC attached to port %d\n",
+               chihiro_usb_sc->port ? chihiro_usb_sc->port->index : -1);
+    }
+}
 
 /* Called from SMC handler when kernel writes SMC_REG_POWER (QuickReboot).
  * Blocks qemu_system_reset_request for Chihiro — the kernel handles
@@ -312,6 +350,14 @@ static void chihiro_lpc_realize(DeviceState *dev, Error **errp)
 
     /* Initialize mbcom protocol handler */
     chihiro_mbcom_init();
+
+    /* USB hotplug timer — simulates AN2131 I2C EEPROM firmware boot delay.
+     * 1500ms gives the kernel time to finish its initial USB scan and
+     * load SEGABOOT, which registers the baseboard class driver. */
+    s->usb_hotplug_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL,
+                                         chihiro_usb_hotplug_cb, s);
+    timer_mod(s->usb_hotplug_timer,
+              qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 1500);
 
     printf("Chihiro: Mediaboard LPC I/O initialized at 0x4000-0x40FF\n");
 }

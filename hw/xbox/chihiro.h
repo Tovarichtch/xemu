@@ -3,10 +3,16 @@
 
 #include "system/block-backend.h"
 
+/* Forward declaration */
+typedef struct USBDevice USBDevice;
+
 /* mbcom IDE hooks — called from IDE DMA path */
 void chihiro_mbcom_init(void);
 bool chihiro_ide_read_sector(uint32_t lba, void *buffer);
 bool chihiro_ide_write_sector(uint32_t lba, const void *buffer);
 void chihiro_ide_dma_write_done(BlockBackend *blk, int64_t sector_num);
+
+/* USB delayed hotplug (AN2131 firmware boot simulation) */
+void chihiro_usb_set_devices(USBDevice *qc, USBDevice *sc);
 
 #endif

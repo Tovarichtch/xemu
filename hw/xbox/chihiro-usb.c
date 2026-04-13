@@ -383,6 +383,8 @@ static void chihiro_an2131qc_realize(USBDevice *dev, Error **errp)
     ChihiroUSBState *s = (ChihiroUSBState *)dev;
     s->is_qc = true;
     usb_desc_init(dev);
+    dev->auto_attach = 0;  /* Attach later via hotplug timer */
+    printf("chihiro-usb [QC]: realized (auto_attach=0, will hotplug later)\n");
 
     /* Initialize ic10 EEPROM with default data.
      * TODO: load from ic10_g24lc64.bin file instead of hardcoding. */
@@ -439,6 +441,8 @@ static void chihiro_an2131sc_realize(USBDevice *dev, Error **errp)
     ChihiroUSBState *s = (ChihiroUSBState *)dev;
     s->is_qc = false;
     usb_desc_init(dev);
+    dev->auto_attach = 0;  /* Attach later via hotplug timer */
+    printf("chihiro-usb [SC]: realized (auto_attach=0, will hotplug later)\n");
 }
 
 static void chihiro_an2131sc_unrealize(USBDevice *dev)
