@@ -23,6 +23,8 @@
 #include "hw/usb.h"
 #include "hw/usb/desc.h"
 
+#include "qemu/timer.h"
+#define TS_MS ((long long)(qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL)))
 #define DEBUG_CUSB
 #ifdef DEBUG_CUSB
 #define DPRINTF(s, ...) printf("chihiro-usb: " s, ## __VA_ARGS__)
@@ -238,7 +240,7 @@ static const USBDesc desc_chihiro_an2131sc = {
 static void handle_reset(USBDevice *dev)
 {
     const char *id = ((ChihiroUSBState *)dev)->is_qc ? "QC" : "SC";
-    printf("chihiro-usb [%s]: device reset\n", id);
+    printf("[%07lld] chihiro-usb [%s]: device reset\n", TS_MS, id);
     fflush(stdout);
 }
 
@@ -248,14 +250,14 @@ static void handle_control(USBDevice *dev, USBPacket *p,
     ChihiroUSBState *s = (ChihiroUSBState *)dev;
     const char *id = ((ChihiroUSBState *)dev)->is_qc ? "QC" : "SC";
 
-    printf("chihiro-usb [%s]: control req=0x%04X val=0x%04X idx=0x%04X len=%d\n",
+    printf("[%07lld] chihiro-usb [%s]: control req=0x%04X val=0x%04X idx=0x%04X len=%d\n", TS_MS,
            id, request, value, index, length);
     fflush(stdout);
 
     int ret = usb_desc_handle_control(dev, p, request, value, index,
                                       length, data);
     if (ret >= 0) {
-        printf("chihiro-usb [%s]: → std handled, dev addr=%d\n", id, dev->addr);
+        printf("[%07lld] chihiro-usb [%s]: → std handled, dev addr=%d\n", TS_MS, id, dev->addr);
         return;
     }
 
@@ -287,7 +289,7 @@ static void handle_control(USBDevice *dev, USBPacket *p,
         s->bulk_pending = count;
         s->bulk_offset = 0;
         s->bulk_ep = 1;
-        printf("chihiro-usb [%s]: READ EEPROM1 addr=0x%04X count=%d → queued for EP1\n",
+        printf("[%07lld] chihiro-usb [%s]: READ EEPROM1 addr=0x%04X count=%d → queued for EP1\n", TS_MS,
                id, addr, count);
         break;
     }
@@ -305,7 +307,7 @@ static void handle_control(USBDevice *dev, USBPacket *p,
         s->bulk_pending = count;
         s->bulk_offset = 0;
         s->bulk_ep = 2;
-        printf("chihiro-usb [%s]: READ EEPROM2 addr=0x%04X count=%d\n", id, addr, count);
+        printf("[%07lld] chihiro-usb [%s]: READ EEPROM2 addr=0x%04X count=%d\n", TS_MS, id, addr, count);
         break;
     }
     case 0x19: /* Get JVS responses — no JVS data pending */
@@ -314,12 +316,12 @@ static void handle_control(USBDevice *dev, USBPacket *p,
         data[5] = 0;
         break;
     case 0x20: /* Send JVS packets — accept and discard */
-        printf("chihiro-usb [%s]: JVS SEND count=%d (stub)\n", id, index);
+        printf("[%07lld] chihiro-usb [%s]: JVS SEND count=%d (stub)\n", TS_MS, id, index);
         break;
     case 0x30: /* External interrupt control */
         data[4] = (value & 0xFF) > 0 ? 1 : 0;  /* enabled? */
         data[5] = 0;  /* IRQ counter */
-        printf("chihiro-usb [%s]: EXT IRQ control val=%d\n", id, value);
+        printf("[%07lld] chihiro-usb [%s]: EXT IRQ control val=%d\n", TS_MS, id, value);
         break;
     case 0x1C: /* Read RTC — stub */
         break;
@@ -339,7 +341,7 @@ static void handle_control(USBDevice *dev, USBPacket *p,
         break;
     }
     default:
-        printf("chihiro-usb [%s]: unknown vendor req 0x%02X val=0x%04X idx=0x%04X\n",
+        printf("[%07lld] chihiro-usb [%s]: unknown vendor req 0x%02X val=0x%04X idx=0x%04X\n", TS_MS,
                id, bRequest, value, index);
         p->status = USB_RET_STALL;
         return;
@@ -361,7 +363,7 @@ static void handle_data(USBDevice *dev, USBPacket *p)
             usb_packet_copy(p, s->bulk_buf + s->bulk_offset, len);
             s->bulk_offset += len;
             s->bulk_pending -= len;
-            printf("chihiro-usb [%s]: bulk IN ep%d %d bytes (%d remaining)\n",
+            printf("[%07lld] chihiro-usb [%s]: bulk IN ep%d %d bytes (%d remaining)\n", TS_MS,
                    id, ep, len, s->bulk_pending);
         } else {
             /* No data pending — return NAK (not ready, try later) */
@@ -376,7 +378,7 @@ static void handle_data(USBDevice *dev, USBPacket *p)
             usb_packet_copy(p, discard, chunk);
             len -= chunk;
         }
-        printf("chihiro-usb [%s]: bulk OUT ep%d %zd bytes (discarded)\n",
+        printf("[%07lld] chihiro-usb [%s]: bulk OUT ep%d %zd bytes (discarded)\n", TS_MS,
                id, ep, p->iov.size);
     }
 }
@@ -387,7 +389,7 @@ static void chihiro_an2131qc_realize(USBDevice *dev, Error **errp)
     s->is_qc = true;
     usb_desc_init(dev);
     dev->auto_attach = 0;  /* Attach later via hotplug timer */
-    printf("chihiro-usb [QC]: realized (auto_attach=0, will hotplug later)\n");
+    printf("[%07lld] chihiro-usb [QC]: realized (auto_attach=0, will hotplug later)\n", TS_MS);
 
     /* Initialize ic10 EEPROM with default data.
      * TODO: load from ic10_g24lc64.bin file instead of hardcoding. */
@@ -406,8 +408,8 @@ static void chihiro_an2131qc_realize(USBDevice *dev, Error **errp)
     s->bulk_offset = 0;
     s->bulk_ep = 0;
 
-    printf("Chihiro: AN2131QC USB device initialized "
-           "(serial=AAEE-01D44744715, region=JPN)\n");
+    printf("[%07lld] Chihiro: AN2131QC USB device initialized "
+           "(serial=AAEE-01D44744715, region=JPN)\n", TS_MS);
 }
 
 static void chihiro_an2131qc_unrealize(USBDevice *dev)
@@ -445,7 +447,7 @@ static void chihiro_an2131sc_realize(USBDevice *dev, Error **errp)
     s->is_qc = false;
     usb_desc_init(dev);
     dev->auto_attach = 0;  /* Attach later via hotplug timer */
-    printf("chihiro-usb [SC]: realized (auto_attach=0, will hotplug later)\n");
+    printf("[%07lld] chihiro-usb [SC]: realized (auto_attach=0, will hotplug later)\n", TS_MS);
 }
 
 static void chihiro_an2131sc_unrealize(USBDevice *dev)

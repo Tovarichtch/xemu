@@ -30,6 +30,7 @@
 #include "qemu/error-report.h"
 #include "qemu/main-loop.h"
 #include "qemu/timer.h"
+#define TS_MS ((long long)(qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL)))
 #include "qemu/hw-version.h"
 #include "qemu/memalign.h"
 #include "system/system.h"
@@ -1364,8 +1365,8 @@ void ide_ioport_write(void *opaque, uint32_t addr, uint32_t val)
             int unit = active->unit;
             int64_t sector = ide_get_sector(active);
             int nsector = active->nsector ? active->nsector : 256;
-            printf("IDE cmd=0x%02X unit=%d LBA=0x%llX nsect=%d\n",
-                   val, unit, (long long)sector, nsector);
+            printf("[%07lld] IDE cmd=0x%02X unit=%d LBA=0x%llX nsect=%d\n",
+                   TS_MS, val, unit, (long long)sector, nsector);
         }
         ide_bus_exec_cmd(bus, val);
         break;

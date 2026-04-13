@@ -27,6 +27,7 @@
 #include "system/memory.h"
 #include "qemu/error-report.h"
 #include "qemu/timer.h"
+#define TS_MS ((long long)(qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL)))
 #include "system/address-spaces.h"
 #include "system/block-backend.h"
 #include "chihiro.h"
@@ -129,17 +130,17 @@ void chihiro_usb_set_devices(USBDevice *qc, USBDevice *sc)
  */
 static void chihiro_usb_hotplug_cb(void *opaque)
 {
-    printf("Chihiro USB HOTPLUG: AN2131 firmware boot complete, attaching devices\n");
+    printf("[%07lld] Chihiro USB HOTPLUG: AN2131 firmware boot complete, attaching devices\n", TS_MS);
 
     if (chihiro_usb_qc && !chihiro_usb_qc->attached) {
         usb_device_attach(chihiro_usb_qc, &error_abort);
-        printf("Chihiro USB HOTPLUG: QC attached to port %d\n",
+        printf("[%07lld] Chihiro USB HOTPLUG: QC attached to port %d\n", TS_MS,
                chihiro_usb_qc->port ? chihiro_usb_qc->port->index : -1);
     }
 
     if (chihiro_usb_sc && !chihiro_usb_sc->attached) {
         usb_device_attach(chihiro_usb_sc, &error_abort);
-        printf("Chihiro USB HOTPLUG: SC attached to port %d\n",
+        printf("[%07lld] Chihiro USB HOTPLUG: SC attached to port %d\n", TS_MS,
                chihiro_usb_sc->port ? chihiro_usb_sc->port->index : -1);
     }
 }
@@ -151,7 +152,7 @@ static void chihiro_usb_hotplug_cb(void *opaque)
 bool chihiro_intercept_reset(void)
 {
     if (chihiro_active) {
-        printf("Chihiro: QuickReboot intercepted (SMC cmd=0x02) — blocking QEMU reset\n");
+        printf("[%07lld] Chihiro: QuickReboot intercepted (SMC cmd=0x02) — blocking QEMU reset\n", TS_MS);
         return true;  /* Block qemu_system_reset_request */
     }
     return false;
@@ -174,7 +175,7 @@ static uint64_t chihiro_lpc_io_read(void *opaque, hwaddr addr,
         default: r = 0; break;
         }
         if (CHIHIRO_LOG) {
-            printf("chihiro lpc reg read  [0x%08X] -> 0x%08X\n",
+            printf("[%07lld] chihiro lpc reg read  [0x%08X] -> 0x%08X\n", TS_MS,
                    s->lpc_reg_addr, (unsigned)r);
         }
         return r;
@@ -201,7 +202,7 @@ static uint64_t chihiro_lpc_io_read(void *opaque, hwaddr addr,
     }
 
     if (CHIHIRO_LOG) {
-        printf("chihiro lpc read  [0x%04x] -> 0x%04x (size=%d)\n",
+        printf("[%07lld] chihiro lpc read  [0x%04x] -> 0x%04x (size=%d)\n", TS_MS,
                (unsigned)(addr + 0x4000), (unsigned)r, size);
     }
     return r;
@@ -214,13 +215,13 @@ static void chihiro_lpc_io_write(void *opaque, hwaddr addr, uint64_t val,
     ChihiroLPCState *s = CHIHIRO_LPC_DEVICE(opaque);
 
     /* Log ALL writes */
-    printf("chihiro lpc write [0x%04x] <- 0x%04x (size=%d)\n",
+    printf("[%07lld] chihiro lpc write [0x%04x] <- 0x%04x (size=%d)\n", TS_MS,
            (unsigned)(addr + 0x4000), (unsigned)val, size);
 
     switch (addr) {
     case 0x00: /* Port 0x4000: write register data */
         s->lpc_reg_data = (uint32_t)val;
-        printf("chihiro lpc reg write [0x%08X] <- 0x%08X\n",
+        printf("[%07lld] chihiro lpc reg write [0x%08X] <- 0x%08X\n", TS_MS,
                s->lpc_reg_addr, (unsigned)val);
         return;
     case 0x04: /* Port 0x4004: set register address */
@@ -230,7 +231,7 @@ static void chihiro_lpc_io_write(void *opaque, hwaddr addr, uint64_t val,
         return;
     case SEGA_IRQ10_ACK:
         /* Clear IRQ10 — SEGABOOT writes here after handling baseboard IRQ */
-        printf("chihiro IRQ10 LOWER (ack from SEGABOOT)\n");
+        printf("[%07lld] chihiro IRQ10 LOWER (ack from SEGABOOT)\n", TS_MS);
         qemu_irq_lower(s->irq10);
         break;
     default:
@@ -306,8 +307,8 @@ static void chihiro_eeprom_hack_cb(void *opaque)
                                 MEMTXATTRS_UNSPECIFIED, leave_ret, 2);
 
             s->eeprom_hack_applied = true;
-            printf("Chihiro: Applied EEPROM validation hack "
-                   "(arcdkrnl @ 0x8003B744)\n");
+            printf("[%07lld] Chihiro: Applied EEPROM validation hack "
+                   "(arcdkrnl @ 0x8003B744)\n", TS_MS);
             return;
         }
         /* Retry until kernel is decrypted */
@@ -359,7 +360,7 @@ static void chihiro_lpc_realize(DeviceState *dev, Error **errp)
     timer_mod(s->usb_hotplug_timer,
               qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 1500);
 
-    printf("Chihiro: Mediaboard LPC I/O initialized at 0x4000-0x40FF\n");
+    printf("[%07lld] Chihiro: Mediaboard LPC I/O initialized at 0x4000-0x40FF\n", TS_MS);
 }
 
 static void chihiro_lpc_class_init(ObjectClass *klass, const void *data)
@@ -410,7 +411,7 @@ void chihiro_mbcom_init(void)
 {
     memset(chihiro_mbcom_response, 0, sizeof(chihiro_mbcom_response));
     chihiro_mbcom_enabled = true;
-    printf("Chihiro: mbcom protocol handler initialized\n");
+    printf("[%07lld] Chihiro: mbcom protocol handler initialized\n", TS_MS);
 }
 
 /* Process an mbcom command and generate response */
@@ -427,7 +428,7 @@ static void chihiro_mbcom_process(const uint8_t *cmd_data)
     chihiro_mbcom_response[2] = 0x01;
     chihiro_mbcom_response[3] = 0x80;
 
-    printf("Chihiro mbcom: cmd=0x%04X echo=0x%04X\n", cmd_code, cmd_echo);
+    printf("[%07lld] Chihiro mbcom: cmd=0x%04X echo=0x%04X\n", TS_MS, cmd_code, cmd_echo);
 
     switch (cmd_code) {
     case 0x0001: /* DIMM_SIZE */
@@ -462,7 +463,7 @@ static void chihiro_mbcom_process(const uint8_t *cmd_data)
         memcpy(chihiro_mbcom_response + 4, "-abc-abc12345678", 16);
         break;
     default:
-        printf("Chihiro mbcom: unknown command 0x%04X\n", cmd_code);
+        printf("[%07lld] Chihiro mbcom: unknown command 0x%04X\n", TS_MS, cmd_code);
         break;
     }
 }
@@ -478,9 +479,9 @@ bool chihiro_ide_read_sector(uint32_t lba, void *buffer)
     if (lba == CHIHIRO_MBCOM_RESPONSE) {
         memcpy(buffer, chihiro_mbcom_response, 512);
         const uint8_t *d = (const uint8_t *)buffer;
-        printf("Chihiro mbcom: read response @ LBA 0x%X data=%02X%02X%02X%02X "
+        printf("[%07lld] Chihiro mbcom: read response @ LBA 0x%X data=%02X%02X%02X%02X "
                "%02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X\n",
-               lba, d[0],d[1],d[2],d[3],d[4],d[5],d[6],d[7],
+               TS_MS, lba, d[0],d[1],d[2],d[3],d[4],d[5],d[6],d[7],
                d[8],d[9],d[10],d[11],d[12],d[13],d[14],d[15]);
         return true;
     }
@@ -500,9 +501,9 @@ bool chihiro_ide_write_sector(uint32_t lba, const void *buffer)
 
     if (lba == CHIHIRO_MBCOM_COMMAND) {
         const uint8_t *cmd = (const uint8_t *)buffer;
-        printf("Chihiro mbcom: write command @ LBA 0x%X data=%02X%02X%02X%02X "
+        printf("[%07lld] Chihiro mbcom: write command @ LBA 0x%X data=%02X%02X%02X%02X "
                "%02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X\n",
-               lba, cmd[0],cmd[1],cmd[2],cmd[3],cmd[4],cmd[5],cmd[6],cmd[7],
+               TS_MS, lba, cmd[0],cmd[1],cmd[2],cmd[3],cmd[4],cmd[5],cmd[6],cmd[7],
                cmd[8],cmd[9],cmd[10],cmd[11],cmd[12],cmd[13],cmd[14],cmd[15]);
         if (cmd[0] != 0 || cmd[1] != 0) {
             chihiro_mbcom_process(cmd);
@@ -541,7 +542,7 @@ void chihiro_ide_dma_write_done(BlockBackend *blk, int64_t sector_num)
     uint8_t cmd_data[512];
     int ret = blk_pread(blk, cmd_lba * 512, 512, cmd_data, 0);
     if (ret < 0) {
-        printf("Chihiro mbcom: failed to read command sector (ret=%d)\n", ret);
+        printf("[%07lld] Chihiro mbcom: failed to read command sector (ret=%d)\n", TS_MS, ret);
         return;
     }
 
@@ -554,7 +555,7 @@ void chihiro_ide_dma_write_done(BlockBackend *blk, int64_t sector_num)
     /* Write the response to the response sector */
     ret = blk_pwrite(blk, resp_lba * 512, 512, chihiro_mbcom_response, 0);
     if (ret < 0) {
-        printf("Chihiro mbcom: failed to write response sector (ret=%d)\n", ret);
+        printf("[%07lld] Chihiro mbcom: failed to write response sector (ret=%d)\n", TS_MS, ret);
         return;
     }
 
@@ -562,12 +563,12 @@ void chihiro_ide_dma_write_done(BlockBackend *blk, int64_t sector_num)
     memset(cmd_data, 0, 512);
     blk_pwrite(blk, cmd_lba * 512, 512, cmd_data, 0);
 
-    printf("Chihiro mbcom: processed command, response written to LBA 0x%llX\n",
+    printf("[%07lld] Chihiro mbcom: processed command, response written to LBA 0x%llX\n", TS_MS,
            (long long)resp_lba);
 
     /* Signal SEGABOOT that response is ready */
     if (chihiro_irq10_global) {
-        printf("chihiro IRQ10 RAISE (mbcom response ready)\n");
+        printf("[%07lld] chihiro IRQ10 RAISE (mbcom response ready)\n", TS_MS);
         qemu_irq_raise(chihiro_irq10_global);
     }
 }
