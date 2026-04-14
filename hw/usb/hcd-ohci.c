@@ -1537,7 +1537,16 @@ static void ohci_port_set_status(OHCIState *ohci, int portnum, uint32_t val)
         port->ctrl &= ~(val & OHCI_PORT_WTC);
     }
     if (val & OHCI_PORT_CCS) {
-        port->ctrl &= ~OHCI_PORT_PES;
+        /* Chihiro: do NOT disable port — SEGABOOT's baseboard devices
+         * need ports to stay enabled for later bulk transfers.
+         * On real hardware, the class driver prevents ClearPortEnable. */
+        if (port->port.dev && port->port.dev->product_desc &&
+            strncmp(port->port.dev->product_desc, "Chihiro", 7) == 0) {
+            printf("[%07lld] OHCI PORT%d: BLOCKED ClearPortEnable (Chihiro device)\n",
+                   TS_MS, portnum);
+        } else {
+            port->ctrl &= ~OHCI_PORT_PES;
+        }
     }
     ohci_port_set_if_connected(ohci, portnum, val & OHCI_PORT_PES);
 

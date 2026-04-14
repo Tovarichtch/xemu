@@ -104,6 +104,8 @@ typedef struct ChihiroLPCState {
     /* USB hotplug timers (simulates staggered AN2131 I2C firmware boot) */
     QEMUTimer *usb_hotplug_timer;     /* QC at T+1500ms */
     QEMUTimer *usb_hotplug_sc_timer;  /* SC at T+1700ms */
+    QEMUTimer *usb_poll_patch_timer;  /* Patch UsbPollQC/SC to return 0 */
+    bool usb_poll_patched;
 } ChihiroLPCState;
 
 #define CHIHIRO_LPC_DEVICE(obj) \
@@ -160,6 +162,191 @@ static void chihiro_usb_hotplug_sc_cb(void *opaque)
         printf("[%07lld] Chihiro USB HOTPLUG: SC attached to port %d\n", TS_MS,
                chihiro_usb_sc->port ? chihiro_usb_sc->port->index : -1);
     }
+}
+
+/*
+ * SEGABOOT Physical RAM Patcher
+ * =============================
+ *
+ * SEGABOOT is loaded by the Xbox kernel into paged virtual memory.
+ * Physical addresses are unknown. We scan RAM for unique byte signatures
+ * and patch conditional jumps to force the success path.
+ *
+ * baseboard_init (VA 0x41EF0) structure:
+ *   1. UsbEnumPoll()         → if fail → return 5  (Error 02)
+ *   2. RegisterClassDriver() → if fail → return 2  (Error 02)
+ *   3. ReadEEPROM(0)         → no fatal check
+ *   4. ReadEEPROM(1)         → no fatal check
+ *   5. InitMbcom()           → initializes mediaboard communication
+ *   6. return 0              → SUCCESS
+ */
+
+typedef struct {
+    const uint8_t *bytes;
+    int length;
+    int patch_offset;
+    const uint8_t *patch_bytes;
+    int patch_len;
+    const char *name;
+    bool applied;
+} ChihiroPatch;
+
+static void chihiro_usb_poll_patch_cb(void *opaque)
+{
+    ChihiroLPCState *s = opaque;
+    if (s->usb_poll_patched) return;
+
+    /*
+     * Patch 1: UsbEnumPoll error check (VA 0x41F57)
+     *   E8 64 F6 FF FF   call UsbEnumPoll
+     *   85 C0             test eax, eax
+     *   74 0F             je +0x0F → success path  ← patch to EB (jmp)
+     */
+    static const uint8_t sig_enumpoll[] = {
+        0xE8, 0x64, 0xF6, 0xFF, 0xFF,
+        0x85, 0xC0,
+        0x74, 0x0F
+    };
+
+    /*
+     * Patch 2: RegisterClassDriver error check (VA 0x41F74)
+     *   E8 27 54 00 00   call RegisterClassDriver
+     *   85 C0             test eax, eax
+     *   74 0F             je +0x0F → success path  ← patch to EB (jmp)
+     */
+    static const uint8_t sig_classdrv[] = {
+        0xE8, 0x27, 0x54, 0x00, 0x00,
+        0x85, 0xC0,
+        0x74, 0x0F
+    };
+
+    /*
+     * Patch 3: CheckErrors "baseboard ready" return value (VA 0x3D26B)
+     *
+     *   8B 35 F8 7A 08 00  mov esi, [0x87AF8]  ; "ready" flag
+     *   33 C0              xor eax, eax
+     *   3B F3              cmp esi, ebx
+     *   0F 95 C0           setne al
+     *   5D 5F 5E 5B        pop ebp/edi/esi/ebx
+     *   48                 dec eax
+     *   83 E0 05           and eax, 5           <- patch 05 -> 00
+     *   C3                 ret
+     *
+     * Without patch: CheckErrors returns 5 when [0x87AF8]==0 (not ready),
+     * causing an infinite loop: while(CheckErrors()==5) Sleep(16).
+     * With patch: and eax,0 -> always returns 0 -> loop exits immediately.
+     */
+    static const uint8_t sig_chkerr[] = {
+        0x8B, 0x35, 0xF8, 0x7A, 0x08, 0x00,  /* mov esi,[0x87AF8] */
+        0x33, 0xC0,                            /* xor eax, eax      */
+        0x3B, 0xF3,                            /* cmp esi, ebx      */
+        0x0F, 0x95, 0xC0                       /* setne al          */
+    };
+
+    /*
+     * Patch 4: GetQcStatusByte0 (VA 0x3AD80)
+     *
+     *   E8 2B 6E 01 00    call GetQcStatus (0x51BB0)
+     *   0F B6 00          movzx eax, byte ptr [eax]
+     *   C3                ret
+     *
+     * Patch: replace first 3 bytes with 31 C0 C3 (xor eax,eax; ret)
+     * -> always returns 0 -> caller takes CreateThread path
+     */
+    static const uint8_t sig_qcbyte0[] = {
+        0xE8, 0x2B, 0x6E, 0x01, 0x00,  /* call GetQcStatus      */
+        0x0F, 0xB6, 0x00,              /* movzx eax, byte [eax]  */
+        0xC3                            /* ret                    */
+    };
+
+    /*
+     * Patch 5: CreateThread return check (VA 0x425DE)
+     *
+     *   85 C0                test eax, eax
+     *   A3 34 A1 08 00       mov [0x8A134], eax
+     *   5B                   pop ebx
+     *   75 12                jne +0x12 (success)    <- patch to EB
+     *
+     * CreateThread (PsCreateSystemThreadEx) returns NULL in our
+     * emulation. Force success path to see what's past Error 02.
+     */
+    static const uint8_t sig_createthread[] = {
+        0x85, 0xC0,                            /* test eax, eax      */
+        0xA3, 0x34, 0xA1, 0x08, 0x00,         /* mov [0x8A134], eax */
+        0x5B,                                  /* pop ebx            */
+        0x75, 0x12                             /* jne +0x12          */
+    };
+
+    /*
+     * Patch 6 (DIAGNOSTIC): Error value at VA 0x2E3AB
+     *
+     *   C7 07 14 00 00 00    mov [edi], 0x14  (error code)
+     *
+     * Change 0x14 to 0x00. If the on-screen error changes,
+     * this confirms the error path at 0x2E3A5 is being taken.
+     * If nothing changes, the error comes from elsewhere.
+     */
+    static const uint8_t sig_errval[] = {
+        0xC7, 0x07, 0x14, 0x00, 0x00, 0x00   /* mov [edi], 0x14 */
+    };
+
+    /* Patch byte arrays */
+    static const uint8_t patch_jmp[]   = { 0xEB };
+    static const uint8_t patch_and0[]  = { 0x00 };
+    static const uint8_t patch_xor_ret[] = { 0x31, 0xC0, 0xC3 };
+
+    ChihiroPatch patches[] = {
+        { sig_enumpoll, sizeof(sig_enumpoll), 7,  patch_jmp,     1, "UsbEnumPoll check (je->jmp)",         false },
+        { sig_classdrv, sizeof(sig_classdrv), 7,  patch_jmp,     1, "RegisterClassDriver check (je->jmp)", false },
+        { sig_chkerr,   sizeof(sig_chkerr),  18,  patch_and0,    1, "CheckErrors (and eax,5 -> and eax,0)", false },
+        { sig_qcbyte0,  sizeof(sig_qcbyte0),  0,  patch_xor_ret, 3, "GetQcStatusByte0 (xor eax,eax; ret)", false },
+        { sig_createthread, sizeof(sig_createthread), 8, patch_jmp, 1, "CreateThread return (jne->jmp)", false },
+        { sig_errval,   sizeof(sig_errval),   2,  patch_and0,    1, "DIAG: error value 0x14->0x00",        false },
+    };
+    int num_patches = sizeof(patches) / sizeof(patches[0]);
+    int applied = 0;
+
+    uint8_t buf[4096];
+    for (uint32_t pa = 0x10000; pa < 0x08000000 && applied < num_patches; pa += 4096) {
+        address_space_read(&address_space_memory, pa,
+                           MEMTXATTRS_UNSPECIFIED, buf, 4096);
+
+        for (int p = 0; p < num_patches; p++) {
+            if (patches[p].applied) continue;
+
+            for (int i = 0; i <= 4096 - patches[p].length; i++) {
+                if (i + patches[p].patch_offset + patches[p].patch_len > 4096)
+                    continue;  /* Patch target would be off-page */
+                if (memcmp(&buf[i], patches[p].bytes, patches[p].length) != 0)
+                    continue;
+
+                uint32_t patch_pa = pa + i + patches[p].patch_offset;
+                address_space_write(&address_space_memory, patch_pa,
+                                    MEMTXATTRS_UNSPECIFIED,
+                                    patches[p].patch_bytes, patches[p].patch_len);
+
+                patches[p].applied = true;
+                applied++;
+
+                printf("[%07lld] Chihiro: PATCH %d/%d '%s' — "
+                       "sig at PA 0x%08X, patched %d byte(s) at PA 0x%08X\n",
+                       TS_MS, applied, num_patches,
+                       patches[p].name, pa + i, patches[p].patch_len, patch_pa);
+                break;
+            }
+        }
+    }
+
+    if (applied == num_patches) {
+        s->usb_poll_patched = true;
+        printf("[%07lld] Chihiro: All %d SEGABOOT patches applied\n", TS_MS, num_patches);
+        printf("[%07lld] Chihiro: baseboard_init->0 CheckErrors->0 "
+               "GetQcStatusByte0->0 -> CreateThread(GameThread)\n", TS_MS);
+        return;
+    }
+
+    timer_mod(s->usb_poll_patch_timer,
+              qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 50);
 }
 
 /* Called from SMC handler when kernel writes SMC_REG_POWER (QuickReboot).
@@ -383,6 +570,13 @@ static void chihiro_lpc_realize(DeviceState *dev, Error **errp)
                                             chihiro_usb_hotplug_sc_cb, s);
     timer_mod(s->usb_hotplug_sc_timer,
               qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 1700);
+
+    /* UsbPollQC/SC patch — retry every 1ms until SEGABOOT is loaded */
+    s->usb_poll_patched = false;
+    s->usb_poll_patch_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL,
+                                            chihiro_usb_poll_patch_cb, s);
+    timer_mod(s->usb_poll_patch_timer,
+              qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 10);
 
     printf("[%07lld] Chihiro: Mediaboard LPC I/O initialized at 0x4000-0x40FF\n", TS_MS);
 }
