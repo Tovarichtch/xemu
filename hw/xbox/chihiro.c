@@ -33,6 +33,7 @@
 #include "chihiro.h"
 #include "system/blockdev.h"
 #include "hw/usb.h"
+#include "target/i386/cpu.h"
 
 /*
  * Chihiro Mediaboard LPC I/O
@@ -106,6 +107,12 @@ typedef struct ChihiroLPCState {
     QEMUTimer *usb_hotplug_sc_timer;  /* SC at T+1700ms */
     QEMUTimer *usb_poll_patch_timer;  /* Patch UsbPollQC/SC to return 0 */
     bool usb_poll_patched;
+
+    /* Diagnostic: periodic state machine dump */
+    QEMUTimer *diag_timer;
+    uint32_t diag_state_pa;    /* PA of CheckErrors state [VA 0x87AFC] */
+    uint32_t diag_counter_pa;  /* PA of CheckErrors counter [VA 0x87AE8] */
+    uint32_t diag_ready_pa;    /* PA of CheckErrors ready [VA 0x87AF8] */
 } ChihiroLPCState;
 
 #define CHIHIRO_LPC_DEVICE(obj) \
@@ -187,9 +194,74 @@ typedef struct {
     int patch_offset;
     const uint8_t *patch_bytes;
     int patch_len;
+    uint32_t sig_va;  /* Known VA of this signature in SEGABOOT */
     const char *name;
     bool applied;
 } ChihiroPatch;
+
+/*
+ * Walk x86 page tables (non-PAE) to translate VA → PA.
+ * Returns physical address, or 0xFFFFFFFF on failure.
+ */
+static uint32_t chihiro_va_to_pa(uint32_t va)
+{
+    CPUState *cpu = first_cpu;
+    if (!cpu) return 0xFFFFFFFF;
+
+    X86CPU *x86 = X86_CPU(cpu);
+    uint32_t cr3 = x86->env.cr[3] & 0xFFFFF000;
+    uint32_t pde_addr = cr3 + ((va >> 22) * 4);
+    uint32_t pde;
+    cpu_physical_memory_read(pde_addr, &pde, 4);
+    if (!(pde & 1)) return 0xFFFFFFFF;  /* not present */
+
+    if (pde & 0x80) {
+        /* 4MB page (PS bit set) */
+        return (pde & 0xFFC00000) | (va & 0x003FFFFF);
+    }
+
+    uint32_t pte_addr = (pde & 0xFFFFF000) + (((va >> 12) & 0x3FF) * 4);
+    uint32_t pte;
+    cpu_physical_memory_read(pte_addr, &pte, 4);
+    if (!(pte & 1)) return 0xFFFFFFFF;  /* not present */
+
+    return (pte & 0xFFFFF000) | (va & 0xFFF);
+}
+
+/*
+ * Diagnostic: periodically dump CheckErrors state machine variables.
+ * PAs are computed via x86 page table walk at patch time.
+ *   VA [0x87AFC] = state (0-10)
+ *   VA [0x87AE8] = counter
+ *   VA [0x87AF8] = ready flag
+ */
+static void chihiro_diag_timer_cb(void *opaque)
+{
+    ChihiroLPCState *s = (ChihiroLPCState *)opaque;
+    uint32_t state = 0, counter = 0, ready = 0;
+
+    /* Resolve PAs on first call (page tables are set up by then) */
+    if (!s->diag_state_pa) {
+        s->diag_state_pa   = chihiro_va_to_pa(0x87AFC);
+        s->diag_counter_pa = chihiro_va_to_pa(0x87AE8);
+        s->diag_ready_pa   = chihiro_va_to_pa(0x87AF8);
+        printf("[%07lld] DIAG: resolved VAs → state PA=0x%X counter PA=0x%X "
+               "ready PA=0x%X\n", TS_MS,
+               s->diag_state_pa, s->diag_counter_pa, s->diag_ready_pa);
+    }
+
+    if (s->diag_state_pa != 0xFFFFFFFF) {
+        cpu_physical_memory_read(s->diag_state_pa, &state, 4);
+        cpu_physical_memory_read(s->diag_counter_pa, &counter, 4);
+        cpu_physical_memory_read(s->diag_ready_pa, &ready, 4);
+    }
+
+    printf("[%07lld] DIAG: CheckErrors state=%u counter=%u ready=%u\n",
+           TS_MS, state, counter, ready);
+
+    timer_mod(s->diag_timer,
+              qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 1000);
+}
 
 static void chihiro_usb_poll_patch_cb(void *opaque)
 {
@@ -297,13 +369,13 @@ static void chihiro_usb_poll_patch_cb(void *opaque)
     static const uint8_t patch_xor_ret4[] = { 0x31, 0xC0, 0xC2, 0x04, 0x00 };
 
     ChihiroPatch patches[] = {
-        { sig_enumpoll, sizeof(sig_enumpoll), 7,  patch_jmp,     1, "UsbEnumPoll check (je->jmp)",         false },
-        { sig_classdrv, sizeof(sig_classdrv), 7,  patch_jmp,     1, "RegisterClassDriver check (je->jmp)", false },
-        { sig_qcbyte0,  sizeof(sig_qcbyte0),  0,  patch_xor_ret, 3, "GetQcStatusByte0 (xor eax,eax; ret)", false },
-        { sig_createthread, sizeof(sig_createthread), 8, patch_jmp, 1, "CreateThread return (jne->jmp)", false },
-        { sig_errval,   sizeof(sig_errval),   2,  patch_and0,    1, "DIAG: error value 0x14->0x00",        false },
-        { sig_usbpollqc, sizeof(sig_usbpollqc), 0, patch_xor_ret4, 5, "UsbPollQC_inner (xor eax,eax; ret 4)", false },
-        { sig_usbpollsc, sizeof(sig_usbpollsc), 0, patch_xor_ret4, 5, "UsbPollSC_inner (xor eax,eax; ret 4)", false },
+        { sig_enumpoll, sizeof(sig_enumpoll), 7,  patch_jmp,     1, 0x41F57, "UsbEnumPoll check (je->jmp)",         false },
+        { sig_classdrv, sizeof(sig_classdrv), 7,  patch_jmp,     1, 0x41F74, "RegisterClassDriver check (je->jmp)", false },
+        { sig_qcbyte0,  sizeof(sig_qcbyte0),  0,  patch_xor_ret, 3, 0x3AD80, "GetQcStatusByte0 (xor eax,eax; ret)", false },
+        { sig_createthread, sizeof(sig_createthread), 8, patch_jmp, 1, 0x425D6, "CreateThread return (jne->jmp)", false },
+        { sig_errval,   sizeof(sig_errval),   2,  patch_and0,    1, 0x2E3AB, "DIAG: error value 0x14->0x00",        false },
+        { sig_usbpollqc, sizeof(sig_usbpollqc), 0, patch_xor_ret4, 5, 0x51140, "UsbPollQC_inner (xor eax,eax; ret 4)", false },
+        { sig_usbpollsc, sizeof(sig_usbpollsc), 0, patch_xor_ret4, 5, 0x51150, "UsbPollSC_inner (xor eax,eax; ret 4)", false },
     };
     int num_patches = sizeof(patches) / sizeof(patches[0]);
     int applied = 0;
@@ -344,6 +416,10 @@ static void chihiro_usb_poll_patch_cb(void *opaque)
         printf("[%07lld] Chihiro: All %d SEGABOOT patches applied\n", TS_MS, num_patches);
         printf("[%07lld] Chihiro: CheckErrors state machine will run naturally "
                "with UsbPollQC/SC bypassed\n", TS_MS);
+
+        /* Start diagnostic timer to monitor state machine progress */
+        s->diag_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, chihiro_diag_timer_cb, s);
+        timer_mod(s->diag_timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 1000);
         return;
     }
 
