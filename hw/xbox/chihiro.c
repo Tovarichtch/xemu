@@ -396,7 +396,7 @@ static uint64_t chihiro_lpc_io_read(void *opaque, hwaddr addr,
         r = 0x4D41;     /* "MA" → full string reads as "XBAM" */
         break;
     case SEGA_CHIP_REVISION:
-        r = SEGA_CHIP_REVISION_TYPE3;  /* ASIC production baseboard (same as MAME) */
+        r = 0x0000;  /* MAME: mediaboard_r offset 0xF0/4 → 0 ("media board present") */
         break;
     case SEGA_DIMM_SIZE:
         r = SEGA_DIMM_SIZE_512M;        /* 512MB DIMM (matches MAME default) */

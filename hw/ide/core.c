@@ -36,6 +36,7 @@
 #include "system/system.h"
 #include "system/blockdev.h"
 #include "system/dma.h"
+#include "system/address-spaces.h"
 #include "hw/block/block.h"
 #include "system/block-backend.h"
 #include "qapi/error.h"
@@ -977,6 +978,30 @@ static void ide_dma_cb(void *opaque, int ret)
     }
 
     offset = sector_num << BDRV_SECTOR_BITS;
+
+    /* Chihiro: intercept IDE reads on baseboard (unit 1) for mbcom sectors */
+    if (s->dma_cmd == IDE_DMA_READ && s->unit == 1 && n > 0) {
+        extern bool chihiro_ide_read_sector(uint32_t lba, void *buffer);
+        uint8_t sector_buf[512];
+        if (chihiro_ide_read_sector((uint32_t)sector_num, sector_buf)) {
+            /* Write intercepted sector data into the DMA scatter-gather buffer */
+            dma_memory_write(&address_space_memory,
+                             s->sg.sg[0].base, sector_buf, 512,
+                             MEMTXATTRS_UNSPECIFIED);
+            /* Advance state as if we read 1 sector */
+            sector_num += 1;
+            ide_set_sector(s, sector_num);
+            s->nsector -= 1;
+            /* If transfer complete, signal done */
+            if (s->nsector == 0) {
+                s->status = READY_STAT | SEEK_STAT;
+                ide_bus_set_irq(s->bus);
+                goto eot;
+            }
+            /* Otherwise continue with remaining sectors normally */
+        }
+    }
+
     switch (s->dma_cmd) {
     case IDE_DMA_READ:
         s->bus->dma->aiocb = dma_blk_read(s->blk, &s->sg, offset,
