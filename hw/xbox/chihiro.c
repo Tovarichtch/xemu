@@ -221,30 +221,7 @@ static void chihiro_usb_poll_patch_cb(void *opaque)
     };
 
     /*
-     * Patch 3: CheckErrors "baseboard ready" return value (VA 0x3D26B)
-     *
-     *   8B 35 F8 7A 08 00  mov esi, [0x87AF8]  ; "ready" flag
-     *   33 C0              xor eax, eax
-     *   3B F3              cmp esi, ebx
-     *   0F 95 C0           setne al
-     *   5D 5F 5E 5B        pop ebp/edi/esi/ebx
-     *   48                 dec eax
-     *   83 E0 05           and eax, 5           <- patch 05 -> 00
-     *   C3                 ret
-     *
-     * Without patch: CheckErrors returns 5 when [0x87AF8]==0 (not ready),
-     * causing an infinite loop: while(CheckErrors()==5) Sleep(16).
-     * With patch: and eax,0 -> always returns 0 -> loop exits immediately.
-     */
-    static const uint8_t sig_chkerr[] = {
-        0x8B, 0x35, 0xF8, 0x7A, 0x08, 0x00,  /* mov esi,[0x87AF8] */
-        0x33, 0xC0,                            /* xor eax, eax      */
-        0x3B, 0xF3,                            /* cmp esi, ebx      */
-        0x0F, 0x95, 0xC0                       /* setne al          */
-    };
-
-    /*
-     * Patch 4: GetQcStatusByte0 (VA 0x3AD80)
+     * Patch 3: GetQcStatusByte0 (VA 0x3AD80)
      *
      *   E8 2B 6E 01 00    call GetQcStatus (0x51BB0)
      *   0F B6 00          movzx eax, byte ptr [eax]
@@ -260,15 +237,12 @@ static void chihiro_usb_poll_patch_cb(void *opaque)
     };
 
     /*
-     * Patch 5: CreateThread return check (VA 0x425DE)
+     * Patch 4: CreateThread return check (VA 0x425DE)
      *
      *   85 C0                test eax, eax
      *   A3 34 A1 08 00       mov [0x8A134], eax
      *   5B                   pop ebx
      *   75 12                jne +0x12 (success)    <- patch to EB
-     *
-     * CreateThread (PsCreateSystemThreadEx) returns NULL in our
-     * emulation. Force success path to see what's past Error 02.
      */
     static const uint8_t sig_createthread[] = {
         0x85, 0xC0,                            /* test eax, eax      */
@@ -278,30 +252,58 @@ static void chihiro_usb_poll_patch_cb(void *opaque)
     };
 
     /*
-     * Patch 6 (DIAGNOSTIC): Error value at VA 0x2E3AB
-     *
+     * Patch 5 (DIAGNOSTIC): Error value at VA 0x2E3AB
      *   C7 07 14 00 00 00    mov [edi], 0x14  (error code)
-     *
-     * Change 0x14 to 0x00. If the on-screen error changes,
-     * this confirms the error path at 0x2E3A5 is being taken.
-     * If nothing changes, the error comes from elsewhere.
      */
     static const uint8_t sig_errval[] = {
         0xC7, 0x07, 0x14, 0x00, 0x00, 0x00   /* mov [edi], 0x14 */
+    };
+
+    /*
+     * Patch 6: UsbPollQC_inner (VA 0x51140)
+     *
+     *   E9 FB FE FF FF    jmp 0x51040
+     *   90 90 90 90        nop padding
+     *
+     * Patch: xor eax,eax; ret -> USB poll "succeeds"
+     * CheckErrors state machine State 1 calls this.
+     */
+    static const uint8_t sig_usbpollqc[] = {
+        0xE9, 0xFB, 0xFE, 0xFF, 0xFF,  /* jmp 0x51040  */
+        0x90, 0x90, 0x90, 0x90          /* nop padding  */
+    };
+
+    /*
+     * Patch 7: UsbPollSC_inner (VA 0x51150)
+     *
+     *   55                push ebp
+     *   8B EC             mov ebp, esp
+     *   83 E4 F8          and esp, -8
+     *   81 EC 0C 03 00 00 sub esp, 0x30C
+     *
+     * Patch: xor eax,eax; ret -> USB poll "succeeds"
+     */
+    static const uint8_t sig_usbpollsc[] = {
+        0x55,                                  /* push ebp           */
+        0x8B, 0xEC,                            /* mov ebp, esp       */
+        0x83, 0xE4, 0xF8,                      /* and esp, -8        */
+        0x81, 0xEC, 0x0C, 0x03, 0x00, 0x00     /* sub esp, 0x30C    */
     };
 
     /* Patch byte arrays */
     static const uint8_t patch_jmp[]   = { 0xEB };
     static const uint8_t patch_and0[]  = { 0x00 };
     static const uint8_t patch_xor_ret[] = { 0x31, 0xC0, 0xC3 };
+    static const uint8_t patch_xor_ret4[] = { 0x31, 0xC0, 0xC2, 0x04, 0x00 };
 
     ChihiroPatch patches[] = {
         { sig_enumpoll, sizeof(sig_enumpoll), 7,  patch_jmp,     1, "UsbEnumPoll check (je->jmp)",         false },
         { sig_classdrv, sizeof(sig_classdrv), 7,  patch_jmp,     1, "RegisterClassDriver check (je->jmp)", false },
-        { sig_chkerr,   sizeof(sig_chkerr),  18,  patch_and0,    1, "CheckErrors (and eax,5 -> and eax,0)", false },
         { sig_qcbyte0,  sizeof(sig_qcbyte0),  0,  patch_xor_ret, 3, "GetQcStatusByte0 (xor eax,eax; ret)", false },
         { sig_createthread, sizeof(sig_createthread), 8, patch_jmp, 1, "CreateThread return (jne->jmp)", false },
         { sig_errval,   sizeof(sig_errval),   2,  patch_and0,    1, "DIAG: error value 0x14->0x00",        false },
+        { sig_usbpollqc, sizeof(sig_usbpollqc), 0, patch_xor_ret4, 5, "UsbPollQC_inner (xor eax,eax; ret 4)", false },
+        { sig_usbpollsc, sizeof(sig_usbpollsc), 0, patch_xor_ret4, 5, "UsbPollSC_inner (xor eax,eax; ret 4)", false },
     };
     int num_patches = sizeof(patches) / sizeof(patches[0]);
     int applied = 0;
@@ -340,8 +342,8 @@ static void chihiro_usb_poll_patch_cb(void *opaque)
     if (applied == num_patches) {
         s->usb_poll_patched = true;
         printf("[%07lld] Chihiro: All %d SEGABOOT patches applied\n", TS_MS, num_patches);
-        printf("[%07lld] Chihiro: baseboard_init->0 CheckErrors->0 "
-               "GetQcStatusByte0->0 -> CreateThread(GameThread)\n", TS_MS);
+        printf("[%07lld] Chihiro: CheckErrors state machine will run naturally "
+               "with UsbPollQC/SC bypassed\n", TS_MS);
         return;
     }
 
@@ -725,6 +727,11 @@ bool chihiro_ide_write_sector(uint32_t lba, const void *buffer)
                cmd[8],cmd[9],cmd[10],cmd[11],cmd[12],cmd[13],cmd[14],cmd[15]);
         if (cmd[0] != 0 || cmd[1] != 0) {
             chihiro_mbcom_process(cmd);
+            /* Signal SEGABOOT that response is ready (MAME: mcpxlpc->irq10(1)) */
+            if (chihiro_irq10_global) {
+                printf("[%07lld] chihiro IRQ10 RAISE (mbcom response ready)\n", TS_MS);
+                qemu_irq_raise(chihiro_irq10_global);
+            }
         }
         return true;
     }

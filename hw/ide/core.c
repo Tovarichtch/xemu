@@ -970,6 +970,46 @@ static void ide_dma_cb(void *opaque, int ret)
 
     trace_ide_dma_cb(s, sector_num, n, IDE_DMA_CMD_str(s->dma_cmd));
 
+    /* Chihiro: intercept IDE reads on baseboard (unit 1) for mbcom sectors.
+     * Must be BEFORE ide_sect_range_ok — mbcom LBAs (0xFC800+) are beyond
+     * the baseboard.img size and would be rejected as out-of-range. */
+    if (s->dma_cmd == IDE_DMA_READ && s->unit == 1 && n > 0) {
+        extern bool chihiro_ide_read_sector(uint32_t lba, void *buffer);
+        uint8_t sector_buf[512];
+        if (chihiro_ide_read_sector((uint32_t)sector_num, sector_buf)) {
+            dma_memory_write(&address_space_memory,
+                             s->sg.sg[0].base, sector_buf, 512,
+                             MEMTXATTRS_UNSPECIFIED);
+            sector_num += 1;
+            ide_set_sector(s, sector_num);
+            s->nsector -= 1;
+            if (s->nsector == 0) {
+                s->status = READY_STAT | SEEK_STAT;
+                ide_bus_set_irq(s->bus);
+                goto eot;
+            }
+        }
+    }
+
+    /* Chihiro: intercept IDE writes on baseboard (unit 1) for mbcom sectors */
+    if (s->dma_cmd == IDE_DMA_WRITE && s->unit == 1 && n > 0) {
+        extern bool chihiro_ide_write_sector(uint32_t lba, const void *buffer);
+        uint8_t sector_buf[512];
+        dma_memory_read(&address_space_memory,
+                        s->sg.sg[0].base, sector_buf, 512,
+                        MEMTXATTRS_UNSPECIFIED);
+        if (chihiro_ide_write_sector((uint32_t)sector_num, sector_buf)) {
+            sector_num += 1;
+            ide_set_sector(s, sector_num);
+            s->nsector -= 1;
+            if (s->nsector == 0) {
+                s->status = READY_STAT | SEEK_STAT;
+                ide_bus_set_irq(s->bus);
+                goto eot;
+            }
+        }
+    }
+
     if ((s->dma_cmd == IDE_DMA_READ || s->dma_cmd == IDE_DMA_WRITE) &&
         !ide_sect_range_ok(s, sector_num, n)) {
         ide_dma_error(s);
@@ -978,30 +1018,6 @@ static void ide_dma_cb(void *opaque, int ret)
     }
 
     offset = sector_num << BDRV_SECTOR_BITS;
-
-    /* Chihiro: intercept IDE reads on baseboard (unit 1) for mbcom sectors */
-    if (s->dma_cmd == IDE_DMA_READ && s->unit == 1 && n > 0) {
-        extern bool chihiro_ide_read_sector(uint32_t lba, void *buffer);
-        uint8_t sector_buf[512];
-        if (chihiro_ide_read_sector((uint32_t)sector_num, sector_buf)) {
-            /* Write intercepted sector data into the DMA scatter-gather buffer */
-            dma_memory_write(&address_space_memory,
-                             s->sg.sg[0].base, sector_buf, 512,
-                             MEMTXATTRS_UNSPECIFIED);
-            /* Advance state as if we read 1 sector */
-            sector_num += 1;
-            ide_set_sector(s, sector_num);
-            s->nsector -= 1;
-            /* If transfer complete, signal done */
-            if (s->nsector == 0) {
-                s->status = READY_STAT | SEEK_STAT;
-                ide_bus_set_irq(s->bus);
-                goto eot;
-            }
-            /* Otherwise continue with remaining sectors normally */
-        }
-    }
-
     switch (s->dma_cmd) {
     case IDE_DMA_READ:
         s->bus->dma->aiocb = dma_blk_read(s->blk, &s->sg, offset,
