@@ -115,6 +115,12 @@ typedef struct ChihiroLPCState {
     uint32_t diag_ready_pa;    /* PA of CheckErrors ready [VA 0x87AF8] */
     uint32_t diag_gate_pa;     /* PA of gate variable [VA 0x89C38] */
     uint32_t diag_bootstate_pa;/* PA of MbcomBootSequence state [VA 0x89C48] */
+
+    /* LPC port read counters for v136 instrumentation */
+    uint32_t lpc_40f0_reads;   /* MbcomNegotiate (state 1) — port 0x40F0 */
+    uint32_t lpc_401e_reads;   /* MbcomCommand (state 2) — port 0x401E (firmware) */
+    uint32_t lpc_4084_reads;   /* MbcomCommand (state 2) — port 0x4084 (session) */
+    uint32_t last_bootstate;   /* previous bootstate to detect changes */
 } ChihiroLPCState;
 
 #define CHIHIRO_LPC_DEVICE(obj) \
@@ -241,30 +247,55 @@ static void chihiro_diag_timer_cb(void *opaque)
 {
     ChihiroLPCState *s = (ChihiroLPCState *)opaque;
     uint32_t state = 0, counter = 0, ready = 0, gate = 0, bootstate = 0;
+    uint32_t bootflag = 0, slotcount = 0, mainflag = 0;
+    uint8_t slotflag0 = 0;
 
-    /* Resolve PAs on first call (page tables are set up by then) */
-    if (!s->diag_state_pa) {
-        s->diag_state_pa   = chihiro_va_to_pa(0x87AFC);
-        s->diag_counter_pa = chihiro_va_to_pa(0x87AE8);
-        s->diag_ready_pa   = chihiro_va_to_pa(0x87AF8);
-        s->diag_gate_pa    = chihiro_va_to_pa(0x89C38);
-        s->diag_bootstate_pa = chihiro_va_to_pa(0x89C48);
-        printf("[%07lld] DIAG: resolved VAs → state PA=0x%X counter PA=0x%X "
-               "ready PA=0x%X gate PA=0x%X boot PA=0x%X\n", TS_MS,
-               s->diag_state_pa, s->diag_counter_pa, s->diag_ready_pa,
-               s->diag_gate_pa, s->diag_bootstate_pa);
+    /* RE-RESOLVE PAs every tick to detect page-table changes.
+     * If the game changes CR3 after initial resolution, stale PAs would read wrong data. */
+    uint32_t state_pa     = chihiro_va_to_pa(0x87AFC);
+    uint32_t counter_pa   = chihiro_va_to_pa(0x87AE8);
+    uint32_t ready_pa     = chihiro_va_to_pa(0x87AF8);
+    uint32_t gate_pa      = chihiro_va_to_pa(0x89C38);
+    uint32_t bootstate_pa = chihiro_va_to_pa(0x89C48);
+    uint32_t bootflag_pa  = chihiro_va_to_pa(0x89C4C);  /* MbcomNegotiate flag (0x21 on success) */
+    uint32_t slotcount_pa = chihiro_va_to_pa(0x896A8);  /* Mbcom slot count */
+    uint32_t slotflag0_pa = chihiro_va_to_pa(0x896B4);  /* Slot[0].flag */
+    uint32_t mainflag_pa  = chihiro_va_to_pa(0x8A128);  /* MainUpdate [0x8A128] */
+
+    /* Log if any PA changed since last tick */
+    if (s->diag_bootstate_pa && bootstate_pa != s->diag_bootstate_pa) {
+        printf("[%07lld] DIAG: PA CHANGED! boot PA=0x%X→0x%X\n", TS_MS,
+               s->diag_bootstate_pa, bootstate_pa);
     }
 
-    if (s->diag_state_pa != 0xFFFFFFFF) {
-        cpu_physical_memory_read(s->diag_state_pa, &state, 4);
-        cpu_physical_memory_read(s->diag_counter_pa, &counter, 4);
-        cpu_physical_memory_read(s->diag_ready_pa, &ready, 4);
-        cpu_physical_memory_read(s->diag_gate_pa, &gate, 4);
-        cpu_physical_memory_read(s->diag_bootstate_pa, &bootstate, 4);
+    s->diag_state_pa   = state_pa;
+    s->diag_counter_pa = counter_pa;
+    s->diag_ready_pa   = ready_pa;
+    s->diag_gate_pa    = gate_pa;
+    s->diag_bootstate_pa = bootstate_pa;
+
+    if (state_pa != 0xFFFFFFFF) cpu_physical_memory_read(state_pa, &state, 4);
+    if (counter_pa != 0xFFFFFFFF) cpu_physical_memory_read(counter_pa, &counter, 4);
+    if (ready_pa != 0xFFFFFFFF) cpu_physical_memory_read(ready_pa, &ready, 4);
+    if (gate_pa != 0xFFFFFFFF) cpu_physical_memory_read(gate_pa, &gate, 4);
+    if (bootstate_pa != 0xFFFFFFFF) cpu_physical_memory_read(bootstate_pa, &bootstate, 4);
+    if (bootflag_pa != 0xFFFFFFFF) cpu_physical_memory_read(bootflag_pa, &bootflag, 4);
+    if (slotcount_pa != 0xFFFFFFFF) cpu_physical_memory_read(slotcount_pa, &slotcount, 4);
+    if (slotflag0_pa != 0xFFFFFFFF) cpu_physical_memory_read(slotflag0_pa, &slotflag0, 1);
+    if (mainflag_pa != 0xFFFFFFFF) cpu_physical_memory_read(mainflag_pa, &mainflag, 4);
+
+    /* Detect bootstate changes between ticks */
+    if (bootstate != s->last_bootstate) {
+        printf("[%07lld] DIAG: *** BOOTSTATE CHANGED %u → %u ***\n", TS_MS,
+               s->last_bootstate, bootstate);
+        s->last_bootstate = bootstate;
     }
 
-    printf("[%07lld] DIAG: CE state=%u cnt=%u rdy=%u | gate=%u boot=%u\n",
-           TS_MS, state, counter, ready, gate, bootstate);
+    printf("[%07lld] DIAG: CE st=%u cnt=%u rdy=%u | gate=%u boot=%u flag=0x%02X "
+           "slots=%u/s0=0x%02X mflag=%u | 40F0=%u 401E=%u 4084=%u\n",
+           TS_MS, state, counter, ready, gate, bootstate,
+           bootflag & 0xFF, slotcount, slotflag0, mainflag,
+           s->lpc_40f0_reads, s->lpc_401e_reads, s->lpc_4084_reads);
 
     timer_mod(s->diag_timer,
               qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 1000);
@@ -492,6 +523,7 @@ static uint64_t chihiro_lpc_io_read(void *opaque, hwaddr addr,
         return r;
     case SEGA_FIRMWARE_VERSION:
         r = 0x0317;     /* Firmware v3.17 */
+        s->lpc_401e_reads++;
         break;
     case SEGA_XBAM_STRING_0:
         r = 0x00A0;     /* XBAM identifier part 1 */
@@ -504,9 +536,14 @@ static uint64_t chihiro_lpc_io_read(void *opaque, hwaddr addr,
         break;
     case SEGA_CHIP_REVISION:
         r = 0x0001;  /* Mediaboard status: ready for mbcom negotiation */
+        s->lpc_40f0_reads++;
         break;
     case SEGA_DIMM_SIZE:
         r = SEGA_DIMM_SIZE_512M;        /* 512MB DIMM (matches MAME default) */
+        break;
+    case 0x84:  /* Port 0x4084 — MbcomCommand session handle */
+        r = 0x0000;
+        s->lpc_4084_reads++;
         break;
     default:
         break;
