@@ -113,6 +113,8 @@ typedef struct ChihiroLPCState {
     uint32_t diag_state_pa;    /* PA of CheckErrors state [VA 0x87AFC] */
     uint32_t diag_counter_pa;  /* PA of CheckErrors counter [VA 0x87AE8] */
     uint32_t diag_ready_pa;    /* PA of CheckErrors ready [VA 0x87AF8] */
+    uint32_t diag_gate_pa;     /* PA of gate variable [VA 0x89C38] */
+    uint32_t diag_bootstate_pa;/* PA of MbcomBootSequence state [VA 0x89C48] */
 } ChihiroLPCState;
 
 #define CHIHIRO_LPC_DEVICE(obj) \
@@ -238,26 +240,31 @@ static uint32_t chihiro_va_to_pa(uint32_t va)
 static void chihiro_diag_timer_cb(void *opaque)
 {
     ChihiroLPCState *s = (ChihiroLPCState *)opaque;
-    uint32_t state = 0, counter = 0, ready = 0;
+    uint32_t state = 0, counter = 0, ready = 0, gate = 0, bootstate = 0;
 
     /* Resolve PAs on first call (page tables are set up by then) */
     if (!s->diag_state_pa) {
         s->diag_state_pa   = chihiro_va_to_pa(0x87AFC);
         s->diag_counter_pa = chihiro_va_to_pa(0x87AE8);
         s->diag_ready_pa   = chihiro_va_to_pa(0x87AF8);
+        s->diag_gate_pa    = chihiro_va_to_pa(0x89C38);
+        s->diag_bootstate_pa = chihiro_va_to_pa(0x89C48);
         printf("[%07lld] DIAG: resolved VAs → state PA=0x%X counter PA=0x%X "
-               "ready PA=0x%X\n", TS_MS,
-               s->diag_state_pa, s->diag_counter_pa, s->diag_ready_pa);
+               "ready PA=0x%X gate PA=0x%X boot PA=0x%X\n", TS_MS,
+               s->diag_state_pa, s->diag_counter_pa, s->diag_ready_pa,
+               s->diag_gate_pa, s->diag_bootstate_pa);
     }
 
     if (s->diag_state_pa != 0xFFFFFFFF) {
         cpu_physical_memory_read(s->diag_state_pa, &state, 4);
         cpu_physical_memory_read(s->diag_counter_pa, &counter, 4);
         cpu_physical_memory_read(s->diag_ready_pa, &ready, 4);
+        cpu_physical_memory_read(s->diag_gate_pa, &gate, 4);
+        cpu_physical_memory_read(s->diag_bootstate_pa, &bootstate, 4);
     }
 
-    printf("[%07lld] DIAG: CheckErrors state=%u counter=%u ready=%u\n",
-           TS_MS, state, counter, ready);
+    printf("[%07lld] DIAG: CE state=%u cnt=%u rdy=%u | gate=%u boot=%u\n",
+           TS_MS, state, counter, ready, gate, bootstate);
 
     timer_mod(s->diag_timer,
               qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 1000);
@@ -362,6 +369,27 @@ static void chihiro_usb_poll_patch_cb(void *opaque)
         0x81, 0xEC, 0x0C, 0x03, 0x00, 0x00     /* sub esp, 0x30C    */
     };
 
+    /*
+     * Patch 8: EncryptionCheck USB transfer result (VA 0x3A953)
+     *   33 C9        xor ecx, ecx
+     *   85 C0        test eax, eax    ← patch offset 2: change to 31 C0 (xor eax,eax)
+     *   0F 9D C1     setge cl
+     *   5F           pop edi
+     *   49           dec ecx
+     *   83 E1 02     and ecx, 2
+     *
+     * EncryptionCheck calls USB transfer (0x51340→0x1A0B0) which fails because
+     * the AN2131 class driver was never registered. This forces eax=0 (success).
+     */
+    static const uint8_t sig_enccheck[] = {
+        0x33, 0xC9,                            /* xor ecx, ecx       */
+        0x85, 0xC0,                            /* test eax, eax      */
+        0x0F, 0x9D, 0xC1,                      /* setge cl           */
+        0x5F,                                  /* pop edi            */
+        0x49,                                  /* dec ecx            */
+        0x83, 0xE1, 0x02                       /* and ecx, 2         */
+    };
+
     /* Patch byte arrays */
     static const uint8_t patch_jmp[]   = { 0xEB };
     static const uint8_t patch_and0[]  = { 0x00 };
@@ -376,6 +404,7 @@ static void chihiro_usb_poll_patch_cb(void *opaque)
         { sig_errval,   sizeof(sig_errval),   2,  patch_and0,    1, 0x2E3AB, "DIAG: error value 0x14->0x00",        false },
         { sig_usbpollqc, sizeof(sig_usbpollqc), 0, patch_xor_ret4, 5, 0x51140, "UsbPollQC_inner (xor eax,eax; ret 4)", false },
         { sig_usbpollsc, sizeof(sig_usbpollsc), 0, patch_xor_ret4, 5, 0x51150, "UsbPollSC_inner (xor eax,eax; ret 4)", false },
+        { sig_enccheck,  sizeof(sig_enccheck),  2, patch_xor_ret, 2, 0x3A953, "EncryptionCheck (test->xor eax,eax)",  false },
     };
     int num_patches = sizeof(patches) / sizeof(patches[0]);
     int applied = 0;
