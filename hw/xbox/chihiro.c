@@ -421,11 +421,52 @@ static void chihiro_usb_poll_patch_cb(void *opaque)
         0x83, 0xE1, 0x02                       /* and ecx, 2         */
     };
 
+    /*
+     * Patch 9: MbcomPollReady (VA 0x3DBC0) — always return 1
+     *   8A 44 24 04       mov al, [esp+4]
+     *   E8 67 FD FF FF    call FindSlot (0x3D930)
+     *   85 C0             test eax, eax
+     *   74 0E             je 0x3DBDB
+     *   33 C9             xor ecx, ecx
+     *
+     * On real HW, MbcomPollReady returns 1 only when baseboard DMAs a response into
+     * slot[+2]. We do not emulate that DMA, so it always returns 0 and MbcomSetParam
+     * spins forever at 0x3E530. Patch makes it always return 1 so MbcomSetParam
+     * completes and boot_state advances from 2 to 3.
+     */
+    static const uint8_t sig_mbcom_pollready[] = {
+        0x8A, 0x44, 0x24, 0x04,                /* mov al, [esp+4]    */
+        0xE8, 0x67, 0xFD, 0xFF, 0xFF,          /* call FindSlot      */
+        0x85, 0xC0,                            /* test eax, eax      */
+        0x74, 0x0E                             /* je 0x3DBDB         */
+    };
+
+    /*
+     * Patch 10: GetBootData (VA 0x41880) — always return 1
+     *   A1 50 9C 08 00    mov eax, [0x89C50]
+     *   85 C0             test eax, eax
+     *   74 0F             je 0x41898
+     *   83 3D 48 9C 08 00 03  cmp dword [0x89C48], 3
+     *
+     * GetBootData returns [0x89C50]+0xFF000000 if boot==3 and [0x89C50]!=0, else 0.
+     * With our MbcomSetParam stub, [0x89C50] is never populated with real data.
+     * ErrorDisplay state=3 checks GetBootData==0 AND flag==0x21 → sets ERROR 27 after
+     * 2400 ticks. Patching GetBootData to return non-zero avoids ERROR 27.
+     */
+    static const uint8_t sig_getbootdata[] = {
+        0xA1, 0x50, 0x9C, 0x08, 0x00,          /* mov eax, [0x89C50] */
+        0x85, 0xC0,                            /* test eax, eax      */
+        0x74, 0x0F,                            /* je 0x41898         */
+        0x83, 0x3D, 0x48, 0x9C, 0x08, 0x00, 0x03  /* cmp [0x89C48], 3 */
+    };
+
     /* Patch byte arrays */
     static const uint8_t patch_jmp[]   = { 0xEB };
     static const uint8_t patch_and0[]  = { 0x00 };
     static const uint8_t patch_xor_ret[] = { 0x31, 0xC0, 0xC3 };
     static const uint8_t patch_xor_ret4[] = { 0x31, 0xC0, 0xC2, 0x04, 0x00 };
+    static const uint8_t patch_mov1_ret4[] = { 0xB0, 0x01, 0xC2, 0x04, 0x00 };  /* mov al, 1; ret 4 */
+    static const uint8_t patch_mov1_ret[]  = { 0xB8, 0x01, 0x00, 0x00, 0x00, 0xC3 }; /* mov eax, 1; ret */
 
     ChihiroPatch patches[] = {
         { sig_enumpoll, sizeof(sig_enumpoll), 7,  patch_jmp,     1, 0x41F57, "UsbEnumPoll check (je->jmp)",         false },
@@ -436,6 +477,8 @@ static void chihiro_usb_poll_patch_cb(void *opaque)
         { sig_usbpollqc, sizeof(sig_usbpollqc), 0, patch_xor_ret4, 5, 0x51140, "UsbPollQC_inner (xor eax,eax; ret 4)", false },
         { sig_usbpollsc, sizeof(sig_usbpollsc), 0, patch_xor_ret4, 5, 0x51150, "UsbPollSC_inner (xor eax,eax; ret 4)", false },
         { sig_enccheck,  sizeof(sig_enccheck),  2, patch_xor_ret, 2, 0x3A953, "EncryptionCheck (test->xor eax,eax)",  false },
+        { sig_mbcom_pollready, sizeof(sig_mbcom_pollready), 0, patch_mov1_ret4, 5, 0x3DBC0, "MbcomPollReady (always return 1)", false },
+        { sig_getbootdata, sizeof(sig_getbootdata), 0, patch_mov1_ret, 6, 0x41880, "GetBootData (always return 1)", false },
     };
     int num_patches = sizeof(patches) / sizeof(patches[0]);
     int applied = 0;
