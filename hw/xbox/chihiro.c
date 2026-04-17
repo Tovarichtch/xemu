@@ -460,6 +460,58 @@ static void chihiro_usb_poll_patch_cb(void *opaque)
         0x83, 0x3D, 0x48, 0x9C, 0x08, 0x00, 0x03  /* cmp [0x89C48], 3 */
     };
 
+    /*
+     * Patch 11: CheckMainBoardSerial (VA 0x2EC35) — return 0 instead of 3
+     *
+     * At the serial format validation failure path:
+     *   0x2EC31: 85 C0             test eax, eax     (MatchSerialFormat result)
+     *   0x2EC33: 75 D6             jne 0x2EC0B       (format OK → skip)
+     *   0x2EC35: B8 03 00 00 00    mov eax, 3        ← PATCH (error code 3)
+     *   0x2EC3A: 5E                pop esi
+     *   0x2EC3B: C3                ret
+     *
+     * CheckMainBoardSerial (0x2EBF0) calls MatchSerialFormat with the expected format
+     * pattern "%%%@-##@########" (3 letters, 1 alphanum, '-', 2 digits, 1 alphanum,
+     * 8 digits = 16 bytes, matching e.g. "AAEE-01D44744715"). Our mbcom stub returns
+     * zeros in slot data, so the serial read by the game is 16 zero bytes — fails
+     * format match → returns 3 → state-machine sets err_code=3 → displays ERROR 03.
+     *
+     * Replace `mov eax, 3` with `xor eax, eax; nop*3` (same 5 bytes) so the function
+     * returns 0 (no error) even on format mismatch.
+     */
+    static const uint8_t sig_check_mainserial[] = {
+        0x85, 0xC0,                            /* test eax, eax      */
+        0x75, 0xD6,                            /* jne 0x2EC0B        */
+        0xB8, 0x03, 0x00, 0x00, 0x00,          /* mov eax, 3         */
+        0x5E,                                  /* pop esi            */
+        0xC3                                   /* ret                */
+    };
+
+    /*
+     * Patch 12: CheckMediaBoardSerial (VA 0x2EC88) — return 0 instead of 4
+     *
+     * Same structure as main serial check, but for media board. Lives in function
+     * CheckMediaBoardSerial (0x2EC40) which also calls MatchSerialFormat with
+     * "%%%@-##@########":
+     *   0x2EC83: 85 C0             test eax, eax
+     *   0x2EC85: 75 0A             jne 0x2EC91
+     *   0x2EC87: 5F                pop edi
+     *   0x2EC88: B8 04 00 00 00    mov eax, 4        ← PATCH (error code 4)
+     *   0x2EC8D: 5E                pop esi
+     *   0x2EC8E: C2 04 00          ret 4
+     *
+     * Without this patch, fixing error 3 would just reveal error 4 next (Bad serial
+     * number on media board). Replace same way as patch 11.
+     */
+    static const uint8_t sig_check_mediaserial[] = {
+        0x85, 0xC0,                            /* test eax, eax      */
+        0x75, 0x0A,                            /* jne 0x2EC91        */
+        0x5F,                                  /* pop edi            */
+        0xB8, 0x04, 0x00, 0x00, 0x00,          /* mov eax, 4         */
+        0x5E,                                  /* pop esi            */
+        0xC2, 0x04, 0x00                       /* ret 4              */
+    };
+
     /* Patch byte arrays */
     static const uint8_t patch_jmp[]   = { 0xEB };
     static const uint8_t patch_and0[]  = { 0x00 };
@@ -467,6 +519,7 @@ static void chihiro_usb_poll_patch_cb(void *opaque)
     static const uint8_t patch_xor_ret4[] = { 0x31, 0xC0, 0xC2, 0x04, 0x00 };
     static const uint8_t patch_mov1_ret4[] = { 0xB0, 0x01, 0xC2, 0x04, 0x00 };  /* mov al, 1; ret 4 */
     static const uint8_t patch_mov1_ret[]  = { 0xB8, 0x01, 0x00, 0x00, 0x00, 0xC3 }; /* mov eax, 1; ret */
+    static const uint8_t patch_xor_nop3[]  = { 0x31, 0xC0, 0x90, 0x90, 0x90 }; /* xor eax, eax; nop*3 */
 
     ChihiroPatch patches[] = {
         { sig_enumpoll, sizeof(sig_enumpoll), 7,  patch_jmp,     1, 0x41F57, "UsbEnumPoll check (je->jmp)",         false },
@@ -479,6 +532,8 @@ static void chihiro_usb_poll_patch_cb(void *opaque)
         { sig_enccheck,  sizeof(sig_enccheck),  2, patch_xor_ret, 2, 0x3A953, "EncryptionCheck (test->xor eax,eax)",  false },
         { sig_mbcom_pollready, sizeof(sig_mbcom_pollready), 0, patch_mov1_ret4, 5, 0x3DBC0, "MbcomPollReady (always return 1)", false },
         { sig_getbootdata, sizeof(sig_getbootdata), 0, patch_mov1_ret, 6, 0x41880, "GetBootData (always return 1)", false },
+        { sig_check_mainserial,  sizeof(sig_check_mainserial),  4, patch_xor_nop3, 5, 0x2EC35, "CheckMainBoardSerial (err 3 -> 0)",  false },
+        { sig_check_mediaserial, sizeof(sig_check_mediaserial), 5, patch_xor_nop3, 5, 0x2EC88, "CheckMediaBoardSerial (err 4 -> 0)", false },
     };
     int num_patches = sizeof(patches) / sizeof(patches[0]);
     int applied = 0;
