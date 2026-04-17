@@ -864,119 +864,145 @@ type_init(chihiro_register_types)
 #define CHIHIRO_MBROM0          0x8000000
 #define CHIHIRO_MBROM1          0x8000800
 
-static uint8_t chihiro_mbcom_response[512];
+static uint8_t chihiro_mbcom_response[512];  /* read_buffer in MAME terminology */
+static uint8_t chihiro_mbcom_command[512];   /* write_buffer in MAME terminology */
 static bool chihiro_mbcom_enabled = false;
+
+/* v146 minimal dedup logging — avoid timing regression from stdout saturation */
+static uint16_t mbcom_last_cmd_logged = 0xFFFF;
+static uint32_t mbcom_cmd_repeat_count = 0;
+static uint8_t mbcom_last_read_sig[4] = {0};
+static uint32_t mbcom_read_repeat_count = 0;
 
 void chihiro_mbcom_init(void)
 {
     memset(chihiro_mbcom_response, 0, sizeof(chihiro_mbcom_response));
+    memset(chihiro_mbcom_command, 0, sizeof(chihiro_mbcom_command));
     chihiro_mbcom_enabled = true;
-    printf("[%07lld] Chihiro: mbcom protocol handler initialized\n", TS_MS);
+    printf("[%07lld] Chihiro: mbcom protocol handler initialized (v146 MAME-aligned)\n", TS_MS);
 }
 
-/* Process an mbcom command and generate response */
-static void chihiro_mbcom_process(const uint8_t *cmd_data)
+/* Process mbcom command and generate response
+ * Aligned with MAME chihiro.cpp::baseboard_ide_event() */
+static void chihiro_mbcom_process(void)
 {
-    uint16_t cmd_echo = cmd_data[0] | (cmd_data[1] << 8);
-    uint16_t cmd_code = cmd_data[2] | (cmd_data[3] << 8);
+    const uint8_t *w = chihiro_mbcom_command;
+    uint8_t *r = chihiro_mbcom_response;
 
-    memset(chihiro_mbcom_response, 0, sizeof(chihiro_mbcom_response));
+    if (w[0] == 0 && w[1] == 0) return;  /* no command */
 
-    /* Echo command ID + set response marker 0x8001 */
-    chihiro_mbcom_response[0] = cmd_data[0];
-    chihiro_mbcom_response[1] = cmd_data[1];
-    chihiro_mbcom_response[2] = 0x01;
-    chihiro_mbcom_response[3] = 0x80;
+    uint16_t cmd_echo = w[0] | (w[1] << 8);
+    uint16_t cmd_code = w[2] | (w[3] << 8);
 
-    printf("[%07lld] Chihiro mbcom: cmd=0x%04X echo=0x%04X\n", TS_MS, cmd_code, cmd_echo);
+    /* MAME-style response: echo cmd id + set 8001 marker in second word */
+    r[0] = w[0];
+    r[1] = w[1];
+    r[2] = 0x01;
+    r[3] = 0x80;
+    /* zero out rest of 32-byte response area */
+    memset(r + 4, 0, 28);
+
+    /* dedup logging: only log new cmds, count repeats */
+    if (cmd_code != mbcom_last_cmd_logged) {
+        if (mbcom_cmd_repeat_count > 1) {
+            printf("[%07lld] Chihiro mbcom: (prev cmd=0x%04X repeated %u times)\n",
+                   TS_MS, mbcom_last_cmd_logged, mbcom_cmd_repeat_count);
+        }
+        printf("[%07lld] Chihiro mbcom: cmd=0x%04X echo=0x%04X\n", TS_MS, cmd_code, cmd_echo);
+        mbcom_last_cmd_logged = cmd_code;
+        mbcom_cmd_repeat_count = 1;
+    } else {
+        mbcom_cmd_repeat_count++;
+    }
 
     switch (cmd_code) {
-    case 0x0001: /* DIMM_SIZE */
-        chihiro_mbcom_response[4] = 0x00;
-        chihiro_mbcom_response[5] = 0x00;
-        chihiro_mbcom_response[6] = 0xF0;
-        chihiro_mbcom_response[7] = 0x00;
+    case 0x0001: /* DIMM_SIZE — MAME: dword_write_le(r+4, 0x00f00000) */
+        r[4] = 0x00; r[5] = 0x00; r[6] = 0xF0; r[7] = 0x00;
         break;
-    case 0x0100: /* STATUS → READY(5), completion 100% */
-        chihiro_mbcom_response[4] = 5;
-        chihiro_mbcom_response[5] = 0;
-        chihiro_mbcom_response[6] = 0;
-        chihiro_mbcom_response[7] = 0;
-        chihiro_mbcom_response[8] = 100;  /* completion % */
-        chihiro_mbcom_response[9] = 0;
-        chihiro_mbcom_response[10] = 0;
-        chihiro_mbcom_response[11] = 0;
+    case 0x0100: /* STATUS — MAME: phase=5 (loading), completion=0 */
+        r[4] = 5; r[5] = 0; r[6] = 0; r[7] = 0;
+        r[8] = 0; r[9] = 0; r[10] = 0; r[11] = 0;  /* completion 0% per MAME */
         break;
-    case 0x0101: /* FIRMWARE_VERSION → 12.34 */
-        chihiro_mbcom_response[4] = 0x34;
-        chihiro_mbcom_response[5] = 0x12;
-        chihiro_mbcom_response[6] = 0x67;
-        chihiro_mbcom_response[7] = 0x45;
+    case 0x0101: /* FW_VER — MAME: 0x1234 (12.34) + 0x4567 */
+        r[4] = 0x34; r[5] = 0x12; r[6] = 0x67; r[7] = 0x45;
         break;
-    case 0x0102: /* SYSTEM_TYPE → 0 (retail) */
-        chihiro_mbcom_response[4] = 0;
-        chihiro_mbcom_response[5] = 0;
-        chihiro_mbcom_response[6] = 0;
-        chihiro_mbcom_response[7] = 0;
+    case 0x0102: /* SYSTEM_TYPE — MAME: 0 (retail, bit 16 = devel) */
+        r[4] = 0; r[5] = 0; r[6] = 0; r[7] = 0;
         break;
-    case 0x0103: /* SERIAL_NUMBER */
-        memcpy(chihiro_mbcom_response + 4, "-abc-abc12345678", 16);
+    case 0x0103: /* SERIAL — MAME: "-abc-abc12345678" */
+        memcpy(r + 4, "-abc-abc12345678", 16);
         break;
     default:
-        printf("[%07lld] Chihiro mbcom: unknown command 0x%04X\n", TS_MS, cmd_code);
+        printf("[%07lld] Chihiro mbcom: UNKNOWN cmd=0x%04X\n", TS_MS, cmd_code);
         break;
     }
+
+    /* MAME: clear command header bytes 0-3 after processing (ack to baseboard) */
+    chihiro_mbcom_command[0] = 0;
+    chihiro_mbcom_command[1] = 0;
+    chihiro_mbcom_command[2] = 0;
+    chihiro_mbcom_command[3] = 0;
 }
 
 /*
- * Called from IDE DMA read path. Returns true if the sector was handled
- * (mbcom response), false for normal disk read.
+ * IDE DMA read. Aligned with MAME chihiro.cpp::read_sector():
+ *   LBA 0xFC800 (BASE+0x4800) → returns chihiro_mbcom_response (read_buffer)
+ *   LBA 0xFC801 (BASE+0x4801) → returns chihiro_mbcom_command (write_buffer)
+ *   Only first 32 bytes are meaningful; rest is zero.
  */
 bool chihiro_ide_read_sector(uint32_t lba, void *buffer)
 {
     if (!chihiro_mbcom_enabled) return false;
 
     if (lba == CHIHIRO_MBCOM_RESPONSE) {
-        memcpy(buffer, chihiro_mbcom_response, 512);
+        memset(buffer, 0, 512);
+        memcpy(buffer, chihiro_mbcom_response, 32);
         const uint8_t *d = (const uint8_t *)buffer;
-        printf("[%07lld] Chihiro mbcom: read response @ LBA 0x%X data=%02X%02X%02X%02X "
-               "%02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X\n",
-               TS_MS, lba, d[0],d[1],d[2],d[3],d[4],d[5],d[6],d[7],
-               d[8],d[9],d[10],d[11],d[12],d[13],d[14],d[15]);
+        /* dedup: only log when response signature changes */
+        if (memcmp(d, mbcom_last_read_sig, 4) != 0) {
+            if (mbcom_read_repeat_count > 1) {
+                printf("[%07lld] Chihiro mbcom: (prev response repeated %u times)\n",
+                       TS_MS, mbcom_read_repeat_count);
+            }
+            printf("[%07lld] Chihiro mbcom: read FC800 response=%02X%02X%02X%02X "
+                   "%02X%02X%02X%02X %02X%02X%02X%02X\n",
+                   TS_MS, d[0],d[1],d[2],d[3],d[4],d[5],d[6],d[7],d[8],d[9],d[10],d[11]);
+            memcpy(mbcom_last_read_sig, d, 4);
+            mbcom_read_repeat_count = 1;
+        } else {
+            mbcom_read_repeat_count++;
+        }
         return true;
     }
     if (lba == CHIHIRO_MBCOM_COMMAND) {
         memset(buffer, 0, 512);
+        memcpy(buffer, chihiro_mbcom_command, 32);
         return true;
     }
     return false;
 }
 
 /*
- * Called from IDE DMA write path. Returns true if handled.
+ * IDE DMA write. Aligned with MAME chihiro.cpp::write_sector():
+ *   LBA 0xFC800 → write into chihiro_mbcom_response (read_buffer)
+ *   LBA 0xFC801 → write into chihiro_mbcom_command (write_buffer) THEN process + IRQ10
  */
 bool chihiro_ide_write_sector(uint32_t lba, const void *buffer)
 {
     if (!chihiro_mbcom_enabled) return false;
 
+    if (lba == CHIHIRO_MBCOM_RESPONSE) {
+        memcpy(chihiro_mbcom_response, buffer, 32);
+        return true;
+    }
     if (lba == CHIHIRO_MBCOM_COMMAND) {
-        const uint8_t *cmd = (const uint8_t *)buffer;
-        printf("[%07lld] Chihiro mbcom: write command @ LBA 0x%X data=%02X%02X%02X%02X "
-               "%02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X\n",
-               TS_MS, lba, cmd[0],cmd[1],cmd[2],cmd[3],cmd[4],cmd[5],cmd[6],cmd[7],
-               cmd[8],cmd[9],cmd[10],cmd[11],cmd[12],cmd[13],cmd[14],cmd[15]);
-        if (cmd[0] != 0 || cmd[1] != 0) {
-            chihiro_mbcom_process(cmd);
-            /* Signal SEGABOOT that response is ready (MAME: mcpxlpc->irq10(1)) */
+        memcpy(chihiro_mbcom_command, buffer, 32);
+        if (chihiro_mbcom_command[0] != 0 || chihiro_mbcom_command[1] != 0) {
+            chihiro_mbcom_process();
             if (chihiro_irq10_global) {
-                printf("[%07lld] chihiro IRQ10 RAISE (mbcom response ready)\n", TS_MS);
                 qemu_irq_raise(chihiro_irq10_global);
             }
         }
-        return true;
-    }
-    if (lba == CHIHIRO_MBCOM_RESPONSE) {
-        memcpy(chihiro_mbcom_response, buffer, 512);
         return true;
     }
     return false;
@@ -985,55 +1011,41 @@ bool chihiro_ide_write_sector(uint32_t lba, const void *buffer)
 /*
  * Called from ide_dma_cb() when a DMA WRITE completes on IDE unit 1.
  * Checks if the write was to the mbcom command sector (LBA 0xFC801).
- * If so, reads back the command, processes it, and writes the response
- * to the response sector (LBA 0xFC800). The IRQ10 periodic timer
- * signals SEGABOOT that the response is ready.
+ * If so, reads back the command, processes it, and writes the response.
+ * v146: aligned with MAME convention (FC800=response, FC801=cmd).
  */
 void chihiro_ide_dma_write_done(BlockBackend *blk, int64_t sector_num)
 {
     if (!chihiro_mbcom_enabled) return;
 
-    /* sector_num is the sector AFTER the last written sector.
-     * For a 1-sector write to LBA 0xFC801, sector_num = 0xFC802.
-     * Check if the write range included the command sector. */
     int64_t cmd_lba = CHIHIRO_MBCOM_COMMAND;
     int64_t resp_lba = CHIHIRO_MBCOM_RESPONSE;
 
-    /* Check range: the write could span multiple sectors */
     if (sector_num <= cmd_lba) return;
-    if (sector_num > cmd_lba + 256) return; /* sanity */
+    if (sector_num > cmd_lba + 256) return;
 
-    /* Read back the command sector from the block device */
+    /* Read back the command sector */
     uint8_t cmd_data[512];
     int ret = blk_pread(blk, cmd_lba * 512, 512, cmd_data, 0);
-    if (ret < 0) {
-        printf("[%07lld] Chihiro mbcom: failed to read command sector (ret=%d)\n", TS_MS, ret);
-        return;
-    }
+    if (ret < 0) return;
 
-    /* Check if it's a valid command (first two bytes non-zero) */
     if (cmd_data[0] == 0 && cmd_data[1] == 0) return;
 
-    /* Process the mbcom command */
-    chihiro_mbcom_process(cmd_data);
+    /* Copy into command buffer then process (MAME style) */
+    memcpy(chihiro_mbcom_command, cmd_data, 32);
+    chihiro_mbcom_process();
 
-    /* Write the response to the response sector */
-    ret = blk_pwrite(blk, resp_lba * 512, 512, chihiro_mbcom_response, 0);
-    if (ret < 0) {
-        printf("[%07lld] Chihiro mbcom: failed to write response sector (ret=%d)\n", TS_MS, ret);
-        return;
-    }
+    /* Write response back to disk (for persistence through any DMA rereads) */
+    uint8_t resp_sector[512];
+    memset(resp_sector, 0, 512);
+    memcpy(resp_sector, chihiro_mbcom_response, 32);
+    blk_pwrite(blk, resp_lba * 512, 512, resp_sector, 0);
 
-    /* Clear the command sector so we don't re-process it */
+    /* Clear command sector on disk (MAME clears header bytes; we clear whole sector) */
     memset(cmd_data, 0, 512);
     blk_pwrite(blk, cmd_lba * 512, 512, cmd_data, 0);
 
-    printf("[%07lld] Chihiro mbcom: processed command, response written to LBA 0x%llX\n", TS_MS,
-           (long long)resp_lba);
-
-    /* Signal SEGABOOT that response is ready */
     if (chihiro_irq10_global) {
-        printf("[%07lld] chihiro IRQ10 RAISE (mbcom response ready)\n", TS_MS);
         qemu_irq_raise(chihiro_irq10_global);
     }
 }
