@@ -304,11 +304,12 @@ static void chihiro_diag_timer_cb(void *opaque)
     }
 
     printf("[%07lld] DIAG: CE st=%u cnt=%u rdy=%u | gate=%u boot=%u flag=0x%02X "
-           "slots=%u/s0=0x%02X mflag=%u | 40F0=%u 401E=%u 4084=%u | tick=%u d7a8=%u ce2=%u\n",
+           "slots=%u/s0=0x%02X mflag=%u | 40F0=%u 401E=%u 4084=%u | tick=%u d7a8=%u ce2=%u %s\n",
            TS_MS, state, counter, ready, gate, bootstate,
            bootflag & 0xFF, slotcount, slotflag0, mainflag,
            s->lpc_40f0_reads, s->lpc_401e_reads, s->lpc_4084_reads,
-           xbe2_d0798, xbe2_d07a8, xbe2_ce_state);
+           xbe2_d0798, xbe2_d07a8, xbe2_ce_state,
+           (xbe2_ce_pa != 0xFFFFFFFF) ? "xbe2:mapped" : "xbe2:UNMAPPED");
 
     timer_mod(s->diag_timer,
               qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 1000);

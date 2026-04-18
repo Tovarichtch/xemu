@@ -1400,14 +1400,25 @@ void ide_ioport_write(void *opaque, uint32_t addr, uint32_t val)
     case ATA_IOPORT_WR_COMMAND:
         ide_clear_hob(bus);
         qemu_irq_lower(bus->irq);
-        /* Chihiro debug: log all IDE commands */
+        /* Chihiro debug: log IDE commands (suppress FC801 polling spam) */
         {
             IDEState *active = ide_bus_active_if(bus);
             int unit = active->unit;
             int64_t sector = ide_get_sector(active);
             int nsector = active->nsector ? active->nsector : 256;
-            printf("[%07lld] IDE cmd=0x%02X unit=%d LBA=0x%llX nsect=%d\n",
-                   TS_MS, val, unit, (long long)sector, nsector);
+            static uint32_t fc801_count = 0;
+            if (unit == 1 && sector == 0xFC801) {
+                fc801_count++;
+                if (fc801_count <= 15) {
+                    printf("[%07lld] IDE cmd=0x%02X unit=%d LBA=0x%llX nsect=%d\n",
+                           TS_MS, val, unit, (long long)sector, nsector);
+                } else if (fc801_count == 16) {
+                    printf("[%07lld] IDE FC801 polling — suppressing further logs\n", TS_MS);
+                }
+            } else {
+                printf("[%07lld] IDE cmd=0x%02X unit=%d LBA=0x%llX nsect=%d\n",
+                       TS_MS, val, unit, (long long)sector, nsector);
+            }
         }
         ide_bus_exec_cmd(bus, val);
         break;
