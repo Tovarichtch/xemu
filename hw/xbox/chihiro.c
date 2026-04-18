@@ -535,43 +535,9 @@ static void chihiro_usb_poll_patch_cb(void *opaque)
         0xC2, 0x04, 0x00                       /* ret 4              */
     };
 
-    /*
-     * Patch 11: AV video check skip (VA 0x796A4) — force VGA path
-     *
-     * SEGABOOT checks AV type at [ebx+0x8C0]. With xemu's retail Xbox
-     * EEPROM (no Chihiro EEPROM exists in ROM dumps), the kernel reports
-     * an AV type that fails all checks → CAUTION 51.
-     * Chihiro hardware always uses VGA (31kHz). Skip ALL AV checks and
-     * jump directly to VGA success path at 0x79788.
-     *
-     * NOTE: Two copies of "mov al,[ebx+0x8C0]; cmp al,7" exist.
-     * Disambiguated by the je offset: 0x74 0x1C (target) vs 0x74 0x18.
-     *
-     *   0x796A4: 8A 83 C0 08 00 00  mov al, [ebx+0x8C0]
-     *   0x796AA: 3C 07              cmp al, 7
-     *   0x796AC: 74 1C              je +0x1C  ← unique byte
-     *
-     * Replace first 6 bytes: E9 DF 00 00 00 90  (jmp 0x79788 + NOP)
-     */
-    static const uint8_t sig_avcheck[] = {
-        0x8A, 0x83, 0xC0, 0x08, 0x00, 0x00, /* mov al, [ebx+0x8C0] */
-        0x3C, 0x07,                          /* cmp al, 7            */
-        0x74, 0x1C                           /* je +0x1C (unique!)   */
-    };
-    static const uint8_t patch_jmp_vga[] = { 0xE9, 0xDF, 0x00, 0x00, 0x00, 0x90 };
-
-    /*
-     * Patch 12: Second AV check skip (VA 0x795E6)
-     * Same structure but only accepts {7,9,C,D} — no VGA (4) at all.
-     * Disambiguated by je +0x18 (vs +0x1C above).
-     * Jump to 0x79608 (accepted path) to skip type rejection.
-     */
-    static const uint8_t sig_avcheck2[] = {
-        0x8A, 0x83, 0xC0, 0x08, 0x00, 0x00, /* mov al, [ebx+0x8C0] */
-        0x3C, 0x07,                          /* cmp al, 7            */
-        0x74, 0x18                           /* je +0x18 (unique)    */
-    };
-    static const uint8_t patch_jmp_av2[] = { 0xE9, 0x88, 0x03, 0x00, 0x00, 0x90 };
+    /* v172: REMOVED AV video check patches (11+12). CAUTION 51 was caused by
+     * wrong DIP switch state in PINSA (chihiro-usb.c), not EEPROM/AV pack.
+     * Fixed by setting DIP2=ON (bit1=0) in PINSA for 31kHz mode. */
 
     /* Patch byte arrays */
     static const uint8_t patch_jmp[]   = { 0xEB };
@@ -593,8 +559,6 @@ static void chihiro_usb_poll_patch_cb(void *opaque)
         /* v153: REMOVED GetBootData (was always return 1) — let real boot data flow through */
         { sig_check_mainserial,  sizeof(sig_check_mainserial),  4, patch_xor_nop3, 5, 0x2EC35, "CheckMainBoardSerial (err 3 -> 0)",  false },
         { sig_check_mediaserial, sizeof(sig_check_mediaserial), 5, patch_xor_nop3, 5, 0x2EC88, "CheckMediaBoardSerial (err 4 -> 0)", false },
-        { sig_avcheck, sizeof(sig_avcheck), 0, patch_jmp_vga, 6, 0x796A4, "AV video check 1 (jmp to VGA path)", false },
-        { sig_avcheck2, sizeof(sig_avcheck2), 0, patch_jmp_av2, 6, 0x795E6, "AV video check 2 (jmp to epilogue)", false },
     };
     int num_patches = sizeof(patches) / sizeof(patches[0]);
     int applied = 0;

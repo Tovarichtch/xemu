@@ -273,7 +273,15 @@ static void handle_control(USBDevice *dev, USBPacket *p,
         data[n] = 0x50 ^ n;
     }
     data[0] = 0x00;  /* success */
-    data[1] = 0x4B;  /* PINSA: DIP switches */
+    data[1] = 0x6B;  /* PINSA: DIP switches (pull-up: 0=ON, 1=OFF)
+                      * HOD3 setting: DIP 1,2,5=OFF  DIP 3,4=ON
+                      * bit0=1 DIP1 OFF (horizontal monitor)
+                      * bit1=1 DIP2 OFF
+                      * bit2=0 DIP3 ON
+                      * bit3=1 CS pin
+                      * bit4=0 DIP4 ON
+                      * bit5=1 DIP5 OFF (was 0 in MAME)
+                      * bit6-7 buttons */
     data[2] = 0x52;  /* PINSB: JVS sense = all addressed */
     data[3] = 0x53;  /* OUTB register */
 
