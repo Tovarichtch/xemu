@@ -250,6 +250,7 @@ static void chihiro_diag_timer_cb(void *opaque)
     uint32_t bootflag = 0, slotcount = 0, mainflag = 0;
     uint8_t slotflag0 = 0;
     uint32_t xbe2_d07a8 = 0, xbe2_d0798 = 0;
+    uint32_t xbe2_ce_state = 0;
 
     /* RE-RESOLVE PAs every tick to detect page-table changes.
      * If the game changes CR3 after initial resolution, stale PAs would read wrong data. */
@@ -291,6 +292,10 @@ static void chihiro_diag_timer_cb(void *opaque)
     if (d07a8_pa != 0xFFFFFFFF) cpu_physical_memory_read(d07a8_pa, &xbe2_d07a8, 4);
     if (d0798_pa != 0xFFFFFFFF) cpu_physical_memory_read(d0798_pa, &xbe2_d0798, 4);
 
+    /* XBE2 CE state machine at [0xCB9EC] — mirrors SEGABOOT's CE at [0x87AFC] */
+    uint32_t xbe2_ce_pa = chihiro_va_to_pa(0xCB9EC);
+    if (xbe2_ce_pa != 0xFFFFFFFF) cpu_physical_memory_read(xbe2_ce_pa, &xbe2_ce_state, 4);
+
     /* Detect bootstate changes between ticks */
     if (bootstate != s->last_bootstate) {
         printf("[%07lld] DIAG: *** BOOTSTATE CHANGED %u → %u ***\n", TS_MS,
@@ -299,11 +304,11 @@ static void chihiro_diag_timer_cb(void *opaque)
     }
 
     printf("[%07lld] DIAG: CE st=%u cnt=%u rdy=%u | gate=%u boot=%u flag=0x%02X "
-           "slots=%u/s0=0x%02X mflag=%u | 40F0=%u 401E=%u 4084=%u | tick=%u d7a8=%u\n",
+           "slots=%u/s0=0x%02X mflag=%u | 40F0=%u 401E=%u 4084=%u | tick=%u d7a8=%u ce2=%u\n",
            TS_MS, state, counter, ready, gate, bootstate,
            bootflag & 0xFF, slotcount, slotflag0, mainflag,
            s->lpc_40f0_reads, s->lpc_401e_reads, s->lpc_4084_reads,
-           xbe2_d0798, xbe2_d07a8);
+           xbe2_d0798, xbe2_d07a8, xbe2_ce_state);
 
     timer_mod(s->diag_timer,
               qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 1000);
@@ -668,9 +673,11 @@ static void chihiro_lpc_io_write(void *opaque, hwaddr addr, uint64_t val,
 
     ChihiroLPCState *s = CHIHIRO_LPC_DEVICE(opaque);
 
-    /* Log ALL writes */
-    printf("[%07lld] chihiro lpc write [0x%04x] <- 0x%04x (size=%d)\n", TS_MS,
-           (unsigned)(addr + 0x4000), (unsigned)val, size);
+    /* Log writes (suppress 0x4026 IRQ ACK spam) */
+    if (addr != 0x26) {
+        printf("[%07lld] chihiro lpc write [0x%04x] <- 0x%04x (size=%d)\n", TS_MS,
+               (unsigned)(addr + 0x4000), (unsigned)val, size);
+    }
 
     switch (addr) {
     case 0x00: /* Port 0x4000: write register data */
@@ -684,8 +691,7 @@ static void chihiro_lpc_io_write(void *opaque, hwaddr addr, uint64_t val,
     case 0x08: /* Port 0x4008: command/clear */
         return;
     case SEGA_IRQ10_ACK:
-        /* Clear IRQ10 — SEGABOOT writes here after handling baseboard IRQ */
-        printf("[%07lld] chihiro IRQ10 LOWER (ack from SEGABOOT)\n", TS_MS);
+        /* Clear IRQ10 — game writes here after handling baseboard IRQ */
         qemu_irq_lower(s->irq10);
         break;
     default:
