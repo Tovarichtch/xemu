@@ -535,9 +535,16 @@ static void chihiro_usb_poll_patch_cb(void *opaque)
         0xC2, 0x04, 0x00                       /* ret 4              */
     };
 
-    /* v172: REMOVED AV video check patches (11+12). CAUTION 51 was caused by
-     * wrong DIP switch state in PINSA (chihiro-usb.c), not EEPROM/AV pack.
-     * Fixed by setting DIP2=ON (bit1=0) in PINSA for 31kHz mode. */
+    /* v172: REMOVED per-path AV patches (11+12). Root cause is DIP switches
+     * (PINSA 0x4B→0x6B in chihiro-usb.c) AND GPU output mode mismatch.
+     * Until a proper Chihiro EEPROM sets GPU to 31kHz, NOP the call. */
+    static const uint8_t sig_avcall[] = {
+        0x57,                                /* push edi             */
+        0x56,                                /* push esi             */
+        0xFF, 0x75, 0x08,                    /* push [ebp+8]         */
+        0xE8, 0x13, 0xB3, 0xFF, 0xFF         /* call 0x794E0         */
+    };
+    static const uint8_t patch_nop5[] = { 0x90, 0x90, 0x90, 0x90, 0x90 };
 
     /* Patch byte arrays */
     static const uint8_t patch_jmp[]   = { 0xEB };
@@ -559,6 +566,7 @@ static void chihiro_usb_poll_patch_cb(void *opaque)
         /* v153: REMOVED GetBootData (was always return 1) — let real boot data flow through */
         { sig_check_mainserial,  sizeof(sig_check_mainserial),  4, patch_xor_nop3, 5, 0x2EC35, "CheckMainBoardSerial (err 3 -> 0)",  false },
         { sig_check_mediaserial, sizeof(sig_check_mediaserial), 5, patch_xor_nop3, 5, 0x2EC88, "CheckMediaBoardSerial (err 4 -> 0)", false },
+        { sig_avcall, sizeof(sig_avcall), 5, patch_nop5, 5, 0x7E1C8, "AV video check call (NOP)", false },
     };
     int num_patches = sizeof(patches) / sizeof(patches[0]);
     int applied = 0;
