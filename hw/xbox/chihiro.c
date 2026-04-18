@@ -795,14 +795,15 @@ static void chihiro_irq10_timer_cb(void *opaque)
             /* Baseboard DMA response emulation: mark slots as "ready" in META area.
              *
              * Verified slot layout (stride 0x40):
-             *   META at VA 0x89740 + slot*0x40:  word[+2] = response marker
-             *   DATA at VA 0x89760 + slot*0x40:  byte[0] = type, byte[+3] bit7 = pending
+             *   META at VA 0x89740 + slot*0x40:
+             *     word[+2] = response marker (PollReady checks != 0)
+             *     dword[+4] = response data (ReadSlotData copies to output ptr)
+             *   DATA at VA 0x89760 + slot*0x40:
+             *     byte[0] = type, word[+2] = cmd opcode, byte[+3] bit7 = pending
              *
-             * PollReady (0x3DBC0) checks META word[+2] != 0.
-             * ValidateType (0x3E4A0) writes DATA word[+2] = 1 (different address!).
-             * On real HW, baseboard DMA writes META word[+2] after processing.
-             * We emulate this: if DATA byte[0] != 0 (type allocated) and
-             * META word[+2] == 0 (not yet ready), write META word[+2] = 1.
+             * ReadSlotData (0x3E4FD) copies META[+4] to output (e.g. [0x89C50]).
+             * GetBootData (0x41880) returns [0x89C50] + 0xFF000000.
+             * For non-zero result: META[+4] must be > 0x01000000 (DIMM base).
              */
             uint32_t meta_base_pa = slot_base_pa - 0x20; /* VA 0x89740 */
             for (int s = 0; s < 16; s++) {
@@ -814,11 +815,19 @@ static void chihiro_irq10_timer_cb(void *opaque)
                 cpu_physical_memory_read(meta_pa + 2, &meta_marker, 2);
 
                 if (data_byte0 != 0 && meta_marker == 0) {
+                    /* Set marker → PollReady returns 1 */
                     meta_marker = 0x0001;
                     cpu_physical_memory_write(meta_pa + 2, &meta_marker, 2);
-                    printf("[%07lld] Chihiro DMA: META marker set for slot %d"
-                           " (type=0x%02X) at PA 0x%08X\n",
-                           TS_MS, s, data_byte0, meta_pa + 2);
+
+                    /* Set data → ReadSlotData copies to [0x89C50]
+                     * DIMM base = 0x01000000. Game data offset = 0.
+                     * Value must be > 0x01000000 for GetBootData non-zero. */
+                    uint32_t dimm_data_addr = 0x01001000;
+                    cpu_physical_memory_write(meta_pa + 4, &dimm_data_addr, 4);
+
+                    printf("[%07lld] Chihiro DMA: slot %d ready (type=0x%02X)"
+                           " marker=0x%04X data=0x%08X\n",
+                           TS_MS, s, data_byte0, meta_marker, dimm_data_addr);
                 }
             }
         }
