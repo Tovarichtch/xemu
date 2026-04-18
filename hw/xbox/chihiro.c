@@ -831,6 +831,11 @@ static void chihiro_irq10_timer_cb(void *opaque)
                     case 0x0001: /* Boot data pointer → DIMM address */
                         resp_data = 0x01001000;
                         break;
+                    case 0x0100: /* STATUS → phase=7 (loading complete).
+                                 * Gate at 0x2E0AF needs phase >= 5.
+                                 * Phase 5=loading, 7=complete. */
+                        resp_data = 7;
+                        break;
                     case 0x0102: /* SYSTEM_TYPE → bit 16 = develop mode */
                         resp_data = 0x00010000;
                         break;
@@ -840,9 +845,22 @@ static void chihiro_irq10_timer_cb(void *opaque)
                     }
                     cpu_physical_memory_write(meta_pa + 4, &resp_data, 4);
 
-                    printf("[%07lld] Chihiro DMA: slot %d ready (type=0x%02X"
-                           " cmd=0x%04X) resp=0x%08X\n",
-                           TS_MS, s, data_byte0, cmd_opcode, resp_data);
+                    /* Dedup repeated STATUS polls to avoid log spam */
+                    static uint16_t last_dma_cmd = 0xFFFF;
+                    static uint32_t dma_repeat_count = 0;
+                    if (cmd_opcode == last_dma_cmd) {
+                        dma_repeat_count++;
+                    } else {
+                        if (dma_repeat_count > 1) {
+                            printf("[%07lld] Chihiro DMA: (prev cmd=0x%04X repeated %u times)\n",
+                                   TS_MS, last_dma_cmd, dma_repeat_count);
+                        }
+                        printf("[%07lld] Chihiro DMA: slot %d ready (type=0x%02X"
+                               " cmd=0x%04X) resp=0x%08X\n",
+                               TS_MS, s, data_byte0, cmd_opcode, resp_data);
+                        last_dma_cmd = cmd_opcode;
+                        dma_repeat_count = 1;
+                    }
                 }
             }
         }
