@@ -546,6 +546,19 @@ static void chihiro_usb_poll_patch_cb(void *opaque)
     };
     static const uint8_t patch_nop5[] = { 0x90, 0x90, 0x90, 0x90, 0x90 };
 
+    /*
+     * Patch 12: Second AV video check — NOP call to 0x7A2A1 at VA 0x83907
+     * A SECOND video check function (0x7A2A1) sets flags at [ebx+0xA72]
+     * (0x7A51D, 0x7A529, 0x7A552, 0x7A565, 0x7A5B1) independently of
+     * the first (0x794E0). Both must be NOP'd to prevent CAUTION 51.
+     */
+    static const uint8_t sig_avcall2[] = {
+        0xFF, 0x75, 0x0C,                    /* push [ebp+0xC]       */
+        0x8B, 0x4D, 0xFC,                    /* mov ecx, [ebp-4]     */
+        0x57,                                /* push edi             */
+        0xE8, 0x95, 0x69, 0xFF, 0xFF         /* call 0x7A2A1         */
+    };
+
     /* Patch byte arrays */
     static const uint8_t patch_jmp[]   = { 0xEB };
     static const uint8_t patch_and0[]  = { 0x00 };
@@ -567,6 +580,7 @@ static void chihiro_usb_poll_patch_cb(void *opaque)
         { sig_check_mainserial,  sizeof(sig_check_mainserial),  4, patch_xor_nop3, 5, 0x2EC35, "CheckMainBoardSerial (err 3 -> 0)",  false },
         { sig_check_mediaserial, sizeof(sig_check_mediaserial), 5, patch_xor_nop3, 5, 0x2EC88, "CheckMediaBoardSerial (err 4 -> 0)", false },
         { sig_avcall, sizeof(sig_avcall), 5, patch_nop5, 5, 0x7E1C8, "AV video check call (NOP)", false },
+        { sig_avcall2, sizeof(sig_avcall2), 7, patch_nop5, 5, 0x83907, "AV video check 2 call (NOP)", false },
     };
     int num_patches = sizeof(patches) / sizeof(patches[0]);
     int applied = 0;
