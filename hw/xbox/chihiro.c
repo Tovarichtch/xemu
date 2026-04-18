@@ -249,6 +249,7 @@ static void chihiro_diag_timer_cb(void *opaque)
     uint32_t state = 0, counter = 0, ready = 0, gate = 0, bootstate = 0;
     uint32_t bootflag = 0, slotcount = 0, mainflag = 0;
     uint8_t slotflag0 = 0;
+    uint32_t xbe2_d07a8 = 0, xbe2_d0798 = 0;
 
     /* RE-RESOLVE PAs every tick to detect page-table changes.
      * If the game changes CR3 after initial resolution, stale PAs would read wrong data. */
@@ -284,6 +285,12 @@ static void chihiro_diag_timer_cb(void *opaque)
     if (slotflag0_pa != 0xFFFFFFFF) cpu_physical_memory_read(slotflag0_pa, &slotflag0, 1);
     if (mainflag_pa != 0xFFFFFFFF) cpu_physical_memory_read(mainflag_pa, &mainflag, 4);
 
+    /* XBE2 game state — D07A8 must reach 4 for game to advance */
+    uint32_t d07a8_pa = chihiro_va_to_pa(0xD07A8);
+    uint32_t d0798_pa = chihiro_va_to_pa(0xD0798);
+    if (d07a8_pa != 0xFFFFFFFF) cpu_physical_memory_read(d07a8_pa, &xbe2_d07a8, 4);
+    if (d0798_pa != 0xFFFFFFFF) cpu_physical_memory_read(d0798_pa, &xbe2_d0798, 4);
+
     /* Detect bootstate changes between ticks */
     if (bootstate != s->last_bootstate) {
         printf("[%07lld] DIAG: *** BOOTSTATE CHANGED %u → %u ***\n", TS_MS,
@@ -292,10 +299,11 @@ static void chihiro_diag_timer_cb(void *opaque)
     }
 
     printf("[%07lld] DIAG: CE st=%u cnt=%u rdy=%u | gate=%u boot=%u flag=0x%02X "
-           "slots=%u/s0=0x%02X mflag=%u | 40F0=%u 401E=%u 4084=%u\n",
+           "slots=%u/s0=0x%02X mflag=%u | 40F0=%u 401E=%u 4084=%u | tick=%u d7a8=%u\n",
            TS_MS, state, counter, ready, gate, bootstate,
            bootflag & 0xFF, slotcount, slotflag0, mainflag,
-           s->lpc_40f0_reads, s->lpc_401e_reads, s->lpc_4084_reads);
+           s->lpc_40f0_reads, s->lpc_401e_reads, s->lpc_4084_reads,
+           xbe2_d0798, xbe2_d07a8);
 
     timer_mod(s->diag_timer,
               qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 1000);
