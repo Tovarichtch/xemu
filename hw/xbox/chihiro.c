@@ -538,24 +538,25 @@ static void chihiro_usb_poll_patch_cb(void *opaque)
     /*
      * Patch 11: AV video check skip (VA 0x796A4) — force VGA path
      *
-     * SEGABOOT checks AV type at [ebx+0x8C0]. If not in {7,9,C,D,4},
-     * sets error flag. If in list but != 4 (VGA), runs frequency check
-     * that shows CAUTION 51. The EEPROM video flags determine the AV type
-     * reported by the kernel. With xemu's standard EEPROM, the AV type
-     * is not in the accepted list → error flag set before our old patch.
+     * SEGABOOT checks AV type at [ebx+0x8C0]. With xemu's retail Xbox
+     * EEPROM (no Chihiro EEPROM exists in ROM dumps), the kernel reports
+     * an AV type that fails all checks → CAUTION 51.
+     * Chihiro hardware always uses VGA (31kHz). Skip ALL AV checks and
+     * jump directly to VGA success path at 0x79788.
      *
-     * Fix: jump directly from the start of the check to the VGA success
-     * path at 0x79788, bypassing ALL AV type and frequency checks.
-     * Chihiro hardware always uses VGA (31kHz) — this is correct behavior.
+     * NOTE: Two copies of "mov al,[ebx+0x8C0]; cmp al,7" exist.
+     * Disambiguated by the je offset: 0x74 0x1C (target) vs 0x74 0x18.
      *
-     *   0x796A4: 8A 83 C0 08 00 00  mov al, [ebx+0x8C0]  ← PATCH HERE
+     *   0x796A4: 8A 83 C0 08 00 00  mov al, [ebx+0x8C0]
      *   0x796AA: 3C 07              cmp al, 7
+     *   0x796AC: 74 1C              je +0x1C  ← unique byte
      *
-     * Replace with: E9 DF 00 00 00 90  jmp 0x79788 + NOP
+     * Replace first 6 bytes: E9 DF 00 00 00 90  (jmp 0x79788 + NOP)
      */
     static const uint8_t sig_avcheck[] = {
         0x8A, 0x83, 0xC0, 0x08, 0x00, 0x00, /* mov al, [ebx+0x8C0] */
-        0x3C, 0x07                           /* cmp al, 7            */
+        0x3C, 0x07,                          /* cmp al, 7            */
+        0x74, 0x1C                           /* je +0x1C (unique!)   */
     };
     static const uint8_t patch_jmp_vga[] = { 0xE9, 0xDF, 0x00, 0x00, 0x00, 0x90 };
 
