@@ -139,5 +139,13 @@ bool xbox_eeprom_generate(const char *file, XboxEEPROMVersion ver) {
 
     bool success = fwrite(&e, sizeof(e), 1, fd) == 1;
     fclose(fd);
+
+    /* Log video_standard value and raw EEPROM bytes at offset 0x58 */
+    uint8_t *raw = (uint8_t *)&e;
+    printf("Chihiro: EEPROM generated — video_standard=0x%08X "
+           "raw[0x58..0x5B]=%02X %02X %02X %02X\n",
+           le32_to_cpu(e.video_standard),
+           raw[0x58], raw[0x59], raw[0x5A], raw[0x5B]);
+
     return success;
 }

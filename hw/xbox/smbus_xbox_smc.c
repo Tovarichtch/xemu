@@ -188,8 +188,15 @@ static uint8_t smc_receive_byte(SMBusDevice *dev)
     case SMC_REG_SCRATCH:
         return smc->scratch_reg;
 
-    case SMC_REG_AVPACK:
+    case SMC_REG_AVPACK: {
+        static int avpack_log_once = 0;
+        if (!avpack_log_once) {
+            avpack_log_once = 1;
+            printf("Chihiro SMC: avpack_reg=0x%02X (0=SCART 1=HDTV 2=VGA 4=SVIDEO 6=COMPOSITE)\n",
+                   smc->avpack_reg);
+        }
         return smc->avpack_reg;
+    }
 
     case SMC_REG_ERROR_READ:
         return smc->error_reg;

@@ -330,6 +330,70 @@ static void chihiro_diag_timer_cb(void *opaque)
         }
     }
 
+    /* v177 DIAG: NV2A video mode at boot=3 (CAUTION state) — measure before coding */
+    if (bootstate == 3) {
+        static int boot3_diag_done = 0;
+        if (!boot3_diag_done) {
+            boot3_diag_done = 1;
+            /* NV2A PRAMDAC: physical 0xFD680000 + offset */
+            uint32_t pramdac_base = 0xFD680000;
+            uint32_t pcrtc_base   = 0xFD600000;
+            uint32_t prmcio_base  = 0xFD601000;
+            uint32_t vdisp = 0, hdisp = 0, vsync = 0, vvalid = 0, hvalid = 0;
+            uint32_t vpll = 0, pcrtc_cfg = 0;
+            uint8_t interlace = 0;
+
+            address_space_read(&address_space_memory, pramdac_base + 0x800,
+                               MEMTXATTRS_UNSPECIFIED, &vdisp, 4);
+            address_space_read(&address_space_memory, pramdac_base + 0x810,
+                               MEMTXATTRS_UNSPECIFIED, &vsync, 4);
+            address_space_read(&address_space_memory, pramdac_base + 0x818,
+                               MEMTXATTRS_UNSPECIFIED, &vvalid, 4);
+            address_space_read(&address_space_memory, pramdac_base + 0x820,
+                               MEMTXATTRS_UNSPECIFIED, &hdisp, 4);
+            address_space_read(&address_space_memory, pramdac_base + 0x838,
+                               MEMTXATTRS_UNSPECIFIED, &hvalid, 4);
+            address_space_read(&address_space_memory, pramdac_base + 0x508,
+                               MEMTXATTRS_UNSPECIFIED, &vpll, 4);
+            address_space_read(&address_space_memory, pcrtc_base + 0x804,
+                               MEMTXATTRS_UNSPECIFIED, &pcrtc_cfg, 4);
+            address_space_read(&address_space_memory, prmcio_base + 0x39,
+                               MEMTXATTRS_UNSPECIFIED, &interlace, 1);
+
+            printf("[%07lld] DIAG NV2A VIDEO MODE:\n"
+                   "  VDISPLAY_END=0x%X VSYNC_END=0x%X VVALID_END=0x%X\n"
+                   "  HDISPLAY_END=0x%X HVALID_END=0x%X\n"
+                   "  VPLL_COEFF=0x%08X PCRTC_CONFIG=0x%08X INTERLACE=0x%02X\n",
+                   TS_MS, vdisp, vsync, vvalid, hdisp, hvalid,
+                   vpll, pcrtc_cfg, interlace);
+
+            /* Dump DMA DATA slots 0-3 to see what SEGABOOT wrote */
+            for (int ds = 0; ds < 4; ds++) {
+                uint32_t ds_pa = chihiro_va_to_pa(0x89760 + ds * 0x40);
+                if (ds_pa != 0xFFFFFFFF) {
+                    uint8_t dsbuf[16];
+                    cpu_physical_memory_read(ds_pa, dsbuf, 16);
+                    printf("  DMA DATA slot%d: %02X %02X %02X %02X %02X %02X %02X %02X"
+                           " %02X %02X %02X %02X %02X %02X %02X %02X\n",
+                           ds, dsbuf[0], dsbuf[1], dsbuf[2], dsbuf[3],
+                           dsbuf[4], dsbuf[5], dsbuf[6], dsbuf[7],
+                           dsbuf[8], dsbuf[9], dsbuf[10], dsbuf[11],
+                           dsbuf[12], dsbuf[13], dsbuf[14], dsbuf[15]);
+                }
+                uint32_t ms_pa = chihiro_va_to_pa(0x89740 + ds * 0x40);
+                if (ms_pa != 0xFFFFFFFF) {
+                    uint8_t msbuf[12];
+                    cpu_physical_memory_read(ms_pa, msbuf, 12);
+                    printf("  DMA META slot%d: %02X %02X %02X %02X %02X %02X %02X %02X"
+                           " %02X %02X %02X %02X\n",
+                           ds, msbuf[0], msbuf[1], msbuf[2], msbuf[3],
+                           msbuf[4], msbuf[5], msbuf[6], msbuf[7],
+                           msbuf[8], msbuf[9], msbuf[10], msbuf[11]);
+                }
+            }
+        }
+    }
+
     timer_mod(s->diag_timer,
               qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 1000);
 }
