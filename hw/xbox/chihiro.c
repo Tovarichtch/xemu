@@ -535,6 +535,32 @@ static void chihiro_usb_poll_patch_cb(void *opaque)
         0xC2, 0x04, 0x00                       /* ret 4              */
     };
 
+    /*
+     * Patch 11: AV frequency check skip (VA 0x796D4) — force VGA path
+     *
+     * SEGABOOT checks AV type at [ebx+0x8C0]. If type != 4 (VGA), it runs
+     * a horizontal scanning frequency check that shows CAUTION 51.
+     * Chihiro uses VGA (31kHz) monitors. With xemu's EEPROM, the kernel
+     * reports a non-VGA AV type. Force the VGA path for all accepted types.
+     *
+     *   0x796CA: 33 C9             xor ecx, ecx
+     *   0x796CC: 3C 04             cmp al, 4
+     *   0x796CE: 89 4D E8          mov [ebp-0x18], ecx
+     *   0x796D1: 89 4D F4          mov [ebp-0x0C], ecx
+     *   0x796D4: 0F 84 AE 00 00 00 je 0x79788     ← patch to jmp
+     *
+     * Replace je (0F 84) with jmp (E9) + NOP:
+     *   E9 AF 00 00 00 90
+     */
+    static const uint8_t sig_avcheck[] = {
+        0x33, 0xC9,                            /* xor ecx, ecx       */
+        0x3C, 0x04,                            /* cmp al, 4          */
+        0x89, 0x4D, 0xE8,                      /* mov [ebp-0x18], ecx */
+        0x89, 0x4D, 0xF4,                      /* mov [ebp-0x0C], ecx */
+        0x0F, 0x84                             /* je ...              */
+    };
+    static const uint8_t patch_jmp_vga[] = { 0xE9, 0xAF, 0x00, 0x00, 0x00, 0x90 };
+
     /* Patch byte arrays */
     static const uint8_t patch_jmp[]   = { 0xEB };
     static const uint8_t patch_and0[]  = { 0x00 };
@@ -555,6 +581,7 @@ static void chihiro_usb_poll_patch_cb(void *opaque)
         /* v153: REMOVED GetBootData (was always return 1) — let real boot data flow through */
         { sig_check_mainserial,  sizeof(sig_check_mainserial),  4, patch_xor_nop3, 5, 0x2EC35, "CheckMainBoardSerial (err 3 -> 0)",  false },
         { sig_check_mediaserial, sizeof(sig_check_mediaserial), 5, patch_xor_nop3, 5, 0x2EC88, "CheckMediaBoardSerial (err 4 -> 0)", false },
+        { sig_avcheck, sizeof(sig_avcheck), 10, patch_jmp_vga, 6, 0x796D4, "AV freq check (je->jmp, force VGA path)", false },
     };
     int num_patches = sizeof(patches) / sizeof(patches[0]);
     int applied = 0;
