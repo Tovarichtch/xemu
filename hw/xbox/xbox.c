@@ -309,11 +309,8 @@ void xbox_init_common(MachineState *machine,
     // idebus[1] = qdev_get_child_bus(&dev->qdev, "ide.1");
 
     /* smbus devices */
-    /* Chihiro arcade boards use VGA (31kHz) monitors.
-     * Override avpack before SMC init so the SMC reads the correct value. */
-    if (machine->ram_size > 64 * 1024 * 1024) {
-        object_property_set_str(OBJECT(machine), "avpack", "vga", &error_fatal);
-    }
+    /* Chihiro: SMC default 0x00 maps to VGA in arcade kernel.
+     * No avpack override needed — the kernel handles the mapping. */
     smbus_xbox_smc_init(smbus, 0x10);
 
     const char *video_encoder =

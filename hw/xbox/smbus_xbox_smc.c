@@ -28,6 +28,7 @@
 #include "hw/hw.h"
 #include "hw/acpi/acpi.h"
 #include "hw/i2c/i2c.h"
+#include "hw/boards.h"
 #include "hw/i2c/smbus_slave.h"
 #include "qemu/config-file.h"
 #include "qapi/error.h"
@@ -272,7 +273,7 @@ static void smbus_smc_realize(DeviceState *dev, Error **errp)
     smc->version_string = NULL;
     smc->version_string_index = 0;
     smc->traystate_reg = 0;
-    smc->avpack_reg = SMC_REG_AVPACK_VGA; /* Chihiro arcade boards use VGA (31kHz) */
+    smc->avpack_reg = SMC_REG_AVPACK_SCART; /* Chihiro: kernel maps 0x00→VGA (DIP 6,7,8 ground AV pins) */
     smc->intstatus_reg = 0;
     smc->scratch_reg = 0;
     smc->cmd = 0;
@@ -290,6 +291,17 @@ static void smbus_smc_realize(DeviceState *dev, Error **errp)
         }
 
         g_free(avpack);
+    }
+
+    /* Chihiro: force SMC avpack to 0x00 regardless of command line.
+     * On real hardware, DIP 6,7,8 ground the AV sense pins → SMC reads 0x00.
+     * The Chihiro kernel maps 0x00 → AV_PACK_VGA (unlike retail → SCART).
+     * This is the ONLY value that makes the kernel program NV2A for VGA. */
+    {
+        MachineState *ms = MACHINE(qdev_get_machine());
+        if (ms->ram_size > 64 * 1024 * 1024) {
+            smc->avpack_reg = SMC_REG_AVPACK_SCART; /* 0x00 = VGA on Chihiro */
+        }
     }
 
     smc_version = object_property_get_str(qdev_get_machine(), "smc-version", NULL);
