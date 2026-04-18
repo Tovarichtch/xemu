@@ -714,11 +714,11 @@ static qemu_irq chihiro_irq10_global = NULL;
  */
 
 /* mbcom state — defined here (before IRQ10 timer that uses them) */
-static uint8_t chihiro_mbcom_response[512];  /* read_buffer in MAME terminology */
-static uint8_t chihiro_mbcom_command[512];   /* write_buffer in MAME terminology */
+static uint8_t chihiro_mbcom_response[512];
+static uint8_t chihiro_mbcom_command[512];
 static bool chihiro_mbcom_enabled = false;
 static bool chihiro_boot_slot_injected = false;
-static void chihiro_mbcom_process(void);  /* forward decl */
+static void chihiro_mbcom_process(void);
 
 static void chihiro_irq10_timer_cb(void *opaque)
 {
@@ -787,26 +787,37 @@ static void chihiro_irq10_timer_cb(void *opaque)
                 uint32_t boot_state = 0;
                 cpu_physical_memory_read(boot_state_pa, &boot_state, 4);
 
-                if (boot_state == 2 && !chihiro_boot_slot_injected) {
-                    /* Create a type=2 slot at slot[1] (slot[0] may be used by DIMM_SIZE) */
+                if (boot_state == 2) {
+                    static int push_count = 0;
+                    /* Create a type=2 slot at slot[1] */
                     uint32_t slot_pa = slot_base_pa + 1 * 0x40;
 
                     /* Metadata: type=2, marker=non-zero, bit7=CLEAR */
                     uint8_t meta[4] = { 0x02, 0x00, 0x01, 0x00 };
                     cpu_physical_memory_write(slot_pa, meta, 4);
 
-                    /* Data area: minimal response — echo + marker + zeros */
+                    /* Data area: minimal response */
                     uint8_t resp[32];
                     memset(resp, 0, 32);
-                    resp[0] = 0x01;  /* echo low */
-                    resp[1] = 0x00;  /* echo high */
-                    resp[2] = 0x01;  /* marker low */
-                    resp[3] = 0x80;  /* marker high (0x8001) */
+                    resp[0] = 0x01; resp[2] = 0x01; resp[3] = 0x80;
                     cpu_physical_memory_write(slot_pa + 0x20, resp, 32);
 
-                    chihiro_boot_slot_injected = true;
-                    printf("[%07lld] Chihiro mbcom: DMA PUSH type=2 slot"
-                           " (boot_state=2, baseboard init response)\n", TS_MS);
+                    push_count++;
+                    if (push_count <= 3 || (push_count % 100) == 0) {
+                        /* Verify: read back and dump first 3 slots */
+                        printf("[%07lld] Chihiro DMA PUSH #%d (boot=2). Slot dump:\n",
+                               TS_MS, push_count);
+                        for (int s = 0; s < 3; s++) {
+                            uint32_t sp = slot_base_pa + s * 0x40;
+                            uint8_t m[4], d[8];
+                            cpu_physical_memory_read(sp, m, 4);
+                            cpu_physical_memory_read(sp + 0x20, d, 8);
+                            printf("  slot[%d] PA=0x%08X meta=%02X %02X %02X %02X"
+                                   " data=%02X%02X%02X%02X %02X%02X%02X%02X\n",
+                                   s, sp, m[0], m[1], m[2], m[3],
+                                   d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]);
+                        }
+                    }
                 }
             }
         }
