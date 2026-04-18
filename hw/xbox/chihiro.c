@@ -919,8 +919,10 @@ static void chihiro_mbcom_process(void)
     case 0x0001: /* DIMM_SIZE — MAME: dword_write_le(r+4, 0x00f00000) */
         r[4] = 0x00; r[5] = 0x00; r[6] = 0xF0; r[7] = 0x00;
         break;
-    case 0x0100: /* STATUS — MAME: phase=5 (loading), completion=0 */
-        r[4] = 5; r[5] = 0; r[6] = 0; r[7] = 0;
+    case 0x0100: /* STATUS — phase=0 (ready), completion=100
+                  * Real HW: baseboard loads GD-ROM→DIMM, phase=5 during load.
+                  * We have no GD-ROM — game data is pre-loaded in baseboard.img. */
+        r[4] = 0; r[5] = 0; r[6] = 0; r[7] = 0;
         r[8] = 0; r[9] = 0; r[10] = 0; r[11] = 0;  /* completion 0% per MAME */
         break;
     case 0x0101: /* FW_VER — MAME: 0x1234 (12.34) + 0x4567 */
