@@ -801,9 +801,11 @@ static void chihiro_irq10_timer_cb(void *opaque)
              *   DATA at VA 0x89760 + slot*0x40:
              *     byte[0] = type, word[+2] = cmd opcode, byte[+3] bit7 = pending
              *
-             * ReadSlotData (0x3E4FD) copies META[+4] to output (e.g. [0x89C50]).
-             * GetBootData (0x41880) returns [0x89C50] + 0xFF000000.
-             * For non-zero result: META[+4] must be > 0x01000000 (DIMM base).
+             * DATA word[+2] identifies the request type. Each needs a different
+             * response at META[+4]:
+             *   0x0001 = boot data pointer → DIMM address (> 0x01000000)
+             *   0x0102 = SYSTEM_TYPE → bit 16 = develop mode
+             *   0x0101/0x0103 = secondary boot data → 0 (not yet implemented)
              */
             uint32_t meta_base_pa = slot_base_pa - 0x20; /* VA 0x89740 */
             for (int s = 0; s < 16; s++) {
@@ -819,15 +821,28 @@ static void chihiro_irq10_timer_cb(void *opaque)
                     meta_marker = 0x0001;
                     cpu_physical_memory_write(meta_pa + 2, &meta_marker, 2);
 
-                    /* Set data → ReadSlotData copies to [0x89C50]
-                     * DIMM base = 0x01000000. Game data offset = 0.
-                     * Value must be > 0x01000000 for GetBootData non-zero. */
-                    uint32_t dimm_data_addr = 0x01001000;
-                    cpu_physical_memory_write(meta_pa + 4, &dimm_data_addr, 4);
+                    /* Read command opcode from DATA[+2] */
+                    uint16_t cmd_opcode = 0;
+                    cpu_physical_memory_read(data_pa + 2, &cmd_opcode, 2);
 
-                    printf("[%07lld] Chihiro DMA: slot %d ready (type=0x%02X)"
-                           " marker=0x%04X data=0x%08X\n",
-                           TS_MS, s, data_byte0, meta_marker, dimm_data_addr);
+                    /* Command-specific response at META[+4] */
+                    uint32_t resp_data = 0;
+                    switch (cmd_opcode) {
+                    case 0x0001: /* Boot data pointer → DIMM address */
+                        resp_data = 0x01001000;
+                        break;
+                    case 0x0102: /* SYSTEM_TYPE → bit 16 = develop mode */
+                        resp_data = 0x00010000;
+                        break;
+                    default:
+                        resp_data = 0;
+                        break;
+                    }
+                    cpu_physical_memory_write(meta_pa + 4, &resp_data, 4);
+
+                    printf("[%07lld] Chihiro DMA: slot %d ready (type=0x%02X"
+                           " cmd=0x%04X) resp=0x%08X\n",
+                           TS_MS, s, data_byte0, cmd_opcode, resp_data);
                 }
             }
         }
