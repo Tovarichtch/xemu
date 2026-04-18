@@ -42,17 +42,18 @@
  * on the LPC/ISA bus. These are used by SEGABOOT to detect the baseboard,
  * query firmware version, DIMM size, and board type.
  *
- * Register map (from MAME chihiro.cpp + CXBX MediaBoard.cpp):
- *   0x1E: Firmware version (16-bit, e.g. 0x0317 = v3.17)
- *   0x20: XBAM string byte 1-2 (0x00A0)
+ * Register map (from MAME chihiro.cpp + CXBX MediaBoard.cpp + RE of 0x3DF40):
+ *   0x1E: DIMM base address low word (combined with 0x20 for FC800/FC801 offset calc)
+ *   0x20: DIMM base address high word (0x0100 → base = 0x01000000)
  *   0x22: XBAM string byte 3-4 (0x4258 = "BX")
  *   0x24: XBAM string byte 5-6 (0x4D41 = "MA")
  *   0xE0: IRQ10 acknowledge (write clears IRQ10)
  *   0xF0: Chip revision / board type (0x0000 = Type-1, 0x0100 = Type-3)
  *   0xF4: DIMM size (0=128M, 1=256M, 2=512M, 3=1024M)
  *
- * SEGABOOT checks for the "XBAM" string at 0x4020-0x4024 to confirm
- * the mediaboard is present. If absent, Chihiro boot path is skipped.
+ * SEGABOOT 0x3DF40 checks for "XBAM" at ports 0x4022-0x4024 to confirm
+ * the mediaboard is present. Ports 0x401E/0x4020 provide the DIMM base
+ * address used to compute FC800/FC801 mbcom file offsets.
  */
 
 #define SEGA_FIRMWARE_VERSION               0x1E
@@ -447,13 +448,8 @@ static void chihiro_usb_poll_patch_cb(void *opaque)
      * slot[+2]. We do not emulate that DMA, so it always returns 0 and MbcomSetParam
      * spins forever at 0x3E530. Patch makes it always return 1 so MbcomSetParam
      * completes and boot_state advances from 2 to 3.
+     * v153: REMOVED — TX scan + DMA inject handles this now.
      */
-    static const uint8_t sig_mbcom_pollready[] = {
-        0x8A, 0x44, 0x24, 0x04,                /* mov al, [esp+4]    */
-        0xE8, 0x67, 0xFD, 0xFF, 0xFF,          /* call FindSlot      */
-        0x85, 0xC0,                            /* test eax, eax      */
-        0x74, 0x0E                             /* je 0x3DBDB         */
-    };
 
     /*
      * Patch 10: GetBootData (VA 0x41880) — always return 1
@@ -466,13 +462,8 @@ static void chihiro_usb_poll_patch_cb(void *opaque)
      * With our MbcomSetParam stub, [0x89C50] is never populated with real data.
      * ErrorDisplay state=3 checks GetBootData==0 AND flag==0x21 → sets ERROR 27 after
      * 2400 ticks. Patching GetBootData to return non-zero avoids ERROR 27.
+     * v153: REMOVED — let real boot data flow through.
      */
-    static const uint8_t sig_getbootdata[] = {
-        0xA1, 0x50, 0x9C, 0x08, 0x00,          /* mov eax, [0x89C50] */
-        0x85, 0xC0,                            /* test eax, eax      */
-        0x74, 0x0F,                            /* je 0x41898         */
-        0x83, 0x3D, 0x48, 0x9C, 0x08, 0x00, 0x03  /* cmp [0x89C48], 3 */
-    };
 
     /*
      * Patch 11: CheckMainBoardSerial (VA 0x2EC35) — return 0 instead of 3
@@ -531,8 +522,6 @@ static void chihiro_usb_poll_patch_cb(void *opaque)
     static const uint8_t patch_and0[]  = { 0x00 };
     static const uint8_t patch_xor_ret[] = { 0x31, 0xC0, 0xC3 };
     static const uint8_t patch_xor_ret4[] = { 0x31, 0xC0, 0xC2, 0x04, 0x00 };
-    static const uint8_t patch_mov1_ret4[] = { 0xB0, 0x01, 0xC2, 0x04, 0x00 };  /* mov al, 1; ret 4 */
-    static const uint8_t patch_mov1_ret[]  = { 0xB8, 0x01, 0x00, 0x00, 0x00, 0xC3 }; /* mov eax, 1; ret */
     static const uint8_t patch_xor_nop3[]  = { 0x31, 0xC0, 0x90, 0x90, 0x90 }; /* xor eax, eax; nop*3 */
 
     ChihiroPatch patches[] = {
@@ -544,8 +533,8 @@ static void chihiro_usb_poll_patch_cb(void *opaque)
         { sig_usbpollqc, sizeof(sig_usbpollqc), 0, patch_xor_ret4, 5, 0x51140, "UsbPollQC_inner (xor eax,eax; ret 4)", false },
         { sig_usbpollsc, sizeof(sig_usbpollsc), 0, patch_xor_ret4, 5, 0x51150, "UsbPollSC_inner (xor eax,eax; ret 4)", false },
         { sig_enccheck,  sizeof(sig_enccheck),  2, patch_xor_ret, 2, 0x3A953, "EncryptionCheck (test->xor eax,eax)",  false },
-        { sig_mbcom_pollready, sizeof(sig_mbcom_pollready), 0, patch_mov1_ret4, 5, 0x3DBC0, "MbcomPollReady (always return 1)", false },
-        { sig_getbootdata, sizeof(sig_getbootdata), 0, patch_mov1_ret, 6, 0x41880, "GetBootData (always return 1)", false },
+        /* v153: REMOVED MbcomPollReady (was always return 1) — let clear-on-read deliver real responses */
+        /* v153: REMOVED GetBootData (was always return 1) — let real boot data flow through */
         { sig_check_mainserial,  sizeof(sig_check_mainserial),  4, patch_xor_nop3, 5, 0x2EC35, "CheckMainBoardSerial (err 3 -> 0)",  false },
         { sig_check_mediaserial, sizeof(sig_check_mediaserial), 5, patch_xor_nop3, 5, 0x2EC88, "CheckMediaBoardSerial (err 4 -> 0)", false },
     };
@@ -634,11 +623,16 @@ static uint64_t chihiro_lpc_io_read(void *opaque, hwaddr addr,
         }
         return r;
     case SEGA_FIRMWARE_VERSION:
-        r = 0x0317;     /* Firmware v3.17 */
+        /* Port 0x401E: DIMM base address low word.
+         * Combined with port 0x4020 (high word) by 0x3DF40 to compute
+         * FC800/FC801 file offsets: edi = (4020<<16)|401E; FC800 = edi - 0x1000000 + 0x900000.
+         * For correct offsets (0x900000/0x900200): edi must = 0x01000000.
+         * → port 0x401E = 0x0000, port 0x4020 = 0x0100. */
+        r = 0x0000;
         s->lpc_401e_reads++;
         break;
     case SEGA_XBAM_STRING_0:
-        r = 0x00A0;     /* XBAM identifier part 1 */
+        r = 0x0100;     /* DIMM base address high word (0x0100 << 16 = 0x01000000) */
         break;
     case SEGA_XBAM_STRING_1:
         r = 0x4258;     /* "BX" */
@@ -719,12 +713,103 @@ static qemu_irq chihiro_irq10_global = NULL;
  * We pulse it periodically since we pre-fill the response sector.
  */
 
+/* mbcom state — defined here (before IRQ10 timer that uses them) */
+static uint8_t chihiro_mbcom_response[512];  /* read_buffer in MAME terminology */
+static uint8_t chihiro_mbcom_command[512];   /* write_buffer in MAME terminology */
+static bool chihiro_mbcom_enabled = false;
+static bool chihiro_boot_slot_injected = false;
+static void chihiro_mbcom_process(void);  /* forward decl */
+
 static void chihiro_irq10_timer_cb(void *opaque)
 {
     ChihiroLPCState *s = opaque;
 
     if (s->eeprom_hack_applied) {
         qemu_irq_raise(s->irq10);
+    }
+
+    /* DMA emulation: scan game's mbcom TX slots for pending commands.
+     * On real HW, the baseboard picks up commands via DMA and responds.
+     * Without this, commands queued by the async mbcom path (boot data reader)
+     * never reach FC801 because the mbcom tick is on the same blocked thread.
+     *
+     * Slot array at VA 0x89760, 16 slots, stride 0x40:
+     *   byte[3] bit7 SET = command pending (SendCommand sets this)
+     *   byte[3] bit7 CLEAR = free or response ready
+     *   slot+0x20 = data area (32 bytes: type, flags, command, params)
+     */
+    if (chihiro_mbcom_enabled) {
+        uint32_t slot_base_pa = chihiro_va_to_pa(0x89760);
+        if (slot_base_pa != 0xFFFFFFFF) {
+            /* TX scan: process any pending commands from the game */
+            for (int i = 0; i < 16; i++) {
+                uint32_t slot_pa = slot_base_pa + i * 0x40;
+                uint8_t meta[4];
+                cpu_physical_memory_read(slot_pa, meta, 4);
+
+                if (!(meta[3] & 0x80)) continue;  /* bit7 CLEAR = not pending */
+
+                /* Read command from data area */
+                uint8_t tx_data[32];
+                cpu_physical_memory_read(slot_pa + 0x20, tx_data, 32);
+                if (tx_data[0] == 0 && tx_data[2] == 0 && tx_data[3] == 0)
+                    continue;  /* empty slot */
+
+                /* Process: copy TX data to command buffer, run handler */
+                memcpy(chihiro_mbcom_command, tx_data, 32);
+                chihiro_mbcom_process();
+
+                /* Inject response to data area */
+                cpu_physical_memory_write(slot_pa + 0x20,
+                                          chihiro_mbcom_response, 32);
+
+                /* Clear bit7 + set non-zero marker → PollReady returns 1 */
+                uint16_t marker = chihiro_mbcom_response[0]
+                                | (chihiro_mbcom_response[1] << 8);
+                if (!marker) marker = 0x0001;
+                marker &= 0x7FFF;  /* ensure bit15 clear */
+                cpu_physical_memory_write(slot_pa + 2, &marker, 2);
+
+                printf("[%07lld] Chihiro mbcom: TX scan slot %d → processed"
+                       " (type=0x%02X cmd=0x%02X%02X)\n",
+                       TS_MS, i, tx_data[0], tx_data[3], tx_data[2]);
+            }
+
+            /* Baseboard DMA push: create type=2 slot when boot_state==2.
+             * On real HW, the baseboard pushes boot data into DIMM memory
+             * via DMA. PollReady(type=2) loops waiting for this slot.
+             * The game never SENDS a type=2 command — the baseboard initiates.
+             *
+             * boot_state at VA 0x89C48: 0=init, 1=CE, 2=boot_data, 3=done
+             */
+            uint32_t boot_state_pa = chihiro_va_to_pa(0x89C48);
+            if (boot_state_pa != 0xFFFFFFFF) {
+                uint32_t boot_state = 0;
+                cpu_physical_memory_read(boot_state_pa, &boot_state, 4);
+
+                if (boot_state == 2 && !chihiro_boot_slot_injected) {
+                    /* Create a type=2 slot at slot[1] (slot[0] may be used by DIMM_SIZE) */
+                    uint32_t slot_pa = slot_base_pa + 1 * 0x40;
+
+                    /* Metadata: type=2, marker=non-zero, bit7=CLEAR */
+                    uint8_t meta[4] = { 0x02, 0x00, 0x01, 0x00 };
+                    cpu_physical_memory_write(slot_pa, meta, 4);
+
+                    /* Data area: minimal response — echo + marker + zeros */
+                    uint8_t resp[32];
+                    memset(resp, 0, 32);
+                    resp[0] = 0x01;  /* echo low */
+                    resp[1] = 0x00;  /* echo high */
+                    resp[2] = 0x01;  /* marker low */
+                    resp[3] = 0x80;  /* marker high (0x8001) */
+                    cpu_physical_memory_write(slot_pa + 0x20, resp, 32);
+
+                    chihiro_boot_slot_injected = true;
+                    printf("[%07lld] Chihiro mbcom: DMA PUSH type=2 slot"
+                           " (boot_state=2, baseboard init response)\n", TS_MS);
+                }
+            }
+        }
     }
 
     /* Re-arm every 16ms (~60Hz) */
@@ -879,10 +964,6 @@ type_init(chihiro_register_types)
 #define CHIHIRO_MBROM0          0x8000000
 #define CHIHIRO_MBROM1          0x8000800
 
-static uint8_t chihiro_mbcom_response[512];  /* read_buffer in MAME terminology */
-static uint8_t chihiro_mbcom_command[512];   /* write_buffer in MAME terminology */
-static bool chihiro_mbcom_enabled = false;
-
 /* v146 minimal dedup logging — avoid timing regression from stdout saturation */
 static uint16_t mbcom_last_cmd_logged = 0xFFFF;
 static uint32_t mbcom_cmd_repeat_count = 0;
@@ -934,11 +1015,11 @@ static void chihiro_mbcom_process(void)
     case 0x0001: /* DIMM_SIZE — MAME: dword_write_le(r+4, 0x00f00000) */
         r[4] = 0x00; r[5] = 0x00; r[6] = 0xF0; r[7] = 0x00;
         break;
-    case 0x0100: /* STATUS — phase=0 (ready), completion=100
-                  * Real HW: baseboard loads GD-ROM→DIMM, phase=5 during load.
-                  * We have no GD-ROM — game data is pre-loaded in baseboard.img. */
-        r[4] = 0; r[5] = 0; r[6] = 0; r[7] = 0;
-        r[8] = 0; r[9] = 0; r[10] = 0; r[11] = 0;  /* completion 0% per MAME */
+    case 0x0100: /* STATUS — phase=5 (game loading), completion=0
+                  * Real HW: baseboard loads GD-ROM→DIMM, reports phase=5 during load.
+                  * SEGABOOT gate at 0x2E0AF needs phase >= 5 to proceed to boot.id read. */
+        r[4] = 5; r[5] = 0; r[6] = 0; r[7] = 0;
+        r[8] = 0; r[9] = 0; r[10] = 0; r[11] = 0;  /* completion 0% */
         break;
     case 0x0101: /* FW_VER — MAME: 0x1234 (12.34) + 0x4567 */
         r[4] = 0x34; r[5] = 0x12; r[6] = 0x67; r[7] = 0x45;
@@ -954,11 +1035,50 @@ static void chihiro_mbcom_process(void)
         break;
     }
 
+    /* Save slot type before clearing (needed for DMA injection below) */
+    uint8_t slot_type = w[0];
+
     /* MAME: clear command header bytes 0-3 after processing (ack to baseboard) */
     chihiro_mbcom_command[0] = 0;
     chihiro_mbcom_command[1] = 0;
     chihiro_mbcom_command[2] = 0;
     chihiro_mbcom_command[3] = 0;
+
+    /* DMA-style response injection: write response directly into game's RX slot.
+     * On real HW, the baseboard writes responses to DIMM memory via DMA.
+     * Without this, PollReady loops forever because the mbcom tick (which normally
+     * delivers responses from FC801 to slots) runs on the same thread that's
+     * blocked waiting at PollReady — a deadlock.
+     *
+     * Slot array at VA 0x89760, 16 slots, stride 0x40:
+     *   [+0x00] byte: slot type       (FindSlot match key)
+     *   [+0x02] word: response marker (PollReady checks != 0)
+     *   [+0x03] byte: flags bit7      (FindSlot: 0=pending, 1=done)
+     *   [+0x20] 32B:  data area       (command TX / response RX)
+     */
+    uint32_t slot_base_pa = chihiro_va_to_pa(0x89760);
+    if (slot_base_pa != 0xFFFFFFFF) {
+        for (int i = 0; i < 16; i++) {
+            uint32_t slot_pa = slot_base_pa + i * 0x40;
+            uint8_t slot_meta[4];
+            cpu_physical_memory_read(slot_pa, slot_meta, 4);
+
+            if (slot_meta[3] & 0x80) continue;   /* bit7 set = not pending */
+            if (slot_meta[0] != slot_type) continue;  /* type mismatch */
+
+            /* Found pending slot — inject response to data area (+0x20) */
+            cpu_physical_memory_write(slot_pa + 0x20, chihiro_mbcom_response, 32);
+
+            /* Set metadata word[+2] to non-zero → PollReady returns 1 */
+            uint16_t marker = r[2] | (r[3] << 8);
+            if (!marker) marker = 0x8001;
+            cpu_physical_memory_write(slot_pa + 2, &marker, 2);
+
+            printf("[%07lld] Chihiro mbcom: DMA inject slot %d (type=0x%02X)\n",
+                   TS_MS, i, slot_type);
+            break;
+        }
+    }
 }
 
 /*
