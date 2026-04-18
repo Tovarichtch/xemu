@@ -535,29 +535,9 @@ static void chihiro_usb_poll_patch_cb(void *opaque)
         0xC2, 0x04, 0x00                       /* ret 4              */
     };
 
-    /* v172: REMOVED per-path AV patches (11+12). Root cause is DIP switches
-     * (PINSA 0x4B→0x6B in chihiro-usb.c) AND GPU output mode mismatch.
-     * Until a proper Chihiro EEPROM sets GPU to 31kHz, NOP the call. */
-    static const uint8_t sig_avcall[] = {
-        0x57,                                /* push edi             */
-        0x56,                                /* push esi             */
-        0xFF, 0x75, 0x08,                    /* push [ebp+8]         */
-        0xE8, 0x13, 0xB3, 0xFF, 0xFF         /* call 0x794E0         */
-    };
-    static const uint8_t patch_nop5[] = { 0x90, 0x90, 0x90, 0x90, 0x90 };
-
-    /*
-     * Patch 12: Second AV video check — NOP call to 0x7A2A1 at VA 0x83907
-     * A SECOND video check function (0x7A2A1) sets flags at [ebx+0xA72]
-     * (0x7A51D, 0x7A529, 0x7A552, 0x7A565, 0x7A5B1) independently of
-     * the first (0x794E0). Both must be NOP'd to prevent CAUTION 51.
-     */
-    static const uint8_t sig_avcall2[] = {
-        0xFF, 0x75, 0x0C,                    /* push [ebp+0xC]       */
-        0x8B, 0x4D, 0xFC,                    /* mov ecx, [ebp-4]     */
-        0x57,                                /* push edi             */
-        0xE8, 0x95, 0x69, 0xFF, 0xFF         /* call 0x7A2A1         */
-    };
+    /* v176: REMOVED AV NOP patches (11+12). Proper fix: EEPROM video_standard
+     * now includes AV_FLAGS_HDTV_480p (0x00080000) so the kernel configures
+     * NV2A for progressive scan 31kHz. SEGABOOT's video check passes naturally. */
 
     /* Patch byte arrays */
     static const uint8_t patch_jmp[]   = { 0xEB };
@@ -579,8 +559,6 @@ static void chihiro_usb_poll_patch_cb(void *opaque)
         /* v153: REMOVED GetBootData (was always return 1) — let real boot data flow through */
         { sig_check_mainserial,  sizeof(sig_check_mainserial),  4, patch_xor_nop3, 5, 0x2EC35, "CheckMainBoardSerial (err 3 -> 0)",  false },
         { sig_check_mediaserial, sizeof(sig_check_mediaserial), 5, patch_xor_nop3, 5, 0x2EC88, "CheckMediaBoardSerial (err 4 -> 0)", false },
-        { sig_avcall, sizeof(sig_avcall), 5, patch_nop5, 5, 0x7E1C8, "AV video check call (NOP)", false },
-        { sig_avcall2, sizeof(sig_avcall2), 7, patch_nop5, 5, 0x83907, "AV video check 2 call (NOP)", false },
     };
     int num_patches = sizeof(patches) / sizeof(patches[0]);
     int applied = 0;
@@ -838,20 +816,25 @@ static void chihiro_irq10_timer_cb(void *opaque)
                 uint32_t data_pa = slot_base_pa + s * 0x40;
                 uint32_t meta_pa = meta_base_pa + s * 0x40;
                 uint8_t data_byte0;
-                uint8_t data_byte3;
                 uint16_t meta_marker;
                 cpu_physical_memory_read(data_pa, &data_byte0, 1);
-                cpu_physical_memory_read(data_pa + 3, &data_byte3, 1);
                 cpu_physical_memory_read(meta_pa + 2, &meta_marker, 2);
 
-                if (data_byte0 != 0 && (data_byte3 & 0x80) && meta_marker == 0) {
+                if (data_byte0 != 0 && meta_marker == 0) {
+                    /* Read cmd BEFORE setting marker (race fix: ValidateType
+                     * writes byte0 before cmd opcode is written) */
+                    uint16_t cmd_opcode = 0;
+                    cpu_physical_memory_read(data_pa + 2, &cmd_opcode, 2);
+
+                    if (cmd_opcode != 0x0001 && cmd_opcode != 0x0100 &&
+                        cmd_opcode != 0x0101 && cmd_opcode != 0x0102 &&
+                        cmd_opcode != 0x0103) {
+                        continue; /* cmd not written yet — wait next tick */
+                    }
+
                     /* Set marker → PollReady returns 1 */
                     meta_marker = 0x0001;
                     cpu_physical_memory_write(meta_pa + 2, &meta_marker, 2);
-
-                    /* Read command opcode from DATA[+2] */
-                    uint16_t cmd_opcode = 0;
-                    cpu_physical_memory_read(data_pa + 2, &cmd_opcode, 2);
 
                     /* Command-specific response at META[+4] */
                     uint32_t resp_data = 0;
