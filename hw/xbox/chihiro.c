@@ -717,7 +717,6 @@ static qemu_irq chihiro_irq10_global = NULL;
 static uint8_t chihiro_mbcom_response[512];
 static uint8_t chihiro_mbcom_command[512];
 static bool chihiro_mbcom_enabled = false;
-static bool chihiro_boot_slot_injected = false;
 static void chihiro_mbcom_process(void);
 
 static void chihiro_irq10_timer_cb(void *opaque)
@@ -775,51 +774,11 @@ static void chihiro_irq10_timer_cb(void *opaque)
                        TS_MS, i, tx_data[0], tx_data[3], tx_data[2]);
             }
 
-            /* Baseboard DMA push: create type=2 slot when boot_state==2.
-             * On real HW, the baseboard pushes boot data into DIMM memory
-             * via DMA. PollReady(type=2) loops waiting for this slot.
-             * The game never SENDS a type=2 command — the baseboard initiates.
-             *
-             * boot_state at VA 0x89C48: 0=init, 1=CE, 2=boot_data, 3=done
-             */
-            uint32_t boot_state_pa = chihiro_va_to_pa(0x89C48);
-            if (boot_state_pa != 0xFFFFFFFF) {
-                uint32_t boot_state = 0;
-                cpu_physical_memory_read(boot_state_pa, &boot_state, 4);
-
-                if (boot_state == 2) {
-                    static int push_count = 0;
-                    /* Create a type=2 slot at slot[1] */
-                    uint32_t slot_pa = slot_base_pa + 1 * 0x40;
-
-                    /* Metadata: type=2, marker=non-zero, bit7=CLEAR */
-                    uint8_t meta[4] = { 0x02, 0x00, 0x01, 0x00 };
-                    cpu_physical_memory_write(slot_pa, meta, 4);
-
-                    /* Data area: minimal response */
-                    uint8_t resp[32];
-                    memset(resp, 0, 32);
-                    resp[0] = 0x01; resp[2] = 0x01; resp[3] = 0x80;
-                    cpu_physical_memory_write(slot_pa + 0x20, resp, 32);
-
-                    push_count++;
-                    if (push_count <= 3 || (push_count % 100) == 0) {
-                        /* Verify: read back and dump first 3 slots */
-                        printf("[%07lld] Chihiro DMA PUSH #%d (boot=2). Slot dump:\n",
-                               TS_MS, push_count);
-                        for (int s = 0; s < 3; s++) {
-                            uint32_t sp = slot_base_pa + s * 0x40;
-                            uint8_t m[4], d[8];
-                            cpu_physical_memory_read(sp, m, 4);
-                            cpu_physical_memory_read(sp + 0x20, d, 8);
-                            printf("  slot[%d] PA=0x%08X meta=%02X %02X %02X %02X"
-                                   " data=%02X%02X%02X%02X %02X%02X%02X%02X\n",
-                                   s, sp, m[0], m[1], m[2], m[3],
-                                   d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]);
-                        }
-                    }
-                }
-            }
+            /* v158: type=2 slot injection REMOVED.
+             * ValidateType allocates types dynamically via GetMbcomType (0x3E0D0).
+             * Our type=2 injection was wrong (game uses allocated type N, not 2)
+             * and the non-zero word[+2] polluted GetMbcomType's empty-slot scan.
+             * ValidateType at 0x3E4A0 sets word[+2]=1 → PollReady returns 1. */
         }
     }
 
@@ -1046,50 +1005,17 @@ static void chihiro_mbcom_process(void)
         break;
     }
 
-    /* Save slot type before clearing (needed for DMA injection below) */
-    uint8_t slot_type = w[0];
-
     /* MAME: clear command header bytes 0-3 after processing (ack to baseboard) */
     chihiro_mbcom_command[0] = 0;
     chihiro_mbcom_command[1] = 0;
     chihiro_mbcom_command[2] = 0;
     chihiro_mbcom_command[3] = 0;
 
-    /* DMA-style response injection: write response directly into game's RX slot.
-     * On real HW, the baseboard writes responses to DIMM memory via DMA.
-     * Without this, PollReady loops forever because the mbcom tick (which normally
-     * delivers responses from FC801 to slots) runs on the same thread that's
-     * blocked waiting at PollReady — a deadlock.
-     *
-     * Slot array at VA 0x89760, 16 slots, stride 0x40:
-     *   [+0x00] byte: slot type       (FindSlot match key)
-     *   [+0x02] word: response marker (PollReady checks != 0)
-     *   [+0x03] byte: flags bit7      (FindSlot: 0=pending, 1=done)
-     *   [+0x20] 32B:  data area       (command TX / response RX)
-     */
-    uint32_t slot_base_pa = chihiro_va_to_pa(0x89760);
-    if (slot_base_pa != 0xFFFFFFFF) {
-        for (int i = 0; i < 16; i++) {
-            uint32_t slot_pa = slot_base_pa + i * 0x40;
-            uint8_t slot_meta[4];
-            cpu_physical_memory_read(slot_pa, slot_meta, 4);
-
-            if (slot_meta[3] & 0x80) continue;   /* bit7 set = not pending */
-            if (slot_meta[0] != slot_type) continue;  /* type mismatch */
-
-            /* Found pending slot — inject response to data area (+0x20) */
-            cpu_physical_memory_write(slot_pa + 0x20, chihiro_mbcom_response, 32);
-
-            /* Set metadata word[+2] to non-zero → PollReady returns 1 */
-            uint16_t marker = r[2] | (r[3] << 8);
-            if (!marker) marker = 0x8001;
-            cpu_physical_memory_write(slot_pa + 2, &marker, 2);
-
-            printf("[%07lld] Chihiro mbcom: DMA inject slot %d (type=0x%02X)\n",
-                   TS_MS, i, slot_type);
-            break;
-        }
-    }
+    /* v158: DMA inject into slot array REMOVED.
+     * Writing word[+2] to non-zero pollutes GetMbcomType's empty-slot scan
+     * at 0x3E176 (checks word[+2]==0 for "empty"). ValidateType at 0x3E4A0
+     * already sets word[+2]=1, making PollReady return immediately.
+     * No DMA injection needed — the slot system is self-contained. */
 }
 
 /*
