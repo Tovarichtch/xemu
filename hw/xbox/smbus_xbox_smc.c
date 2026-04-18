@@ -265,7 +265,7 @@ static void smbus_smc_realize(DeviceState *dev, Error **errp)
     smc->version_string = NULL;
     smc->version_string_index = 0;
     smc->traystate_reg = 0;
-    smc->avpack_reg = 0; /* Default value for Chihiro machine */
+    smc->avpack_reg = SMC_REG_AVPACK_VGA; /* Chihiro arcade boards use VGA (31kHz) */
     smc->intstatus_reg = 0;
     smc->scratch_reg = 0;
     smc->cmd = 0;
