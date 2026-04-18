@@ -312,6 +312,24 @@ static void chihiro_diag_timer_cb(void *opaque)
            xbe2_d0798, xbe2_d07a8, xbe2_ce_state,
            (xbe2_ce_pa != 0xFFFFFFFF) ? "xbe2:mapped" : "xbe2:UNMAPPED");
 
+    /* v159 DIAG: key addresses for boot data flow */
+    if (bootstate == 2) {
+        uint32_t initptr_pa = chihiro_va_to_pa(0x896AC);
+        uint32_t slot0_pa   = chihiro_va_to_pa(0x89740);
+        uint32_t slot0d_pa  = chihiro_va_to_pa(0x89760);
+        uint32_t initptr = 0, slot0_meta = 0, slot0_data = 0;
+        if (initptr_pa != 0xFFFFFFFF) cpu_physical_memory_read(initptr_pa, &initptr, 4);
+        if (slot0_pa != 0xFFFFFFFF) cpu_physical_memory_read(slot0_pa, &slot0_meta, 4);
+        if (slot0d_pa != 0xFFFFFFFF) cpu_physical_memory_read(slot0d_pa, &slot0_data, 4);
+        static int boot2_diag_count = 0;
+        boot2_diag_count++;
+        if (boot2_diag_count <= 5 || (boot2_diag_count % 10) == 0) {
+            printf("[%07lld] DIAG boot=2: initPtr=[896AC]=0x%08X slot0meta=[89740]=0x%08X "
+                   "slot0data=[89760]=0x%08X\n",
+                   TS_MS, initptr, slot0_meta, slot0_data);
+        }
+    }
+
     timer_mod(s->diag_timer,
               qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 1000);
 }
