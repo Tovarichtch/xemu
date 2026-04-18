@@ -1045,8 +1045,11 @@ static void chihiro_mbcom_process(void)
     case 0x0101: /* FW_VER — MAME: 0x1234 (12.34) + 0x4567 */
         r[4] = 0x34; r[5] = 0x12; r[6] = 0x67; r[7] = 0x45;
         break;
-    case 0x0102: /* SYSTEM_TYPE — MAME: 0 (retail, bit 16 = devel) */
-        r[4] = 0; r[5] = 0; r[6] = 0; r[7] = 0;
+    case 0x0102: /* SYSTEM_TYPE — bit 16 = develop mode.
+                  * Develop mode (0x2E074) skips game/board compatibility check
+                  * at 0x2EC9E which requires proper game info data in boot area.
+                  * Retail boards set bit16=0; dev boards set bit16=1. */
+        r[4] = 0; r[5] = 0; r[6] = 1; r[7] = 0;  /* bit 16 set = devel */
         break;
     case 0x0103: /* SERIAL — MAME: "-abc-abc12345678" */
         memcpy(r + 4, "-abc-abc12345678", 16);
