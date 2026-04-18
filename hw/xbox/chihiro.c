@@ -838,11 +838,13 @@ static void chihiro_irq10_timer_cb(void *opaque)
                 uint32_t data_pa = slot_base_pa + s * 0x40;
                 uint32_t meta_pa = meta_base_pa + s * 0x40;
                 uint8_t data_byte0;
+                uint8_t data_byte3;
                 uint16_t meta_marker;
                 cpu_physical_memory_read(data_pa, &data_byte0, 1);
+                cpu_physical_memory_read(data_pa + 3, &data_byte3, 1);
                 cpu_physical_memory_read(meta_pa + 2, &meta_marker, 2);
 
-                if (data_byte0 != 0 && meta_marker == 0) {
+                if (data_byte0 != 0 && (data_byte3 & 0x80) && meta_marker == 0) {
                     /* Set marker → PollReady returns 1 */
                     meta_marker = 0x0001;
                     cpu_physical_memory_write(meta_pa + 2, &meta_marker, 2);
