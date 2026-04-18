@@ -560,6 +560,19 @@ static void chihiro_usb_poll_patch_cb(void *opaque)
     };
     static const uint8_t patch_jmp_vga[] = { 0xE9, 0xDF, 0x00, 0x00, 0x00, 0x90 };
 
+    /*
+     * Patch 12: Second AV check skip (VA 0x795E6)
+     * Same structure but only accepts {7,9,C,D} — no VGA (4) at all.
+     * Disambiguated by je +0x18 (vs +0x1C above).
+     * Jump to 0x79608 (accepted path) to skip type rejection.
+     */
+    static const uint8_t sig_avcheck2[] = {
+        0x8A, 0x83, 0xC0, 0x08, 0x00, 0x00, /* mov al, [ebx+0x8C0] */
+        0x3C, 0x07,                          /* cmp al, 7            */
+        0x74, 0x18                           /* je +0x18 (unique)    */
+    };
+    static const uint8_t patch_jmp_av2[] = { 0xE9, 0x1D, 0x00, 0x00, 0x00, 0x90 };
+
     /* Patch byte arrays */
     static const uint8_t patch_jmp[]   = { 0xEB };
     static const uint8_t patch_and0[]  = { 0x00 };
@@ -580,7 +593,8 @@ static void chihiro_usb_poll_patch_cb(void *opaque)
         /* v153: REMOVED GetBootData (was always return 1) — let real boot data flow through */
         { sig_check_mainserial,  sizeof(sig_check_mainserial),  4, patch_xor_nop3, 5, 0x2EC35, "CheckMainBoardSerial (err 3 -> 0)",  false },
         { sig_check_mediaserial, sizeof(sig_check_mediaserial), 5, patch_xor_nop3, 5, 0x2EC88, "CheckMediaBoardSerial (err 4 -> 0)", false },
-        { sig_avcheck, sizeof(sig_avcheck), 0, patch_jmp_vga, 6, 0x796A4, "AV video check (jmp to VGA path)", false },
+        { sig_avcheck, sizeof(sig_avcheck), 0, patch_jmp_vga, 6, 0x796A4, "AV video check 1 (jmp to VGA path)", false },
+        { sig_avcheck2, sizeof(sig_avcheck2), 0, patch_jmp_av2, 6, 0x795E6, "AV video check 2 (jmp to accepted path)", false },
     };
     int num_patches = sizeof(patches) / sizeof(patches[0]);
     int applied = 0;
