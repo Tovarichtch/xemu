@@ -975,8 +975,14 @@ bool chihiro_ide_read_sector(uint32_t lba, void *buffer)
         return true;
     }
     if (lba == CHIHIRO_MBCOM_COMMAND) {
+        /* v148: FC801 serves dual purpose in the wire protocol:
+         *   - Slot-clear check (before sending): expects zeros = "ready"
+         *   - Response read (after IRQ10): expects response data
+         * Clear-on-read: return response once, then zeros for next slot-clear check. */
         memset(buffer, 0, 512);
-        memcpy(buffer, chihiro_mbcom_command, 32);
+        memcpy(buffer, chihiro_mbcom_response, 32);
+        /* Clear response after delivery so next read sees "slot clear" */
+        memset(chihiro_mbcom_response, 0, 32);
         return true;
     }
     return false;
