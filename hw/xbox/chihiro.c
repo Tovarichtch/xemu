@@ -1021,6 +1021,22 @@ static void chihiro_diag_timer_cb(void *opaque)
                 printf("[%07lld] Chihiro: WARNING — could not find game "
                        "filename in RAM at boot=3\n", TS_MS);
             }
+
+            /* Dump RAM at boot=3 for offline analysis.
+             * Covers kernel (0x00000-0x40000) + SEGABOOT (0x40000-0xC0000). */
+            {
+                FILE *f = fopen("/tmp/ram_boot3.bin", "wb");
+                if (f) {
+                    uint8_t page[4096];
+                    for (uint32_t pa = 0; pa < 0xC0000; pa += 4096) {
+                        cpu_physical_memory_read(pa, page, 4096);
+                        fwrite(page, 1, 4096, f);
+                    }
+                    fclose(f);
+                    printf("[%07lld] Chihiro: RAM dump saved to /tmp/ram_boot3.bin "
+                           "(768KB, PA 0x00000-0xBFFFF)\n", TS_MS);
+                }
+            }
         }
         s->last_bootstate = bootstate;
     }
