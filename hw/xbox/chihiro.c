@@ -581,6 +581,155 @@ static void chihiro_diag_timer_cb(void *opaque)
                        kdata[12],kdata[13],kdata[14],kdata[15]);
             }
 
+            /* 15. SCAN KERNEL DATA for XeImageFileName ("hod3" or ".xbe") */
+            {
+                printf("  KERNEL STRING SCAN:\n");
+                /* Scan kernel data area (PA 0x30000-0x70000) for key strings */
+                int found_xbe = 0, found_cdrom = 0, found_mbfs = 0, found_launch = 0;
+                for (uint32_t pa = 0x30000; pa < 0x70000 - 32; pa += 4) {
+                    uint8_t buf[32];
+                    cpu_physical_memory_read(pa, buf, 32);
+                    /* Search for "hod3" (game name in path) */
+                    for (int i = 0; i < 28; i++) {
+                        if (buf[i]=='h' && buf[i+1]=='o' && buf[i+2]=='d' && buf[i+3]=='3' && !found_xbe) {
+                            /* Print surrounding context */
+                            uint8_t ctx[64];
+                            uint32_t ctx_pa = (pa + i > 16) ? pa + i - 16 : pa + i;
+                            cpu_physical_memory_read(ctx_pa, ctx, 64);
+                            printf("    'hod3' at PA 0x%05X: ", pa + i);
+                            for (int c = 0; c < 48 && ctx[c+16]; c++) 
+                                printf("%c", ctx[c+16] >= 0x20 && ctx[c+16] < 0x7F ? ctx[c+16] : '.');
+                            printf("\n");
+                            found_xbe = 1;
+                        }
+                        if (buf[i]=='C' && buf[i+1]=='d' && buf[i+2]=='R' && buf[i+3]=='o' && !found_cdrom) {
+                            uint8_t ctx[48];
+                            cpu_physical_memory_read(pa + i, ctx, 48);
+                            printf("    'CdRo' at PA 0x%05X: ", pa + i);
+                            for (int c = 0; c < 48 && ctx[c]; c++)
+                                printf("%c", ctx[c] >= 0x20 && ctx[c] < 0x7F ? ctx[c] : '.');
+                            printf("\n");
+                            found_cdrom = 1;
+                        }
+                        if (buf[i]=='m' && buf[i+1]=='b' && buf[i+2]=='f' && buf[i+3]=='s' && !found_mbfs) {
+                            uint8_t ctx[48];
+                            cpu_physical_memory_read(pa + i, ctx, 48);
+                            printf("    'mbfs' at PA 0x%05X: ", pa + i);
+                            for (int c = 0; c < 48 && ctx[c]; c++)
+                                printf("%c", ctx[c] >= 0x20 && ctx[c] < 0x7F ? ctx[c] : '.');
+                            printf("\n");
+                            found_mbfs = 1;
+                        }
+                    }
+                }
+                if (!found_xbe) printf("    'hod3': NOT FOUND in kernel data\n");
+                if (!found_cdrom) printf("    'CdRo': NOT FOUND\n");
+                if (!found_mbfs) printf("    'mbfs': NOT FOUND\n");
+            }
+
+            /* 16. XboxHardwareInfo — search for the structure
+             * On retail Xbox: flags=0x00000000, on Chihiro: flags should have 0x08 (ARCADE)
+             * The structure is at a kernel export, typically 0x80036000-0x80038000 area */
+            {
+                printf("  XboxHardwareInfo scan:\n");
+                /* Known Xbox kernel exports XboxHardwareInfo. It contains:
+                 * ULONG Flags, UCHAR GpuRevision, UCHAR McpRevision, UCHAR Unknown1, UCHAR Unknown2 */
+                for (uint32_t va = 0x80035000; va < 0x8003A000; va += 4) {
+                    uint32_t pa = chihiro_va_to_pa(va);
+                    if (pa == 0xFFFFFFFF) continue;
+                    uint32_t val;
+                    cpu_physical_memory_read(pa, &val, 4);
+                    /* Look for ARCADE flag pattern: flags with bit 3 set, followed by GPU/MCP rev */
+                    if ((val & 0x08) && (val & 0xFFFFFF00) == 0) {
+                        uint8_t hw[8];
+                        cpu_physical_memory_read(pa, hw, 8);
+                        printf("    Candidate @0x%08X(PA=0x%05X): flags=0x%08X GPU=%02X MCP=%02X\n",
+                               va, pa, val, hw[4], hw[5]);
+                    }
+                }
+                /* Also check if flags=0 (non-ARCADE kernel) */
+                uint32_t hwinfo_pa = chihiro_va_to_pa(0x80036000);
+                if (hwinfo_pa != 0xFFFFFFFF) {
+                    uint8_t hw[16];
+                    cpu_physical_memory_read(hwinfo_pa, hw, 16);
+                    printf("    @0x80036000: %02X%02X%02X%02X %02X%02X%02X%02X"
+                           " %02X%02X%02X%02X %02X%02X%02X%02X\n",
+                           hw[0],hw[1],hw[2],hw[3],hw[4],hw[5],hw[6],hw[7],
+                           hw[8],hw[9],hw[10],hw[11],hw[12],hw[13],hw[14],hw[15]);
+                }
+            }
+
+            /* 17. KERNEL STACK deep scan — look for NTSTATUS error codes */
+            {
+                CPUState *cpu = first_cpu;
+                if (cpu) {
+                    X86CPU *x86 = X86_CPU(cpu);
+                    uint32_t esp = (uint32_t)x86->env.regs[R_ESP];
+                    /* Scan 256 bytes below and above ESP for status codes */
+                    uint32_t scan_start = esp - 256;
+                    uint32_t scan_pa = chihiro_va_to_pa(scan_start);
+                    if (scan_pa != 0xFFFFFFFF) {
+                        uint32_t stk[128]; /* 512 bytes */
+                        cpu_physical_memory_read(scan_pa, stk, 512);
+                        printf("  STACK SCAN (ESP-256 to ESP+256):\n");
+                        printf("    NTSTATUS candidates: ");
+                        int ns_count = 0;
+                        for (int i = 0; i < 128; i++) {
+                            /* NTSTATUS: 0xC0xxxxxx = error, 0x80xxxxxx = warning (but also kernel VA) */
+                            if ((stk[i] & 0xF0000000) == 0xC0000000) {
+                                printf("0x%08X(@+%X) ", stk[i], (i*4) - 256);
+                                if (++ns_count >= 8) break;
+                            }
+                        }
+                        if (ns_count == 0) printf("none");
+                        printf("\n");
+                    }
+                }
+            }
+
+            /* 18. LaunchDataPage — scan for pointer in kernel exports area */
+            {
+                printf("  LaunchDataPage scan:\n");
+                /* The kernel stores LaunchDataPage pointer at export #164 (varies by kernel).
+                 * Scan kernel data for a pointer to low memory that could be the LDP.
+                 * LDP starts with dwLaunchDataType (usually 1=QuickReboot or 2=Dashboard) */
+                for (uint32_t pa = 0x30000; pa < 0x50000; pa += 4) {
+                    uint32_t ptr;
+                    cpu_physical_memory_read(pa, &ptr, 4);
+                    /* LDP is allocated in contiguous memory, usually 0xD0xxxxxx or low user VA */
+                    if (ptr >= 0x00010000 && ptr < 0x01000000) {
+                        uint32_t ldp_pa = chihiro_va_to_pa(ptr);
+                        if (ldp_pa != 0xFFFFFFFF) {
+                            uint32_t ldp_type;
+                            cpu_physical_memory_read(ldp_pa, &ldp_type, 4);
+                            /* QuickReboot LDP has type 1 or 0x00000001 */
+                            if (ldp_type == 1 || ldp_type == 2 || ldp_type == 0) {
+                                uint8_t ldp[80];
+                                cpu_physical_memory_read(ldp_pa, ldp, 80);
+                                printf("    LDP candidate: kern_PA=0x%05X ptr=0x%08X type=%u\n", pa, ptr, ldp_type);
+                                printf("    Path: ");
+                                /* LaunchPath starts at offset 4, ASCII, 520 bytes max */
+                                for (int c = 4; c < 76 && ldp[c]; c++)
+                                    printf("%c", ldp[c] >= 0x20 && ldp[c] < 0x7F ? ldp[c] : '.');
+                                printf("\n");
+                                break; /* show first match only */
+                            }
+                        }
+                    }
+                }
+            }
+
+            /* 19. XBE TLS callback — check if TLS init ran */
+            if (tls_va) {
+                uint32_t tls_pa = chihiro_va_to_pa(tls_va);
+                if (tls_pa != 0xFFFFFFFF) {
+                    uint32_t tls[4];
+                    cpu_physical_memory_read(tls_pa, tls, 16);
+                    printf("  TLS @0x%08X: RawStart=0x%08X RawEnd=0x%08X IdxAddr=0x%08X Callbacks=0x%08X\n",
+                           tls_va, tls[0], tls[1], tls[2], tls[3]);
+                }
+            }
+
             printf("============================\n");
         }
 
