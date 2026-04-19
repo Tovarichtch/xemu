@@ -459,6 +459,128 @@ static void chihiro_diag_timer_cb(void *opaque)
             }
             printf("\n");
 
+            /* 11. CPU STATE — where is the CPU right now? */
+            {
+                CPUState *cpu = first_cpu;
+                if (cpu) {
+                    X86CPU *x86 = X86_CPU(cpu);
+                    CPUX86State *env = &x86->env;
+                    printf("  CPU: EIP=0x%08X ESP=0x%08X EBP=0x%08X\n",
+                           (uint32_t)env->eip, (uint32_t)env->regs[R_ESP],
+                           (uint32_t)env->regs[R_EBP]);
+                    printf("  EAX=0x%08X EBX=0x%08X ECX=0x%08X EDX=0x%08X\n",
+                           (uint32_t)env->regs[R_EAX], (uint32_t)env->regs[R_EBX],
+                           (uint32_t)env->regs[R_ECX], (uint32_t)env->regs[R_EDX]);
+                    printf("  ESI=0x%08X EDI=0x%08X CR0=0x%08X CR3=0x%08X\n",
+                           (uint32_t)env->regs[R_ESI], (uint32_t)env->regs[R_EDI],
+                           (uint32_t)env->cr[0], (uint32_t)env->cr[3]);
+
+                    /* Stack backtrace — read 16 DWORDs from ESP */
+                    uint32_t esp = (uint32_t)env->regs[R_ESP];
+                    uint32_t esp_pa = chihiro_va_to_pa(esp);
+                    if (esp_pa != 0xFFFFFFFF) {
+                        uint32_t stack[16];
+                        cpu_physical_memory_read(esp_pa, stack, 64);
+                        printf("  STACK @0x%08X (PA=0x%08X):\n", esp, esp_pa);
+                        printf("    +00: %08X %08X %08X %08X\n",
+                               stack[0], stack[1], stack[2], stack[3]);
+                        printf("    +10: %08X %08X %08X %08X\n",
+                               stack[4], stack[5], stack[6], stack[7]);
+                        printf("    +20: %08X %08X %08X %08X\n",
+                               stack[8], stack[9], stack[10], stack[11]);
+                        printf("    +30: %08X %08X %08X %08X\n",
+                               stack[12], stack[13], stack[14], stack[15]);
+                    } else {
+                        printf("  STACK @0x%08X: UNMAPPED\n", esp);
+                    }
+
+                    /* Code at EIP — what instruction is executing? */
+                    uint32_t eip = (uint32_t)env->eip;
+                    uint32_t eip_pa = chihiro_va_to_pa(eip);
+                    if (eip_pa != 0xFFFFFFFF) {
+                        uint8_t code[16];
+                        cpu_physical_memory_read(eip_pa, code, 16);
+                        printf("  CODE @EIP=0x%08X (PA=0x%08X): "
+                               "%02X %02X %02X %02X %02X %02X %02X %02X "
+                               "%02X %02X %02X %02X %02X %02X %02X %02X\n",
+                               eip, eip_pa,
+                               code[0],code[1],code[2],code[3],
+                               code[4],code[5],code[6],code[7],
+                               code[8],code[9],code[10],code[11],
+                               code[12],code[13],code[14],code[15]);
+                    }
+
+                    /* EBP chain — walk frame pointers */
+                    printf("  FRAMES: ");
+                    uint32_t ebp = (uint32_t)env->regs[R_EBP];
+                    for (int f = 0; f < 8 && ebp > 0x10000 && ebp < 0x08000000; f++) {
+                        uint32_t ebp_pa = chihiro_va_to_pa(ebp);
+                        if (ebp_pa == 0xFFFFFFFF) { printf("(unmapped@%X) ", ebp); break; }
+                        uint32_t frame[2]; /* saved_ebp, return_addr */
+                        cpu_physical_memory_read(ebp_pa, frame, 8);
+                        printf("%X→%X ", ebp, frame[1]);
+                        ebp = frame[0];
+                    }
+                    printf("\n");
+                }
+            }
+
+            /* 12. CONTIGUOUS MEMORY — D0000000 range detail */
+            printf("  CONTIGUOUS D0xxxxxx: ");
+            for (uint32_t d = 0xD0000000; d <= 0xD0080000; d += 0x10000) {
+                uint32_t pa = chihiro_va_to_pa(d);
+                if (pa != 0xFFFFFFFF)
+                    printf("%X→%X ", d & 0xFFFFF, pa);
+                else
+                    printf("%X→X ", d & 0xFFFFF);
+            }
+            printf("\n");
+
+            /* 13. PFN DATABASE — kernel MmPfnDatabase location */
+            /* Xbox kernel stores MmPfnDatabase at ~0x8003FE00 area */
+            /* The PFN limit tells us max usable page: 0x3FDF=64MB, 0x7FBF=128MB */
+            /* Search kernel for "mov edx, 0x3FDF" (BA DF 3F 00 00) = 64MB limit */
+            {
+                int found_3fdf = 0, found_7fbf = 0;
+                uint8_t pat64[] = {0xDF, 0x3F, 0x00, 0x00};
+                uint8_t pat128[] = {0xBF, 0x7F, 0x00, 0x00};
+                /* Scan kernel code (PA 0x10000-0x50000) */
+                for (uint32_t pa = 0x10000; pa < 0x50000; pa += 4) {
+                    uint8_t buf[4];
+                    cpu_physical_memory_read(pa, buf, 4);
+                    if (!found_3fdf && memcmp(buf, pat64, 4) == 0) {
+                        uint8_t prev;
+                        cpu_physical_memory_read(pa - 1, &prev, 1);
+                        printf("  PFN: found 0x3FDF (64MB limit) at PA 0x%05X (prev_byte=0x%02X)\n", pa, prev);
+                        found_3fdf = 1;
+                    }
+                    if (!found_7fbf && memcmp(buf, pat128, 4) == 0) {
+                        uint8_t prev;
+                        cpu_physical_memory_read(pa - 1, &prev, 1);
+                        printf("  PFN: found 0x7FBF (128MB limit) at PA 0x%05X (prev_byte=0x%02X)\n", pa, prev);
+                        found_7fbf = 1;
+                    }
+                }
+                if (!found_3fdf && !found_7fbf) printf("  PFN: neither 0x3FDF nor 0x7FBF found in kernel\n");
+            }
+
+            /* 14. HDD PARTITION TABLE — check if kernel found partitions */
+            /* Xbox partition table is at LBA 0 of HDD, but kernel accesses via IopPartitionTable */
+            /* Check if \Device\Harddisk0\Partition0 is accessible */
+            uint32_t part_check_va = 0x80060000; /* near kernel data */
+            uint32_t part_pa = chihiro_va_to_pa(part_check_va);
+            if (part_pa != 0xFFFFFFFF) {
+                uint8_t kdata[32];
+                cpu_physical_memory_read(part_pa, kdata, 32);
+                printf("  KernData@0x%08X: %02X%02X%02X%02X %02X%02X%02X%02X"
+                       " %02X%02X%02X%02X %02X%02X%02X%02X\n",
+                       part_check_va,
+                       kdata[0],kdata[1],kdata[2],kdata[3],
+                       kdata[4],kdata[5],kdata[6],kdata[7],
+                       kdata[8],kdata[9],kdata[10],kdata[11],
+                       kdata[12],kdata[13],kdata[14],kdata[15]);
+            }
+
             printf("============================\n");
         }
 
