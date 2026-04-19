@@ -130,6 +130,7 @@ typedef struct ChihiroLPCState {
 static bool chihiro_active;
 bool chihiro_game_running;  /* Set after QuickReboot — disables SEGABOOT DMA scan */
 static bool chihiro_boot3_reached; /* Set when SEGABOOT reaches boot=3 (checks complete) */
+static char chihiro_game_filename[64]; /* Game XBE filename saved at boot=3 */
 static ChihiroLPCState *chihiro_lpc_global;
 
 /* USB devices for delayed hotplug (simulates AN2131 I2C firmware boot) */
@@ -978,6 +979,35 @@ static void chihiro_diag_timer_cb(void *opaque)
                s->last_bootstate, bootstate);
         if (bootstate == 3) {
             chihiro_boot3_reached = true;
+            /* Save game filename NOW — SEGABOOT wrote "mbfs:\<game>.xbe"
+             * to RAM but the QuickReboot will clear it. */
+            chihiro_game_filename[0] = 0;
+            for (uint32_t pa = 0x50000; pa < 0x60000; pa++) {
+                uint8_t buf[6];
+                cpu_physical_memory_read(pa, buf, 6);
+                if (memcmp(buf, "mbfs:\\", 6) == 0 ||
+                    memcmp(buf, "mbfs:/", 6) == 0) {
+                    uint8_t path[64];
+                    cpu_physical_memory_read(pa + 6, path, 63);
+                    path[63] = 0;
+                    int j = 0;
+                    for (int i = 0; i < 63 && path[i] >= 0x20 &&
+                         path[i] < 0x7F; i++) {
+                        chihiro_game_filename[j++] = path[i];
+                    }
+                    chihiro_game_filename[j] = 0;
+                    if (j > 4) {
+                        printf("[%07lld] Chihiro: saved game filename '%s' "
+                               "(from mbfs:\\ at PA 0x%05X)\n",
+                               TS_MS, chihiro_game_filename, pa);
+                        break;
+                    }
+                }
+            }
+            if (!chihiro_game_filename[0]) {
+                printf("[%07lld] Chihiro: WARNING — could not find game "
+                       "filename in RAM at boot=3\n", TS_MS);
+            }
         }
         s->last_bootstate = bootstate;
     }
@@ -1445,36 +1475,11 @@ static uint64_t chihiro_lpc_io_read(void *opaque, hwaddr addr,
              *   0x004: DWORD dwTitleId
              *   0x008: CHAR  szLaunchPath[520]
              *
-             * We read the game path from RAM (SEGABOOT wrote it at
-             * PA ~0x54C00 as "mbfs:\<game>.xbe") and write it to the LDP
-             * as "D:\<game>.xbe" (D:\ → mbfs: symlink is created by the
-             * kernel's launch code). */
+             * The game filename was saved at boot=3 (before QuickReboot
+             * cleared RAM). We write it as "D:\<game>.xbe" — the kernel's
+             * launch code creates D:\ → mbfs: symlink. */
             {
-                /* Find game path: scan for "mbfs:\" in RAM */
-                char game_filename[64] = {0};
-                bool found_game = false;
-                for (uint32_t pa = 0x50000; pa < 0x60000; pa++) {
-                    uint8_t buf[6];
-                    cpu_physical_memory_read(pa, buf, 6);
-                    if (memcmp(buf, "mbfs:\\", 6) == 0 || memcmp(buf, "mbfs:/", 6) == 0) {
-                        /* Read the filename after "mbfs:\" (6 bytes) */
-                        uint8_t path[64];
-                        cpu_physical_memory_read(pa + 6, path, 63);
-                        path[63] = 0;
-                        /* Extract just the filename (stop at null or non-printable) */
-                        int j = 0;
-                        for (int i = 0; i < 63 && path[i] >= 0x20 && path[i] < 0x7F; i++) {
-                            game_filename[j++] = path[i];
-                        }
-                        game_filename[j] = 0;
-                        if (j > 4) { /* at least "x.xbe" */
-                            found_game = true;
-                            break;
-                        }
-                    }
-                }
-
-                if (found_game) {
+                if (chihiro_game_filename[0]) {
                     /* Read LDP pointer from kernel export area */
                     uint32_t ldp_va;
                     cpu_physical_memory_read(0x30A10, &ldp_va, 4);
@@ -1492,7 +1497,7 @@ static uint64_t chihiro_lpc_io_read(void *opaque, hwaddr addr,
                         /* Write LaunchPath = "D:\<filename>" */
                         char launch_path[520] = {0};
                         snprintf(launch_path, sizeof(launch_path),
-                                 "D:\\%s", game_filename);
+                                 "D:\\%s", chihiro_game_filename);
                         cpu_physical_memory_write(ldp_pa + 8, launch_path, 520);
 
                         printf("[%07lld] Chihiro: Filled LaunchDataPage (PA 0x%08X):"
@@ -1503,8 +1508,8 @@ static uint64_t chihiro_lpc_io_read(void *opaque, hwaddr addr,
                                "not mapped, cannot fill\n", TS_MS, ldp_va);
                     }
                 } else {
-                    printf("[%07lld] Chihiro: WARNING — game path (mbfs:\\) "
-                           "not found in RAM\n", TS_MS);
+                    printf("[%07lld] Chihiro: WARNING — no game filename saved "
+                           "at boot=3, cannot fill LDP\n", TS_MS);
                 }
             }
 
