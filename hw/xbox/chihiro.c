@@ -129,6 +129,7 @@ typedef struct ChihiroLPCState {
 
 static bool chihiro_active;
 static bool chihiro_game_running;  /* Set after QuickReboot — disables SEGABOOT DMA scan */
+static bool chihiro_boot3_reached; /* Set when SEGABOOT reaches boot=3 (checks complete) */
 static ChihiroLPCState *chihiro_lpc_global;
 
 /* USB devices for delayed hotplug (simulates AN2131 I2C firmware boot) */
@@ -310,6 +311,9 @@ static void chihiro_diag_timer_cb(void *opaque)
     if (bootstate != s->last_bootstate) {
         printf("[%07lld] DIAG: *** BOOTSTATE CHANGED %u → %u ***\n", TS_MS,
                s->last_bootstate, bootstate);
+        if (bootstate == 3) {
+            chihiro_boot3_reached = true;
+        }
         s->last_bootstate = bootstate;
     }
 
@@ -737,10 +741,16 @@ static uint64_t chihiro_lpc_io_read(void *opaque, hwaddr addr,
         r = 0x4D41;     /* "MA" → full string reads as "XBAM" */
         break;
     case SEGA_CHIP_REVISION:
-        r = 0x0001;  /* Must be non-zero for SEGABOOT mbcom negotiation to start.
-                       * MAME/CXBX return 0x0000 but they use different mbcom transport.
-                       * Our IDE sector-based mbcom requires 0x0001 here. */
+        r = 0x0001;
         s->lpc_40f0_reads++;
+        /* Detect game XBE reboot: if SEGABOOT already reached boot=3
+         * and the kernel re-reads 0x40F0, the game XBE is initializing.
+         * Disable DMA scan immediately to prevent memory corruption. */
+        if (chihiro_boot3_reached && !chihiro_game_running) {
+            chihiro_game_running = true;
+            printf("[%07lld] Chihiro: game XBE detected (0x40F0 re-read after boot=3)"
+                   " — DMA scan disabled\n", TS_MS);
+        }
         break;
     case SEGA_DIMM_SIZE:
         r = SEGA_DIMM_SIZE_512M;        /* 512MB DIMM (matches MAME default) */
