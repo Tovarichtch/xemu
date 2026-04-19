@@ -24,6 +24,7 @@
 #include "hw/usb/desc.h"
 
 #include "qemu/timer.h"
+#include "chihiro-firmware.h"
 #define TS_MS ((long long)(qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL)))
 #define DEBUG_CUSB
 #ifdef DEBUG_CUSB
@@ -38,8 +39,8 @@ typedef struct ChihiroUSBState {
     /* Device identity (set at realize, safe to use in all callbacks) */
     bool is_qc;  /* true = AN2131QC (PID 0x0002), false = AN2131SC (PID 0x0003) */
 
-    /* ic10 EEPROM data (8KB, read via vendor request 0x16) */
-    uint8_t ic10_eeprom[8192];
+    /* I2C EEPROM data (8KB): ic10 for QC, pc20 for SC — loaded at realize */
+    uint8_t eeprom[8192];
 
     /* Pending bulk transfer (queued by vendor request 0x16/0x17) */
     uint8_t bulk_buf[256];
@@ -293,7 +294,7 @@ static void handle_control(USBDevice *dev, USBPacket *p,
         if (count > 256) count = 256;
         if (addr + count > 8192) count = 8192 - addr;
         if (addr >= 0 && count > 0) {
-            memcpy(s->bulk_buf, s->ic10_eeprom + addr, count);
+            memcpy(s->bulk_buf, s->eeprom + addr, count);
         } else {
             memset(s->bulk_buf, 0xFF, count);
         }
@@ -311,7 +312,7 @@ static void handle_control(USBDevice *dev, USBPacket *p,
         if (count > 256) count = 256;
         if (addr + count > 8192) count = 8192 - addr;
         if (addr >= 0 && addr < 8192 && count > 0) {
-            memcpy(s->bulk_buf, s->ic10_eeprom + addr, count);
+            memcpy(s->bulk_buf, s->eeprom + addr, count);
         } else {
             memset(s->bulk_buf, 0xFF, count);
         }
@@ -400,27 +401,27 @@ static void chihiro_an2131qc_realize(USBDevice *dev, Error **errp)
     s->is_qc = true;
     usb_desc_init(dev);
     dev->auto_attach = 0;  /* Attach later via hotplug timer */
-    printf("[%07lld] chihiro-usb [QC]: realized (auto_attach=0, will hotplug later)\n", TS_MS);
 
-    /* Initialize ic10 EEPROM with default data.
-     * TODO: load from ic10_g24lc64.bin file instead of hardcoding. */
-    memset(s->ic10_eeprom, 0xFF, sizeof(s->ic10_eeprom));
+    /* Load real ic10 QC EEPROM firmware (8192 bytes from MAME hotd3.zip).
+     * Contains AN2131 8051 firmware code + region/serial/game data.
+     * SEGABOOT reads this via vendor request 0x16 + bulk IN EP1. */
+    _Static_assert(sizeof(hotd3_ic10_g24lc64) == 8192,
+                   "ic10 firmware must be exactly 8KB");
+    memcpy(s->eeprom, hotd3_ic10_g24lc64, sizeof(s->eeprom));
 
-    /* Region + flags at 0x1F00 */
-    s->ic10_eeprom[0x1F00] = 0x02;  /* Region: 01=JPN, 02=USA, 03=EXP */
-    s->ic10_eeprom[0x1F01] = 0xFE;  /* Flags */
-
-    /* Baseboard serial at 0x1F10 — "AAEE-01D44744715"
-     * Validated against mask "%%%@-##@########" */
-    memcpy(&s->ic10_eeprom[0x1F10], "AAEE-01D44744715", 16);
+    /* Override region to USA (0x02) for compatibility.
+     * Original HOD3 ic10 has 0x01 (Japan).
+     * CXBX does the same auto-patch at JVS_Init(). */
+    s->eeprom[0x1F00] = 0x02;  /* Region: 01=JPN, 02=USA, 03=EXP */
 
     /* Initialize bulk transfer state */
     s->bulk_pending = 0;
     s->bulk_offset = 0;
     s->bulk_ep = 0;
 
-    printf("[%07lld] Chihiro: AN2131QC USB device initialized "
-           "(serial=AAEE-01D44744715, region=JPN)\n", TS_MS);
+    printf("[%07lld] Chihiro QC: loaded ic10 firmware (8192B), "
+           "region patched to USA (0x02), serial=%.16s\n",
+           TS_MS, (const char *)&s->eeprom[0x1F10]);
 }
 
 static void chihiro_an2131qc_unrealize(USBDevice *dev)
@@ -458,7 +459,18 @@ static void chihiro_an2131sc_realize(USBDevice *dev, Error **errp)
     s->is_qc = false;
     usb_desc_init(dev);
     dev->auto_attach = 0;  /* Attach later via hotplug timer */
-    printf("[%07lld] chihiro-usb [SC]: realized (auto_attach=0, will hotplug later)\n", TS_MS);
+
+    /* Load real pc20 SC EEPROM firmware (8192 bytes from MAME hotd3.zip). */
+    _Static_assert(sizeof(hotd3_pc20_g24lc64) == 8192,
+                   "pc20 firmware must be exactly 8KB");
+    memcpy(s->eeprom, hotd3_pc20_g24lc64, sizeof(s->eeprom));
+
+    /* Initialize bulk transfer state */
+    s->bulk_pending = 0;
+    s->bulk_offset = 0;
+    s->bulk_ep = 0;
+
+    printf("[%07lld] Chihiro SC: loaded pc20 firmware (8192B)\n", TS_MS);
 }
 
 static void chihiro_an2131sc_unrealize(USBDevice *dev)
