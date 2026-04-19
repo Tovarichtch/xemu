@@ -1433,6 +1433,81 @@ static uint64_t chihiro_lpc_io_read(void *opaque, hwaddr addr,
             uint8_t gate_val = 1;
             address_space_write(&address_space_memory, 0x3A93C,
                                 MEMTXATTRS_UNSPECIFIED, &gate_val, 1);
+
+            /* Fill the LaunchDataPage.
+             *
+             * On real hardware, SEGABOOT calls XLaunchNewImage() which
+             * writes the game path to the LDP before triggering QuickReboot.
+             * Our patches prevent SEGABOOT from reaching that call.
+             *
+             * Structure (from Xbox kernel):
+             *   0x000: DWORD dwLaunchDataType (1 = launch XBE)
+             *   0x004: DWORD dwTitleId
+             *   0x008: CHAR  szLaunchPath[520]
+             *
+             * We read the game path from RAM (SEGABOOT wrote it at
+             * PA ~0x54C00 as "mbfs:\<game>.xbe") and write it to the LDP
+             * as "D:\<game>.xbe" (D:\ → mbfs: symlink is created by the
+             * kernel's launch code). */
+            {
+                /* Find game path: scan for "mbfs:\" in RAM */
+                char game_filename[64] = {0};
+                bool found_game = false;
+                for (uint32_t pa = 0x50000; pa < 0x60000; pa++) {
+                    uint8_t buf[6];
+                    cpu_physical_memory_read(pa, buf, 6);
+                    if (memcmp(buf, "mbfs:\\", 6) == 0 || memcmp(buf, "mbfs:/", 6) == 0) {
+                        /* Read the filename after "mbfs:\" (6 bytes) */
+                        uint8_t path[64];
+                        cpu_physical_memory_read(pa + 6, path, 63);
+                        path[63] = 0;
+                        /* Extract just the filename (stop at null or non-printable) */
+                        int j = 0;
+                        for (int i = 0; i < 63 && path[i] >= 0x20 && path[i] < 0x7F; i++) {
+                            game_filename[j++] = path[i];
+                        }
+                        game_filename[j] = 0;
+                        if (j > 4) { /* at least "x.xbe" */
+                            found_game = true;
+                            break;
+                        }
+                    }
+                }
+
+                if (found_game) {
+                    /* Read LDP pointer from kernel export area */
+                    uint32_t ldp_va;
+                    cpu_physical_memory_read(0x30A10, &ldp_va, 4);
+                    uint32_t ldp_pa = chihiro_va_to_pa(ldp_va);
+
+                    if (ldp_pa != 0xFFFFFFFF) {
+                        /* Write LaunchDataType = 1 (launch XBE) */
+                        uint32_t launch_type = 1;
+                        cpu_physical_memory_write(ldp_pa, &launch_type, 4);
+
+                        /* Write TitleId = 0 */
+                        uint32_t title_id = 0;
+                        cpu_physical_memory_write(ldp_pa + 4, &title_id, 4);
+
+                        /* Write LaunchPath = "D:\<filename>" */
+                        char launch_path[520] = {0};
+                        snprintf(launch_path, sizeof(launch_path),
+                                 "D:\\%s", game_filename);
+                        cpu_physical_memory_write(ldp_pa + 8, launch_path, 520);
+
+                        printf("[%07lld] Chihiro: Filled LaunchDataPage (PA 0x%08X):"
+                               " type=1 path='%s'\n",
+                               TS_MS, ldp_pa, launch_path);
+                    } else {
+                        printf("[%07lld] Chihiro: WARNING — LDP VA 0x%08X "
+                               "not mapped, cannot fill\n", TS_MS, ldp_va);
+                    }
+                } else {
+                    printf("[%07lld] Chihiro: WARNING — game path (mbfs:\\) "
+                           "not found in RAM\n", TS_MS);
+                }
+            }
+
             printf("[%07lld] Chihiro: game XBE detected (0x40F0 re-read after boot=3)"
                    " — set gate [0x8003A93C]=1, DMA scan disabled\n", TS_MS);
         }
