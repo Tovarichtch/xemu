@@ -1685,6 +1685,58 @@ static void chihiro_eeprom_hack_cb(void *opaque)
             s->eeprom_hack_applied = true;
             printf("[%07lld] Chihiro: Applied EEPROM validation hack "
                    "(arcdkrnl @ 0x8003B744)\n", TS_MS);
+
+            /* Chihiro MediaBoard init kernel patch.
+             *
+             * The arcdkrnl's boot init at ~VA 0x80025329 calls:
+             *   1. baseboard detection (IDE slave check)
+             *   2. IF gate flag [0x8003A93C] != 0: MediaBoard partition init
+             *      ELSE: HW detection (DIMM params) → return
+             *
+             * On real hardware, the gate flag is set to 1 during QuickReboot
+             * (HalReturnToFirmware). On first boot, only HW detection runs.
+             * After QuickReboot, MediaBoard init creates the partitions
+             * (\Device\MediaBoard, CdRom0, D:\).
+             *
+             * Our SEGABOOT patches prevent proper QuickReboot, so the gate
+             * flag never gets set → MediaBoard init never runs.
+             *
+             * Fix: patch the JMP after HW detection to fall through to
+             * MediaBoard init instead of returning.
+             *
+             * Before: call HW_detect; JMP return  (EB F6 = jmp -10)
+             * After:  call HW_detect; JMP mb_init (EB F1 = jmp -15)
+             *
+             * Signature: pop ebx; leave; ret; call HW_detect; jmp return
+             * = 5B C9 C3 E8 EA 6A 01 00 EB F6  (10 bytes, unique)
+             * Patch byte: offset 9 (F6 → F1).
+             */
+            {
+                /* Signature: pop ebx; leave; ret; call HW_detect; jmp return
+                 * = 5B C9 C3 E8 EA 6A 01 00 EB F6  (10 bytes, unique) */
+                uint8_t mb_sig[] = { 0x5B, 0xC9, 0xC3, 0xE8, 0xEA,
+                                     0x6A, 0x01, 0x00, 0xEB, 0xF6 };
+                bool mb_found = false;
+                for (uint32_t pa = 0x25000; pa < 0x26000; pa++) {
+                    uint8_t buf[10];
+                    address_space_read(&address_space_memory, pa,
+                                       MEMTXATTRS_UNSPECIFIED, buf, 10);
+                    if (memcmp(buf, mb_sig, 10) == 0) {
+                        uint8_t new_jmp = 0xF1;  /* jmp -15 → MediaBoard init */
+                        address_space_write(&address_space_memory, pa + 9,
+                                            MEMTXATTRS_UNSPECIFIED, &new_jmp, 1);
+                        printf("[%07lld] Chihiro: Applied MediaBoard init patch "
+                               "(arcdkrnl @ 0x%08X: EB F6→EB F1)\n",
+                               TS_MS, 0x80000000 + pa + 8);
+                        mb_found = true;
+                        break;
+                    }
+                }
+                if (!mb_found) {
+                    printf("[%07lld] Chihiro: WARNING — MediaBoard init patch "
+                           "signature NOT FOUND\n", TS_MS);
+                }
+            }
             return;
         }
         /* Retry until kernel is decrypted */
