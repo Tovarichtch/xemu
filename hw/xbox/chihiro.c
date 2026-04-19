@@ -727,7 +727,9 @@ static uint64_t chihiro_lpc_io_read(void *opaque, hwaddr addr,
         r = 0x4D41;     /* "MA" → full string reads as "XBAM" */
         break;
     case SEGA_CHIP_REVISION:
-        r = SEGA_CHIP_REVISION_TYPE1;  /* 0x0000 = Type-1 media board present (MAME/CXBX) */
+        r = 0x0001;  /* Must be non-zero for SEGABOOT mbcom negotiation to start.
+                       * MAME/CXBX return 0x0000 but they use different mbcom transport.
+                       * Our IDE sector-based mbcom requires 0x0001 here. */
         s->lpc_40f0_reads++;
         break;
     case SEGA_DIMM_SIZE:
