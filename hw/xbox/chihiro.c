@@ -727,7 +727,7 @@ static uint64_t chihiro_lpc_io_read(void *opaque, hwaddr addr,
         r = 0x4D41;     /* "MA" → full string reads as "XBAM" */
         break;
     case SEGA_CHIP_REVISION:
-        r = 0x0001;  /* Mediaboard status: ready for mbcom negotiation */
+        r = SEGA_CHIP_REVISION_TYPE1;  /* 0x0000 = Type-1 media board present (MAME/CXBX) */
         s->lpc_40f0_reads++;
         break;
     case SEGA_DIMM_SIZE:
@@ -900,25 +900,39 @@ static void chihiro_irq10_timer_cb(void *opaque)
                     meta_marker = 0x0001;
                     cpu_physical_memory_write(meta_pa + 2, &meta_marker, 2);
 
-                    /* Command-specific response at META[+4] */
+                    /* Command-specific response at META[+4]
+                     * Values verified against MAME chihiro.cpp and CXBX MediaBoard.cpp */
                     uint32_t resp_data = 0;
+                    uint32_t resp_data2 = 0; /* second dword at META[+8] for STATUS */
                     switch (cmd_opcode) {
-                    case 0x0001: /* Boot data pointer → DIMM address */
-                        resp_data = 0x01001000;
+                    case 0x0001: /* DIMM_SIZE — MAME: 0x00F00000 */
+                        resp_data = 0x00F00000;
                         break;
-                    case 0x0100: /* STATUS → phase=7 (loading complete).
-                                 * Gate at 0x2E0AF needs phase >= 5.
-                                 * Phase 5=loading, 7=complete. */
-                        resp_data = 7;
+                    case 0x0100: /* STATUS — 5=READY (CXBX MB_STATUS_READY)
+                                 * MAME: phase=5, completion=0%
+                                 * CXBX: phase=5, completion=100% */
+                        resp_data = 5;
+                        resp_data2 = 100; /* completion percentage */
                         break;
-                    case 0x0102: /* SYSTEM_TYPE → bit 16 = develop mode */
+                    case 0x0101: /* FW_VERSION — MAME: 0x45671234 */
+                        resp_data = 0x45671234;
+                        break;
+                    case 0x0102: /* SYSTEM_TYPE — bit16=develop (skip game compat check)
+                                 * MAME uses 0 (retail). We use develop until we have
+                                 * proper game compatibility data from baseboard. */
                         resp_data = 0x00010000;
+                        break;
+                    case 0x0103: /* SERIAL — first 4 bytes of serial string */
+                        resp_data = 0x6261632D; /* "-abc" LE */
                         break;
                     default:
                         resp_data = 0;
                         break;
                     }
                     cpu_physical_memory_write(meta_pa + 4, &resp_data, 4);
+                    if (cmd_opcode == 0x0100) {
+                        cpu_physical_memory_write(meta_pa + 8, &resp_data2, 4);
+                    }
 
                     /* Dedup repeated STATUS polls to avoid log spam */
                     static uint16_t last_dma_cmd = 0xFFFF;
@@ -1144,11 +1158,10 @@ static void chihiro_mbcom_process(void)
     case 0x0001: /* DIMM_SIZE — MAME: dword_write_le(r+4, 0x00f00000) */
         r[4] = 0x00; r[5] = 0x00; r[6] = 0xF0; r[7] = 0x00;
         break;
-    case 0x0100: /* STATUS — phase=5 (game loading), completion=0
-                  * Real HW: baseboard loads GD-ROM→DIMM, reports phase=5 during load.
-                  * SEGABOOT gate at 0x2E0AF needs phase >= 5 to proceed to boot.id read. */
+    case 0x0100: /* STATUS — phase=5 (READY), completion=100%
+                  * CXBX: MB_STATUS_READY=5, percentage=100 */
         r[4] = 5; r[5] = 0; r[6] = 0; r[7] = 0;
-        r[8] = 0; r[9] = 0; r[10] = 0; r[11] = 0;  /* completion 0% */
+        r[8] = 100; r[9] = 0; r[10] = 0; r[11] = 0;  /* completion 100% */
         break;
     case 0x0101: /* FW_VER — MAME: 0x1234 (12.34) + 0x4567 */
         r[4] = 0x34; r[5] = 0x12; r[6] = 0x67; r[7] = 0x45;
