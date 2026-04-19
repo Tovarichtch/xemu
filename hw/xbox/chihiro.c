@@ -263,139 +263,214 @@ static void chihiro_diag_timer_cb(void *opaque)
             /* 1. XBE HEADER at VA 0x10000 */
             uint32_t hdr_pa = chihiro_va_to_pa(0x10000);
             printf("  XBE header: VA=0x10000 PA=0x%08X\n", hdr_pa);
+            uint32_t entry_addr = 0, thunk_addr = 0, base_addr = 0;
+            uint32_t section_hdr_va = 0, num_sections = 0;
+            uint32_t tls_va = 0;
             if (hdr_pa != 0xFFFFFFFF) {
                 uint8_t hdr[0x180];
                 cpu_physical_memory_read(hdr_pa, hdr, sizeof(hdr));
                 printf("  Magic: %c%c%c%c\n", hdr[0], hdr[1], hdr[2], hdr[3]);
-                uint32_t base_addr   = *(uint32_t*)(hdr + 0x104);
-                uint32_t entry_enc   = *(uint32_t*)(hdr + 0x128);
-                uint32_t thunk_enc   = *(uint32_t*)(hdr + 0x158);
-                uint32_t init_flags  = *(uint32_t*)(hdr + 0x10C);
-                printf("  dwBaseAddr=0x%08X dwEntryAddr=0x%08X dwThunk=0x%08X flags=0x%08X\n",
-                       base_addr, entry_enc, thunk_enc, init_flags);
+                base_addr       = *(uint32_t*)(hdr + 0x104);
+                entry_addr      = *(uint32_t*)(hdr + 0x128);
+                thunk_addr      = *(uint32_t*)(hdr + 0x158);
+                section_hdr_va  = *(uint32_t*)(hdr + 0x120);
+                num_sections    = *(uint32_t*)(hdr + 0x11C);
+                tls_va          = *(uint32_t*)(hdr + 0x154);
+                uint32_t init_flags = *(uint32_t*)(hdr + 0x10C);
+                printf("  Base=0x%08X Entry=0x%08X Thunk=0x%08X Flags=0x%08X\n",
+                       base_addr, entry_addr, thunk_addr, init_flags);
+                printf("  Sections: %u at VA=0x%08X, TLS=0x%08X\n",
+                       num_sections, section_hdr_va, tls_va);
+            }
 
-                /* Decode with all 3 keys */
-                uint32_t ep_chi = entry_enc ^ 0x40B5C16E;
-                uint32_t ep_dbg = entry_enc ^ 0x94859D4B;
-                uint32_t ep_ret = entry_enc ^ 0xA8FC57AB;
-                printf("  Entry decoded: Chihiro=0x%08X Debug=0x%08X Retail=0x%08X\n",
-                       ep_chi, ep_dbg, ep_ret);
+            /* 2. CODE at entry point (already decrypted by kernel) */
+            if (entry_addr && entry_addr < 0x08000000) {
+                uint32_t ep_pa = chihiro_va_to_pa(entry_addr);
+                if (ep_pa != 0xFFFFFFFF) {
+                    uint8_t code[32];
+                    cpu_physical_memory_read(ep_pa, code, 32);
+                    printf("  ENTRY @0x%08X (PA=0x%08X):\n", entry_addr, ep_pa);
+                    printf("    %02X %02X %02X %02X %02X %02X %02X %02X"
+                           " %02X %02X %02X %02X %02X %02X %02X %02X\n",
+                           code[0],code[1],code[2],code[3],code[4],code[5],code[6],code[7],
+                           code[8],code[9],code[10],code[11],code[12],code[13],code[14],code[15]);
+                    printf("    %02X %02X %02X %02X %02X %02X %02X %02X"
+                           " %02X %02X %02X %02X %02X %02X %02X %02X\n",
+                           code[16],code[17],code[18],code[19],code[20],code[21],code[22],code[23],
+                           code[24],code[25],code[26],code[27],code[28],code[29],code[30],code[31]);
+                } else {
+                    printf("  ENTRY @0x%08X: UNMAPPED!\n", entry_addr);
+                }
+            }
 
-                /* 2. CODE BYTES at each possible entry point */
-                uint32_t candidates[] = { ep_chi, ep_dbg, ep_ret };
-                const char *names[] = { "Chihiro", "Debug", "Retail" };
-                for (int i = 0; i < 3; i++) {
-                    if (candidates[i] < 0x08000000) {  /* within 128MB */
-                        uint32_t code_pa = chihiro_va_to_pa(candidates[i]);
-                        if (code_pa != 0xFFFFFFFF) {
-                            uint8_t code[16];
-                            cpu_physical_memory_read(code_pa, code, 16);
-                            printf("  Code@%s(0x%08X PA=0x%08X): "
-                                   "%02X %02X %02X %02X %02X %02X %02X %02X "
-                                   "%02X %02X %02X %02X %02X %02X %02X %02X\n",
-                                   names[i], candidates[i], code_pa,
-                                   code[0],code[1],code[2],code[3],
-                                   code[4],code[5],code[6],code[7],
-                                   code[8],code[9],code[10],code[11],
-                                   code[12],code[13],code[14],code[15]);
-                        } else {
-                            printf("  Code@%s(0x%08X): UNMAPPED\n", names[i], candidates[i]);
-                        }
-                    } else {
-                        printf("  Code@%s(0x%08X): OUT OF RAM\n", names[i], candidates[i]);
+            /* 3. THUNK TABLE — are kernel imports resolved? */
+            if (thunk_addr && thunk_addr < 0x08000000) {
+                uint32_t tk_pa = chihiro_va_to_pa(thunk_addr);
+                if (tk_pa != 0xFFFFFFFF) {
+                    uint32_t thunks[8];
+                    cpu_physical_memory_read(tk_pa, thunks, 32);
+                    printf("  THUNK @0x%08X (PA=0x%08X):\n", thunk_addr, tk_pa);
+                    printf("    [0]=0x%08X [1]=0x%08X [2]=0x%08X [3]=0x%08X\n",
+                           thunks[0], thunks[1], thunks[2], thunks[3]);
+                    printf("    [4]=0x%08X [5]=0x%08X [6]=0x%08X [7]=0x%08X\n",
+                           thunks[4], thunks[5], thunks[6], thunks[7]);
+                    /* Thunks should be 0x80xxxxxx (kernel VA) if resolved */
+                    int resolved = 0;
+                    for (int i = 0; i < 8; i++)
+                        if ((thunks[i] & 0x80000000) && thunks[i] != 0xFFFFFFFF) resolved++;
+                    printf("    %d/8 resolved to kernel VA\n", resolved);
+                }
+            }
+
+            /* 4. XBE SECTION HEADERS — map the memory layout */
+            if (section_hdr_va && num_sections > 0 && num_sections <= 64) {
+                uint32_t sh_pa = chihiro_va_to_pa(section_hdr_va);
+                if (sh_pa != 0xFFFFFFFF) {
+                    printf("  SECTIONS:\n");
+                    for (uint32_t si = 0; si < num_sections && si < 8; si++) {
+                        uint8_t sec[56];
+                        cpu_physical_memory_read(sh_pa + si * 56, sec, 56);
+                        uint32_t sec_flags = *(uint32_t*)(sec + 0x00);
+                        uint32_t sec_va    = *(uint32_t*)(sec + 0x04);
+                        uint32_t sec_vsz   = *(uint32_t*)(sec + 0x08);
+                        uint32_t sec_raw   = *(uint32_t*)(sec + 0x0C);
+                        uint32_t sec_rsz   = *(uint32_t*)(sec + 0x10);
+                        uint32_t sec_name  = *(uint32_t*)(sec + 0x14);
+                        /* Read first 8 bytes of section to check content */
+                        uint32_t sva_pa = chihiro_va_to_pa(sec_va);
+                        uint8_t peek[8] = {0};
+                        if (sva_pa != 0xFFFFFFFF)
+                            cpu_physical_memory_read(sva_pa, peek, 8);
+                        printf("    [%u] VA=0x%08X sz=0x%X raw=0x%X flags=0x%X name@0x%X"
+                               " peek=%02X%02X%02X%02X%02X%02X%02X%02X %s\n",
+                               si, sec_va, sec_vsz, sec_rsz, sec_flags, sec_name,
+                               peek[0],peek[1],peek[2],peek[3],
+                               peek[4],peek[5],peek[6],peek[7],
+                               sva_pa != 0xFFFFFFFF ? "" : "UNMAPPED");
                     }
                 }
-            } else {
-                printf("  XBE header: VA 0x10000 UNMAPPED — game not loaded?\n");
             }
 
-            /* 3. KERNEL CRASH INDICATORS */
-            /* Xbox kernel KeBugCheckEx writes to PA 0x2F000 area */
-            uint8_t bugchk[16];
-            cpu_physical_memory_read(0x2F000, bugchk, 16);
-            printf("  Bugcheck@PA0x2F000: %02X %02X %02X %02X %02X %02X %02X %02X"
-                   " %02X %02X %02X %02X %02X %02X %02X %02X\n",
-                   bugchk[0],bugchk[1],bugchk[2],bugchk[3],
-                   bugchk[4],bugchk[5],bugchk[6],bugchk[7],
-                   bugchk[8],bugchk[9],bugchk[10],bugchk[11],
-                   bugchk[12],bugchk[13],bugchk[14],bugchk[15]);
+            /* 5. STACK — check if any thread has used the stack */
+            /* Xbox default stack top is around 0x00B7xxxx for game threads */
+            uint32_t stack_probes[] = {0x00B70000, 0x00B6F000, 0x00400000, 0x00300000};
+            printf("  STACK probes:\n");
+            for (int sp = 0; sp < 4; sp++) {
+                uint32_t sp_pa = chihiro_va_to_pa(stack_probes[sp]);
+                if (sp_pa != 0xFFFFFFFF) {
+                    uint8_t stk[16];
+                    cpu_physical_memory_read(sp_pa, stk, 16);
+                    int nonzero = 0;
+                    for (int j = 0; j < 16; j++) if (stk[j]) nonzero++;
+                    printf("    0x%08X: %02X%02X%02X%02X %02X%02X%02X%02X %s\n",
+                           stack_probes[sp],
+                           stk[0],stk[1],stk[2],stk[3],stk[4],stk[5],stk[6],stk[7],
+                           nonzero ? "HAS DATA" : "ZEROS");
+                } else {
+                    printf("    0x%08X: UNMAPPED\n", stack_probes[sp]);
+                }
+            }
 
-            /* 4. NV2A PFB CONFIG — does kernel see 128MB? */
+            /* 6. KERNEL STATE — XboxKrnl exports at known offsets */
+            /* LaunchDataPage pointer is at kernel export #164 (0xA4) */
+            /* KeTickCount is at export #156 — if changing, CPU is alive */
+            uint32_t ke_tick_va = 0x80063B58; /* approximate, varies by kernel */
+            uint32_t ke_tick_pa = chihiro_va_to_pa(ke_tick_va);
+            if (ke_tick_pa != 0xFFFFFFFF) {
+                uint32_t ticks;
+                cpu_physical_memory_read(ke_tick_pa, &ticks, 4);
+                printf("  KeTickCount@0x%08X = %u\n", ke_tick_va, ticks);
+            }
+            /* Try to find LaunchDataPage — scan for signature */
+            uint32_t ldp_va = 0x80067A20; /* approximate for arcdkrnl */
+            uint32_t ldp_pa = chihiro_va_to_pa(ldp_va);
+            if (ldp_pa != 0xFFFFFFFF) {
+                uint32_t ldp_ptr;
+                cpu_physical_memory_read(ldp_pa, &ldp_ptr, 4);
+                printf("  LaunchDataPage@0x%08X ptr=0x%08X\n", ldp_va, ldp_ptr);
+                if (ldp_ptr && ldp_ptr < 0x08000000) {
+                    uint32_t ldp_data_pa = chihiro_va_to_pa(ldp_ptr);
+                    if (ldp_data_pa != 0xFFFFFFFF) {
+                        uint8_t ldp[64];
+                        cpu_physical_memory_read(ldp_data_pa, ldp, 64);
+                        printf("  LDP data: %02X%02X%02X%02X %02X%02X%02X%02X"
+                               " %02X%02X%02X%02X %02X%02X%02X%02X\n",
+                               ldp[0],ldp[1],ldp[2],ldp[3],ldp[4],ldp[5],ldp[6],ldp[7],
+                               ldp[8],ldp[9],ldp[10],ldp[11],ldp[12],ldp[13],ldp[14],ldp[15]);
+                    }
+                }
+            }
+
+            /* 7. NV2A STATE */
             uint32_t pfb_cfg0 = 0, pfb_cstatus = 0, pfb_nvm = 0;
-            address_space_read(&address_space_memory, 0xFD100200,
-                               MEMTXATTRS_UNSPECIFIED, &pfb_cfg0, 4);
-            address_space_read(&address_space_memory, 0xFD10020C,
-                               MEMTXATTRS_UNSPECIFIED, &pfb_cstatus, 4);
-            address_space_read(&address_space_memory, 0xFD100214,
-                               MEMTXATTRS_UNSPECIFIED, &pfb_nvm, 4);
-            printf("  NV2A PFB: CFG0=0x%08X CSTATUS=0x%08X(=%uMB) NVM=0x%08X\n",
-                   pfb_cfg0, pfb_cstatus, pfb_cstatus / (1024*1024), pfb_nvm);
-
-            /* 5. NV2A PFIFO — DMA channels configured? */
             uint32_t pfifo_mode = 0, pfifo_enable = 0, pfifo_reassign = 0;
-            address_space_read(&address_space_memory, 0xFD002504,
-                               MEMTXATTRS_UNSPECIFIED, &pfifo_mode, 4);
-            address_space_read(&address_space_memory, 0xFD002200,
-                               MEMTXATTRS_UNSPECIFIED, &pfifo_enable, 4);
-            address_space_read(&address_space_memory, 0xFD002000,
-                               MEMTXATTRS_UNSPECIFIED, &pfifo_reassign, 4);
+            uint32_t pgraph_status = 0, pgraph_intr = 0;
+            uint32_t pmc_enable = 0, pmc_intr = 0;
+            address_space_read(&address_space_memory, 0xFD100200, MEMTXATTRS_UNSPECIFIED, &pfb_cfg0, 4);
+            address_space_read(&address_space_memory, 0xFD10020C, MEMTXATTRS_UNSPECIFIED, &pfb_cstatus, 4);
+            address_space_read(&address_space_memory, 0xFD100214, MEMTXATTRS_UNSPECIFIED, &pfb_nvm, 4);
+            address_space_read(&address_space_memory, 0xFD002504, MEMTXATTRS_UNSPECIFIED, &pfifo_mode, 4);
+            address_space_read(&address_space_memory, 0xFD002200, MEMTXATTRS_UNSPECIFIED, &pfifo_enable, 4);
+            address_space_read(&address_space_memory, 0xFD002000, MEMTXATTRS_UNSPECIFIED, &pfifo_reassign, 4);
+            address_space_read(&address_space_memory, 0xFD400700, MEMTXATTRS_UNSPECIFIED, &pgraph_status, 4);
+            address_space_read(&address_space_memory, 0xFD400100, MEMTXATTRS_UNSPECIFIED, &pgraph_intr, 4);
+            address_space_read(&address_space_memory, 0xFD000200, MEMTXATTRS_UNSPECIFIED, &pmc_enable, 4);
+            address_space_read(&address_space_memory, 0xFD000100, MEMTXATTRS_UNSPECIFIED, &pmc_intr, 4);
+            printf("  NV2A PMC: enable=0x%08X intr=0x%08X\n", pmc_enable, pmc_intr);
+            printf("  NV2A PFB: CFG0=0x%08X CSTATUS=0x%08X(%uMB) NVM=0x%08X\n",
+                   pfb_cfg0, pfb_cstatus, pfb_cstatus/(1024*1024), pfb_nvm);
             printf("  NV2A PFIFO: mode=0x%08X enable=0x%08X reassign=0x%08X\n",
                    pfifo_mode, pfifo_enable, pfifo_reassign);
+            printf("  NV2A PGRAPH: status=0x%08X intr=0x%08X\n", pgraph_status, pgraph_intr);
 
-            /* 6. FRAMEBUFFER — any content? */
+            /* 8. FRAMEBUFFER content */
             uint32_t pcrtc_start = 0;
-            address_space_read(&address_space_memory, 0xFD600800,
-                               MEMTXATTRS_UNSPECIFIED, &pcrtc_start, 4);
-            uint8_t fb_sample[32];
-            cpu_physical_memory_read(pcrtc_start, fb_sample, 32);
-            cpu_physical_memory_read(pcrtc_start + 640*4, fb_sample + 16, 16); /* line 1 */
-            printf("  FB@0x%08X line0: %02X%02X%02X%02X %02X%02X%02X%02X"
+            address_space_read(&address_space_memory, 0xFD600800, MEMTXATTRS_UNSPECIFIED, &pcrtc_start, 4);
+            uint8_t fb[16];
+            cpu_physical_memory_read(pcrtc_start, fb, 16);
+            printf("  FB@0x%08X: %02X%02X%02X%02X %02X%02X%02X%02X"
                    " %02X%02X%02X%02X %02X%02X%02X%02X\n",
                    pcrtc_start,
-                   fb_sample[0],fb_sample[1],fb_sample[2],fb_sample[3],
-                   fb_sample[4],fb_sample[5],fb_sample[6],fb_sample[7],
-                   fb_sample[8],fb_sample[9],fb_sample[10],fb_sample[11],
-                   fb_sample[12],fb_sample[13],fb_sample[14],fb_sample[15]);
-            printf("  FB line1: %02X%02X%02X%02X %02X%02X%02X%02X"
-                   " %02X%02X%02X%02X %02X%02X%02X%02X\n",
-                   fb_sample[16],fb_sample[17],fb_sample[18],fb_sample[19],
-                   fb_sample[20],fb_sample[21],fb_sample[22],fb_sample[23],
-                   fb_sample[24],fb_sample[25],fb_sample[26],fb_sample[27],
-                   fb_sample[28],fb_sample[29],fb_sample[30],fb_sample[31]);
+                   fb[0],fb[1],fb[2],fb[3],fb[4],fb[5],fb[6],fb[7],
+                   fb[8],fb[9],fb[10],fb[11],fb[12],fb[13],fb[14],fb[15]);
 
-            /* 7. PAGE TABLE — check key VAs are mapped */
-            uint32_t va_tests[] = {0x10000, 0xB8BAC, 0x80010000, 0xD0000000, 0xFD000000};
-            printf("  VA mapping: ");
-            for (int v = 0; v < 5; v++) {
-                uint32_t pa = chihiro_va_to_pa(va_tests[v]);
-                printf("0x%08X→%s ", va_tests[v],
-                       pa != 0xFFFFFFFF ? "OK" : "UNMAPPED");
+            /* 9. Scan kernel memory for HalReturnToFirmware action code */
+            /* The kernel stores the reboot reason at a known location */
+            /* Xbox kernel stores XeImageFileName at ~0x80060080 */
+            uint32_t xeimg_pa = chihiro_va_to_pa(0x80060080);
+            if (xeimg_pa != 0xFFFFFFFF) {
+                uint8_t xeimg[64];
+                cpu_physical_memory_read(xeimg_pa, xeimg, 64);
+                printf("  XeImageFileName@0x80060080: ");
+                for (int i = 0; i < 48 && xeimg[i]; i++) printf("%c", xeimg[i] >= 0x20 ? xeimg[i] : '.');
+                printf("\n");
+            }
+
+            /* 10. VA map for game address range */
+            printf("  VA map: ");
+            uint32_t va_probes[] = {0x10000, 0xB8BAC, 0x100000, 0x150000, 0x1A0000,
+                                    0x200000, 0x80010000, 0xD0000000, 0xD0010000, 0xFD000000};
+            for (int v = 0; v < 10; v++) {
+                uint32_t pa = chihiro_va_to_pa(va_probes[v]);
+                if (pa != 0xFFFFFFFF)
+                    printf("%X→%X ", va_probes[v], pa);
+                else
+                    printf("%X→X ", va_probes[v]);
             }
             printf("\n");
-
-            /* 8. SMC SCRATCH / kernel state */
-            uint8_t smc_scratch = 0;
-            /* Read kernel's IdleProcess.Threads to check if threads running */
-            uint32_t kprocess_pa = chihiro_va_to_pa(0x80048A60); /* approx KiIdleProcess */
-            printf("  KiIdleProcess VA=0x80048A60 PA=0x%08X\n", kprocess_pa);
 
             printf("============================\n");
         }
 
-        /* === PERIODIC SUMMARY (every 10s) === */
+        /* === PERIODIC SUMMARY === */
         if (game_diag_count <= 5 || (game_diag_count % 10) == 0) {
             uint32_t pgraph_status = 0, pcrtc_start = 0, pcrtc_intr = 0;
             uint32_t pramdac_vdisp = 0, pramdac_hdisp = 0;
-            address_space_read(&address_space_memory, 0xFD400700,
-                               MEMTXATTRS_UNSPECIFIED, &pgraph_status, 4);
-            address_space_read(&address_space_memory, 0xFD600800,
-                               MEMTXATTRS_UNSPECIFIED, &pcrtc_start, 4);
-            address_space_read(&address_space_memory, 0xFD600100,
-                               MEMTXATTRS_UNSPECIFIED, &pcrtc_intr, 4);
-            address_space_read(&address_space_memory, 0xFD680800,
-                               MEMTXATTRS_UNSPECIFIED, &pramdac_vdisp, 4);
-            address_space_read(&address_space_memory, 0xFD680820,
-                               MEMTXATTRS_UNSPECIFIED, &pramdac_hdisp, 4);
+            address_space_read(&address_space_memory, 0xFD400700, MEMTXATTRS_UNSPECIFIED, &pgraph_status, 4);
+            address_space_read(&address_space_memory, 0xFD600800, MEMTXATTRS_UNSPECIFIED, &pcrtc_start, 4);
+            address_space_read(&address_space_memory, 0xFD600100, MEMTXATTRS_UNSPECIFIED, &pcrtc_intr, 4);
+            address_space_read(&address_space_memory, 0xFD680800, MEMTXATTRS_UNSPECIFIED, &pramdac_vdisp, 4);
+            address_space_read(&address_space_memory, 0xFD680820, MEMTXATTRS_UNSPECIFIED, &pramdac_hdisp, 4);
             printf("[%07lld] GAME DIAG #%d: PGRAPH=0x%08X PCRTC=0x%08X/%u VIDEO=%ux%u\n",
                    TS_MS, game_diag_count, pgraph_status, pcrtc_start, pcrtc_intr,
                    (pramdac_hdisp & 0xFFF) + 1, (pramdac_vdisp & 0xFFF) + 1);
