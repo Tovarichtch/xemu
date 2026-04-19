@@ -250,8 +250,41 @@ static void chihiro_diag_timer_cb(void *opaque)
 {
     ChihiroLPCState *s = (ChihiroLPCState *)opaque;
 
-    /* After QuickReboot, SEGABOOT VAs are invalid — game XBE owns memory */
+    /* After QuickReboot, SEGABOOT VAs are invalid — game XBE owns memory.
+     * Provide lightweight game-mode DIAG instead. */
     if (chihiro_game_running) {
+        static int game_diag_count = 0;
+        game_diag_count++;
+        if (game_diag_count <= 5 || (game_diag_count % 10) == 0) {
+            /* NV2A PGRAPH: check if GPU is receiving commands */
+            uint32_t pgraph_status = 0, pgraph_intr = 0;
+            uint32_t pcrtc_start = 0, pcrtc_intr = 0;
+            uint32_t pfifo_cache = 0, pfifo_mode = 0;
+            uint32_t pramdac_vdisp = 0, pramdac_hdisp = 0;
+            address_space_read(&address_space_memory, 0xFD400700,
+                               MEMTXATTRS_UNSPECIFIED, &pgraph_status, 4);
+            address_space_read(&address_space_memory, 0xFD400100,
+                               MEMTXATTRS_UNSPECIFIED, &pgraph_intr, 4);
+            address_space_read(&address_space_memory, 0xFD600800,
+                               MEMTXATTRS_UNSPECIFIED, &pcrtc_start, 4);
+            address_space_read(&address_space_memory, 0xFD600100,
+                               MEMTXATTRS_UNSPECIFIED, &pcrtc_intr, 4);
+            address_space_read(&address_space_memory, 0xFD003210,
+                               MEMTXATTRS_UNSPECIFIED, &pfifo_cache, 4);
+            address_space_read(&address_space_memory, 0xFD002504,
+                               MEMTXATTRS_UNSPECIFIED, &pfifo_mode, 4);
+            address_space_read(&address_space_memory, 0xFD680800,
+                               MEMTXATTRS_UNSPECIFIED, &pramdac_vdisp, 4);
+            address_space_read(&address_space_memory, 0xFD680820,
+                               MEMTXATTRS_UNSPECIFIED, &pramdac_hdisp, 4);
+            printf("[%07lld] GAME DIAG #%d: PGRAPH status=0x%08X intr=0x%08X |"
+                   " PCRTC start=0x%08X intr=0x%08X |"
+                   " PFIFO cache=0x%08X mode=0x%08X |"
+                   " VIDEO %ux%u\n",
+                   TS_MS, game_diag_count, pgraph_status, pgraph_intr,
+                   pcrtc_start, pcrtc_intr, pfifo_cache, pfifo_mode,
+                   (pramdac_hdisp & 0xFFF) + 1, (pramdac_vdisp & 0xFFF) + 1);
+        }
         timer_mod(s->diag_timer,
                   qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 1000);
         return;
