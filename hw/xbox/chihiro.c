@@ -128,6 +128,7 @@ typedef struct ChihiroLPCState {
     OBJECT_CHECK(ChihiroLPCState, (obj), "chihiro-lpc")
 
 static bool chihiro_active;
+static bool chihiro_game_running;  /* Set after QuickReboot — disables SEGABOOT DMA scan */
 static ChihiroLPCState *chihiro_lpc_global;
 
 /* USB devices for delayed hotplug (simulates AN2131 I2C firmware boot) */
@@ -247,6 +248,14 @@ static uint32_t chihiro_va_to_pa(uint32_t va)
 static void chihiro_diag_timer_cb(void *opaque)
 {
     ChihiroLPCState *s = (ChihiroLPCState *)opaque;
+
+    /* After QuickReboot, SEGABOOT VAs are invalid — game XBE owns memory */
+    if (chihiro_game_running) {
+        timer_mod(s->diag_timer,
+                  qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 1000);
+        return;
+    }
+
     uint32_t state = 0, counter = 0, ready = 0, gate = 0, bootstate = 0;
     uint32_t bootflag = 0, slotcount = 0, mainflag = 0;
     uint8_t slotflag0 = 0;
@@ -681,7 +690,8 @@ static void chihiro_usb_poll_patch_cb(void *opaque)
 bool chihiro_intercept_reset(void)
 {
     if (chihiro_active) {
-        printf("[%07lld] Chihiro: QuickReboot intercepted (SMC cmd=0x02) — blocking QEMU reset\n", TS_MS);
+        printf("[%07lld] Chihiro: QuickReboot intercepted — game XBE taking over, disabling mbcom DMA scan\n", TS_MS);
+        chihiro_game_running = true;
         return true;  /* Block qemu_system_reset_request */
     }
     return false;
@@ -811,21 +821,15 @@ static void chihiro_irq10_timer_cb(void *opaque)
 {
     ChihiroLPCState *s = opaque;
 
-    if (s->eeprom_hack_applied) {
+    if (s->eeprom_hack_applied && !chihiro_game_running) {
         qemu_irq_raise(s->irq10);
     }
 
     /* DMA emulation: scan game's mbcom TX slots for pending commands.
-     * On real HW, the baseboard picks up commands via DMA and responds.
-     * Without this, commands queued by the async mbcom path (boot data reader)
-     * never reach FC801 because the mbcom tick is on the same blocked thread.
-     *
-     * Slot array at VA 0x89760, 16 slots, stride 0x40:
-     *   byte[3] bit7 SET = command pending (SendCommand sets this)
-     *   byte[3] bit7 CLEAR = free or response ready
-     *   slot+0x20 = data area (32 bytes: type, flags, command, params)
-     */
-    if (chihiro_mbcom_enabled) {
+     * DISABLED after QuickReboot — the game XBE uses these memory addresses
+     * for its own code/data, not mbcom commands. Reading them as commands
+     * corrupts game memory with garbage responses. */
+    if (chihiro_mbcom_enabled && !chihiro_game_running) {
         uint32_t slot_base_pa = chihiro_va_to_pa(0x89760);
         if (slot_base_pa != 0xFFFFFFFF) {
             /* TX scan: process any pending commands from the game */
