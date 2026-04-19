@@ -730,6 +730,176 @@ static void chihiro_diag_timer_cb(void *opaque)
                 }
             }
 
+            /* 20. FULL DEVICE STRING SCAN — find ALL \Device\ paths in kernel memory */
+            {
+                printf("  DEVICE PATHS (PA 0x10000-0x80000):\n");
+                int dev_count = 0;
+                for (uint32_t pa = 0x10000; pa < 0x80000 - 16; pa++) {
+                    uint8_t buf[8];
+                    cpu_physical_memory_read(pa, buf, 8);
+                    /* Look for "\\Device\\" or "\Device\" (ASCII) */
+                    if ((buf[0]=='\\' && buf[1]=='D' && buf[2]=='e' && buf[3]=='v' &&
+                         buf[4]=='i' && buf[5]=='c' && buf[6]=='e' && buf[7]=='\\') ||
+                        (buf[0]=='\\' && buf[1]=='D' && buf[2]=='E' && buf[3]=='V')) {
+                        uint8_t path[80];
+                        cpu_physical_memory_read(pa, path, 80);
+                        printf("    PA 0x%05X: ", pa);
+                        for (int c = 0; c < 78 && path[c] >= 0x20 && path[c] < 0x7F; c++)
+                            printf("%c", path[c]);
+                        printf("\n");
+                        if (++dev_count >= 20) { printf("    ... (truncated)\n"); break; }
+                        pa += 8; /* skip past this match */
+                    }
+                }
+                if (dev_count == 0) printf("    NONE FOUND\n");
+            }
+
+            /* 21. DRIVE LETTER & SYMLINK SCAN — look for D:\, T:\, mbfs:, etc */
+            {
+                printf("  DRIVE LETTERS / SYMLINKS:\n");
+                const char *needles[] = {"D:\\", "T:\\", "U:\\", "Z:\\", "E:\\", "mbfs:", "mbcom:", "mbrom:", "\\??\\", NULL};
+                for (int n = 0; needles[n]; n++) {
+                    int nlen = strlen(needles[n]);
+                    int found = 0;
+                    for (uint32_t pa = 0x10000; pa < 0x80000 - nlen && !found; pa++) {
+                        uint8_t buf[8];
+                        cpu_physical_memory_read(pa, buf, nlen);
+                        if (memcmp(buf, needles[n], nlen) == 0) {
+                            uint8_t ctx[64];
+                            cpu_physical_memory_read(pa, ctx, 64);
+                            printf("    '%s' at PA 0x%05X: ", needles[n], pa);
+                            for (int c = 0; c < 60 && ctx[c] >= 0x20 && ctx[c] < 0x7F; c++)
+                                printf("%c", ctx[c]);
+                            printf("\n");
+                            found = 1;
+                        }
+                    }
+                }
+            }
+
+            /* 22. WIDE STRING DEVICE SCAN — kernel uses Unicode (UTF-16LE) for object names */
+            {
+                printf("  UNICODE DEVICE SCAN (\\0D\\0e\\0v\\0i):\n");
+                int udev_count = 0;
+                for (uint32_t pa = 0x10000; pa < 0x80000 - 20; pa += 2) {
+                    uint8_t buf[16];
+                    cpu_physical_memory_read(pa, buf, 16);
+                    /* UTF-16LE: \=5C00 D=4400 e=6500 v=7600 i=6900 c=6300 e=6500 */
+                    if (buf[0]==0x5C && buf[1]==0x00 && buf[2]==0x44 && buf[3]==0x00 &&
+                        buf[4]==0x65 && buf[5]==0x00 && buf[6]==0x76 && buf[7]==0x00 &&
+                        buf[8]==0x69 && buf[9]==0x00) {
+                        uint8_t wpath[128];
+                        cpu_physical_memory_read(pa, wpath, 128);
+                        printf("    PA 0x%05X: ", pa);
+                        for (int c = 0; c < 126; c += 2) {
+                            if (wpath[c] == 0 && wpath[c+1] == 0) break;
+                            if (wpath[c] >= 0x20 && wpath[c] < 0x7F && wpath[c+1] == 0)
+                                printf("%c", wpath[c]);
+                            else
+                                printf("?");
+                        }
+                        printf("\n");
+                        if (++udev_count >= 20) { printf("    ... (truncated)\n"); break; }
+                        pa += 16;
+                    }
+                }
+                if (udev_count == 0) printf("    NONE FOUND\n");
+            }
+
+            /* 23. UNICODE CdRom + Harddisk scan — specifically look for these */
+            {
+                printf("  UNICODE KEY STRINGS:\n");
+                /* CdRom in UTF-16LE: 43006400520068006F006D00 */
+                uint8_t cdrom_u16[] = {0x43,0x00,0x64,0x00,0x52,0x00,0x6F,0x00,0x6D,0x00};
+                /* Harddisk: 48006100720064006400 */
+                uint8_t hddisk_u16[] = {0x48,0x00,0x61,0x00,0x72,0x00,0x64,0x00,0x64,0x00};
+                int found_cd = 0, found_hd = 0;
+                for (uint32_t pa = 0x10000; pa < 0x80000 - 12; pa += 2) {
+                    uint8_t buf[10];
+                    cpu_physical_memory_read(pa, buf, 10);
+                    if (!found_cd && memcmp(buf, cdrom_u16, 10) == 0) {
+                        uint8_t ctx[64];
+                        cpu_physical_memory_read(pa, ctx, 64);
+                        printf("    'CdRom'(u16) PA 0x%05X: ", pa);
+                        for (int c = 0; c < 62; c += 2) {
+                            if (ctx[c]==0 && ctx[c+1]==0) break;
+                            printf("%c", (ctx[c]>=0x20 && ctx[c]<0x7F && ctx[c+1]==0) ? ctx[c] : '.');
+                        }
+                        printf("\n");
+                        found_cd = 1;
+                    }
+                    if (!found_hd && memcmp(buf, hddisk_u16, 10) == 0) {
+                        uint8_t ctx[64];
+                        cpu_physical_memory_read(pa, ctx, 64);
+                        printf("    'Hardd'(u16) PA 0x%05X: ", pa);
+                        for (int c = 0; c < 62; c += 2) {
+                            if (ctx[c]==0 && ctx[c+1]==0) break;
+                            printf("%c", (ctx[c]>=0x20 && ctx[c]<0x7F && ctx[c+1]==0) ? ctx[c] : '.');
+                        }
+                        printf("\n");
+                        found_hd = 1;
+                    }
+                }
+                if (!found_cd) printf("    'CdRom'(u16): NOT FOUND\n");
+                if (!found_hd) printf("    'Hardd'(u16): NOT FOUND\n");
+            }
+
+            /* 24. QuickReboot / HalReturnToFirmware state */
+            {
+                printf("  REBOOT STATE:\n");
+                /* SMC scratch register (HalReturnToFirmware writes here) */
+                /* Check PA 0x00050000-0x00060000 for QuickReboot magic */
+                /* Xbox LaunchDataPage is at a fixed kernel export address */
+                /* Scan for the QuickReboot magic 0x01 at various kernel locations */
+                uint32_t reboot_vas[] = {0x80038000, 0x80039000, 0x8003A000, 0x8003B000,
+                                         0x8003C000, 0x8003D000, 0x8003E000, 0x8003F000};
+                for (int rv = 0; rv < 8; rv++) {
+                    uint32_t rpa = chihiro_va_to_pa(reboot_vas[rv]);
+                    if (rpa != 0xFFFFFFFF) {
+                        uint8_t rd[16];
+                        cpu_physical_memory_read(rpa, rd, 16);
+                        /* Only print if non-zero */
+                        int nz = 0;
+                        for (int i = 0; i < 16; i++) if (rd[i]) nz = 1;
+                        if (nz) {
+                            printf("    @0x%08X: %02X%02X%02X%02X %02X%02X%02X%02X"
+                                   " %02X%02X%02X%02X %02X%02X%02X%02X\n",
+                                   reboot_vas[rv],
+                                   rd[0],rd[1],rd[2],rd[3],rd[4],rd[5],rd[6],rd[7],
+                                   rd[8],rd[9],rd[10],rd[11],rd[12],rd[13],rd[14],rd[15]);
+                        }
+                    }
+                }
+            }
+
+            /* 25. IDE drive identity — what does the kernel see on IDE1? */
+            {
+                printf("  IDE1 IDENTITY CHECK:\n");
+                /* Read the IDE status registers directly from PCI config space */
+                /* BAR4 for IDE is at PCI 0:9.0 offset 0x20 */
+                /* Check IDE secondary status at I/O 0x170-0x177 */
+                /* Actually, just check if IDE unit 1 responded to IDENTIFY */
+                /* Look at kernel memory for the IDENTIFY response data */
+                /* The kernel stores disk geometry info after IDE enumeration */
+                /* Search for "QEMU" or disk model string in kernel memory */
+                int found_ident = 0;
+                for (uint32_t pa = 0x10000; pa < 0x80000 - 8; pa += 2) {
+                    uint8_t buf[8];
+                    cpu_physical_memory_read(pa, buf, 8);
+                    if (buf[0]=='Q' && buf[1]=='E' && buf[2]=='M' && buf[3]=='U') {
+                        uint8_t ctx[48];
+                        cpu_physical_memory_read(pa, ctx, 48);
+                        printf("    'QEMU' at PA 0x%05X: ", pa);
+                        for (int c = 0; c < 44; c++)
+                            printf("%c", ctx[c] >= 0x20 && ctx[c] < 0x7F ? ctx[c] : '.');
+                        printf("\n");
+                        found_ident = 1;
+                        break;
+                    }
+                }
+                if (!found_ident) printf("    'QEMU' ident string: NOT FOUND\n");
+            }
+
             printf("============================\n");
         }
 
