@@ -128,7 +128,7 @@ typedef struct ChihiroLPCState {
     OBJECT_CHECK(ChihiroLPCState, (obj), "chihiro-lpc")
 
 static bool chihiro_active;
-static bool chihiro_game_running;  /* Set after QuickReboot — disables SEGABOOT DMA scan */
+bool chihiro_game_running;  /* Set after QuickReboot — disables SEGABOOT DMA scan */
 static bool chihiro_boot3_reached; /* Set when SEGABOOT reaches boot=3 (checks complete) */
 static ChihiroLPCState *chihiro_lpc_global;
 
