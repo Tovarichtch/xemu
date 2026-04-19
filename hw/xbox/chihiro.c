@@ -1236,7 +1236,7 @@ static uint64_t chihiro_lpc_io_read(void *opaque, hwaddr addr,
         r = 0x4D41;     /* "MA" → full string reads as "XBAM" */
         break;
     case SEGA_CHIP_REVISION:
-        r = 0x0001;
+        r = 0x0000;     /* bits 15-0: 0 = media board present (MAME) */
         s->lpc_40f0_reads++;
         /* Detect game XBE reboot: if SEGABOOT already reached boot=3
          * and the kernel re-reads 0x40F0, the game XBE is initializing.
