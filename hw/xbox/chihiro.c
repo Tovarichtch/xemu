@@ -979,28 +979,41 @@ static void chihiro_diag_timer_cb(void *opaque)
                s->last_bootstate, bootstate);
         if (bootstate == 3) {
             chihiro_boot3_reached = true;
-            /* Save game filename NOW — SEGABOOT wrote "mbfs:\<game>.xbe"
-             * to RAM but the QuickReboot will clear it. */
+            /* Save game filename NOW — SEGABOOT wrote "<game>.xbe"
+             * to RAM but the QuickReboot will clear it.
+             * Scan for ".xbe" in PA 0x50000-0x56000, then walk backwards
+             * to find the start of the filename. */
             chihiro_game_filename[0] = 0;
-            for (uint32_t pa = 0x50000; pa < 0x60000; pa++) {
-                uint8_t buf[6];
-                cpu_physical_memory_read(pa, buf, 6);
-                if (memcmp(buf, "mbfs:\\", 6) == 0 ||
-                    memcmp(buf, "mbfs:/", 6) == 0) {
-                    uint8_t path[64];
-                    cpu_physical_memory_read(pa + 6, path, 63);
-                    path[63] = 0;
-                    int j = 0;
-                    for (int i = 0; i < 63 && path[i] >= 0x20 &&
-                         path[i] < 0x7F; i++) {
-                        chihiro_game_filename[j++] = path[i];
+            for (uint32_t pa = 0x50000; pa < 0x56000; pa++) {
+                uint8_t buf[4];
+                cpu_physical_memory_read(pa, buf, 4);
+                if (memcmp(buf, ".xbe", 4) == 0 ||
+                    memcmp(buf, ".XBE", 4) == 0) {
+                    /* Found .xbe extension — walk backwards to find
+                     * start of filename */
+                    int start = 0;
+                    uint8_t fname[64];
+                    for (int back = 1; back <= 42; back++) {
+                        uint8_t c;
+                        cpu_physical_memory_read(pa - back, &c, 1);
+                        if (c < 0x20 || c >= 0x7F || c == '\\' ||
+                            c == '/' || c == ':') {
+                            start = back - 1;
+                            break;
+                        }
+                        start = back;
                     }
-                    chihiro_game_filename[j] = 0;
-                    if (j > 4) {
-                        printf("[%07lld] Chihiro: saved game filename '%s' "
-                               "(from mbfs:\\ at PA 0x%05X)\n",
-                               TS_MS, chihiro_game_filename, pa);
-                        break;
+                    if (start > 0) {
+                        cpu_physical_memory_read(pa - start, fname, start + 4);
+                        fname[start + 4] = 0;
+                        int len = start + 4;
+                        if (len > 4 && len < 60) {
+                            memcpy(chihiro_game_filename, fname, len + 1);
+                            printf("[%07lld] Chihiro: saved game filename '%s' "
+                                   "(from .xbe at PA 0x%05X)\n",
+                                   TS_MS, chihiro_game_filename, pa - start);
+                            break;
+                        }
                     }
                 }
             }
