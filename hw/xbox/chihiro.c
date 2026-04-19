@@ -1236,7 +1236,13 @@ static uint64_t chihiro_lpc_io_read(void *opaque, hwaddr addr,
         r = 0x4D41;     /* "MA" → full string reads as "XBAM" */
         break;
     case SEGA_CHIP_REVISION:
-        r = 0x0000;     /* bits 15-0: 0 = media board present (MAME) */
+        /* Port 0x40F0 has two consumers:
+         * 1. The KERNEL reads it during early boot (first 2 reads, ~5s).
+         *    MAME: "bits 15-0 = 0 if media board present" → must return 0
+         *    so the arcdkrnl creates \Device\CdRom0 → D:\ mapping.
+         * 2. SEGABOOT reads it later (~15s) as a negotiation status check.
+         *    Must return non-zero (0x0001) or SEGABOOT skips mbcom → ERROR 22. */
+        r = (s->lpc_40f0_reads < 2) ? 0x0000 : 0x0001;
         s->lpc_40f0_reads++;
         /* Detect game XBE reboot: if SEGABOOT already reached boot=3
          * and the kernel re-reads 0x40F0, the game XBE is initializing.
