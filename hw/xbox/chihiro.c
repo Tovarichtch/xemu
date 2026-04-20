@@ -1595,8 +1595,14 @@ static uint64_t chihiro_lpc_io_read(void *opaque, hwaddr addr,
          *    MAME: "bits 15-0 = 0 if media board present" → must return 0
          *    so the arcdkrnl creates \Device\CdRom0 → D:\ mapping.
          * 2. SEGABOOT reads it later (~15s) as a negotiation status check.
-         *    Must return non-zero (0x0001) or SEGABOOT skips mbcom → ERROR 22. */
-        r = (s->lpc_40f0_reads < 2) ? 0x0000 : 0x0001;
+         *    Must return non-zero (0x0001) or SEGABOOT skips mbcom → ERROR 22.
+         * 3. v209: GAME KERNEL re-reads it after QuickReboot. Must return 0
+         *    again (mediaboard present) or game won't create D:\ mapping. */
+        if (chihiro_game_running) {
+            r = 0x0000;  /* Game kernel: mediaboard present */
+        } else {
+            r = (s->lpc_40f0_reads < 2) ? 0x0000 : 0x0001;
+        }
         s->lpc_40f0_reads++;
         /* Detect game XBE reboot: if SEGABOOT already reached boot=3
          * and the kernel re-reads 0x40F0, the game XBE is initializing.
