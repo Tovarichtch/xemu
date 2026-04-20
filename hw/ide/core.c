@@ -1531,6 +1531,25 @@ static bool cmd_identify(IDEState *s, uint8_t cmd)
         } else {
             ide_cfata_identify(s);
         }
+
+        /* Chihiro: override IDENTIFY for baseboard (unit 1).
+         * MAME's ide_baseboard_device reports CHS 65535/255/255.
+         * The arcdkrnl MediaBoard driver checks this geometry to
+         * distinguish the baseboard from a regular HDD. Without it,
+         * the kernel never creates \Device\MediaBoard partitions. */
+        if (s->unit == 1) {
+            extern bool chihiro_game_running;
+            extern void chihiro_mbcom_init(void);
+            uint16_t *p = (uint16_t *)s->identify_data;
+            put_le16(p + 1, 65535);  /* cylinders */
+            put_le16(p + 3, 255);    /* heads */
+            put_le16(p + 6, 255);    /* sectors per track */
+            put_le16(p + 54, 65535); /* current cylinders */
+            put_le16(p + 55, 255);   /* current heads */
+            put_le16(p + 56, 255);   /* current sectors */
+            padstr((char *)(p + 27), "SEGA CHIHIRO BASEBOARD", 40);
+        }
+
         s->status = READY_STAT | SEEK_STAT;
         ide_transfer_start(s, s->io_buffer, 512, ide_transfer_stop);
         ide_bus_set_irq(s->bus);
