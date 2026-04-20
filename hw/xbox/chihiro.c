@@ -1115,13 +1115,9 @@ static void chihiro_diag_timer_cb(void *opaque)
            xbe2_d0798, xbe2_d07a8, xbe2_ce_state,
            (xbe2_ce_pa != 0xFFFFFFFF) ? "xbe2:mapped" : "xbe2:UNMAPPED");
 
-    /* v206b: Monitor AND force baseboard_dev[].flags.
-     * RE confirmed: baseboard_dev[] at VA 0xA3778, stride 0x218, flags at offset +4.
-     * bit 0x01=init, 0x08=?, 0x20=opened, 0x40=connected.
-     * If flags are 0 during boot=1 (UsbEnumPoll window), force to 0x7F
-     * to break the circular dependency and see if bulk transfers start. */
+    /* v206b: Read-only monitoring of baseboard_dev[].flags.
+     * RE confirmed: baseboard_dev[] at VA 0xA3778, stride 0x218, flags at offset +4. */
     {
-        static bool flags_forced = false;
         uint32_t dev0_base_va = 0xA3778;
         uint32_t dev1_base_va = 0xA3778 + 0x218;  /* 0xA3990 */
         uint32_t dev0_flags_pa = chihiro_va_to_pa(dev0_base_va + 4);
@@ -1141,7 +1137,7 @@ static void chihiro_diag_timer_cb(void *opaque)
 
         printf("[%07lld] DIAG USB-DEV: dev0[%05X→PA %X] raw=%02X%02X%02X%02X "
                "FLAGS=0x%08X %02X%02X%02X%02X %02X%02X%02X%02X | "
-               "dev1[%05X→PA %X] FLAGS=0x%08X%s\n",
+               "dev1[%05X→PA %X] FLAGS=0x%08X\n",
                TS_MS,
                dev0_base_va, dev0_base_pa,
                dev0_raw[0], dev0_raw[1], dev0_raw[2], dev0_raw[3],
@@ -1149,19 +1145,7 @@ static void chihiro_diag_timer_cb(void *opaque)
                dev0_raw[8], dev0_raw[9], dev0_raw[10], dev0_raw[11],
                dev0_raw[12], dev0_raw[13], dev0_raw[14], dev0_raw[15],
                dev1_base_va, dev1_base_pa,
-               dev1_flags,
-               flags_forced ? " [FORCED]" : "");
-
-        /* Force flags during UsbEnumPoll window (boot=1, first 6 seconds) */
-        if (bootstate == 1 && !flags_forced &&
-            dev0_flags_pa != 0xFFFFFFFF && dev1_flags_pa != 0xFFFFFFFF) {
-            uint32_t force_val = 0x7F;  /* all bits 0-6 set */
-            cpu_physical_memory_write(dev0_flags_pa, &force_val, 4);
-            cpu_physical_memory_write(dev1_flags_pa, &force_val, 4);
-            flags_forced = true;
-            printf("[%07lld] DIAG USB-DEV: *** FORCED dev0+dev1 flags to 0x7F at PA 0x%X / 0x%X ***\n",
-                   TS_MS, dev0_flags_pa, dev1_flags_pa);
-        }
+               dev1_flags);
     }
 
     /* v202: Thread + USB counters (only print if any activity or thread exists) */
@@ -1278,15 +1262,15 @@ static void chihiro_usb_poll_patch_cb(void *opaque)
     };
 
     /*
-     * Patch 2: RegisterClassDriver error check (VA 0x41F74) — REMOVED in v203
-     *   Was: je→jmp to skip RegisterClassDriver failure handling
-     *   Now: let RegisterClassDriver execute — class driver registration will run
+     * Patch 2: RegisterClassDriver error check (VA 0x41F74) — v207b: RE-ENABLED
+     *   Also fails because depends on UsbEnumPoll side effects.
+     *   Both skips needed to pass baseboard_init. Post-init is full LLE.
      */
-    /* static const uint8_t sig_classdrv[] = {
-        0xE8, 0x27, 0x54, 0x00, 0x00,
-        0x85, 0xC0,
-        0x74, 0x0F
-    }; */
+    static const uint8_t sig_classdrv[] = {
+        0xE8, 0x27, 0x54, 0x00, 0x00,  /* call RegisterClassDriver */
+        0x85, 0xC0,                    /* test eax, eax            */
+        0x74, 0x0F                     /* je +0x0F                 */
+    };
 
     /*
      * Patch 3: GetQcStatusByte0 (VA 0x3AD80)
@@ -1452,38 +1436,9 @@ static void chihiro_usb_poll_patch_cb(void *opaque)
      * now includes AV_FLAGS_HDTV_480p (0x00080000) so the kernel configures
      * NV2A for progressive scan 31kHz. SEGABOOT's video check passes naturally. */
 
-    /* v206: TDBuilder bit 0x20 check NOP patches.
-     * RE confirmed: TDBuilder checks baseboard_dev[dev].flags & 0x20 before
-     * submitting ANY bulk transfer. If bit 0x20 (device opened) is not set,
-     * the transfer is silently dropped — no USB packet reaches the device.
-     *
-     * Bit 0x20 requires bit 0x40 (device connected), which requires SET_CONFIG,
-     * which requires FindMatchingDriver, which requires RegisterClassDriver,
-     * which is called AFTER UsbEnumPoll — circular dependency.
-     *
-     * NOP the conditional jumps so TDBuilder always submits transfers.
-     * This allows UsbPollQC/SC bulk reads to reach the AN2131 devices.
-     *
-     * TDBuilder instance 1 (VA 0x69F8E):
-     *   test byte [eax+4], 0x20  ; F6 40 04 20
-     *   je +0x0D                 ; 74 0D  ← NOP this
-     *
-     * TDBuilder instance 2 (VA 0x6FFA8):
-     *   test byte [eax+4], 0x20  ; F6 40 04 20
-     *   je +0x0C                 ; 74 0C  ← NOP this
-     */
-    static const uint8_t sig_tdbuilder1[] = {
-        0xA0, 0xDD, 0x01, 0x00,            /* mov eax, 0x1DDA0 (fallback) */
-        0xF6, 0x40, 0x04, 0x20,            /* test byte [eax+4], 0x20    */
-        0x74, 0x0D,                        /* je +0x0D                   */
-        0x6A, 0x02                         /* push 2                     */
-    };
-    static const uint8_t sig_tdbuilder2[] = {
-        0xA0, 0xDD, 0x01, 0x00,            /* mov eax, 0x1DDA0 (fallback) */
-        0xF6, 0x40, 0x04, 0x20,            /* test byte [eax+4], 0x20    */
-        0x74, 0x0C,                        /* je +0x0C                   */
-        0x6A, 0x02                         /* push 2                     */
-    };
+    /* v207b: TDBuilder NOP patches REMOVED — diagnostic only, proven ineffective
+     * in v206. With UsbEnumPoll/RegisterClassDriver skipped, this code path
+     * is bypassed anyway. Kept as documentation of the RE finding. */
 
     /* Patch byte arrays */
     static const uint8_t patch_jmp[]   = { 0xEB };
@@ -1492,14 +1447,14 @@ static void chihiro_usb_poll_patch_cb(void *opaque)
     /* v200: patch_xor_ret4 removed — was only used by UsbPollQC/SC patches */
     /* static const uint8_t patch_xor_ret4[] = { 0x31, 0xC0, 0xC2, 0x04, 0x00 }; */
     static const uint8_t patch_xor_nop3[]  = { 0x31, 0xC0, 0x90, 0x90, 0x90 }; /* xor eax, eax; nop*3 */
-    static const uint8_t patch_nop2[]       = { 0x90, 0x90 };                    /* v206: NOP NOP */
 
     ChihiroPatch patches[] = {
-        /* v207: UsbEnumPoll skip RE-ENABLED — breaks circular dependency timing.
-         * RegisterClassDriver remains UNPATCHED — runs natively after this. */
-        { sig_enumpoll, sizeof(sig_enumpoll), 7,  patch_jmp,     1, 0x41F57, "UsbEnumPoll check (je->jmp) [v207]",  false },
-        /* v203: RegisterClassDriver UNPATCHED — executes natively to register bDeviceClass=0x60 driver */
-        /* { sig_classdrv, sizeof(sig_classdrv), 7,  patch_jmp,     1, 0x41F74, "RegisterClassDriver check (je->jmp)", false }, */
+        /* v207b: Both UsbEnumPoll + RegisterClassDriver skips re-enabled.
+         * Circular dependency: kernel doesn't SET_CONFIG for class 0x60,
+         * so SEGABOOT's USB handler can't enumerate → both functions fail.
+         * Post-init code (mbcom, USB thread, OHCI handler) runs full LLE. */
+        { sig_enumpoll, sizeof(sig_enumpoll), 7,  patch_jmp,     1, 0x41F57, "UsbEnumPoll check (je->jmp)",         false },
+        { sig_classdrv, sizeof(sig_classdrv), 7,  patch_jmp,     1, 0x41F74, "RegisterClassDriver check (je->jmp)", false },
         { sig_qcbyte0,  sizeof(sig_qcbyte0),  0,  patch_xor_ret, 3, 0x3AD80, "GetQcStatusByte0 (xor eax,eax; ret)", false },
         /* v201: CreateThread patch REMOVED — let USB poll thread be created */
         /* { sig_createthread, sizeof(sig_createthread), 8, patch_jmp, 1, 0x425D6, "CreateThread return (jne->jmp)", false }, */
@@ -1512,9 +1467,6 @@ static void chihiro_usb_poll_patch_cb(void *opaque)
         /* v153: REMOVED GetBootData (was always return 1) — let real boot data flow through */
         { sig_check_mainserial,  sizeof(sig_check_mainserial),  4, patch_xor_nop3, 5, 0x2EC35, "CheckMainBoardSerial (err 3 -> 0)",  false },
         { sig_check_mediaserial, sizeof(sig_check_mediaserial), 5, patch_xor_nop3, 5, 0x2EC88, "CheckMediaBoardSerial (err 4 -> 0)", false },
-        /* v206: TDBuilder bit 0x20 NOP — allow bulk transfers without SET_CONFIG */
-        { sig_tdbuilder1, sizeof(sig_tdbuilder1), 8, patch_nop2, 2, 0x69F92, "TDBuilder1 bit0x20 check (je->nop)",  false },
-        { sig_tdbuilder2, sizeof(sig_tdbuilder2), 8, patch_nop2, 2, 0x6FFAC, "TDBuilder2 bit0x20 check (je->nop)",  false },
     };
     int num_patches = sizeof(patches) / sizeof(patches[0]);
     int applied = 0;
@@ -1553,8 +1505,8 @@ static void chihiro_usb_poll_patch_cb(void *opaque)
     if (applied == num_patches) {
         s->usb_poll_patched = true;
         printf("[%07lld] Chihiro: All %d SEGABOOT patches applied\n", TS_MS, num_patches);
-        printf("[%07lld] Chihiro: v207 — UsbEnumPoll SKIP re-enabled (timing workaround), "
-               "RegisterClassDriver UNPATCHED (runs natively)\n", TS_MS);
+        printf("[%07lld] Chihiro: v207b — 7 patches applied. UsbEnumPoll+RegisterClassDriver "
+               "skipped (circular dep). Post-init USB/mbcom in LLE.\n", TS_MS);
 
         /* Start diagnostic timer to monitor state machine progress */
         s->diag_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, chihiro_diag_timer_cb, s);
