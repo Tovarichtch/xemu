@@ -1171,28 +1171,26 @@ static void chihiro_usb_poll_patch_cb(void *opaque)
     if (s->usb_poll_patched) return;
 
     /*
-     * Patch 1: UsbEnumPoll error check (VA 0x41F57)
-     *   E8 64 F6 FF FF   call UsbEnumPoll
-     *   85 C0             test eax, eax
-     *   74 0F             je +0x0F → success path  ← patch to EB (jmp)
+     * Patch 1: UsbEnumPoll error check (VA 0x41F57) — REMOVED in v203
+     *   Was: je→jmp to skip UsbEnumPoll failure handling
+     *   Now: let UsbEnumPoll execute — kernel USB enumeration will run
      */
-    static const uint8_t sig_enumpoll[] = {
+    /* static const uint8_t sig_enumpoll[] = {
         0xE8, 0x64, 0xF6, 0xFF, 0xFF,
         0x85, 0xC0,
         0x74, 0x0F
-    };
+    }; */
 
     /*
-     * Patch 2: RegisterClassDriver error check (VA 0x41F74)
-     *   E8 27 54 00 00   call RegisterClassDriver
-     *   85 C0             test eax, eax
-     *   74 0F             je +0x0F → success path  ← patch to EB (jmp)
+     * Patch 2: RegisterClassDriver error check (VA 0x41F74) — REMOVED in v203
+     *   Was: je→jmp to skip RegisterClassDriver failure handling
+     *   Now: let RegisterClassDriver execute — class driver registration will run
      */
-    static const uint8_t sig_classdrv[] = {
+    /* static const uint8_t sig_classdrv[] = {
         0xE8, 0x27, 0x54, 0x00, 0x00,
         0x85, 0xC0,
         0x74, 0x0F
-    };
+    }; */
 
     /*
      * Patch 3: GetQcStatusByte0 (VA 0x3AD80)
@@ -1367,8 +1365,9 @@ static void chihiro_usb_poll_patch_cb(void *opaque)
     static const uint8_t patch_xor_nop3[]  = { 0x31, 0xC0, 0x90, 0x90, 0x90 }; /* xor eax, eax; nop*3 */
 
     ChihiroPatch patches[] = {
-        { sig_enumpoll, sizeof(sig_enumpoll), 7,  patch_jmp,     1, 0x41F57, "UsbEnumPoll check (je->jmp)",         false },
-        { sig_classdrv, sizeof(sig_classdrv), 7,  patch_jmp,     1, 0x41F74, "RegisterClassDriver check (je->jmp)", false },
+        /* v203: UsbEnumPoll + RegisterClassDriver patches REMOVED — let real USB enumeration run */
+        /* { sig_enumpoll, sizeof(sig_enumpoll), 7,  patch_jmp,     1, 0x41F57, "UsbEnumPoll check (je->jmp)",         false }, */
+        /* { sig_classdrv, sizeof(sig_classdrv), 7,  patch_jmp,     1, 0x41F74, "RegisterClassDriver check (je->jmp)", false }, */
         { sig_qcbyte0,  sizeof(sig_qcbyte0),  0,  patch_xor_ret, 3, 0x3AD80, "GetQcStatusByte0 (xor eax,eax; ret)", false },
         /* v201: CreateThread patch REMOVED — let USB poll thread be created */
         /* { sig_createthread, sizeof(sig_createthread), 8, patch_jmp, 1, 0x425D6, "CreateThread return (jne->jmp)", false }, */
@@ -1419,8 +1418,8 @@ static void chihiro_usb_poll_patch_cb(void *opaque)
     if (applied == num_patches) {
         s->usb_poll_patched = true;
         printf("[%07lld] Chihiro: All %d SEGABOOT patches applied\n", TS_MS, num_patches);
-        printf("[%07lld] Chihiro: CreateThread + UsbPollQC/SC NOT patched (v201) — "
-               "USB thread will run with real bulk transfers\n", TS_MS);
+        printf("[%07lld] Chihiro: v203 — UsbEnumPoll + RegisterClassDriver + CreateThread + "
+               "UsbPollQC/SC all UNPATCHED — real USB flow\n", TS_MS);
 
         /* Start diagnostic timer to monitor state machine progress */
         s->diag_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, chihiro_diag_timer_cb, s);
