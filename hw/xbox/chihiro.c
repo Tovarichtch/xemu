@@ -1399,6 +1399,39 @@ static void chihiro_usb_poll_patch_cb(void *opaque)
      * now includes AV_FLAGS_HDTV_480p (0x00080000) so the kernel configures
      * NV2A for progressive scan 31kHz. SEGABOOT's video check passes naturally. */
 
+    /* v206: TDBuilder bit 0x20 check NOP patches.
+     * RE confirmed: TDBuilder checks baseboard_dev[dev].flags & 0x20 before
+     * submitting ANY bulk transfer. If bit 0x20 (device opened) is not set,
+     * the transfer is silently dropped — no USB packet reaches the device.
+     *
+     * Bit 0x20 requires bit 0x40 (device connected), which requires SET_CONFIG,
+     * which requires FindMatchingDriver, which requires RegisterClassDriver,
+     * which is called AFTER UsbEnumPoll — circular dependency.
+     *
+     * NOP the conditional jumps so TDBuilder always submits transfers.
+     * This allows UsbPollQC/SC bulk reads to reach the AN2131 devices.
+     *
+     * TDBuilder instance 1 (VA 0x69F8E):
+     *   test byte [eax+4], 0x20  ; F6 40 04 20
+     *   je +0x0D                 ; 74 0D  ← NOP this
+     *
+     * TDBuilder instance 2 (VA 0x6FFA8):
+     *   test byte [eax+4], 0x20  ; F6 40 04 20
+     *   je +0x0C                 ; 74 0C  ← NOP this
+     */
+    static const uint8_t sig_tdbuilder1[] = {
+        0xA0, 0xDD, 0x01, 0x00,            /* mov eax, 0x1DDA0 (fallback) */
+        0xF6, 0x40, 0x04, 0x20,            /* test byte [eax+4], 0x20    */
+        0x74, 0x0D,                        /* je +0x0D                   */
+        0x6A, 0x02                         /* push 2                     */
+    };
+    static const uint8_t sig_tdbuilder2[] = {
+        0xA0, 0xDD, 0x01, 0x00,            /* mov eax, 0x1DDA0 (fallback) */
+        0xF6, 0x40, 0x04, 0x20,            /* test byte [eax+4], 0x20    */
+        0x74, 0x0C,                        /* je +0x0C                   */
+        0x6A, 0x02                         /* push 2                     */
+    };
+
     /* Patch byte arrays */
     static const uint8_t patch_jmp[]   = { 0xEB };
     static const uint8_t patch_and0[]  = { 0x00 };
@@ -1406,6 +1439,7 @@ static void chihiro_usb_poll_patch_cb(void *opaque)
     /* v200: patch_xor_ret4 removed — was only used by UsbPollQC/SC patches */
     /* static const uint8_t patch_xor_ret4[] = { 0x31, 0xC0, 0xC2, 0x04, 0x00 }; */
     static const uint8_t patch_xor_nop3[]  = { 0x31, 0xC0, 0x90, 0x90, 0x90 }; /* xor eax, eax; nop*3 */
+    static const uint8_t patch_nop2[]       = { 0x90, 0x90 };                    /* v206: NOP NOP */
 
     ChihiroPatch patches[] = {
         /* v203: UsbEnumPoll + RegisterClassDriver patches REMOVED — let real USB enumeration run */
@@ -1423,6 +1457,9 @@ static void chihiro_usb_poll_patch_cb(void *opaque)
         /* v153: REMOVED GetBootData (was always return 1) — let real boot data flow through */
         { sig_check_mainserial,  sizeof(sig_check_mainserial),  4, patch_xor_nop3, 5, 0x2EC35, "CheckMainBoardSerial (err 3 -> 0)",  false },
         { sig_check_mediaserial, sizeof(sig_check_mediaserial), 5, patch_xor_nop3, 5, 0x2EC88, "CheckMediaBoardSerial (err 4 -> 0)", false },
+        /* v206: TDBuilder bit 0x20 NOP — allow bulk transfers without SET_CONFIG */
+        { sig_tdbuilder1, sizeof(sig_tdbuilder1), 8, patch_nop2, 2, 0x69F92, "TDBuilder1 bit0x20 check (je->nop)",  false },
+        { sig_tdbuilder2, sizeof(sig_tdbuilder2), 8, patch_nop2, 2, 0x6FFAC, "TDBuilder2 bit0x20 check (je->nop)",  false },
     };
     int num_patches = sizeof(patches) / sizeof(patches[0]);
     int applied = 0;
