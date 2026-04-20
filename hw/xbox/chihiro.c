@@ -1139,6 +1139,23 @@ static void chihiro_diag_timer_cb(void *opaque)
                         printf("[%07lld] Chihiro: Created LDP PTE 0x%08X @ PA 0x%05X "
                                "(VA 0x%08X → PA 0x%08X)\n",
                                TS_MS, new_pte, pte_addr, ldp_va, chihiro_ldp_pa);
+
+                        /* v209c: Fill the LDP NOW at boot=3, BEFORE QuickReboot.
+                         * The kernel reads LDP within microseconds of reboot.
+                         * If we wait until game-detect (port 0x40F0), it's 4.5s
+                         * too late — kernel already fell back to xboxdash.xbe. */
+                        if (chihiro_game_filename[0]) {
+                            uint32_t launch_type = 1;
+                            cpu_physical_memory_write(chihiro_ldp_pa, &launch_type, 4);
+                            uint32_t title_id = 0;
+                            cpu_physical_memory_write(chihiro_ldp_pa + 4, &title_id, 4);
+                            char launch_path[520] = {0};
+                            snprintf(launch_path, sizeof(launch_path),
+                                     "D:\\%s", chihiro_game_filename);
+                            cpu_physical_memory_write(chihiro_ldp_pa + 8, launch_path, 520);
+                            printf("[%07lld] Chihiro: Pre-filled LDP at boot=3: "
+                                   "type=1 path='%s'\n", TS_MS, launch_path);
+                        }
                     } else {
                         chihiro_ldp_pa = (pte_val & 0xFFFFF000) | (ldp_va & 0xFFF);
                         printf("[%07lld] Chihiro: LDP already mapped PTE=0x%08X PA=0x%08X\n",
