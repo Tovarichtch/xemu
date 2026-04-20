@@ -137,6 +137,10 @@ static ChihiroLPCState *chihiro_lpc_global;
 static USBDevice *chihiro_usb_qc = NULL;
 static USBDevice *chihiro_usb_sc = NULL;
 
+/* v202: Counter accessors from chihiro-usb.c */
+extern void chihiro_usb_get_counters(USBDevice *dev, uint32_t *nak, uint32_t *bulk_in, uint32_t *bulk_out);
+extern void chihiro_usb_reset_counters(USBDevice *dev);
+
 void chihiro_usb_set_devices(USBDevice *qc, USBDevice *sc)
 {
     chihiro_usb_qc = qc;
@@ -963,6 +967,25 @@ static void chihiro_diag_timer_cb(void *opaque)
     if (slotflag0_pa != 0xFFFFFFFF) cpu_physical_memory_read(slotflag0_pa, &slotflag0, 1);
     if (mainflag_pa != 0xFFFFFFFF) cpu_physical_memory_read(mainflag_pa, &mainflag, 4);
 
+    /* v202: Thread handle [0x8A134] and thread state [0x8A138] */
+    uint32_t thread_handle = 0, thread_state = 0;
+    uint32_t thread_handle_pa = chihiro_va_to_pa(0x8A134);
+    uint32_t thread_state_pa  = chihiro_va_to_pa(0x8A138);
+    if (thread_handle_pa != 0xFFFFFFFF) cpu_physical_memory_read(thread_handle_pa, &thread_handle, 4);
+    if (thread_state_pa != 0xFFFFFFFF)  cpu_physical_memory_read(thread_state_pa, &thread_state, 4);
+
+    /* v202: USB NAK/bulk counters */
+    uint32_t qc_nak = 0, qc_bin = 0, qc_bout = 0;
+    uint32_t sc_nak = 0, sc_bin = 0, sc_bout = 0;
+    if (chihiro_usb_qc) {
+        chihiro_usb_get_counters(chihiro_usb_qc, &qc_nak, &qc_bin, &qc_bout);
+        chihiro_usb_reset_counters(chihiro_usb_qc);
+    }
+    if (chihiro_usb_sc) {
+        chihiro_usb_get_counters(chihiro_usb_sc, &sc_nak, &sc_bin, &sc_bout);
+        chihiro_usb_reset_counters(chihiro_usb_sc);
+    }
+
     /* XBE2 game state — D07A8 must reach 4 for game to advance */
     uint32_t d07a8_pa = chihiro_va_to_pa(0xD07A8);
     uint32_t d0798_pa = chihiro_va_to_pa(0xD0798);
@@ -1048,6 +1071,13 @@ static void chihiro_diag_timer_cb(void *opaque)
            s->lpc_40f0_reads, s->lpc_401e_reads, s->lpc_4084_reads,
            xbe2_d0798, xbe2_d07a8, xbe2_ce_state,
            (xbe2_ce_pa != 0xFFFFFFFF) ? "xbe2:mapped" : "xbe2:UNMAPPED");
+
+    /* v202: Thread + USB counters (only print if any activity or thread exists) */
+    if (thread_handle || thread_state || qc_nak || sc_nak || qc_bin || sc_bin || qc_bout || sc_bout) {
+        printf("[%07lld] DIAG USB: thr=0x%X tst=%u | QC nak=%u in=%u out=%u | SC nak=%u in=%u out=%u\n",
+               TS_MS, thread_handle, thread_state,
+               qc_nak, qc_bin, qc_bout, sc_nak, sc_bin, sc_bout);
+    }
 
     /* v159 DIAG: key addresses for boot data flow */
     if (bootstate == 2) {

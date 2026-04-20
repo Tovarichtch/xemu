@@ -1084,13 +1084,29 @@ static int ohci_service_td(OHCIState *ohci, struct ohci_ed *ed)
             case USB_RET_IOERROR:
             case USB_RET_NODEV:
                 trace_usb_ohci_td_dev_error();
+                printf("[%07lld] OHCI TD NODEV: FA=%d EN=%d dir=%s — device not responding!\n",
+                       TS_MS, OHCI_BM(ed->flags, ED_FA), OHCI_BM(ed->flags, ED_EN), str);
                 OHCI_SET_BM(td.flags, TD_CC, OHCI_CC_DEVICENOTRESPONDING);
                 break;
             case USB_RET_NAK:
                 trace_usb_ohci_td_nak();
+                /* v202: Throttled NAK logging */
+                {
+                    static uint32_t ohci_nak_count = 0;
+                    ohci_nak_count++;
+                    if (ohci_nak_count <= 3 || (ohci_nak_count % 1000) == 0) {
+                        printf("[%07lld] OHCI TD NAK: FA=%d EN=%d dir=%s (nak#%u)\n",
+                               TS_MS,
+                               OHCI_BM(ed->flags, ED_FA),
+                               OHCI_BM(ed->flags, ED_EN),
+                               str, ohci_nak_count);
+                    }
+                }
                 return 1;
             case USB_RET_STALL:
                 trace_usb_ohci_td_stall();
+                printf("[%07lld] OHCI TD STALL: FA=%d EN=%d dir=%s — endpoint stalled!\n",
+                       TS_MS, OHCI_BM(ed->flags, ED_FA), OHCI_BM(ed->flags, ED_EN), str);
                 OHCI_SET_BM(td.flags, TD_CC, OHCI_CC_STALL);
                 break;
             case USB_RET_BABBLE:
@@ -1156,6 +1172,17 @@ static int ohci_service_ed_list(OHCIState *ohci, uint32_t head)
 
         if ((ed.head & OHCI_ED_H) || (ed.flags & OHCI_ED_K)) {
             uint32_t addr;
+            /* v202: Log halted/skipped EDs */
+            static uint32_t skip_count = 0;
+            skip_count++;
+            if (skip_count <= 5 || (skip_count % 100) == 0) {
+                printf("[%07lld] OHCI ED SKIP: @0x%08X FA=%d EN=%d H=%d K=%d (skip#%u)\n",
+                       TS_MS, cur,
+                       OHCI_BM(ed.flags, ED_FA), OHCI_BM(ed.flags, ED_EN),
+                       (ed.head & OHCI_ED_H) ? 1 : 0,
+                       (ed.flags & OHCI_ED_K) ? 1 : 0,
+                       skip_count);
+            }
             /* Cancel pending packets for ED that have been paused. */
             addr = ed.head & OHCI_DPTR_MASK;
             if (ohci->async_td && addr == ohci->async_td) {
