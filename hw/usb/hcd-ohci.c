@@ -1564,20 +1564,12 @@ static void ohci_port_set_status(OHCIState *ohci, int portnum, uint32_t val)
         port->ctrl &= ~(val & OHCI_PORT_WTC);
     }
     if (val & OHCI_PORT_CCS) {
-        /* Chihiro: block ClearPortEnable during SEGABOOT phase only.
-         * SEGABOOT's baseboard devices need ports to stay enabled.
-         * After game XBE loads (chihiro_game_running), allow normal
-         * port disable — the game kernel expects ClearPortEnable to work
-         * for proper USB enumeration (SET_ADDRESS → disable → configure). */
-        extern bool chihiro_game_running;
-        if (port->port.dev && port->port.dev->product_desc &&
-            strncmp(port->port.dev->product_desc, "Chihiro", 7) == 0 &&
-            !chihiro_game_running) {
-            printf("[%07lld] OHCI PORT%d: BLOCKED ClearPortEnable (Chihiro SEGABOOT phase)\n",
-                   TS_MS, portnum);
-        } else {
-            port->ctrl &= ~OHCI_PORT_PES;
-        }
+        /* v204: ClearPortEnable NO LONGER blocked for Chihiro.
+         * Previously blocked during SEGABOOT phase to keep devices enabled,
+         * but this prevented the kernel from completing USB enumeration
+         * (GET_DESC→SET_ADDRESS→ClearPortEnable→re-enable→SET_CONFIG).
+         * Now allowing normal OHCI port disable/enable flow. */
+        port->ctrl &= ~OHCI_PORT_PES;
     }
     ohci_port_set_if_connected(ohci, portnum, val & OHCI_PORT_PES);
 
