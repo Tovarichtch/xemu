@@ -1204,35 +1204,26 @@ static void chihiro_usb_poll_patch_cb(void *opaque)
     };
 
     /*
-     * Patch 6: UsbPollQC_inner (VA 0x51140)
-     *
-     *   E9 FB FE FF FF    jmp 0x51040
-     *   90 90 90 90        nop padding
-     *
-     * Patch: xor eax,eax; ret -> USB poll "succeeds"
-     * CheckErrors state machine State 1 calls this.
+     * Patch 6: UsbPollQC_inner (VA 0x51140) — REMOVED in v200
+     *   Was: xor eax,eax; ret 4 → always return 0
+     *   Now: let real USB poll function execute (Phase 2 Option 3)
      */
-    static const uint8_t sig_usbpollqc[] = {
-        0xE9, 0xFB, 0xFE, 0xFF, 0xFF,  /* jmp 0x51040  */
-        0x90, 0x90, 0x90, 0x90          /* nop padding  */
-    };
+    /* static const uint8_t sig_usbpollqc[] = {
+        0xE9, 0xFB, 0xFE, 0xFF, 0xFF,
+        0x90, 0x90, 0x90, 0x90
+    }; */
 
     /*
-     * Patch 7: UsbPollSC_inner (VA 0x51150)
-     *
-     *   55                push ebp
-     *   8B EC             mov ebp, esp
-     *   83 E4 F8          and esp, -8
-     *   81 EC 0C 03 00 00 sub esp, 0x30C
-     *
-     * Patch: xor eax,eax; ret -> USB poll "succeeds"
+     * Patch 7: UsbPollSC_inner (VA 0x51150) — REMOVED in v200
+     *   Was: xor eax,eax; ret 4 → always return 0
+     *   Now: let real USB poll function execute (Phase 2 Option 3)
      */
-    static const uint8_t sig_usbpollsc[] = {
-        0x55,                                  /* push ebp           */
-        0x8B, 0xEC,                            /* mov ebp, esp       */
-        0x83, 0xE4, 0xF8,                      /* and esp, -8        */
-        0x81, 0xEC, 0x0C, 0x03, 0x00, 0x00     /* sub esp, 0x30C    */
-    };
+    /* static const uint8_t sig_usbpollsc[] = {
+        0x55,
+        0x8B, 0xEC,
+        0x83, 0xE4, 0xF8,
+        0x81, 0xEC, 0x0C, 0x03, 0x00, 0x00
+    }; */
 
     /*
      * Patch 8: EncryptionCheck USB transfer result (VA 0x3A953)
@@ -1344,7 +1335,8 @@ static void chihiro_usb_poll_patch_cb(void *opaque)
     static const uint8_t patch_jmp[]   = { 0xEB };
     static const uint8_t patch_and0[]  = { 0x00 };
     static const uint8_t patch_xor_ret[] = { 0x31, 0xC0, 0xC3 };
-    static const uint8_t patch_xor_ret4[] = { 0x31, 0xC0, 0xC2, 0x04, 0x00 };
+    /* v200: patch_xor_ret4 removed — was only used by UsbPollQC/SC patches */
+    /* static const uint8_t patch_xor_ret4[] = { 0x31, 0xC0, 0xC2, 0x04, 0x00 }; */
     static const uint8_t patch_xor_nop3[]  = { 0x31, 0xC0, 0x90, 0x90, 0x90 }; /* xor eax, eax; nop*3 */
 
     ChihiroPatch patches[] = {
@@ -1353,8 +1345,9 @@ static void chihiro_usb_poll_patch_cb(void *opaque)
         { sig_qcbyte0,  sizeof(sig_qcbyte0),  0,  patch_xor_ret, 3, 0x3AD80, "GetQcStatusByte0 (xor eax,eax; ret)", false },
         { sig_createthread, sizeof(sig_createthread), 8, patch_jmp, 1, 0x425D6, "CreateThread return (jne->jmp)", false },
         { sig_errval,   sizeof(sig_errval),   2,  patch_and0,    1, 0x2E3AB, "DIAG: error value 0x14->0x00",        false },
-        { sig_usbpollqc, sizeof(sig_usbpollqc), 0, patch_xor_ret4, 5, 0x51140, "UsbPollQC_inner (xor eax,eax; ret 4)", false },
-        { sig_usbpollsc, sizeof(sig_usbpollsc), 0, patch_xor_ret4, 5, 0x51150, "UsbPollSC_inner (xor eax,eax; ret 4)", false },
+        /* v200: UsbPollQC/SC patches REMOVED — let real USB poll functions execute */
+        /* { sig_usbpollqc, sizeof(sig_usbpollqc), 0, patch_xor_ret4, 5, 0x51140, "UsbPollQC_inner (xor eax,eax; ret 4)", false }, */
+        /* { sig_usbpollsc, sizeof(sig_usbpollsc), 0, patch_xor_ret4, 5, 0x51150, "UsbPollSC_inner (xor eax,eax; ret 4)", false }, */
         { sig_enccheck,  sizeof(sig_enccheck),  2, patch_xor_ret, 2, 0x3A953, "EncryptionCheck (test->xor eax,eax)",  false },
         /* v153: REMOVED MbcomPollReady (was always return 1) — let clear-on-read deliver real responses */
         /* v153: REMOVED GetBootData (was always return 1) — let real boot data flow through */
@@ -1398,8 +1391,8 @@ static void chihiro_usb_poll_patch_cb(void *opaque)
     if (applied == num_patches) {
         s->usb_poll_patched = true;
         printf("[%07lld] Chihiro: All %d SEGABOOT patches applied\n", TS_MS, num_patches);
-        printf("[%07lld] Chihiro: CheckErrors state machine will run naturally "
-               "with UsbPollQC/SC bypassed\n", TS_MS);
+        printf("[%07lld] Chihiro: UsbPollQC/SC NOT patched (v200) — "
+               "real USB poll functions will execute\n", TS_MS);
 
         /* Start diagnostic timer to monitor state machine progress */
         s->diag_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, chihiro_diag_timer_cb, s);
