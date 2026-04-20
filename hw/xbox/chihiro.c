@@ -1090,19 +1090,40 @@ static void chihiro_diag_timer_cb(void *opaque)
             }
 
             /* v208: Capture LaunchDataPage PA NOW while page tables are valid.
-             * After QuickReboot, the page tables change and the LDP VA
-             * (user-space) won't be translatable anymore.
-             * LDP pointer is at PA 0x30A10 (kernel export #164). */
+             * v209b: Create the LDP PTE NOW so XLaunchNewImage can write to it.
+             * SEGABOOT calls XLaunchNewImage after boot=3. Without the PTE,
+             * the write page-faults → XLaunchNewImage fails → kernel falls
+             * back to xboxdash.xbe → doesn't exist → black screen. */
             {
                 uint32_t ldp_va = 0;
                 cpu_physical_memory_read(0x30A10, &ldp_va, 4);
                 if (ldp_va) {
-                    chihiro_ldp_pa = chihiro_va_to_pa(ldp_va);
-                    printf("[%07lld] Chihiro: LDP pointer VA=0x%08X → PA=0x%08X "
-                           "(captured at boot=3)\n", TS_MS, ldp_va, chihiro_ldp_pa);
+                    uint32_t ldp_page = ldp_va & ~0xFFF;
+                    uint32_t pte_idx = (ldp_va >> 12) & 0x3FF;
+                    uint32_t pde;
+                    cpu_physical_memory_read(0xF000, &pde, 4);
+                    uint32_t pt_base = pde & 0xFFFFF000;
+                    uint32_t pte_addr = pt_base + pte_idx * 4;
+                    uint32_t pte_val;
+                    cpu_physical_memory_read(pte_addr, &pte_val, 4);
+
+                    if (!(pte_val & 1)) {
+                        uint32_t new_pte = ldp_page | 0x067;
+                        cpu_physical_memory_write(pte_addr, &new_pte, 4);
+                        uint8_t zeros[4096] = {0};
+                        cpu_physical_memory_write(ldp_page, zeros, 4096);
+                        chihiro_ldp_pa = ldp_page + (ldp_va & 0xFFF);
+                        printf("[%07lld] Chihiro: Created LDP PTE 0x%08X @ PA 0x%05X "
+                               "(VA 0x%08X → PA 0x%08X)\n",
+                               TS_MS, new_pte, pte_addr, ldp_va, chihiro_ldp_pa);
+                    } else {
+                        chihiro_ldp_pa = (pte_val & 0xFFFFF000) | (ldp_va & 0xFFF);
+                        printf("[%07lld] Chihiro: LDP already mapped PTE=0x%08X PA=0x%08X\n",
+                               TS_MS, pte_val, chihiro_ldp_pa);
+                    }
                 } else {
                     chihiro_ldp_pa = 0xFFFFFFFF;
-                    printf("[%07lld] Chihiro: LDP pointer is NULL at boot=3\n", TS_MS);
+                    printf("[%07lld] Chihiro: LDP pointer is NULL\n", TS_MS);
                 }
             }
 
@@ -1622,51 +1643,35 @@ static uint64_t chihiro_lpc_io_read(void *opaque, hwaddr addr,
             address_space_write(&address_space_memory, 0x3A93C,
                                 MEMTXATTRS_UNSPECIFIED, &gate_val, 1);
 
-            /* Fill the LaunchDataPage.
-             *
-             * On real hardware, SEGABOOT calls XLaunchNewImage() which
-             * writes the game path to the LDP before triggering QuickReboot.
-             * Our patches prevent SEGABOOT from reaching that call.
-             *
-             * Structure (from Xbox kernel):
-             *   0x000: DWORD dwLaunchDataType (1 = launch XBE)
-             *   0x004: DWORD dwTitleId
-             *   0x008: CHAR  szLaunchPath[520]
-             *
-             * The game filename was saved at boot=3 (before QuickReboot
-             * cleared RAM). We write it as "D:\<game>.xbe" — the kernel's
-             * launch code creates D:\ → mbfs: symlink. */
+            /* v209b: Check if XLaunchNewImage filled the LDP (PTE was created
+             * at boot=3). If it did, great. If not, fill it manually. */
             {
-                if (chihiro_game_filename[0]) {
-                    /* v208: Use LDP PA captured at boot=3 (before QuickReboot
-                     * invalidated the page tables). */
-                    uint32_t ldp_pa = chihiro_ldp_pa;
-
-                    if (ldp_pa != 0xFFFFFFFF && ldp_pa != 0) {
-                        /* Write LaunchDataType = 1 (launch XBE) */
+                uint32_t ldp_pa = chihiro_ldp_pa;
+                if (ldp_pa != 0xFFFFFFFF && ldp_pa != 0) {
+                    uint32_t existing_type = 0;
+                    cpu_physical_memory_read(ldp_pa, &existing_type, 4);
+                    if (existing_type != 0) {
+                        char existing_path[64] = {0};
+                        cpu_physical_memory_read(ldp_pa + 8, existing_path, 60);
+                        printf("[%07lld] Chihiro: LDP filled by XLaunchNewImage:"
+                               " type=%u path='%s'\n",
+                               TS_MS, existing_type, existing_path);
+                    } else if (chihiro_game_filename[0]) {
                         uint32_t launch_type = 1;
                         cpu_physical_memory_write(ldp_pa, &launch_type, 4);
-
-                        /* Write TitleId = 0 */
                         uint32_t title_id = 0;
                         cpu_physical_memory_write(ldp_pa + 4, &title_id, 4);
-
-                        /* Write LaunchPath = "D:\<filename>" */
                         char launch_path[520] = {0};
                         snprintf(launch_path, sizeof(launch_path),
                                  "D:\\%s", chihiro_game_filename);
                         cpu_physical_memory_write(ldp_pa + 8, launch_path, 520);
-
-                        printf("[%07lld] Chihiro: Filled LaunchDataPage (PA 0x%08X):"
-                               " type=1 path='%s'\n",
-                               TS_MS, ldp_pa, launch_path);
+                        printf("[%07lld] Chihiro: Filled LDP manually (PA 0x%08X):"
+                               " path='%s'\n", TS_MS, ldp_pa, launch_path);
                     } else {
-                        printf("[%07lld] Chihiro: WARNING — LDP PA not captured "
-                               "at boot=3 (PA=0x%08X)\n", TS_MS, ldp_pa);
+                        printf("[%07lld] Chihiro: WARNING — LDP empty, no filename\n", TS_MS);
                     }
                 } else {
-                    printf("[%07lld] Chihiro: WARNING — no game filename saved "
-                           "at boot=3, cannot fill LDP\n", TS_MS);
+                    printf("[%07lld] Chihiro: WARNING — LDP PA unavailable\n", TS_MS);
                 }
             }
 
