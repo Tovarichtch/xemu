@@ -136,6 +136,49 @@ static ChihiroLPCState *chihiro_lpc_global;
 /* USB devices for delayed hotplug (simulates AN2131 I2C firmware boot) */
 static USBDevice *chihiro_usb_qc = NULL;
 static USBDevice *chihiro_usb_sc = NULL;
+static bool chihiro_usb_hotplug_scheduled = false;
+
+/*
+ * v205: Called from ohci_bus_start() when OHCI goes OPERATIONAL.
+ * Schedule USB device attachment 150ms after BUS START so that:
+ * 1. The kernel has already enabled RHSC interrupts
+ * 2. Fresh CSC events will trigger the RHSC handler
+ * 3. The handler will do full enumeration: PortReset → GET_DESC → SET_ADDRESS
+ *    → GET_CONFIG_DESC → SET_CONFIG (unconditional, per standard USB flow)
+ *
+ * On real hardware, AN2131 chips boot in ~200ms and are present BEFORE the
+ * kernel starts OHCI. The kernel's first port scan sees CSC=1 and enumerates.
+ * In our emulation, we attach AFTER BUS START to ensure the RHSC handler
+ * sees fresh CSC=1 events (not stale ones cleared during OHCI init).
+ */
+void chihiro_on_ohci_bus_start(void)
+{
+    if (!chihiro_active || chihiro_usb_hotplug_scheduled) {
+        return;  /* Not Chihiro, or already scheduled */
+    }
+
+    /* Only trigger on first BUS START (kernel init, not SEGABOOT re-init) */
+    if (chihiro_usb_qc && chihiro_usb_qc->attached) {
+        return;  /* Devices already attached from a previous BUS START */
+    }
+
+    ChihiroLPCState *s = chihiro_lpc_global;
+    if (!s) {
+        return;
+    }
+
+    chihiro_usb_hotplug_scheduled = true;
+    int64_t now = qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL);
+
+    printf("[%07lld] Chihiro USB: OHCI BUS START detected — scheduling hotplug "
+           "QC at +150ms, SC at +350ms\n", TS_MS);
+
+    /* Schedule QC hotplug at BUS_START + 150ms */
+    timer_mod(s->usb_hotplug_timer, now + 150);
+
+    /* Schedule SC hotplug at BUS_START + 350ms (200ms gap for separate RHSC) */
+    timer_mod(s->usb_hotplug_sc_timer, now + 350);
+}
 
 /* v202: Counter accessors from chihiro-usb.c */
 extern void chihiro_usb_get_counters(USBDevice *dev, uint32_t *nak, uint32_t *bulk_in, uint32_t *bulk_out);
@@ -1871,20 +1914,22 @@ static void chihiro_lpc_realize(DeviceState *dev, Error **errp)
     /* Initialize mbcom protocol handler */
     chihiro_mbcom_init();
 
-    /* USB hotplug timers — staggered to simulate independent AN2131 boot.
-     * QC at T+1500ms, SC at T+1700ms.
-     * Each triggers a separate RHSC IRQ so the kernel enumerates
-     * each device independently through the full callback chain:
-     * PortReset → GET_DESC(dev) → SET_ADDRESS → GET_DESC(cfg) → SET_CONFIG */
+    /* USB hotplug timers — v205: NO LONGER scheduled at fixed T+1500ms.
+     * Instead, timers are created but armed only when ohci_bus_start()
+     * fires (via chihiro_on_ohci_bus_start callback).
+     * This ensures devices attach AFTER the kernel has enabled RHSC,
+     * so fresh CSC events trigger full enumeration including SET_CONFIG.
+     *
+     * On real hardware: AN2131 boot ~200ms, kernel OHCI ~600ms.
+     * Kernel sees devices during first scan → SET_CONFIG → CONFIGURED.
+     * In our emulation: attach devices 150ms AFTER BUS START for same effect. */
     s->usb_hotplug_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL,
                                          chihiro_usb_hotplug_qc_cb, s);
-    timer_mod(s->usb_hotplug_timer,
-              qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 1500);
+    /* Timer NOT armed yet — will be armed by chihiro_on_ohci_bus_start() */
 
     s->usb_hotplug_sc_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL,
                                             chihiro_usb_hotplug_sc_cb, s);
-    timer_mod(s->usb_hotplug_sc_timer,
-              qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 1700);
+    /* Timer NOT armed yet — will be armed by chihiro_on_ohci_bus_start() */
 
     /* UsbPollQC/SC patch — retry every 1ms until SEGABOOT is loaded */
     s->usb_poll_patched = false;

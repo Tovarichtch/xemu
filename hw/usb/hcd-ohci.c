@@ -1358,6 +1358,13 @@ static int ohci_bus_start(OHCIState *ohci)
 {
     printf("[%07lld] OHCI BUS START (HCFS -> OPERATIONAL)\n", TS_MS);
     trace_usb_ohci_start(ohci->name);
+
+    /* v205: Notify Chihiro to schedule USB device hotplug.
+     * Devices attach AFTER the kernel enables RHSC so fresh CSC
+     * events trigger full USB enumeration including SET_CONFIG. */
+    extern void chihiro_on_ohci_bus_start(void);
+    chihiro_on_ohci_bus_start();
+
     /*
      * Delay the first SOF event by one frame time as linux driver is
      * not ready to receive it and can meet some race conditions
