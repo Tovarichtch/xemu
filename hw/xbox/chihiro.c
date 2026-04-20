@@ -783,7 +783,7 @@ static void chihiro_diag_timer_cb(void *opaque)
             {
                 printf("  DEVICE PATHS (PA 0x10000-0x80000):\n");
                 int dev_count = 0;
-                for (uint32_t pa = 0x10000; pa < 0x80000 - 16; pa++) {
+                for (uint32_t pa = 0x10000; pa < 0x800000 - 16; pa++) {
                     uint8_t buf[8];
                     cpu_physical_memory_read(pa, buf, 8);
                     /* Look for "\\Device\\" or "\Device\" (ASCII) */
@@ -810,7 +810,7 @@ static void chihiro_diag_timer_cb(void *opaque)
                 for (int n = 0; needles[n]; n++) {
                     int nlen = strlen(needles[n]);
                     int found = 0;
-                    for (uint32_t pa = 0x10000; pa < 0x80000 - nlen && !found; pa++) {
+                    for (uint32_t pa = 0x10000; pa < 0x800000 - nlen && !found; pa++) {
                         uint8_t buf[8];
                         cpu_physical_memory_read(pa, buf, nlen);
                         if (memcmp(buf, needles[n], nlen) == 0) {
@@ -830,7 +830,7 @@ static void chihiro_diag_timer_cb(void *opaque)
             {
                 printf("  UNICODE DEVICE SCAN (\\0D\\0e\\0v\\0i):\n");
                 int udev_count = 0;
-                for (uint32_t pa = 0x10000; pa < 0x80000 - 20; pa += 2) {
+                for (uint32_t pa = 0x10000; pa < 0x800000 - 20; pa += 2) {
                     uint8_t buf[16];
                     cpu_physical_memory_read(pa, buf, 16);
                     /* UTF-16LE: \=5C00 D=4400 e=6500 v=7600 i=6900 c=6300 e=6500 */
@@ -863,7 +863,7 @@ static void chihiro_diag_timer_cb(void *opaque)
                 /* Harddisk: 48006100720064006400 */
                 uint8_t hddisk_u16[] = {0x48,0x00,0x61,0x00,0x72,0x00,0x64,0x00,0x64,0x00};
                 int found_cd = 0, found_hd = 0;
-                for (uint32_t pa = 0x10000; pa < 0x80000 - 12; pa += 2) {
+                for (uint32_t pa = 0x10000; pa < 0x800000 - 12; pa += 2) {
                     uint8_t buf[10];
                     cpu_physical_memory_read(pa, buf, 10);
                     if (!found_cd && memcmp(buf, cdrom_u16, 10) == 0) {
@@ -932,7 +932,7 @@ static void chihiro_diag_timer_cb(void *opaque)
                 /* The kernel stores disk geometry info after IDE enumeration */
                 /* Search for "QEMU" or disk model string in kernel memory */
                 int found_ident = 0;
-                for (uint32_t pa = 0x10000; pa < 0x80000 - 8; pa += 2) {
+                for (uint32_t pa = 0x10000; pa < 0x800000 - 8; pa += 2) {
                     uint8_t buf[8];
                     cpu_physical_memory_read(pa, buf, 8);
                     if (buf[0]=='Q' && buf[1]=='E' && buf[2]=='M' && buf[3]=='U') {
@@ -1732,7 +1732,9 @@ static uint64_t chihiro_lpc_io_read(void *opaque, hwaddr addr,
              * which are needed to load game files.
              *
              * Patch 1: PA 0x30905 — JNE+37 → NOP (skips IoCreateSymbolicLink calls)
-             * Patch 2: PA 0x309AD — JNE+10 → NOP (skips FATX/partition init) */
+             * Patch 2: PA 0x309AD — JNE+10 → NOP (skips FATX/partition init)
+             * Patch 3: PA 0x25B16 — JNE+23 → NOP (skips D:\ symlink when MB_FLAG=1)
+             * Patch 4: PA 0x25AB0 — JNE+24 → NOP (skips mbcom partition when MB_FLAG=1) */
             {
                 uint8_t nop2[2] = {0x90, 0x90};
                 uint8_t check[2];
@@ -1749,6 +1751,24 @@ static uint64_t chihiro_lpc_io_read(void *opaque, hwaddr addr,
                     cpu_physical_memory_write(0x309AD, nop2, 2);
                     printf("[%07lld] Chihiro: Kernel patch 2: NOP JNE @ PA 0x309AD "
                            "(force partition init)\n", TS_MS);
+                }
+
+                /* Patch 3: create_partitions skips D:\ when MB_FLAG=1.
+                 * The port 0x40F0 handler sets MB_FLAG=1 BEFORE calling
+                 * create_partitions, so D:\ is NEVER created. */
+                cpu_physical_memory_read(0x25B16, check, 2);
+                if (check[0] == 0x75 && check[1] == 0x17) {
+                    cpu_physical_memory_write(0x25B16, nop2, 2);
+                    printf("[%07lld] Chihiro: Kernel patch 3: NOP JNE @ PA 0x25B16 "
+                           "(force D:\\ symlink creation)\n", TS_MS);
+                }
+
+                /* Patch 4: create_partitions skips mbcom when MB_FLAG=1 */
+                cpu_physical_memory_read(0x25AB0, check, 2);
+                if (check[0] == 0x75 && check[1] == 0x18) {
+                    cpu_physical_memory_write(0x25AB0, nop2, 2);
+                    printf("[%07lld] Chihiro: Kernel patch 4: NOP JNE @ PA 0x25AB0 "
+                           "(force mbcom partition creation)\n", TS_MS);
                 }
             }
 
