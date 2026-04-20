@@ -131,6 +131,7 @@ static bool chihiro_active;
 bool chihiro_game_running;  /* Set after QuickReboot — disables SEGABOOT DMA scan */
 static bool chihiro_boot3_reached; /* Set when SEGABOOT reaches boot=3 (checks complete) */
 static char chihiro_game_filename[64]; /* Game XBE filename saved at boot=3 */
+static uint32_t chihiro_ldp_pa;  /* v208: LDP physical address, captured at boot=3 */
 static ChihiroLPCState *chihiro_lpc_global;
 
 /* USB devices for delayed hotplug (simulates AN2131 I2C firmware boot) */
@@ -1088,6 +1089,23 @@ static void chihiro_diag_timer_cb(void *opaque)
                        "filename in RAM at boot=3\n", TS_MS);
             }
 
+            /* v208: Capture LaunchDataPage PA NOW while page tables are valid.
+             * After QuickReboot, the page tables change and the LDP VA
+             * (user-space) won't be translatable anymore.
+             * LDP pointer is at PA 0x30A10 (kernel export #164). */
+            {
+                uint32_t ldp_va = 0;
+                cpu_physical_memory_read(0x30A10, &ldp_va, 4);
+                if (ldp_va) {
+                    chihiro_ldp_pa = chihiro_va_to_pa(ldp_va);
+                    printf("[%07lld] Chihiro: LDP pointer VA=0x%08X → PA=0x%08X "
+                           "(captured at boot=3)\n", TS_MS, ldp_va, chihiro_ldp_pa);
+                } else {
+                    chihiro_ldp_pa = 0xFFFFFFFF;
+                    printf("[%07lld] Chihiro: LDP pointer is NULL at boot=3\n", TS_MS);
+                }
+            }
+
             /* Dump RAM at boot=3 for offline analysis.
              * Covers kernel (0x00000-0x40000) + SEGABOOT (0x40000-0xC0000). */
             {
@@ -1616,12 +1634,11 @@ static uint64_t chihiro_lpc_io_read(void *opaque, hwaddr addr,
              * launch code creates D:\ → mbfs: symlink. */
             {
                 if (chihiro_game_filename[0]) {
-                    /* Read LDP pointer from kernel export area */
-                    uint32_t ldp_va;
-                    cpu_physical_memory_read(0x30A10, &ldp_va, 4);
-                    uint32_t ldp_pa = chihiro_va_to_pa(ldp_va);
+                    /* v208: Use LDP PA captured at boot=3 (before QuickReboot
+                     * invalidated the page tables). */
+                    uint32_t ldp_pa = chihiro_ldp_pa;
 
-                    if (ldp_pa != 0xFFFFFFFF) {
+                    if (ldp_pa != 0xFFFFFFFF && ldp_pa != 0) {
                         /* Write LaunchDataType = 1 (launch XBE) */
                         uint32_t launch_type = 1;
                         cpu_physical_memory_write(ldp_pa, &launch_type, 4);
@@ -1640,8 +1657,8 @@ static uint64_t chihiro_lpc_io_read(void *opaque, hwaddr addr,
                                " type=1 path='%s'\n",
                                TS_MS, ldp_pa, launch_path);
                     } else {
-                        printf("[%07lld] Chihiro: WARNING — LDP VA 0x%08X "
-                               "not mapped, cannot fill\n", TS_MS, ldp_va);
+                        printf("[%07lld] Chihiro: WARNING — LDP PA not captured "
+                               "at boot=3 (PA=0x%08X)\n", TS_MS, ldp_pa);
                     }
                 } else {
                     printf("[%07lld] Chihiro: WARNING — no game filename saved "
