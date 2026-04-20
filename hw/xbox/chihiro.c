@@ -2223,11 +2223,11 @@ static void chihiro_mbcom_process(void)
     uint16_t cmd_echo = w[0] | (w[1] << 8);
     uint16_t cmd_code = w[2] | (w[3] << 8);
 
-    /* MAME-style response: echo cmd id + set 8001 marker in second word */
+    /* Cxbx-style response: echo sequence + command|0x8000 success flag */
     r[0] = w[0];
     r[1] = w[1];
-    r[2] = 0x01;
-    r[3] = 0x80;
+    r[2] = w[2] | (cmd_code & 0xFF);         /* low byte of cmd | 0x8000 */
+    r[3] = (w[3] & 0x7F) | 0x80;             /* high byte with bit15 set */
     /* zero out rest of 32-byte response area */
     memset(r + 4, 0, 28);
 
@@ -2264,6 +2264,43 @@ static void chihiro_mbcom_process(void)
         break;
     case 0x0103: /* SERIAL — MAME: "-abc-abc12345678" */
         memcpy(r + 4, "-abc-abc12345678", 16);
+        break;
+    case 0x0104: /* Cxbx: unknown, returns 0 */
+        r[4] = 0; r[5] = 0; r[6] = 0; r[7] = 0;
+        break;
+    case 0x0204: /* Cxbx: returns 0 */
+        r[4] = 0; r[5] = 0; r[6] = 0; r[7] = 0;
+        break;
+    case 0x0301: /* HW_TEST — Cxbx writes "TEST OK" to result ptr */
+        r[4] = w[4]; r[5] = w[5]; r[6] = w[6]; r[7] = w[7];
+        /* Write "TEST OK" to the address specified in the command */
+        {
+            uint32_t result_ptr = w[8] | (w[9]<<8) | (w[10]<<16) | (w[11]<<24);
+            if (result_ptr >= 0x80000000) {
+                uint32_t result_pa = result_ptr - 0x80000000;
+                cpu_physical_memory_write(result_pa, "TEST OK\0", 8);
+            }
+        }
+        break;
+    case 0x0415: /* Cxbx: returns IP 10.0.0.1 */
+        r[4] = 1; r[5] = 0; r[6] = 0; r[7] = 10; /* 10.0.0.1 LE */
+        break;
+    case 0x0601: /* Cxbx: returns 0 */
+        r[4] = 0; r[5] = 0; r[6] = 0; r[7] = 0;
+        break;
+    case 0x0602: /* Cxbx: returns 0xffff (triggers 0x0605) */
+        r[4] = 0xFF; r[5] = 0xFF; r[6] = 0; r[7] = 0;
+        break;
+    case 0x0605: /* Cxbx: returns 0 */
+    case 0x0606: /* Cxbx: returns 0 */
+        r[4] = 0; r[5] = 0; r[6] = 0; r[7] = 0;
+        break;
+    case 0x0607: /* Cxbx: returns 0 */
+        r[4] = 0; r[5] = 0; r[6] = 0; r[7] = 0;
+        r[8] = 0; r[9] = 0; r[10] = 0; r[11] = 0;
+        break;
+    case 0x0608: /* Cxbx: returns IP 10.0.0.1 */
+        r[4] = 1; r[5] = 0; r[6] = 0; r[7] = 10;
         break;
     default:
         printf("[%07lld] Chihiro mbcom: UNKNOWN cmd=0x%04X\n", TS_MS, cmd_code);
