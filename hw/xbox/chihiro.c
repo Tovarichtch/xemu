@@ -1168,18 +1168,18 @@ static void chihiro_diag_timer_cb(void *opaque)
             }
 
             /* Dump RAM at boot=3 for offline analysis.
-             * Covers kernel (0x00000-0x40000) + SEGABOOT (0x40000-0xC0000). */
+             * Covers kernel + pool memory (8MB). */
             {
                 FILE *f = fopen("/tmp/ram_boot3.bin", "wb");
                 if (f) {
                     uint8_t page[4096];
-                    for (uint32_t pa = 0; pa < 0xC0000; pa += 4096) {
+                    for (uint32_t pa = 0; pa < 0x800000; pa += 4096) {
                         cpu_physical_memory_read(pa, page, 4096);
                         fwrite(page, 1, 4096, f);
                     }
                     fclose(f);
                     printf("[%07lld] Chihiro: RAM dump saved to /tmp/ram_boot3.bin "
-                           "(768KB, PA 0x00000-0xBFFFF)\n", TS_MS);
+                           "(8MB, PA 0x00000-0x7FFFFF)\n", TS_MS);
                 }
             }
         }
@@ -1769,6 +1769,22 @@ static uint64_t chihiro_lpc_io_read(void *opaque, hwaddr addr,
                     cpu_physical_memory_write(0x25AAB, nop2, 2);
                     printf("[%07lld] Chihiro: Kernel patch 4: NOP JNE @ PA 0x25AAB "
                            "(force mbcom partition creation)\n", TS_MS);
+                }
+            }
+
+            /* Second RAM dump: after QuickReboot, patches applied.
+             * This captures the GAME state, not SEGABOOT state. */
+            {
+                FILE *f = fopen("/tmp/ram_game.bin", "wb");
+                if (f) {
+                    uint8_t page[4096];
+                    for (uint32_t pa = 0; pa < 0x800000; pa += 4096) {
+                        cpu_physical_memory_read(pa, page, 4096);
+                        fwrite(page, 1, 4096, f);
+                    }
+                    fclose(f);
+                    printf("[%07lld] Chihiro: Game RAM dump saved to /tmp/ram_game.bin "
+                           "(8MB)\n", TS_MS);
                 }
             }
 
