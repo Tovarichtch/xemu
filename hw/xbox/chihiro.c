@@ -1719,6 +1719,37 @@ static uint64_t chihiro_lpc_io_read(void *opaque, hwaddr addr,
             address_space_write(&address_space_memory, 0x3A93C,
                                 MEMTXATTRS_UNSPECIFIED, &gate_val, 1);
 
+            /* v209d: Patch kernel to force MediaBoard driver init.
+             *
+             * The MediaBoard driver has two gate checks that SKIP device
+             * creation when gate=1 (assumes devices persisted via
+             * MmPersistContiguousMemory). We don't have persistence,
+             * so we NOP these JNE instructions to force device creation.
+             *
+             * This creates \Device\CdRom0, D:\, and partition symlinks
+             * which are needed to load game files.
+             *
+             * Patch 1: PA 0x30905 — JNE+37 → NOP (skips IoCreateSymbolicLink calls)
+             * Patch 2: PA 0x309AD — JNE+10 → NOP (skips FATX/partition init) */
+            {
+                uint8_t nop2[2] = {0x90, 0x90};
+                uint8_t check[2];
+
+                cpu_physical_memory_read(0x30905, check, 2);
+                if (check[0] == 0x75 && check[1] == 0x25) {
+                    cpu_physical_memory_write(0x30905, nop2, 2);
+                    printf("[%07lld] Chihiro: Kernel patch 1: NOP JNE @ PA 0x30905 "
+                           "(force MediaBoard device creation)\n", TS_MS);
+                }
+
+                cpu_physical_memory_read(0x309AD, check, 2);
+                if (check[0] == 0x75 && check[1] == 0x0A) {
+                    cpu_physical_memory_write(0x309AD, nop2, 2);
+                    printf("[%07lld] Chihiro: Kernel patch 2: NOP JNE @ PA 0x309AD "
+                           "(force partition init)\n", TS_MS);
+                }
+            }
+
             /* v209b: Check if XLaunchNewImage filled the LDP (PTE was created
              * at boot=3). If it did, great. If not, fill it manually. */
             {
