@@ -1590,15 +1590,13 @@ static uint64_t chihiro_lpc_io_read(void *opaque, hwaddr addr,
         r = 0x4D41;     /* "MA" → full string reads as "XBAM" */
         break;
     case SEGA_CHIP_REVISION:
-        /* Port 0x40F0 has two consumers:
-         * 1. The KERNEL reads it during early boot (first 2 reads, ~5s).
-         *    MAME: "bits 15-0 = 0 if media board present" → must return 0
-         *    so the arcdkrnl creates \Device\CdRom0 → D:\ mapping.
-         * 2. SEGABOOT reads it later (~15s) as a negotiation status check.
-         *    Must return non-zero (0x0001) or SEGABOOT skips mbcom → ERROR 22.
-         * 3. v209: GAME KERNEL re-reads it after QuickReboot. Must return 0
-         *    again (mediaboard present) or game won't create D:\ mapping. */
-        if (chihiro_game_running) {
+        /* Port 0x40F0 — three phases:
+         * 1. Kernel boot (first 2 reads): 0x0000 (mediaboard present)
+         * 2. SEGABOOT negotiation: 0x0001 (ready for mbcom)
+         * 3. Game kernel (after boot=3): 0x0000 (mediaboard present)
+         * v209b: must use boot3_reached (set 4s earlier), NOT game_running
+         * (set during THIS read — too late for the return value). */
+        if (chihiro_boot3_reached) {
             r = 0x0000;  /* Game kernel: mediaboard present */
         } else {
             r = (s->lpc_40f0_reads < 2) ? 0x0000 : 0x0001;
