@@ -1756,18 +1756,18 @@ static uint64_t chihiro_lpc_io_read(void *opaque, hwaddr addr,
                 /* Patch 3: create_partitions skips D:\ when MB_FLAG=1.
                  * The port 0x40F0 handler sets MB_FLAG=1 BEFORE calling
                  * create_partitions, so D:\ is NEVER created. */
-                cpu_physical_memory_read(0x25B16, check, 2);
+                cpu_physical_memory_read(0x25B1B, check, 2);
                 if (check[0] == 0x75 && check[1] == 0x17) {
-                    cpu_physical_memory_write(0x25B16, nop2, 2);
-                    printf("[%07lld] Chihiro: Kernel patch 3: NOP JNE @ PA 0x25B16 "
+                    cpu_physical_memory_write(0x25B1B, nop2, 2);
+                    printf("[%07lld] Chihiro: Kernel patch 3: NOP JNE @ PA 0x25B1B "
                            "(force D:\\ symlink creation)\n", TS_MS);
                 }
 
                 /* Patch 4: create_partitions skips mbcom when MB_FLAG=1 */
-                cpu_physical_memory_read(0x25AB0, check, 2);
+                cpu_physical_memory_read(0x25AAB, check, 2);
                 if (check[0] == 0x75 && check[1] == 0x18) {
-                    cpu_physical_memory_write(0x25AB0, nop2, 2);
-                    printf("[%07lld] Chihiro: Kernel patch 4: NOP JNE @ PA 0x25AB0 "
+                    cpu_physical_memory_write(0x25AAB, nop2, 2);
+                    printf("[%07lld] Chihiro: Kernel patch 4: NOP JNE @ PA 0x25AAB "
                            "(force mbcom partition creation)\n", TS_MS);
                 }
             }
