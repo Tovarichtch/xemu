@@ -47,6 +47,11 @@ typedef struct ChihiroUSBState {
     int bulk_pending;      /* bytes pending for bulk IN */
     int bulk_offset;       /* current read offset in bulk_buf */
     int bulk_ep;           /* which EP the data is queued for */
+
+    /* v202: instrumentation counters (read/reset by DIAG timer) */
+    uint32_t nak_count;    /* bulk IN NAK count since last report */
+    uint32_t bulk_in_count;  /* successful bulk IN count */
+    uint32_t bulk_out_count; /* bulk OUT count */
 } ChihiroUSBState;
 
 enum chihiro_usb_strings {
@@ -254,8 +259,19 @@ static void handle_control(USBDevice *dev, USBPacket *p,
     ChihiroUSBState *s = (ChihiroUSBState *)dev;
     const char *id = ((ChihiroUSBState *)dev)->is_qc ? "QC" : "SC";
 
-    printf("[%07lld] chihiro-usb [%s]: control req=0x%04X val=0x%04X idx=0x%04X len=%d\n", TS_MS,
-           id, request, value, index, length);
+    printf("[%07lld] chihiro-usb [%s]: control req=0x%04X val=0x%04X idx=0x%04X len=%d [%s]\n", TS_MS,
+           id, request, value, index, length,
+           (request == 0x8006 && (value >> 8) == 1) ? "GET_DESCRIPTOR(DEVICE)" :
+           (request == 0x8006 && (value >> 8) == 2) ? "GET_DESCRIPTOR(CONFIG)" :
+           (request == 0x8006 && (value >> 8) == 3) ? "GET_DESCRIPTOR(STRING)" :
+           (request == 0x0005) ? "SET_ADDRESS" :
+           (request == 0x0009) ? "SET_CONFIG" :
+           (request == 0x010B) ? "SET_INTERFACE" :
+           (request == 0x0001) ? "CLEAR_FEATURE" :
+           (request == 0x0003) ? "SET_FEATURE" :
+           (request == 0x8000) ? "GET_STATUS" :
+           ((request >> 8) == 0x40 || (request >> 8) == 0xC0) ? "VENDOR" :
+           "OTHER");
     fflush(stdout);
 
     int ret = usb_desc_handle_control(dev, p, request, value, index,
@@ -263,6 +279,17 @@ static void handle_control(USBDevice *dev, USBPacket *p,
     if (ret >= 0) {
         printf("[%07lld] chihiro-usb [%s]: → std handled, dev addr=%d\n", TS_MS, id, dev->addr);
         return;
+    }
+
+    /* v202: Log when standard handler rejects a request */
+    {
+        uint8_t bmRequestType = request >> 8;
+        uint8_t reqType = (bmRequestType >> 5) & 0x03;  /* 0=std, 1=class, 2=vendor */
+        if (reqType != 2) {
+            /* Non-vendor request rejected by usb_desc — could indicate descriptor issue */
+            printf("[%07lld] chihiro-usb [%s]: ⚠ std handler REJECTED req=0x%04X (ret=%d) — "
+                   "falling through to vendor handler\n", TS_MS, id, request, ret);
+        }
     }
 
     /* Vendor request — extract bRequest from combined field.
@@ -359,6 +386,12 @@ static void handle_control(USBDevice *dev, USBPacket *p,
         return;
     }
 
+    /* v202: Log vendor response data bytes */
+    if (length >= 4) {
+        printf("[%07lld] chihiro-usb [%s]: → vendor resp data[0..3]=%02X %02X %02X %02X (len=%d)\n",
+               TS_MS, id, data[0], data[1], data[2], data[3], length);
+    }
+
     p->actual_length = length;
 }
 
@@ -375,10 +408,12 @@ static void handle_data(USBDevice *dev, USBPacket *p)
             usb_packet_copy(p, s->bulk_buf + s->bulk_offset, len);
             s->bulk_offset += len;
             s->bulk_pending -= len;
+            s->bulk_in_count++;
             printf("[%07lld] chihiro-usb [%s]: bulk IN ep%d %d bytes (%d remaining)\n", TS_MS,
                    id, ep, len, s->bulk_pending);
         } else {
             /* No data pending — return NAK (not ready, try later) */
+            s->nak_count++;
             p->status = USB_RET_NAK;
         }
     } else {
@@ -390,9 +425,27 @@ static void handle_data(USBDevice *dev, USBPacket *p)
             usb_packet_copy(p, discard, chunk);
             len -= chunk;
         }
+        s->bulk_out_count++;
         printf("[%07lld] chihiro-usb [%s]: bulk OUT ep%d %zd bytes (discarded)\n", TS_MS,
                id, ep, p->iov.size);
     }
+}
+
+/* v202: Counter accessors for DIAG timer in chihiro.c */
+void chihiro_usb_get_counters(USBDevice *dev, uint32_t *nak, uint32_t *bulk_in, uint32_t *bulk_out)
+{
+    ChihiroUSBState *s = (ChihiroUSBState *)dev;
+    if (nak)      *nak      = s->nak_count;
+    if (bulk_in)  *bulk_in  = s->bulk_in_count;
+    if (bulk_out) *bulk_out = s->bulk_out_count;
+}
+
+void chihiro_usb_reset_counters(USBDevice *dev)
+{
+    ChihiroUSBState *s = (ChihiroUSBState *)dev;
+    s->nak_count = 0;
+    s->bulk_in_count = 0;
+    s->bulk_out_count = 0;
 }
 
 static void chihiro_an2131qc_realize(USBDevice *dev, Error **errp)
