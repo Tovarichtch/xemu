@@ -1115,6 +1115,55 @@ static void chihiro_diag_timer_cb(void *opaque)
            xbe2_d0798, xbe2_d07a8, xbe2_ce_state,
            (xbe2_ce_pa != 0xFFFFFFFF) ? "xbe2:mapped" : "xbe2:UNMAPPED");
 
+    /* v206b: Monitor AND force baseboard_dev[].flags.
+     * RE confirmed: baseboard_dev[] at VA 0xA3778, stride 0x218, flags at offset +4.
+     * bit 0x01=init, 0x08=?, 0x20=opened, 0x40=connected.
+     * If flags are 0 during boot=1 (UsbEnumPoll window), force to 0x7F
+     * to break the circular dependency and see if bulk transfers start. */
+    {
+        static bool flags_forced = false;
+        uint32_t dev0_base_va = 0xA3778;
+        uint32_t dev1_base_va = 0xA3778 + 0x218;  /* 0xA3990 */
+        uint32_t dev0_flags_pa = chihiro_va_to_pa(dev0_base_va + 4);
+        uint32_t dev1_flags_pa = chihiro_va_to_pa(dev1_base_va + 4);
+
+        /* Read first 16 bytes of each baseboard_dev entry for full context */
+        uint8_t dev0_raw[16] = {0}, dev1_raw[16] = {0};
+        uint32_t dev0_base_pa = chihiro_va_to_pa(dev0_base_va);
+        uint32_t dev1_base_pa = chihiro_va_to_pa(dev1_base_va);
+        if (dev0_base_pa != 0xFFFFFFFF)
+            cpu_physical_memory_read(dev0_base_pa, dev0_raw, 16);
+        if (dev1_base_pa != 0xFFFFFFFF)
+            cpu_physical_memory_read(dev1_base_pa, dev1_raw, 16);
+
+        uint32_t dev0_flags = *(uint32_t *)(dev0_raw + 4);
+        uint32_t dev1_flags = *(uint32_t *)(dev1_raw + 4);
+
+        printf("[%07lld] DIAG USB-DEV: dev0[%05X→PA %X] raw=%02X%02X%02X%02X "
+               "FLAGS=0x%08X %02X%02X%02X%02X %02X%02X%02X%02X | "
+               "dev1[%05X→PA %X] FLAGS=0x%08X%s\n",
+               TS_MS,
+               dev0_base_va, dev0_base_pa,
+               dev0_raw[0], dev0_raw[1], dev0_raw[2], dev0_raw[3],
+               dev0_flags,
+               dev0_raw[8], dev0_raw[9], dev0_raw[10], dev0_raw[11],
+               dev0_raw[12], dev0_raw[13], dev0_raw[14], dev0_raw[15],
+               dev1_base_va, dev1_base_pa,
+               dev1_flags,
+               flags_forced ? " [FORCED]" : "");
+
+        /* Force flags during UsbEnumPoll window (boot=1, first 6 seconds) */
+        if (bootstate == 1 && !flags_forced &&
+            dev0_flags_pa != 0xFFFFFFFF && dev1_flags_pa != 0xFFFFFFFF) {
+            uint32_t force_val = 0x7F;  /* all bits 0-6 set */
+            cpu_physical_memory_write(dev0_flags_pa, &force_val, 4);
+            cpu_physical_memory_write(dev1_flags_pa, &force_val, 4);
+            flags_forced = true;
+            printf("[%07lld] DIAG USB-DEV: *** FORCED dev0+dev1 flags to 0x7F at PA 0x%X / 0x%X ***\n",
+                   TS_MS, dev0_flags_pa, dev1_flags_pa);
+        }
+    }
+
     /* v202: Thread + USB counters (only print if any activity or thread exists) */
     if (thread_handle || thread_state || qc_nak || sc_nak || qc_bin || sc_bin || qc_bout || sc_bout) {
         printf("[%07lld] DIAG USB: thr=0x%X tst=%u | QC nak=%u in=%u out=%u | SC nak=%u in=%u out=%u\n",
