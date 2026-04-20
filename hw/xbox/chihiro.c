@@ -1598,15 +1598,17 @@ static void chihiro_usb_poll_patch_cb(void *opaque)
 }
 
 /* Called from SMC handler when kernel writes SMC_REG_POWER (QuickReboot).
- * Blocks qemu_system_reset_request for Chihiro — the kernel handles
- * soft-reset internally via HalReturnToFirmware(2).
- * TODO: once SEGABOOT passes naturally, write LaunchDataPage here. */
+ * v209e: Let the reset happen! Combined with scratch_reg preservation
+ * (smc_reset no longer clears scratch), the kernel will detect warm boot,
+ * restore MmPersistContiguousMemory pages, and load the game from LDP.
+ * Blocking the reset prevented the real QuickReboot from ever occurring. */
 bool chihiro_intercept_reset(void)
 {
-    if (chihiro_active) {
-        printf("[%07lld] Chihiro: QuickReboot intercepted — game XBE taking over, disabling mbcom DMA scan\n", TS_MS);
+    if (chihiro_active && chihiro_boot3_reached) {
+        printf("[%07lld] Chihiro: QuickReboot — letting real reset proceed "
+               "(scratch_reg preserved for warm boot)\n", TS_MS);
         chihiro_game_running = true;
-        return true;  /* Block qemu_system_reset_request */
+        return false;  /* Allow qemu_system_reset_request */
     }
     return false;
 }
