@@ -1668,6 +1668,42 @@ static uint64_t chihiro_lpc_io_read(void *opaque, hwaddr addr,
          * Disable DMA scan immediately to prevent memory corruption. */
         if (chihiro_boot3_reached && !chihiro_game_running) {
             chihiro_game_running = true;
+
+            /* v209d: Re-create the LDP PTE in the kernel's NEW page tables.
+             * QuickReboot re-initializes page tables, wiping our PTE from
+             * boot=3. But the physical data at PA 0x262000 survived.
+             * We must re-map it NOW, before the kernel reads the LDP
+             * (which happens right after this 0x40F0 read). */
+            if (chihiro_ldp_pa != 0xFFFFFFFF && chihiro_ldp_pa != 0) {
+                uint32_t ldp_page = chihiro_ldp_pa & ~0xFFF;
+                uint32_t pte_idx = (0x002625A0 >> 12) & 0x3FF;
+                uint32_t pde;
+                cpu_physical_memory_read(0xF000, &pde, 4);  /* kernel CR3 */
+                uint32_t pt_base = pde & 0xFFFFF000;
+                uint32_t pte_addr = pt_base + pte_idx * 4;
+                uint32_t new_pte = ldp_page | 0x067;
+                cpu_physical_memory_write(pte_addr, &new_pte, 4);
+
+                /* Verify LDP data survived QuickReboot */
+                uint32_t check_type = 0;
+                cpu_physical_memory_read(chihiro_ldp_pa, &check_type, 4);
+                if (check_type == 0) {
+                    /* Data was cleared — re-fill */
+                    uint32_t launch_type = 1;
+                    cpu_physical_memory_write(chihiro_ldp_pa, &launch_type, 4);
+                    uint32_t title_id = 0;
+                    cpu_physical_memory_write(chihiro_ldp_pa + 4, &title_id, 4);
+                    char lp[520] = {0};
+                    snprintf(lp, sizeof(lp), "D:\\%s", chihiro_game_filename);
+                    cpu_physical_memory_write(chihiro_ldp_pa + 8, lp, 520);
+                    printf("[%07lld] Chihiro: Re-created PTE + re-filled LDP "
+                           "after QuickReboot: path='%s'\n", TS_MS, lp);
+                } else {
+                    printf("[%07lld] Chihiro: Re-created PTE (LDP data survived "
+                           "QuickReboot, type=%u)\n", TS_MS, check_type);
+                }
+            }
+
             /* Set the MediaBoard gate flag [VA 0x8003A93C] = 1.
              *
              * The arcdkrnl checks this flag to decide whether to call
