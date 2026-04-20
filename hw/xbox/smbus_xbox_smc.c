@@ -275,7 +275,15 @@ static void smbus_smc_realize(DeviceState *dev, Error **errp)
     smc->traystate_reg = 0;
     smc->avpack_reg = SMC_REG_AVPACK_SCART; /* Chihiro: kernel maps 0x00→VGA (DIP 6,7,8 ground AV pins) */
     smc->intstatus_reg = 0;
-    smc->scratch_reg = 0;
+    /* NOTE: scratch_reg is NOT cleared here.
+     * On real Xbox hardware, the SMC (PIC16LC) has its own power domain
+     * and preserves the scratch register across CPU resets. The kernel
+     * uses this to distinguish cold boot vs QuickReboot:
+     *   scratch = 0 → cold boot → full init, decompress kernel
+     *   scratch != 0 → warm boot → restore persisted pages (LDP, etc.)
+     * Clearing it here would break QuickReboot persistence for Chihiro
+     * (and retail Xbox title-to-title transitions). */
+    /* smc->scratch_reg = 0; — intentionally preserved */
     smc->cmd = 0;
     smc->error_reg = 0;
 
