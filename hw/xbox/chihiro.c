@@ -1897,6 +1897,68 @@ static qemu_irq chihiro_irq10_global = NULL;
 static uint8_t chihiro_mbcom_response[512];
 static uint8_t chihiro_mbcom_command[512];
 static bool chihiro_mbcom_enabled = false;
+
+/* Flash ROM (SEGABOOT) loaded from file — serves mbrom0/mbrom1 reads.
+ * On real hardware: fpr-23887_29lv160te.ic4 (2MB flash on MediaBoard).
+ * Contains the SEGABOOT XBE that boots before the game. */
+static uint8_t *chihiro_flash_rom = NULL;
+static uint32_t chihiro_flash_rom_size = 0;
+
+/* Load flash ROM from a file path. Called during LPC device init.
+ * Searches for fpr-23887 or fpr21042 in the same directory as the BIOS. */
+void chihiro_load_flash_rom(const char *bios_path)
+{
+    if (chihiro_flash_rom) return; /* already loaded */
+
+    /* Try to find flash ROM in same directory as BIOS */
+    char dir[1024] = {0};
+    const char *last_sep = strrchr(bios_path, '/');
+    if (!last_sep) last_sep = strrchr(bios_path, '\\');
+    if (last_sep) {
+        int dir_len = last_sep - bios_path + 1;
+        if (dir_len < (int)sizeof(dir)) {
+            memcpy(dir, bios_path, dir_len);
+        }
+    }
+
+    const char *flash_names[] = {
+        "fpr-23887_29lv160te.ic4",
+        "fpr21042_m29w160et.bin",
+        "fpr-23887.bin",
+        NULL
+    };
+
+    for (int i = 0; flash_names[i]; i++) {
+        char path[2048];
+        snprintf(path, sizeof(path), "%s%s", dir, flash_names[i]);
+        FILE *f = fopen(path, "rb");
+        if (!f) {
+            /* Also try parent directory */
+            snprintf(path, sizeof(path), "%s../%s", dir, flash_names[i]);
+            f = fopen(path, "rb");
+        }
+        if (f) {
+            fseek(f, 0, SEEK_END);
+            long sz = ftell(f);
+            fseek(f, 0, SEEK_SET);
+            if (sz > 0 && sz <= 4 * 1024 * 1024) {
+                chihiro_flash_rom = (uint8_t *)g_malloc0(sz);
+                if (fread(chihiro_flash_rom, 1, sz, f) == (size_t)sz) {
+                    chihiro_flash_rom_size = sz;
+                    printf("[%07lld] Chihiro: Loaded flash ROM '%s' (%u bytes)\n",
+                           TS_MS, path, (unsigned)sz);
+                } else {
+                    g_free(chihiro_flash_rom);
+                    chihiro_flash_rom = NULL;
+                }
+            }
+            fclose(f);
+            if (chihiro_flash_rom) return;
+        }
+    }
+    printf("[%07lld] Chihiro: No flash ROM found (fpr-23887/fpr21042). "
+           "Will fall through to baseboard.img for mbrom reads.\n", TS_MS);
+}
 static void chihiro_mbcom_process(void);
 
 static void chihiro_irq10_timer_cb(void *opaque)
@@ -2357,6 +2419,21 @@ bool chihiro_ide_read_sector(uint32_t lba, void *buffer)
          * Bug was: returning response instead → non-zero → infinite poll. */
         memset(buffer, 0, 512);
         memcpy(buffer, chihiro_mbcom_command, 32);
+        return true;
+    }
+
+    /* mbrom0/mbrom1: serve from loaded flash ROM file instead of baseboard.img.
+     * MAME: LBA >= 0x8000000 → read from :mediaboard region.
+     * offset = (lba & 0x7FF) * 512 within the 1MB flash ROM. */
+    if (lba >= CHIHIRO_MBROM0 && chihiro_flash_rom) {
+        uint32_t offset = (lba & 0x7FF) * 512;
+        memset(buffer, 0, 512);
+        if (offset < chihiro_flash_rom_size) {
+            uint32_t copy_len = 512;
+            if (offset + copy_len > chihiro_flash_rom_size)
+                copy_len = chihiro_flash_rom_size - offset;
+            memcpy(buffer, chihiro_flash_rom + offset, copy_len);
+        }
         return true;
     }
     return false;

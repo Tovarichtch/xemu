@@ -31,6 +31,7 @@
 #include "net/net.h"
 #include "hw/boards.h"
 #include "hw/ide/pci.h"
+#include "ui/xemu-settings.h"
 #include "system/system.h"
 #include "system/kvm.h"
 #include "kvm/kvm_i386.h"
@@ -368,6 +369,10 @@ void xbox_init_common(MachineState *machine,
     if (machine->ram_size > 64 * 1024 * 1024) {
         printf("Chihiro: 128MB RAM detected, enabling mediaboard LPC\n");
         isa_create_simple(isa_bus, "chihiro-lpc");
+
+        /* Load baseboard flash ROM (SEGABOOT) from file.
+         * Searches for fpr-23887/fpr21042 next to the BIOS file. */
+        chihiro_load_flash_rom(g_config.sys.files.flashrom_path);
 
         /* The Chihiro BIOS jamtable writes to SMBus device 0x6A (Focus
          * FS454 video encoder) during early boot. Without this device,

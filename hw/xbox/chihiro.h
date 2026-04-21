@@ -15,4 +15,7 @@ void chihiro_ide_dma_write_done(BlockBackend *blk, int64_t sector_num);
 /* USB delayed hotplug (AN2131 firmware boot simulation) */
 void chihiro_usb_set_devices(USBDevice *qc, USBDevice *sc);
 
+/* Load baseboard flash ROM (SEGABOOT) from file */
+void chihiro_load_flash_rom(const char *bios_path);
+
 #endif
