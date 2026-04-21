@@ -2383,9 +2383,10 @@ bool chihiro_ide_read_sector(uint32_t lba, void *buffer)
 
     /* mbrom0/mbrom1: serve from loaded flash ROM file instead of baseboard.img.
      * MAME: LBA >= 0x8000000 → read from :mediaboard region.
-     * offset = (lba & 0x7FF) * 512 within the 1MB flash ROM. */
+     * mbrom0 = flash[0..1MB), mbrom1 = flash[1MB..2MB).
+     * offset = (lba - CHIHIRO_MBROM0) * 512 within the 2MB flash ROM. */
     if (lba >= CHIHIRO_MBROM0 && chihiro_flash_rom) {
-        uint32_t offset = (lba & 0x7FF) * 512;
+        uint32_t offset = (lba - CHIHIRO_MBROM0) * 512;
         memset(buffer, 0, 512);
         if (offset < chihiro_flash_rom_size) {
             uint32_t copy_len = 512;
