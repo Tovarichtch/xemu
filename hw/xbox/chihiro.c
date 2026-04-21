@@ -2008,15 +2008,28 @@ static void chihiro_irq10_timer_cb(void *opaque)
 
     /* DMA META scan: marks mbcom slots as "ready" with responses.
      * Required for boot=0 → boot=1 — SEGABOOT polls slot markers.
-     * TX scan (command reading) removed — corrupted fpr-21042 memory.
-     * Slot address VA 0x89760 is fpr-23887 specific. */
+     * fpr-23887: slot VA=0x89760, meta VA=0x89740, stride=0x40
+     * fpr-21042: slot VA=0xAA7B0, meta VA=0xAA790, stride=0x20 */
     if (chihiro_mbcom_enabled && !chihiro_game_running) {
-        uint32_t slot_base_pa = chihiro_va_to_pa(0x89760);
-        if (slot_base_pa != 0xFFFFFFFF) {
-            uint32_t meta_base_pa = slot_base_pa - 0x20;
+        /* Try both SEGABOOT versions */
+        static const struct { uint32_t slot_va; uint32_t meta_va; uint32_t stride; } 
+            slot_layouts[] = {
+                { 0xAA7B0, 0xAA790, 0x20 },  /* fpr-21042 (try first) */
+                { 0x89760, 0x89740, 0x40 },  /* fpr-23887 */
+            };
+
+        for (int layout = 0; layout < 2; layout++) {
+            uint32_t slot_base_pa = chihiro_va_to_pa(slot_layouts[layout].slot_va);
+            if (slot_base_pa == 0xFFFFFFFF) continue;
+
+            uint32_t meta_base_pa = chihiro_va_to_pa(slot_layouts[layout].meta_va);
+            if (meta_base_pa == 0xFFFFFFFF) continue;
+
+            uint32_t stride = slot_layouts[layout].stride;
+
             for (int s = 0; s < 16; s++) {
-                uint32_t data_pa = slot_base_pa + s * 0x40;
-                uint32_t meta_pa = meta_base_pa + s * 0x40;
+                uint32_t data_pa = slot_base_pa + s * stride;
+                uint32_t meta_pa = meta_base_pa + s * stride;
                 uint8_t data_byte0;
                 uint16_t meta_marker;
                 cpu_physical_memory_read(data_pa, &data_byte0, 1);
@@ -2055,13 +2068,15 @@ static void chihiro_irq10_timer_cb(void *opaque)
                         if (dma_repeat_count > 1)
                             printf("[%07lld] Chihiro DMA: (prev cmd=0x%04X repeated %u)\n",
                                    TS_MS, last_dma_cmd, dma_repeat_count);
-                        printf("[%07lld] Chihiro DMA: slot %d ready (type=0x%02X cmd=0x%04X) resp=0x%08X\n",
-                               TS_MS, s, data_byte0, cmd_opcode, resp_data);
+                        printf("[%07lld] Chihiro DMA: slot %d ready (VA=0x%05X stride=0x%02X type=0x%02X cmd=0x%04X) resp=0x%08X\n",
+                               TS_MS, s, slot_layouts[layout].slot_va, stride,
+                               data_byte0, cmd_opcode, resp_data);
                         last_dma_cmd = cmd_opcode;
                         dma_repeat_count = 1;
                     }
                 }
             }
+            break; /* Use first working layout */
         }
     }
 
