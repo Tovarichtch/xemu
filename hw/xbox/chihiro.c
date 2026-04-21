@@ -1507,6 +1507,16 @@ static void chihiro_usb_poll_patch_cb(void *opaque)
         0xC3                                   /* ret                */
     };
 
+    /* fpr-21042 variant — different jne offset + call prefix to avoid false positive */
+    static const uint8_t sig_check_mainserial_21042[] = {
+        0xE8, 0xB4, 0xF7, 0xFF, 0xFF,         /* call CheckSerial      */
+        0x85, 0xC0,                            /* test eax, eax      */
+        0x75, 0x07,                            /* jne +0x07          */
+        0xB8, 0x03, 0x00, 0x00, 0x00,          /* mov eax, 3         */
+        0x5E,                                  /* pop esi            */
+        0xC3                                   /* ret                */
+    };
+
     /*
      * Patch 12: CheckMediaBoardSerial (VA 0x2EC88) — return 0 instead of 4
      *
@@ -1570,6 +1580,7 @@ static void chihiro_usb_poll_patch_cb(void *opaque)
         /* v153: REMOVED MbcomPollReady (was always return 1) — let clear-on-read deliver real responses */
         /* v153: REMOVED GetBootData (was always return 1) — let real boot data flow through */
         { sig_check_mainserial,  sizeof(sig_check_mainserial),  4, patch_xor_nop3, 5, 0x2EC35, "CheckMainBoardSerial (err 3 -> 0)",  false },
+        { sig_check_mainserial_21042, sizeof(sig_check_mainserial_21042), 9, patch_xor_nop3, 5, 0x1EA9C, "CheckMainBoardSerial (err 3 -> 0) [21042]", false },
         { sig_check_mediaserial, sizeof(sig_check_mediaserial), 5, patch_xor_nop3, 5, 0x2EC88, "CheckMediaBoardSerial (err 4 -> 0)", false },
     };
     int num_patches = sizeof(patches) / sizeof(patches[0]);
