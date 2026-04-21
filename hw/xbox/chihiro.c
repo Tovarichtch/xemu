@@ -2020,7 +2020,21 @@ static void chihiro_irq10_timer_cb(void *opaque)
 
         for (int layout = 0; layout < 2; layout++) {
             uint32_t slot_base_pa = chihiro_va_to_pa(slot_layouts[layout].slot_va);
-            if (slot_base_pa == 0xFFFFFFFF) continue;
+            if (slot_base_pa == 0xFFFFFFFF) {
+                continue;
+            }
+
+            uint32_t meta_base_pa = chihiro_va_to_pa(slot_layouts[layout].meta_va);
+            if (meta_base_pa == 0xFFFFFFFF) {
+                continue;
+            }
+
+            static int meta_scan_log_count = 0;
+            if (meta_scan_log_count++ == 0) {
+                printf("[%07lld] Chihiro META: VA 0x%05X → PA 0x%05X (stride=0x%02X)\n",
+                       TS_MS, slot_layouts[layout].slot_va, slot_base_pa,
+                       slot_layouts[layout].stride);
+            }
 
             uint32_t meta_base_pa = chihiro_va_to_pa(slot_layouts[layout].meta_va);
             if (meta_base_pa == 0xFFFFFFFF) continue;

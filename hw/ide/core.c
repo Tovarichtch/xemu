@@ -978,15 +978,26 @@ static void ide_dma_cb(void *opaque, int ret)
         extern bool chihiro_ide_read_sector(uint32_t lba, void *buffer);
         uint8_t sector_buf[512];
         if (chihiro_ide_read_sector((uint32_t)sector_num, sector_buf)) {
-            /* First sector handled — serve ALL remaining sectors too */
+            /* First sector handled — serve ALL remaining via scatter-gather */
             int total = n;
+            int sg_idx = 0;
+            dma_addr_t sg_off = 0;
             for (int i = 0; i < total; i++) {
                 if (i > 0) {
                     chihiro_ide_read_sector((uint32_t)(sector_num + i), sector_buf);
                 }
-                dma_memory_write(&address_space_memory,
-                                 s->sg.sg[0].base + i * 512, sector_buf, 512,
-                                 MEMTXATTRS_UNSPECIFIED);
+                /* Walk scatter-gather list properly */
+                while (sg_idx < s->sg.nsg && sg_off >= s->sg.sg[sg_idx].len) {
+                    sg_off -= s->sg.sg[sg_idx].len;
+                    sg_idx++;
+                }
+                if (sg_idx < s->sg.nsg) {
+                    dma_memory_write(&address_space_memory,
+                                     s->sg.sg[sg_idx].base + sg_off,
+                                     sector_buf, 512,
+                                     MEMTXATTRS_UNSPECIFIED);
+                }
+                sg_off += 512;
             }
             sector_num += total;
             ide_set_sector(s, sector_num);
