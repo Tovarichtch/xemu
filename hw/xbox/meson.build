@@ -3,6 +3,7 @@ specific_ss.add(files(
 	'amd_smbus.c',
 	'chihiro-usb.c',
 	'chihiro.c',
+	'chihiro_fatx.c',
 	'eeprom_generation.c',
 	'lpc47m157.c',
 	'smbus_adm1032.c',

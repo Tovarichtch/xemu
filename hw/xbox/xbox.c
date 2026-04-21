@@ -59,6 +59,7 @@
 #include "hw/xbox/xbox.h"
 #include "smbus.h"
 #include "chihiro.h"
+#include "chihiro_fatx.h"
 
 #define MAX_IDE_BUS 2
 
@@ -373,6 +374,33 @@ void xbox_init_common(MachineState *machine,
         /* Load baseboard flash ROM (SEGABOOT) from file.
          * Searches for fpr-23887/fpr21042 next to the BIOS file. */
         chihiro_load_flash_rom(g_config.sys.files.flashrom_path);
+
+        /* Build FATX from game directory if dvd_path is a directory.
+         * If dvd_path points to an XBE, use its parent directory. */
+        {
+            const char *dvd = g_config.sys.files.dvd_path;
+            if (dvd && strlen(dvd) > 0) {
+                struct stat st;
+                if (stat(dvd, &st) == 0) {
+                    char game_dir[2048];
+                    if (S_ISDIR(st.st_mode)) {
+                        snprintf(game_dir, sizeof(game_dir), "%s", dvd);
+                    } else {
+                        /* XBE file: use parent directory */
+                        snprintf(game_dir, sizeof(game_dir), "%s", dvd);
+                        char *slash = strrchr(game_dir, '/');
+                        if (!slash) slash = strrchr(game_dir, '\\');
+                        if (slash) *slash = '\0';
+                    }
+                    uint32_t fatx_size = 0;
+                    uint8_t *fatx = chihiro_fatx_build(game_dir, &fatx_size);
+                    if (fatx) {
+                        printf("Chihiro: FATX built from '%s' (%u MB)\n",
+                               game_dir, fatx_size / (1024*1024));
+                    }
+                }
+            }
+        }
 
         /* The Chihiro BIOS jamtable writes to SMBus device 0x6A (Focus
          * FS454 video encoder) during early boot. Without this device,

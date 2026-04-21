@@ -31,6 +31,7 @@
 #include "system/address-spaces.h"
 #include "system/block-backend.h"
 #include "chihiro.h"
+#include "chihiro_fatx.h"
 #include "system/blockdev.h"
 #include "hw/usb.h"
 #include "target/i386/cpu.h"
@@ -2351,6 +2352,11 @@ bool chihiro_ide_read_sector(uint32_t lba, void *buffer)
 {
     if (!chihiro_mbcom_enabled) return false;
 
+    /* FATX partition: serve from in-memory image (LBA 0 to ~700K) */
+    if (lba < CHIHIRO_MBCOM_BASE && chihiro_fatx_read_sector(lba, buffer)) {
+        return true;
+    }
+
     if (lba == CHIHIRO_MBCOM_RESPONSE) {
         memset(buffer, 0, 512);
         memcpy(buffer, chihiro_mbcom_response, 32);
@@ -2381,19 +2387,22 @@ bool chihiro_ide_read_sector(uint32_t lba, void *buffer)
         return true;
     }
 
-    /* mbrom0/mbrom1: serve from loaded flash ROM file instead of baseboard.img.
-     * MAME: LBA >= 0x8000000 → read from :mediaboard region.
-     * mbrom0 = flash[0..1MB), mbrom1 = flash[1MB..2MB).
-     * offset = (lba - CHIHIRO_MBROM0) * 512 within the 2MB flash ROM. */
+    /* mbrom0/mbrom1: serve from loaded flash ROM file.
+     * baseboard.img layout: LBA 0x8000800 → byte 0 of fpr-23887 (full 2MB).
+     * mbrom0 (LBA 0x8000000-0x80007FF): returns zeros (not needed for boot).
+     * mbrom1 (LBA 0x8000800+): flash ROM from byte 0. */
     if (lba >= CHIHIRO_MBROM0 && chihiro_flash_rom) {
-        uint32_t offset = (lba - CHIHIRO_MBROM0) * 512;
         memset(buffer, 0, 512);
-        if (offset < chihiro_flash_rom_size) {
-            uint32_t copy_len = 512;
-            if (offset + copy_len > chihiro_flash_rom_size)
-                copy_len = chihiro_flash_rom_size - offset;
-            memcpy(buffer, chihiro_flash_rom + offset, copy_len);
+        if (lba >= CHIHIRO_MBROM1) {
+            uint32_t offset = (lba - CHIHIRO_MBROM1) * 512;
+            if (offset < chihiro_flash_rom_size) {
+                uint32_t copy_len = 512;
+                if (offset + copy_len > chihiro_flash_rom_size)
+                    copy_len = chihiro_flash_rom_size - offset;
+                memcpy(buffer, chihiro_flash_rom + offset, copy_len);
+            }
         }
+        /* mbrom0: zeros (no separate mbrom0 file) */
         return true;
     }
     return false;
