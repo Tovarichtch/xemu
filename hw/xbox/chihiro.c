@@ -2005,12 +2005,64 @@ static void chihiro_irq10_timer_cb(void *opaque)
         qemu_irq_raise(s->irq10);
     }
 
-    /* DMA emulation: DISABLED.
-     * The TX slot scan at VA 0x89760 was designed for fpr-23887 SEGABOOT
-     * layout. With fpr21042, these addresses contain SEGABOOT code, not
-     * mbcom buffers. The scan reads random code bytes as "commands" and
-     * writes garbage responses back, corrupting SEGABOOT.
-     * All mbcom communication is handled by IDE hooks (FC800/FC801). */
+    /* DMA META scan: marks mbcom slots as "ready" with responses.
+     * Required for boot=0 → boot=1 — SEGABOOT polls slot markers.
+     * TX scan (command reading) removed — corrupted fpr-21042 memory.
+     * Slot address VA 0x89760 is fpr-23887 specific. */
+    if (chihiro_mbcom_enabled && !chihiro_game_running) {
+        uint32_t slot_base_pa = chihiro_va_to_pa(0x89760);
+        if (slot_base_pa != 0xFFFFFFFF) {
+            uint32_t meta_base_pa = slot_base_pa - 0x20;
+            for (int s = 0; s < 16; s++) {
+                uint32_t data_pa = slot_base_pa + s * 0x40;
+                uint32_t meta_pa = meta_base_pa + s * 0x40;
+                uint8_t data_byte0;
+                uint16_t meta_marker;
+                cpu_physical_memory_read(data_pa, &data_byte0, 1);
+                cpu_physical_memory_read(meta_pa + 2, &meta_marker, 2);
+
+                if (data_byte0 != 0 && meta_marker == 0) {
+                    uint16_t cmd_opcode = 0;
+                    cpu_physical_memory_read(data_pa + 2, &cmd_opcode, 2);
+
+                    if (cmd_opcode != 0x0001 && cmd_opcode != 0x0100 &&
+                        cmd_opcode != 0x0101 && cmd_opcode != 0x0102 &&
+                        cmd_opcode != 0x0103) {
+                        continue;
+                    }
+
+                    meta_marker = 0x0001;
+                    cpu_physical_memory_write(meta_pa + 2, &meta_marker, 2);
+
+                    uint32_t resp_data = 0, resp_data2 = 0;
+                    switch (cmd_opcode) {
+                    case 0x0001: resp_data = 0x00F00000; break;
+                    case 0x0100: resp_data = 5; resp_data2 = 100; break;
+                    case 0x0101: resp_data = 0x45671234; break;
+                    case 0x0102: resp_data = 0x00010000; break;
+                    case 0x0103: resp_data = 0x6261632D; break;
+                    }
+                    cpu_physical_memory_write(meta_pa + 4, &resp_data, 4);
+                    if (cmd_opcode == 0x0100)
+                        cpu_physical_memory_write(meta_pa + 8, &resp_data2, 4);
+
+                    static uint16_t last_dma_cmd = 0xFFFF;
+                    static uint32_t dma_repeat_count = 0;
+                    if (cmd_opcode == last_dma_cmd) {
+                        dma_repeat_count++;
+                    } else {
+                        if (dma_repeat_count > 1)
+                            printf("[%07lld] Chihiro DMA: (prev cmd=0x%04X repeated %u)\n",
+                                   TS_MS, last_dma_cmd, dma_repeat_count);
+                        printf("[%07lld] Chihiro DMA: slot %d ready (type=0x%02X cmd=0x%04X) resp=0x%08X\n",
+                               TS_MS, s, data_byte0, cmd_opcode, resp_data);
+                        last_dma_cmd = cmd_opcode;
+                        dma_repeat_count = 1;
+                    }
+                }
+            }
+        }
+    }
 
     /* Re-arm every 16ms (~60Hz) */
     timer_mod(s->irq10_timer,
