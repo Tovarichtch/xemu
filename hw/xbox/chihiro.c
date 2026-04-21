@@ -1624,6 +1624,20 @@ static void chihiro_usb_poll_patch_cb(void *opaque)
         printf("[%07lld] Chihiro: UsbEnumPoll+RegisterClassDriver "
                "skipped (circular dep). Post-init USB/mbcom in LLE.\n", TS_MS);
 
+        /* RAM dump for offline RE — page tables, SEGABOOT BSS, slot analysis */
+        {
+            FILE *f = fopen("/tmp/ram_postpatch.bin", "wb");
+            if (f) {
+                uint8_t page[4096];
+                for (uint32_t pa = 0; pa < 0x01000000; pa += 4096) {
+                    cpu_physical_memory_read(pa, page, 4096);
+                    fwrite(page, 1, 4096, f);
+                }
+                fclose(f);
+                printf("[%07lld] Chihiro: RAM dump saved to /tmp/ram_postpatch.bin (16MB)\n", TS_MS);
+            }
+        }
+
         /* Start diagnostic timer to monitor state machine progress */
         s->diag_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, chihiro_diag_timer_cb, s);
         timer_mod(s->diag_timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 1000);
@@ -2011,87 +2025,48 @@ static void chihiro_irq10_timer_cb(void *opaque)
      * fpr-23887: slot VA=0x89760, meta VA=0x89740, stride=0x40
      * fpr-21042: slot VA=0xAA7B0, meta VA=0xAA790, stride=0x20 */
     if (chihiro_mbcom_enabled && !chihiro_game_running) {
-        /* Try both SEGABOOT versions */
-        static const struct { uint32_t slot_va; uint32_t meta_va; uint32_t stride; } 
-            slot_layouts[] = {
-                { 0xAA7B0, 0xAA790, 0x20 },  /* fpr-21042 (try first) */
-                { 0x89760, 0x89740, 0x40 },  /* fpr-23887 */
-            };
-
-        for (int layout = 0; layout < 2; layout++) {
-            uint32_t slot_base_pa = chihiro_va_to_pa(slot_layouts[layout].slot_va);
-            if (slot_base_pa == 0xFFFFFFFF) {
-                continue;
-            }
-
-            uint32_t meta_base_pa = chihiro_va_to_pa(slot_layouts[layout].meta_va);
-            if (meta_base_pa == 0xFFFFFFFF) {
-                continue;
-            }
-
-            static int meta_scan_log_count = 0;
-            if (meta_scan_log_count++ == 0) {
-                printf("[%07lld] Chihiro META: VA 0x%05X → PA 0x%05X (stride=0x%02X)\n",
-                       TS_MS, slot_layouts[layout].slot_va, slot_base_pa,
-                       slot_layouts[layout].stride);
-            }
-
-            uint32_t meta_base_pa = chihiro_va_to_pa(slot_layouts[layout].meta_va);
-            if (meta_base_pa == 0xFFFFFFFF) continue;
-
-            uint32_t stride = slot_layouts[layout].stride;
-
-            for (int s = 0; s < 16; s++) {
-                uint32_t data_pa = slot_base_pa + s * stride;
-                uint32_t meta_pa = meta_base_pa + s * stride;
-                uint8_t data_byte0;
-                uint16_t meta_marker;
-                cpu_physical_memory_read(data_pa, &data_byte0, 1);
-                cpu_physical_memory_read(meta_pa + 2, &meta_marker, 2);
-
-                if (data_byte0 != 0 && meta_marker == 0) {
-                    uint16_t cmd_opcode = 0;
-                    cpu_physical_memory_read(data_pa + 2, &cmd_opcode, 2);
-
-                    if (cmd_opcode != 0x0001 && cmd_opcode != 0x0100 &&
-                        cmd_opcode != 0x0101 && cmd_opcode != 0x0102 &&
-                        cmd_opcode != 0x0103) {
-                        continue;
-                    }
-
-                    meta_marker = 0x0001;
-                    cpu_physical_memory_write(meta_pa + 2, &meta_marker, 2);
-
-                    uint32_t resp_data = 0, resp_data2 = 0;
-                    switch (cmd_opcode) {
-                    case 0x0001: resp_data = 0x00F00000; break;
-                    case 0x0100: resp_data = 5; resp_data2 = 100; break;
-                    case 0x0101: resp_data = 0x45671234; break;
-                    case 0x0102: resp_data = 0x00010000; break;
-                    case 0x0103: resp_data = 0x6261632D; break;
-                    }
-                    cpu_physical_memory_write(meta_pa + 4, &resp_data, 4);
-                    if (cmd_opcode == 0x0100)
-                        cpu_physical_memory_write(meta_pa + 8, &resp_data2, 4);
-
-                    static uint16_t last_dma_cmd = 0xFFFF;
-                    static uint32_t dma_repeat_count = 0;
-                    if (cmd_opcode == last_dma_cmd) {
-                        dma_repeat_count++;
+        /* Periodic VA→PA diagnostic for slot resolution */
+        static int va_diag_count = 0;
+        if (va_diag_count++ % 62 == 0) { /* ~every 1 second at 16ms ticks */
+            CPUState *cpu = first_cpu;
+            if (cpu) {
+                X86CPU *x86 = X86_CPU(cpu);
+                uint32_t cr3 = x86->env.cr[3] & 0xFFFFF000;
+                uint32_t test_va = 0xAA7B0;
+                uint32_t pde_addr = cr3 + ((test_va >> 22) * 4);
+                uint32_t pde;
+                cpu_physical_memory_read(pde_addr, &pde, 4);
+                if (pde & 1) {
+                    if (pde & 0x80) {
+                        uint32_t pa = (pde & 0xFFC00000) | (test_va & 0x003FFFFF);
+                        printf("[%07lld] META-DIAG: VA 0x%05X CR3=0x%08X PDE=0x%08X → PA 0x%05X (4MB page)\n",
+                               TS_MS, test_va, cr3, pde, pa);
                     } else {
-                        if (dma_repeat_count > 1)
-                            printf("[%07lld] Chihiro DMA: (prev cmd=0x%04X repeated %u)\n",
-                                   TS_MS, last_dma_cmd, dma_repeat_count);
-                        printf("[%07lld] Chihiro DMA: slot %d ready (VA=0x%05X stride=0x%02X type=0x%02X cmd=0x%04X) resp=0x%08X\n",
-                               TS_MS, s, slot_layouts[layout].slot_va, stride,
-                               data_byte0, cmd_opcode, resp_data);
-                        last_dma_cmd = cmd_opcode;
-                        dma_repeat_count = 1;
+                        uint32_t pt_addr = (pde & 0xFFFFF000) + (((test_va >> 12) & 0x3FF) * 4);
+                        uint32_t pte;
+                        cpu_physical_memory_read(pt_addr, &pte, 4);
+                        if (pte & 1) {
+                            uint32_t pa = (pte & 0xFFFFF000) | (test_va & 0xFFF);
+                            printf("[%07lld] META-DIAG: VA 0x%05X CR3=0x%08X PDE=0x%08X PTE=0x%08X → PA 0x%05X\n",
+                                   TS_MS, test_va, cr3, pde, pte, pa);
+                        } else {
+                            printf("[%07lld] META-DIAG: VA 0x%05X CR3=0x%08X PDE=0x%08X PTE=0x%08X → NOT PRESENT\n",
+                                   TS_MS, test_va, cr3, pde, pte);
+                        }
                     }
+                } else {
+                    printf("[%07lld] META-DIAG: VA 0x%05X CR3=0x%08X PDE=0x%08X → PDE NOT PRESENT\n",
+                           TS_MS, test_va, cr3, pde);
                 }
             }
-            break; /* Use first working layout */
         }
+
+        /* META scan DISABLED — was writing to potentially wrong PAs,
+         * corrupting VRAM/SEGABOOT memory. Need RAM dump to find
+         * correct slot PAs before re-enabling.
+         * 
+         * mbcom responses will come from IDE hooks (FC800/FC801)
+         * once we verify SEGABOOT uses that path with fpr-21042. */
     }
 
     /* Re-arm every 16ms (~60Hz) */
