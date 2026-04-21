@@ -1340,6 +1340,13 @@ static void chihiro_usb_poll_patch_cb(void *opaque)
         0x74, 0x0F                     /* je +0x0F (skip error)  */
     };
 
+    /* fpr-21042 variant: JNE 32-bit instead of JE 8-bit */
+    static const uint8_t sig_enumpoll_21042[] = {
+        0xE8, 0xEF, 0xF1, 0xFF, 0xFF,  /* call 0x2F760           */
+        0x85, 0xC0,                    /* test eax, eax          */
+        0x0F, 0x85                     /* jne +0x32E (to error)  */
+    };
+
     /*
      * Patch 2: RegisterClassDriver error check (VA 0x41F74) — v207b: RE-ENABLED
      *   Also fails because depends on UsbEnumPoll side effects.
@@ -1347,6 +1354,13 @@ static void chihiro_usb_poll_patch_cb(void *opaque)
      */
     static const uint8_t sig_classdrv[] = {
         0xE8, 0x27, 0x54, 0x00, 0x00,  /* call RegisterClassDriver */
+        0x85, 0xC0,                    /* test eax, eax            */
+        0x74, 0x0F                     /* je +0x0F                 */
+    };
+
+    /* fpr-21042 variant */
+    static const uint8_t sig_classdrv_21042[] = {
+        0xE8, 0x33, 0x95, 0x00, 0x00,  /* call 0x39AE0             */
         0x85, 0xC0,                    /* test eax, eax            */
         0x74, 0x0F                     /* je +0x0F                 */
     };
@@ -1363,6 +1377,13 @@ static void chihiro_usb_poll_patch_cb(void *opaque)
      */
     static const uint8_t sig_qcbyte0[] = {
         0xE8, 0x2B, 0x6E, 0x01, 0x00,  /* call GetQcStatus      */
+        0x0F, 0xB6, 0x00,              /* movzx eax, byte [eax]  */
+        0xC3                            /* ret                    */
+    };
+
+    /* fpr-21042 variant — different call offset */
+    static const uint8_t sig_qcbyte0_21042[] = {
+        0xE8, 0xEB, 0x96, 0x01, 0x00,  /* call 0x44460           */
         0x0F, 0xB6, 0x00,              /* movzx eax, byte [eax]  */
         0xC3                            /* ret                    */
     };
@@ -1526,6 +1547,7 @@ static void chihiro_usb_poll_patch_cb(void *opaque)
     /* v200: patch_xor_ret4 removed — was only used by UsbPollQC/SC patches */
     /* static const uint8_t patch_xor_ret4[] = { 0x31, 0xC0, 0xC2, 0x04, 0x00 }; */
     static const uint8_t patch_xor_nop3[]  = { 0x31, 0xC0, 0x90, 0x90, 0x90 }; /* xor eax, eax; nop*3 */
+    static const uint8_t patch_nop6[] = { 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 }; /* NOP JNE 32-bit */
 
     ChihiroPatch patches[] = {
         /* v207b: Both UsbEnumPoll + RegisterClassDriver skips re-enabled.
@@ -1533,8 +1555,11 @@ static void chihiro_usb_poll_patch_cb(void *opaque)
          * so SEGABOOT's USB handler can't enumerate → both functions fail.
          * Post-init code (mbcom, USB thread, OHCI handler) runs full LLE. */
         { sig_enumpoll, sizeof(sig_enumpoll), 7,  patch_jmp,     1, 0x41F57, "UsbEnumPoll check (je->jmp)",         false },
+        { sig_enumpoll_21042, sizeof(sig_enumpoll_21042), 7, patch_nop6, 6, 0x3056C, "UsbEnumPoll check (nop jne32) [21042]", false },
         { sig_classdrv, sizeof(sig_classdrv), 7,  patch_jmp,     1, 0x41F74, "RegisterClassDriver check (je->jmp)", false },
+        { sig_classdrv_21042, sizeof(sig_classdrv_21042), 7, patch_jmp, 1, 0x305A8, "RegisterClassDriver check (je->jmp) [21042]", false },
         { sig_qcbyte0,  sizeof(sig_qcbyte0),  0,  patch_xor_ret, 3, 0x3AD80, "GetQcStatusByte0 (xor eax,eax; ret)", false },
+        { sig_qcbyte0_21042, sizeof(sig_qcbyte0_21042), 0, patch_xor_ret, 3, 0x2AD70, "GetQcStatusByte0 (xor eax,eax; ret) [21042]", false },
         /* v201: CreateThread patch REMOVED — let USB poll thread be created */
         /* { sig_createthread, sizeof(sig_createthread), 8, patch_jmp, 1, 0x425D6, "CreateThread return (jne->jmp)", false }, */
         { sig_errval,   sizeof(sig_errval),   2,  patch_and0,    1, 0x2E3AB, "DIAG: error value 0x14->0x00",        false },
@@ -1581,10 +1606,10 @@ static void chihiro_usb_poll_patch_cb(void *opaque)
         }
     }
 
-    if (applied == num_patches) {
+    if (applied >= 7) {
         s->usb_poll_patched = true;
-        printf("[%07lld] Chihiro: All %d SEGABOOT patches applied\n", TS_MS, num_patches);
-        printf("[%07lld] Chihiro: v207b — 7 patches applied. UsbEnumPoll+RegisterClassDriver "
+        printf("[%07lld] Chihiro: %d/%d SEGABOOT patches applied\n", TS_MS, applied, num_patches);
+        printf("[%07lld] Chihiro: UsbEnumPoll+RegisterClassDriver "
                "skipped (circular dep). Post-init USB/mbcom in LLE.\n", TS_MS);
 
         /* Start diagnostic timer to monitor state machine progress */
