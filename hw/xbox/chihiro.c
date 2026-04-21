@@ -1922,8 +1922,8 @@ void chihiro_load_flash_rom(const char *bios_path)
     }
 
     const char *flash_names[] = {
-        "fpr-23887_29lv160te.ic4",
-        "fpr21042_m29w160et.bin",
+        "fpr21042_m29w160et.bin",        /* Cxbx version — matches our patches */
+        "fpr-23887_29lv160te.ic4",       /* MAME version — different SEGABOOT */
         "fpr-23887.bin",
         NULL
     };
