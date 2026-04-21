@@ -138,6 +138,10 @@ static int smc_write_data(SMBusDevice *dev, uint8_t *buf, uint8_t len)
         break;
 
     case SMC_REG_POWER:
+        printf("[SMC] POWER write: 0x%02X (%s%s%s)\n", buf[0],
+               (buf[0] & SMC_REG_POWER_RESET) ? "RESET " : "",
+               (buf[0] & SMC_REG_POWER_CYCLE) ? "CYCLE " : "",
+               (buf[0] & SMC_REG_POWER_SHUTDOWN) ? "SHUTDOWN " : "");
         if (buf[0] & (SMC_REG_POWER_RESET | SMC_REG_POWER_CYCLE)) {
             if (chihiro_intercept_reset()) {
                 break; /* Chihiro: loaded game XBE, skip reset */
@@ -153,6 +157,7 @@ static int smc_write_data(SMBusDevice *dev, uint8_t *buf, uint8_t len)
         break;
 
     case SMC_REG_SCRATCH:
+        printf("[SMC] SCRATCH write: 0x%02X (was 0x%02X)\n", buf[0], smc->scratch_reg);
         smc->scratch_reg = buf[0];
         break;
 
