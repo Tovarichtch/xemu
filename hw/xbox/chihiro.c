@@ -1728,7 +1728,8 @@ bool chihiro_intercept_reset(void)
     if (chihiro_active && chihiro_boot3_reached) {
         printf("[%07lld] Chihiro: QuickReboot — letting real reset proceed "
                "(scratch_reg preserved for warm boot)\n", TS_MS);
-        chihiro_game_running = true;
+        /* DON'T set game_running here — 0x40F0 handler sets it
+         * AFTER applying kernel device patches. */
         return false;  /* Allow qemu_system_reset_request */
     }
     return false;
@@ -2538,16 +2539,15 @@ bool chihiro_ide_read_sector(uint32_t lba, void *buffer)
      * mbrom1 (LBA 0x8000800+): flash ROM from byte 0. */
     if (lba >= CHIHIRO_MBROM0 && chihiro_flash_rom) {
         memset(buffer, 0, 512);
-        if (lba >= CHIHIRO_MBROM1) {
-            uint32_t offset = (lba - CHIHIRO_MBROM1) * 512;
-            if (offset < chihiro_flash_rom_size) {
-                uint32_t copy_len = 512;
-                if (offset + copy_len > chihiro_flash_rom_size)
-                    copy_len = chihiro_flash_rom_size - offset;
-                memcpy(buffer, chihiro_flash_rom + offset, copy_len);
-            }
+        /* MAME behavior: (lba & 0x7FF) * 512 for both mbrom0 and mbrom1.
+         * Both serve from the same first 1MB of the flash ROM. */
+        uint32_t offset = (lba & 0x7FF) * 512;
+        if (offset < chihiro_flash_rom_size) {
+            uint32_t copy_len = 512;
+            if (offset + copy_len > chihiro_flash_rom_size)
+                copy_len = chihiro_flash_rom_size - offset;
+            memcpy(buffer, chihiro_flash_rom + offset, copy_len);
         }
-        /* mbrom0: zeros (no separate mbrom0 file) */
         return true;
     }
     return false;
