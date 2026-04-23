@@ -132,6 +132,7 @@ static bool chihiro_active;
 bool chihiro_game_running;  /* Set after QuickReboot — disables SEGABOOT DMA scan */
 static bool chihiro_boot3_reached; /* Set when SEGABOOT reaches boot=3 (checks complete) */
 static char chihiro_game_filename[64]; /* Game XBE filename saved at boot=3 */
+char chihiro_game_dir[1024];   /* Game directory path (from dvd_path) */
 static uint32_t chihiro_ldp_pa;  /* v208: LDP physical address, captured at boot=3 */
 static ChihiroLPCState *chihiro_lpc_global;
 
@@ -1646,6 +1647,75 @@ static void chihiro_usb_poll_patch_cb(void *opaque)
 
     timer_mod(s->usb_poll_patch_timer,
               qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 50);
+}
+
+/* Called from SMC SCRATCH write handler when value=0x02 (QuickReboot).
+ * SEGABOOT writes SCRATCH=0x02 just before HalReturnToFirmware.
+ * This is the version-independent trigger for QuickReboot detection. */
+void chihiro_on_quickreboot_signal(void)
+{
+    if (!chihiro_active || chihiro_boot3_reached) return;
+
+    printf("[%07lld] Chihiro: QuickReboot signal detected (SCRATCH=0x02)\n", TS_MS);
+    chihiro_boot3_reached = true;
+
+    /* Read boot.id from game directory to get game executable name */
+    if (chihiro_game_dir[0] && !chihiro_game_filename[0]) {
+        char bootid_path[1100];
+        snprintf(bootid_path, sizeof(bootid_path), "%s/boot.id", chihiro_game_dir);
+        FILE *f = fopen(bootid_path, "rb");
+        if (f) {
+            uint8_t bid[480];
+            if (fread(bid, 1, 480, f) >= 0xC0) {
+                /* gameExecutable at offset 0xA0, 32 bytes, backslash-prefixed */
+                char *exec = (char *)&bid[0xA0];
+                exec[31] = 0;
+                /* Skip leading backslash */
+                char *name = exec;
+                while (*name == '\\' || *name == '/') name++;
+                if (*name) {
+                    strncpy(chihiro_game_filename, name, 63);
+                    chihiro_game_filename[63] = 0;
+                    printf("[%07lld] Chihiro: boot.id → game executable: '%s'\n",
+                           TS_MS, chihiro_game_filename);
+                }
+            }
+            fclose(f);
+        }
+    }
+
+    /* Walk page tables to find LDP physical address.
+     * LDP pointer is at kernel VA 0x8003B3C8 = PA 0x3B3C8.
+     * But the actual LDP page at VA 0x002625A0 may not be mapped yet.
+     * Save what we can; the post-reboot handler will re-create the PTE. */
+    {
+        uint32_t ldp_va = 0;
+        cpu_physical_memory_read(0x30A10, &ldp_va, 4);  /* XeImageFileName area has LDP ptr */
+        if (ldp_va == 0x002625A0) {
+            uint32_t pa = chihiro_va_to_pa(ldp_va);
+            if (pa != 0xFFFFFFFF) {
+                chihiro_ldp_pa = pa & ~0xFFF;
+                printf("[%07lld] Chihiro: LDP VA 0x%08X → PA 0x%05X\n",
+                       TS_MS, ldp_va, pa);
+
+                /* Fill LDP now (before reset wipes page tables) */
+                uint32_t launch_type = 1;
+                cpu_physical_memory_write(pa, &launch_type, 4);
+                uint32_t title_id = 0;
+                cpu_physical_memory_write(pa + 4, &title_id, 4);
+                char launch_path[520] = {0};
+                snprintf(launch_path, sizeof(launch_path),
+                         "D:\\%s", chihiro_game_filename);
+                cpu_physical_memory_write(pa + 8, launch_path, 520);
+                printf("[%07lld] Chihiro: LDP filled: path='%s'\n",
+                       TS_MS, launch_path);
+            } else {
+                printf("[%07lld] Chihiro: LDP VA 0x%08X → UNMAPPED "
+                       "(will allocate after reboot)\n", TS_MS, ldp_va);
+                chihiro_ldp_pa = 0x262000;  /* default PA for LDP page */
+            }
+        }
+    }
 }
 
 /* Called from SMC handler when kernel writes SMC_REG_POWER (QuickReboot).

@@ -398,6 +398,12 @@ void xbox_init_common(MachineState *machine,
                         printf("Chihiro: FATX built from '%s' (%u MB)\n",
                                game_dir, fatx_size / (1024*1024));
                     }
+                    /* Store game dir for boot.id reading at QuickReboot */
+                    {
+                        extern char chihiro_game_dir[1024];
+                        strncpy(chihiro_game_dir, game_dir, 1023);
+                        chihiro_game_dir[1023] = 0;
+                    }
                 }
             }
         }

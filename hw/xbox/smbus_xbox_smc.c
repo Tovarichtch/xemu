@@ -33,15 +33,13 @@
 #include "qemu/config-file.h"
 #include "qapi/error.h"
 #include "system/block-backend.h"
+#include "chihiro.h"
 #include "system/blockdev.h"
 #include "system/system.h"
 #include "smbus.h"
 #include "system/runstate.h"
 #include "hw/qdev-properties.h"
 #include "block/block_int-io.h"
-
-/* Chihiro: intercept QuickReboot to load game XBE */
-extern bool chihiro_intercept_reset(void);
 
 #define TYPE_XBOX_SMC "smbus-xbox-smc"
 #define XBOX_SMC(obj) OBJECT_CHECK(SMBusSMCDevice, (obj), TYPE_XBOX_SMC)
@@ -158,6 +156,11 @@ static int smc_write_data(SMBusDevice *dev, uint8_t *buf, uint8_t len)
 
     case SMC_REG_SCRATCH:
         printf("[SMC] SCRATCH write: 0x%02X (was 0x%02X)\n", buf[0], smc->scratch_reg);
+        /* Detect QuickReboot: SEGABOOT writes 0x02 before HalReturnToFirmware.
+         * This is the reliable trigger — works regardless of SEGABOOT version. */
+        if (buf[0] == 0x02 && smc->scratch_reg != 0x02) {
+            chihiro_on_quickreboot_signal();
+        }
         smc->scratch_reg = buf[0];
         break;
 
