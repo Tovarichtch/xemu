@@ -2093,7 +2093,7 @@ static void chihiro_irq10_timer_cb(void *opaque)
     /* DMA META scan: marks mbcom slots as "ready" with responses.
      * Required for boot=0 → boot=1 — SEGABOOT polls slot markers.
      * fpr-23887: slot VA=0x89760, meta VA=0x89740, stride=0x40
-     * fpr-21042: slot VA=0xAA7B0, meta VA=0xAA790, stride=0x20 */
+     * fpr-21042: slot VA=0xAA7B0, meta VA=0xAA790, stride=0x60 */
     if (chihiro_mbcom_enabled && !chihiro_game_running) {
         /* Periodic VA→PA diagnostic for slot resolution */
         static int va_diag_count = 0;
@@ -2134,14 +2134,14 @@ static void chihiro_irq10_timer_cb(void *opaque)
         /* META scan: provide mbcom slot responses to SEGABOOT.
          * Only active AFTER patches applied (usb_poll_patched=true)
          * and ONLY when va_to_pa resolves correctly.
-         * v239 RAM dump confirmed: fpr-21042 slot PA=0xF57B0 stride=0x20
+         * v239 RAM dump confirmed: fpr-21042 slot PA=0xF57B0 stride=0x60
          *
          * Guard: validate cmd_opcode is known BEFORE writing anything.
          * Previous corruption was from wrong stride or unmapped PAs. */
         if (chihiro_lpc_global && chihiro_lpc_global->usb_poll_patched) {
             static const struct { uint32_t slot_va; uint32_t meta_va; uint32_t stride; }
                 slot_layouts[] = {
-                    { 0xAA7B0, 0xAA790, 0x20 },  /* fpr-21042 */
+                    { 0xAA7B0, 0xAA790, 0x60 },  /* fpr-21042 */
                     { 0x89760, 0x89740, 0x40 },  /* fpr-23887 */
                 };
 
