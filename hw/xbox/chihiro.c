@@ -2131,12 +2131,83 @@ static void chihiro_irq10_timer_cb(void *opaque)
             }
         }
 
-        /* META scan DISABLED — was writing to potentially wrong PAs,
-         * corrupting VRAM/SEGABOOT memory. Need RAM dump to find
-         * correct slot PAs before re-enabling.
-         * 
-         * mbcom responses will come from IDE hooks (FC800/FC801)
-         * once we verify SEGABOOT uses that path with fpr-21042. */
+        /* META scan: provide mbcom slot responses to SEGABOOT.
+         * Only active AFTER patches applied (usb_poll_patched=true)
+         * and ONLY when va_to_pa resolves correctly.
+         * v239 RAM dump confirmed: fpr-21042 slot PA=0xF57B0 stride=0x20
+         *
+         * Guard: validate cmd_opcode is known BEFORE writing anything.
+         * Previous corruption was from wrong stride or unmapped PAs. */
+        if (chihiro_lpc_global && chihiro_lpc_global->usb_poll_patched) {
+            static const struct { uint32_t slot_va; uint32_t meta_va; uint32_t stride; }
+                slot_layouts[] = {
+                    { 0xAA7B0, 0xAA790, 0x20 },  /* fpr-21042 */
+                    { 0x89760, 0x89740, 0x40 },  /* fpr-23887 */
+                };
+
+            for (int layout = 0; layout < 2; layout++) {
+                uint32_t slot_base_pa = chihiro_va_to_pa(slot_layouts[layout].slot_va);
+                if (slot_base_pa == 0xFFFFFFFF) continue;
+                uint32_t meta_base_pa = chihiro_va_to_pa(slot_layouts[layout].meta_va);
+                if (meta_base_pa == 0xFFFFFFFF) continue;
+
+                /* Sanity: PA must be in RAM range (< 8MB), not VRAM/MMIO */
+                if (slot_base_pa >= 0x800000 || meta_base_pa >= 0x800000) continue;
+
+                uint32_t stride = slot_layouts[layout].stride;
+
+                for (int sl = 0; sl < 16; sl++) {
+                    uint32_t data_pa = slot_base_pa + sl * stride;
+                    uint32_t meta_pa = meta_base_pa + sl * stride;
+
+                    /* Bounds check */
+                    if (data_pa + 4 >= 0x800000 || meta_pa + 12 >= 0x800000) continue;
+
+                    uint8_t data_byte0;
+                    uint16_t meta_marker;
+                    cpu_physical_memory_read(data_pa, &data_byte0, 1);
+                    cpu_physical_memory_read(meta_pa + 2, &meta_marker, 2);
+
+                    /* Only process if type is set (1-5) and marker is clear */
+                    if (data_byte0 < 1 || data_byte0 > 5 || meta_marker != 0) continue;
+
+                    uint16_t cmd_opcode = 0;
+                    cpu_physical_memory_read(data_pa + 2, &cmd_opcode, 2);
+
+                    /* Strict: only known mbcom commands */
+                    uint32_t resp_data = 0, resp_data2 = 0;
+                    switch (cmd_opcode) {
+                    case 0x0001: resp_data = 0x00F00000; break;
+                    case 0x0100: resp_data = 5; resp_data2 = 100; break;
+                    case 0x0101: resp_data = 0x45671234; break;
+                    case 0x0102: resp_data = 0x00010000; break;
+                    case 0x0103: resp_data = 0x6261632D; break;
+                    default: continue; /* Unknown → skip, do NOT write */
+                    }
+
+                    meta_marker = 0x0001;
+                    cpu_physical_memory_write(meta_pa + 2, &meta_marker, 2);
+                    cpu_physical_memory_write(meta_pa + 4, &resp_data, 4);
+                    if (cmd_opcode == 0x0100)
+                        cpu_physical_memory_write(meta_pa + 8, &resp_data2, 4);
+
+                    static uint16_t last_dma_cmd = 0xFFFF;
+                    static uint32_t dma_repeat_count = 0;
+                    if (cmd_opcode == last_dma_cmd) {
+                        dma_repeat_count++;
+                    } else {
+                        if (dma_repeat_count > 1)
+                            printf("[%07lld] Chihiro DMA: (prev cmd=0x%04X repeated %u)\n",
+                                   TS_MS, last_dma_cmd, dma_repeat_count);
+                        printf("[%07lld] Chihiro DMA: slot %d PA=0x%05X cmd=0x%04X resp=0x%08X\n",
+                               TS_MS, sl, data_pa, cmd_opcode, resp_data);
+                        last_dma_cmd = cmd_opcode;
+                        dma_repeat_count = 1;
+                    }
+                }
+                break; /* Use first working layout */
+            }
+        }
     }
 
     /* Re-arm every 16ms (~60Hz) */
