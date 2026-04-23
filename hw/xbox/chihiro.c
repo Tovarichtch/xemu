@@ -1987,8 +1987,13 @@ static void chihiro_lpc_io_write(void *opaque, hwaddr addr, uint64_t val,
         return;
     case 0x08: /* Port 0x4008: command/clear */
         return;
-    case SEGA_IRQ10_ACK:
-        /* Clear IRQ10 — game writes here after handling baseboard IRQ */
+    case SEGA_IRQ10_ACK:  /* 0xE0 */
+    case 0xE1:            /* 0x40E1 — MAME+Cxbx: deassert IRQ10 here */
+    case 0xE2:            /* 0x40E2 — part of mbcom register block */
+        /* Clear/deassert IRQ10.
+         * MAME: offset 0xE0/4 ACCESSING_BITS_8_15 → irq10(0) for byte at 0x40E1
+         * Cxbx: LpcWrite(0x40E1) → HalSystemInterrupts[10].Assert(false)
+         * Handle all three ports in the 0xE0 block for safety. */
         qemu_irq_lower(s->irq10);
         break;
     default:
@@ -2108,26 +2113,33 @@ static void chihiro_irq10_timer_cb(void *opaque)
                 uint32_t pde;
                 cpu_physical_memory_read(pde_addr, &pde, 4);
                 if (pde & 1) {
+                    uint32_t pa = 0;
                     if (pde & 0x80) {
-                        uint32_t pa = (pde & 0xFFC00000) | (test_va & 0x003FFFFF);
-                        printf("[%07lld] META-DIAG: VA 0x%05X CR3=0x%08X PDE=0x%08X → PA 0x%05X (4MB page)\n",
-                               TS_MS, test_va, cr3, pde, pa);
+                        pa = (pde & 0xFFC00000) | (test_va & 0x003FFFFF);
                     } else {
                         uint32_t pt_addr = (pde & 0xFFFFF000) + (((test_va >> 12) & 0x3FF) * 4);
                         uint32_t pte;
                         cpu_physical_memory_read(pt_addr, &pte, 4);
-                        if (pte & 1) {
-                            uint32_t pa = (pte & 0xFFFFF000) | (test_va & 0xFFF);
-                            printf("[%07lld] META-DIAG: VA 0x%05X CR3=0x%08X PDE=0x%08X PTE=0x%08X → PA 0x%05X\n",
-                                   TS_MS, test_va, cr3, pde, pte, pa);
-                        } else {
-                            printf("[%07lld] META-DIAG: VA 0x%05X CR3=0x%08X PDE=0x%08X PTE=0x%08X → NOT PRESENT\n",
-                                   TS_MS, test_va, cr3, pde, pte);
+                        if (pte & 1)
+                            pa = (pte & 0xFFFFF000) | (test_va & 0xFFF);
+                    }
+                    if (pa && (va_diag_count % 310 == 0)) {
+                        /* Dump first 3 slots raw hex every ~5s */
+                        uint32_t meta_pa = pa - 0x20; /* META = DATA - 0x20 */
+                        printf("[%07lld] SLOT-DUMP PA=0x%05X (META=0x%05X stride=0x60):\n",
+                               TS_MS, pa, meta_pa);
+                        for (int sl = 0; sl < 3; sl++) {
+                            uint8_t raw[96];
+                            cpu_physical_memory_read(meta_pa + sl * 0x60, raw, 96);
+                            printf("  slot[%d] META: ", sl);
+                            for (int b = 0; b < 32; b++) printf("%02X", raw[b]);
+                            printf("\n         DATA: ");
+                            for (int b = 32; b < 64; b++) printf("%02X", raw[b]);
+                            printf("\n         +40:  ");
+                            for (int b = 64; b < 96; b++) printf("%02X", raw[b]);
+                            printf("\n");
                         }
                     }
-                } else {
-                    printf("[%07lld] META-DIAG: VA 0x%05X CR3=0x%08X PDE=0x%08X → PDE NOT PRESENT\n",
-                           TS_MS, test_va, cr3, pde);
                 }
             }
         }
