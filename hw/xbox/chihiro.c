@@ -1970,8 +1970,8 @@ static void chihiro_lpc_io_write(void *opaque, hwaddr addr, uint64_t val,
 
     ChihiroLPCState *s = CHIHIRO_LPC_DEVICE(opaque);
 
-    /* Log writes (suppress 0x4026 IRQ ACK spam) */
-    if (addr != 0x26) {
+    /* Log writes (suppress 0x4026 IRQ ACK spam and 0x40E1 polling spam) */
+    if (addr != 0x26 && addr != 0xE1) {
         printf("[%07lld] chihiro lpc write [0x%04x] <- 0x%04x (size=%d)\n", TS_MS,
                (unsigned)(addr + 0x4000), (unsigned)val, size);
     }
@@ -1988,13 +1988,60 @@ static void chihiro_lpc_io_write(void *opaque, hwaddr addr, uint64_t val,
     case 0x08: /* Port 0x4008: command/clear */
         return;
     case SEGA_IRQ10_ACK:  /* 0xE0 */
-    case 0xE1:            /* 0x40E1 — MAME+Cxbx: deassert IRQ10 here */
     case 0xE2:            /* 0x40E2 — part of mbcom register block */
-        /* Clear/deassert IRQ10.
-         * MAME: offset 0xE0/4 ACCESSING_BITS_8_15 → irq10(0) for byte at 0x40E1
-         * Cxbx: LpcWrite(0x40E1) → HalSystemInterrupts[10].Assert(false)
-         * Handle all three ports in the 0xE0 block for safety. */
         qemu_irq_lower(s->irq10);
+        break;
+    case 0xE1:            /* 0x40E1 — mbcom trigger / IRQ10 deassert */
+        if (val != 0 && !chihiro_game_running) {
+            /* fpr-21042 SEGABOOT writes 0x0F to 0x40E1 as a DMA trigger.
+             * On real hardware the MediaBoard receives this, fills DMA
+             * slots in RAM with mbcom responses, then asserts IRQ10.
+             * We emulate this by writing responses directly to the slot
+             * physical addresses and raising IRQ10. */
+            static bool lpc_trigger_logged = false;
+            uint32_t meta_pa = chihiro_va_to_pa(0xAA790);
+            if (meta_pa != 0xFFFFFFFF && meta_pa < 0x800000) {
+                static const struct {
+                    uint8_t  type;
+                    uint16_t cmd;
+                    uint32_t resp;
+                    uint32_t resp2;
+                } mbcom_init_responses[] = {
+                    { 1, 0x0001, 0x00F00000, 0   },  /* DIMM_SIZE */
+                    { 2, 0x0101, 0x45671234, 0   },  /* FW_VERSION */
+                    { 3, 0x0103, 0x6261632D, 0   },  /* SERIAL (partial) */
+                    { 4, 0x0102, 0x00010000, 0   },  /* SYSTEM_TYPE (devel) */
+                    { 5, 0x0100, 0x00000005, 100 },  /* STATUS=READY, 100% */
+                };
+                for (int i = 0; i < 5; i++) {
+                    uint32_t entry = meta_pa + i * 0x60;
+                    uint32_t data  = entry + 0x20;
+                    if (entry + 0x60 > 0x800000) break;
+
+                    uint8_t  type = mbcom_init_responses[i].type;
+                    uint16_t cmd  = mbcom_init_responses[i].cmd;
+                    uint16_t marker = 0x0001;
+
+                    cpu_physical_memory_write(data,      &type, 1);
+                    cpu_physical_memory_write(data + 2,   &cmd, 2);
+                    cpu_physical_memory_write(entry + 2,  &marker, 2);
+                    cpu_physical_memory_write(entry + 4,
+                            &mbcom_init_responses[i].resp, 4);
+                    if (mbcom_init_responses[i].resp2)
+                        cpu_physical_memory_write(entry + 8,
+                                &mbcom_init_responses[i].resp2, 4);
+                }
+                if (!lpc_trigger_logged) {
+                    printf("[%07lld] Chihiro: LPC trigger 0x40E1=0x%04X — "
+                           "filled 5 DMA slots at PA 0x%05X, asserting IRQ10\n",
+                           TS_MS, (unsigned)val, meta_pa);
+                    lpc_trigger_logged = true;
+                }
+            }
+            qemu_irq_raise(s->irq10);
+        } else {
+            qemu_irq_lower(s->irq10);
+        }
         break;
     default:
         break;
