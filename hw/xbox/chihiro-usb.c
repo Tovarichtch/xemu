@@ -22,6 +22,7 @@
 #include "ui/console.h"
 #include "hw/usb.h"
 #include "hw/usb/desc.h"
+#include "qapi/error.h"
 
 #include "qemu/timer.h"
 #include "chihiro-firmware.h"
@@ -48,10 +49,30 @@ typedef struct ChihiroUSBState {
     int bulk_offset;       /* current read offset in bulk_buf */
     int bulk_ep;           /* which EP the data is queued for */
 
+    /* EZ-USB firmware download state (ANCHOR_LOAD / bRequest 0xA0) */
+    uint32_t fw_bytes_written;  /* total bytes received via 0xA0 */
+    bool fw_cpu_held;           /* true if CPUCS register set to hold CPU */
+
+    /* ic11 EEPROM (128 bytes) — baseboard config, "ACBU0001" + game ID */
+    uint8_t ic11[128];
+
+    /* SC UART buffers (for JVS communication) */
+    uint8_t uart0_rx[256];  /* UART0 receive buffer */
+    int uart0_rx_len;
+    uint8_t uart1_rx[256];  /* UART1 / JVS receive buffer */
+    int uart1_rx_len;
+
     /* v202: instrumentation counters (read/reset by DIAG timer) */
     uint32_t nak_count;    /* bulk IN NAK count since last report */
     uint32_t bulk_in_count;  /* successful bulk IN count */
     uint32_t bulk_out_count; /* bulk OUT count */
+
+    /* v302: EZ-USB firmware reboot simulation timers.
+     * Real AN2131 loads firmware from EEPROM after initial enumeration,
+     * then disconnects and reconnects. SEGABOOT waits for the CSC. */
+    QEMUTimer *ezusb_disconnect_timer;
+    QEMUTimer *ezusb_reconnect_timer;
+    bool ezusb_rebooted;
 } ChihiroUSBState;
 
 enum chihiro_usb_strings {
@@ -246,6 +267,42 @@ static const USBDesc desc_chihiro_an2131sc = {
     .str  = chihiro_usb_stringtable,
 };
 
+/* v302: EZ-USB firmware reboot — disconnect callback */
+static void ezusb_disconnect_cb(void *opaque)
+{
+    ChihiroUSBState *s = (ChihiroUSBState *)opaque;
+    USBDevice *dev = &s->dev;
+    const char *id = s->is_qc ? "QC" : "SC";
+
+    if (!dev->attached) {
+        printf("[%07lld] chihiro-usb [%s]: v302 disconnect skipped (already detached)\n", TS_MS, id);
+        return;
+    }
+
+    printf("[%07lld] chihiro-usb [%s]: ★ v302 EZ-USB firmware reboot — DISCONNECT (CSC will fire)\n", TS_MS, id);
+    usb_device_detach(dev);
+
+    /* Schedule reconnect 50ms later */
+    timer_mod(s->ezusb_reconnect_timer,
+              qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 50);
+}
+
+/* v302: EZ-USB firmware reboot — reconnect callback */
+static void ezusb_reconnect_cb(void *opaque)
+{
+    ChihiroUSBState *s = (ChihiroUSBState *)opaque;
+    USBDevice *dev = &s->dev;
+    const char *id = s->is_qc ? "QC" : "SC";
+
+    if (dev->attached) {
+        printf("[%07lld] chihiro-usb [%s]: v302 reconnect skipped (already attached)\n", TS_MS, id);
+        return;
+    }
+
+    printf("[%07lld] chihiro-usb [%s]: ★ v302 EZ-USB firmware reboot — RECONNECT (CSC will fire → Phase 2)\n", TS_MS, id);
+    usb_device_attach(dev, &error_abort);
+}
+
 static void handle_reset(USBDevice *dev)
 {
     const char *id = ((ChihiroUSBState *)dev)->is_qc ? "QC" : "SC";
@@ -277,7 +334,25 @@ static void handle_control(USBDevice *dev, USBPacket *p,
     int ret = usb_desc_handle_control(dev, p, request, value, index,
                                       length, data);
     if (ret >= 0) {
-        printf("[%07lld] chihiro-usb [%s]: → std handled, dev addr=%d\n", TS_MS, id, dev->addr);
+        int actual = p->actual_length;
+        printf("[%07lld] chihiro-usb [%s]: → std handled actual=%d addr=%d", TS_MS, id, actual, dev->addr);
+        if (actual > 0) {
+            printf(" data=");
+            for (int i = 0; i < actual && i < 18; i++) printf("%02X", data[i]);
+        }
+        printf("\n");
+
+        /* v302: After SET_ADDRESS completes, schedule EZ-USB firmware reboot.
+         * Real AN2131 loads firmware from EEPROM, then disconnects+reconnects.
+         * SEGABOOT waits for the CSC from reconnect to start Phase 2. */
+        if (request == (DeviceOutRequest | USB_REQ_SET_ADDRESS) && !s->ezusb_rebooted) {
+            s->ezusb_rebooted = true;
+            printf("[%07lld] chihiro-usb [%s]: v302 SET_ADDRESS done (addr=%d) → scheduling EZ-USB reboot in 100ms\n",
+                   TS_MS, id, dev->addr);
+            timer_mod(s->ezusb_disconnect_timer,
+                      qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 100);
+        }
+
         return;
     }
 
@@ -332,21 +407,24 @@ static void handle_control(USBDevice *dev, USBPacket *p,
                id, addr, count);
         break;
     }
-    case 0x17: /* Read ic10 EEPROM #2 (offset +0x2000) */
+    case 0x17: /* Read baseboard EEPROM ic11 (128 bytes: "ACBU0001" + game config) */
     {
-        int addr = 0x2000 + value;
+        int addr = value;
         int count = index;
         if (count > 256) count = 256;
-        if (addr + count > 8192) count = 8192 - addr;
-        if (addr >= 0 && addr < 8192 && count > 0) {
-            memcpy(s->bulk_buf, s->eeprom + addr, count);
+        if (addr + count > 128) count = 128 - addr;
+        if (addr >= 0 && addr < 128 && count > 0) {
+            memcpy(s->bulk_buf, s->ic11 + addr, count);
         } else {
             memset(s->bulk_buf, 0xFF, count);
+            count = (count > 0) ? count : 0;
         }
         s->bulk_pending = count;
         s->bulk_offset = 0;
         s->bulk_ep = 2;
-        printf("[%07lld] chihiro-usb [%s]: READ EEPROM2 addr=0x%04X count=%d\n", TS_MS, id, addr, count);
+        printf("[%07lld] chihiro-usb [%s]: READ ic11 EEPROM addr=0x%02X count=%d data=", TS_MS, id, addr, count);
+        for (int i = 0; i < count && i < 16; i++) printf("%02X", s->bulk_buf[i]);
+        printf("\n");
         break;
     }
     case 0x19: /* Get JVS responses — no JVS data pending */
@@ -362,8 +440,24 @@ static void handle_control(USBDevice *dev, USBPacket *p,
         data[5] = 0;  /* IRQ counter */
         printf("[%07lld] chihiro-usb [%s]: EXT IRQ control val=%d\n", TS_MS, id, value);
         break;
-    case 0x1C: /* Read RTC — stub */
+    case 0x1C: /* Read RTC — return host time in BCD (Cxbx: JvsRTC_Read) */
+    {
+        time_t now = time(NULL);
+        struct tm *t = localtime(&now);
+        #define TO_BCD(v) ((uint8_t)((v) + 6 * ((v) / 10)))
+        data[0] = TO_BCD(t->tm_sec);
+        data[1] = TO_BCD(t->tm_min);
+        data[2] = TO_BCD(t->tm_hour);
+        data[3] = 0;
+        data[4] = TO_BCD(t->tm_mday);
+        data[5] = TO_BCD(t->tm_mon + 1);
+        data[6] = TO_BCD(t->tm_year - 100);
+        data[7] = 0;
+        #undef TO_BCD
+        printf("[%07lld] chihiro-usb [%s]: RTC READ → %02X:%02X:%02X %02X/%02X/%02X\n",
+               TS_MS, id, data[2], data[1], data[0], data[4], data[5], data[6]);
         break;
+    }
     case 0x1D: /* Write ic10 EEPROM #1 — accept */
     case 0x1E: /* Write ic10 EEPROM #2 — accept */
     case 0x1F: /* Write external memory — accept */
@@ -379,11 +473,82 @@ static void handle_control(USBDevice *dev, USBPacket *p,
         s->bulk_ep = 3;
         break;
     }
-    default:
-        printf("[%07lld] chihiro-usb [%s]: unknown vendor req 0x%02X val=0x%04X idx=0x%04X\n", TS_MS,
-               id, bRequest, value, index);
-        p->status = USB_RET_STALL;
+    case 0xA0: /* ANCHOR_LOAD — EZ-USB firmware download (Cypress AN2131) */
+    {
+        uint16_t ram_addr = value;  /* wValue = target address in 8051 RAM */
+        int count = length;
+        if (ram_addr == 0x7F92) {
+            /* CPUCS register: bit 0 = 1 → hold CPU in reset, 0 → run */
+            bool hold = (count > 0 && data[0] & 0x01);
+            printf("[%07lld] chihiro-usb [%s]: ANCHOR_LOAD CPUCS=%s (total %u bytes downloaded)\n",
+                   TS_MS, id, hold ? "HOLD" : "RUN", s->fw_bytes_written);
+            if (s->fw_cpu_held && !hold) {
+                printf("[%07lld] chihiro-usb [%s]: ★ EZ-USB firmware loaded — CPU released\n",
+                       TS_MS, id);
+            }
+            s->fw_cpu_held = hold;
+        } else {
+            s->fw_bytes_written += count;
+            if (s->fw_bytes_written <= count) {
+                printf("[%07lld] chihiro-usb [%s]: ANCHOR_LOAD start addr=0x%04X len=%d\n",
+                       TS_MS, id, ram_addr, count);
+            }
+        }
+        break;
+    }
+    /* === SC-specific handlers (UART / JVS) === */
+    case 0x1A: /* Get UART0 data (SC only) */
+    {
+        int avail = s->uart0_rx_len;
+        if (avail > 0 && avail <= length) {
+            memcpy(data, s->uart0_rx, avail);
+            p->actual_length = avail;
+            s->uart0_rx_len = 0;
+        } else {
+            p->actual_length = 0;
+        }
+        printf("[%07lld] chihiro-usb [%s]: GET UART0 → %d bytes\n", TS_MS, id, avail);
         return;
+    }
+    case 0x1B: /* Get UART1 / JVS response (SC only) */
+    {
+        int avail = s->uart1_rx_len;
+        if (avail > 0 && avail <= length) {
+            memcpy(data, s->uart1_rx, avail);
+            p->actual_length = avail;
+            s->uart1_rx_len = 0;
+        } else {
+            p->actual_length = 0;
+        }
+        printf("[%07lld] chihiro-usb [%s]: GET UART1/JVS → %d bytes\n", TS_MS, id, avail);
+        return;
+    }
+    case 0x22: /* Send UART0 data (SC only) — accept and discard */
+        printf("[%07lld] chihiro-usb [%s]: SEND UART0 len=%d (stub)\n", TS_MS, id, length);
+        break;
+    case 0x23: /* Send UART1 / JVS command (SC only) — accept and discard */
+        printf("[%07lld] chihiro-usb [%s]: SEND UART1/JVS len=%d (stub)\n", TS_MS, id, length);
+        break;
+    case 0x25: /* UART config (SC only) — accept */
+    case 0x26:
+    case 0x27:
+    case 0x28:
+    case 0x29:
+    case 0x2A:
+    case 0x2B:
+    case 0x2C:
+    case 0x2D:
+    case 0x2E:
+    case 0x2F:
+        printf("[%07lld] chihiro-usb [%s]: UART/GPIO config 0x%02X (stub)\n", TS_MS, id, bRequest);
+        break;
+    case 0x31: /* Set PORTB pins (SC only) — accept */
+        printf("[%07lld] chihiro-usb [%s]: SET PORTB val=0x%04X (stub)\n", TS_MS, id, value);
+        break;
+    default:
+        printf("[%07lld] chihiro-usb [%s]: UNHANDLED vendor req 0x%02X val=0x%04X idx=0x%04X len=%d → accepting\n",
+               TS_MS, id, bRequest, value, index, length);
+        break;
     }
 
     /* v202: Log vendor response data bytes */
@@ -472,13 +637,30 @@ static void chihiro_an2131qc_realize(USBDevice *dev, Error **errp)
     s->bulk_offset = 0;
     s->bulk_ep = 0;
 
-    printf("[%07lld] Chihiro QC: loaded ic10 firmware (8192B), "
+    /* Load ic11 baseboard EEPROM (128 bytes) — shared by QC and SC */
+    _Static_assert(sizeof(hotd3_ic11_24lc024) == 128,
+                   "ic11 EEPROM must be exactly 128 bytes");
+    memcpy(s->ic11, hotd3_ic11_24lc024, sizeof(s->ic11));
+
+    /* Initialize EZ-USB firmware state */
+    s->fw_bytes_written = 0;
+    s->fw_cpu_held = false;
+
+    /* v302: EZ-USB firmware reboot timers */
+    s->ezusb_disconnect_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, ezusb_disconnect_cb, s);
+    s->ezusb_reconnect_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, ezusb_reconnect_cb, s);
+    s->ezusb_rebooted = true;  /* v307: reconnect disabled — Path B fix makes it unnecessary */
+
+    printf("[%07lld] Chihiro QC: loaded ic10 firmware (8192B) + ic11 (128B), "
            "region patched to USA (0x02), serial=%.16s\n",
            TS_MS, (const char *)&s->eeprom[0x1F10]);
 }
 
 static void chihiro_an2131qc_unrealize(USBDevice *dev)
 {
+    ChihiroUSBState *s = (ChihiroUSBState *)dev;
+    timer_free(s->ezusb_disconnect_timer);
+    timer_free(s->ezusb_reconnect_timer);
 }
 
 static void chihiro_an2131qc_class_init(ObjectClass *klass, const void *data)
@@ -523,11 +705,30 @@ static void chihiro_an2131sc_realize(USBDevice *dev, Error **errp)
     s->bulk_offset = 0;
     s->bulk_ep = 0;
 
-    printf("[%07lld] Chihiro SC: loaded pc20 firmware (8192B)\n", TS_MS);
+    /* Load ic11 baseboard EEPROM (128 bytes) */
+    memcpy(s->ic11, hotd3_ic11_24lc024, sizeof(s->ic11));
+
+    /* Initialize EZ-USB firmware state */
+    s->fw_bytes_written = 0;
+    s->fw_cpu_held = false;
+
+    /* Initialize UART buffers */
+    s->uart0_rx_len = 0;
+    s->uart1_rx_len = 0;
+
+    /* v302: EZ-USB firmware reboot timers */
+    s->ezusb_disconnect_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, ezusb_disconnect_cb, s);
+    s->ezusb_reconnect_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, ezusb_reconnect_cb, s);
+    s->ezusb_rebooted = true;  /* v307: reconnect disabled — Path B fix makes it unnecessary */
+
+    printf("[%07lld] Chihiro SC: loaded pc20 firmware (8192B) + ic11 (128B)\n", TS_MS);
 }
 
 static void chihiro_an2131sc_unrealize(USBDevice *dev)
 {
+    ChihiroUSBState *s = (ChihiroUSBState *)dev;
+    timer_free(s->ezusb_disconnect_timer);
+    timer_free(s->ezusb_reconnect_timer);
 }
 
 static void chihiro_an2131sc_class_init(ObjectClass *klass, const void *data)

@@ -371,6 +371,17 @@ void xbox_init_common(MachineState *machine,
         printf("Chihiro: 128MB RAM detected, enabling mediaboard LPC\n");
         isa_create_simple(isa_bus, "chihiro-lpc");
 
+        /* Chihiro southbridge has revision >= 0xB4. This clears bit 0 of
+         * XboxHardwareInfo in the kernel, selecting PATH_B for USB topology
+         * (direct port mapping instead of hub-based). Without this, the
+         * kernel uses PATH_A which requires device table state=1 that LLE
+         * USB entries never reach. */
+        PCIDevice *lpc = pci_find_device(pci_bus, 0, PCI_DEVFN(1, 0));
+        if (lpc) {
+            pci_config_set_revision(lpc->config, 0xB4);
+            printf("Chihiro: LPC bridge revision set to 0xB4 (PATH_B)\n");
+        }
+
         /* Load baseboard flash ROM (SEGABOOT) from file.
          * Searches for fpr-23887/fpr21042 next to the BIOS file. */
         chihiro_load_flash_rom(g_config.sys.files.flashrom_path);
