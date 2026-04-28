@@ -123,6 +123,9 @@ typedef struct ChihiroLPCState {
     uint32_t lpc_401e_reads;   /* MbcomCommand (state 2) — port 0x401E (firmware) */
     uint32_t lpc_4084_reads;   /* MbcomCommand (state 2) — port 0x4084 (session) */
     uint32_t last_bootstate;   /* previous bootstate to detect changes */
+    uint16_t lpc_scratch_4026;    /* Port 0x4026 read-write scratch register */
+    bool     mbcom_handshake_done; /* True after SEGABOOT writes 0x0102 to port 0x4026 */
+    uint8_t  mbcom_e0_status;     /* Port 0x40E0 status bits: bit0=data, bit2=cmd_complete */
 } ChihiroLPCState;
 
 #define CHIHIRO_LPC_DEVICE(obj) \
@@ -135,6 +138,7 @@ static char chihiro_game_filename[64]; /* Game XBE filename saved at boot=3 */
 char chihiro_game_dir[1024];   /* Game directory path (from dvd_path) */
 static uint32_t chihiro_ldp_pa;  /* v208: LDP physical address, captured at boot=3 */
 static ChihiroLPCState *chihiro_lpc_global;
+uint32_t chihiro_usb_sm_pa;  /* PA of USB state machine globals at VA 0xC3F10 */
 
 /* USB devices for delayed hotplug (simulates AN2131 I2C firmware boot) */
 static USBDevice *chihiro_usb_qc = NULL;
@@ -265,7 +269,7 @@ typedef struct {
  * Walk x86 page tables (non-PAE) to translate VA → PA.
  * Returns physical address, or 0xFFFFFFFF on failure.
  */
-static uint32_t chihiro_va_to_pa(uint32_t va)
+uint32_t chihiro_va_to_pa(uint32_t va)
 {
     CPUState *cpu = first_cpu;
     if (!cpu) return 0xFFFFFFFF;
@@ -1042,8 +1046,8 @@ static void chihiro_diag_timer_cb(void *opaque)
     uint32_t xbe2_ce_pa = chihiro_va_to_pa(0xCB9EC);
     if (xbe2_ce_pa != 0xFFFFFFFF) cpu_physical_memory_read(xbe2_ce_pa, &xbe2_ce_state, 4);
 
-    /* Detect bootstate changes between ticks */
-    if (bootstate != s->last_bootstate) {
+    /* Detect bootstate changes between ticks (guard against garbage VAs) */
+    if (bootstate != s->last_bootstate && bootstate < 100 && s->last_bootstate < 100) {
         printf("[%07lld] DIAG: *** BOOTSTATE CHANGED %u → %u ***\n", TS_MS,
                s->last_bootstate, bootstate);
         if (bootstate == 3) {
@@ -1188,19 +1192,34 @@ static void chihiro_diag_timer_cb(void *opaque)
         s->last_bootstate = bootstate;
     }
 
-    printf("[%07lld] DIAG: CE st=%u cnt=%u rdy=%u | gate=%u boot=%u flag=0x%02X "
-           "slots=%u/s0=0x%02X mflag=%u | 40F0=%u 401E=%u 4084=%u | tick=%u d7a8=%u ce2=%u %s\n",
-           TS_MS, state, counter, ready, gate, bootstate,
-           bootflag & 0xFF, slotcount, slotflag0, mainflag,
-           s->lpc_40f0_reads, s->lpc_401e_reads, s->lpc_4084_reads,
-           xbe2_d0798, xbe2_d07a8, xbe2_ce_state,
-           (xbe2_ce_pa != 0xFFFFFFFF) ? "xbe2:mapped" : "xbe2:UNMAPPED");
+    if (bootstate < 100) {
+        printf("[%07lld] DIAG: CE st=%u cnt=%u rdy=%u | gate=%u boot=%u flag=0x%02X "
+               "slots=%u/s0=0x%02X mflag=%u | 40F0=%u 401E=%u 4084=%u | tick=%u d7a8=%u ce2=%u %s\n",
+               TS_MS, state, counter, ready, gate, bootstate,
+               bootflag & 0xFF, slotcount, slotflag0, mainflag,
+               s->lpc_40f0_reads, s->lpc_401e_reads, s->lpc_4084_reads,
+               xbe2_d0798, xbe2_d07a8, xbe2_ce_state,
+               (xbe2_ce_pa != 0xFFFFFFFF) ? "xbe2:mapped" : "xbe2:UNMAPPED");
+    } else {
+        static bool diag_va_warned = false;
+        if (!diag_va_warned) {
+            printf("[%07lld] DIAG: VAs invalid (boot=%u) — DIAG output suppressed\n",
+                   TS_MS, bootstate);
+            diag_va_warned = true;
+        }
+    }
 
     /* v206b: Read-only monitoring of baseboard_dev[].flags.
-     * RE confirmed: baseboard_dev[] at VA 0xA3778, stride 0x218, flags at offset +4. */
+     * fpr-23887: baseboard_dev[] at VA 0xA3778, stride 0x218, flags at offset +4.
+     * fpr-21042: channel table at VA 0xE9BD0, same stride/flags layout.
+     * Auto-detect: try fpr-21042 VA first, fall back to fpr-23887. */
     {
-        uint32_t dev0_base_va = 0xA3778;
-        uint32_t dev1_base_va = 0xA3778 + 0x218;  /* 0xA3990 */
+        uint32_t dev0_base_va = 0xE9BD0;
+        uint32_t dev0_test_pa = chihiro_va_to_pa(dev0_base_va);
+        if (dev0_test_pa == 0xFFFFFFFF) {
+            dev0_base_va = 0xA3778;  /* fpr-23887 fallback */
+        }
+        uint32_t dev1_base_va = dev0_base_va + 0x218;
         uint32_t dev0_flags_pa = chihiro_va_to_pa(dev0_base_va + 4);
         uint32_t dev1_flags_pa = chihiro_va_to_pa(dev1_base_va + 4);
 
@@ -1327,45 +1346,24 @@ static void chihiro_usb_poll_patch_cb(void *opaque)
     ChihiroLPCState *s = opaque;
     if (s->usb_poll_patched) return;
 
-    /*
-     * Patch 1: UsbEnumPoll error check (VA 0x41F57) — REMOVED in v203
-     *   Was: je→jmp to skip UsbEnumPoll failure handling
-     *   v207: RE-ENABLED. RE proved the circular dependency is structural:
-     *   RegisterClassDriver (called AFTER UsbEnumPoll) is needed for the OHCI
-     *   handler to do SET_CONFIG, which populates baseboard_dev[]. Without it,
-     *   UsbEnumPoll always times out. Skip the error to let RegisterClassDriver
-     *   run next — it executes natively and registers the bDeviceClass=0x60 driver.
-     */
-    static const uint8_t sig_enumpoll[] = {
-        0xE8, 0x64, 0xF6, 0xFF, 0xFF,  /* call UsbEnumPoll       */
-        0x85, 0xC0,                    /* test eax, eax          */
-        0x74, 0x0F                     /* je +0x0F (skip error)  */
-    };
-
-    /* fpr-21042 variant: JNE 32-bit instead of JE 8-bit */
-    static const uint8_t sig_enumpoll_21042[] = {
-        0xE8, 0xEF, 0xF1, 0xFF, 0xFF,  /* call 0x2F760           */
-        0x85, 0xC0,                    /* test eax, eax          */
-        0x0F, 0x85                     /* jne +0x32E (to error)  */
-    };
-
-    /*
-     * Patch 2: RegisterClassDriver error check (VA 0x41F74) — v207b: RE-ENABLED
-     *   Also fails because depends on UsbEnumPoll side effects.
-     *   Both skips needed to pass baseboard_init. Post-init is full LLE.
-     */
-    static const uint8_t sig_classdrv[] = {
-        0xE8, 0x27, 0x54, 0x00, 0x00,  /* call RegisterClassDriver */
-        0x85, 0xC0,                    /* test eax, eax            */
-        0x74, 0x0F                     /* je +0x0F                 */
-    };
-
-    /* fpr-21042 variant */
-    static const uint8_t sig_classdrv_21042[] = {
-        0xE8, 0x33, 0x95, 0x00, 0x00,  /* call 0x39AE0             */
-        0x85, 0xC0,                    /* test eax, eax            */
-        0x74, 0x0F                     /* je +0x0F                 */
-    };
+    /* v274: UsbEnumPoll + RegisterClassDriver patches REMOVED.
+     * These patches broke USB enumeration: NOPing the polling loop prevented
+     * the kernel from completing SET_CONFIG → no RegisterClassDriver →
+     * bit 0x20 never set → all JVS communication failed.
+     * Fix: let SEGABOOT run unmodified; USB devices in chihiro-usb.c
+     * handle enumeration via OHCI natively. */
+    /* static const uint8_t sig_enumpoll[] = {
+        0xE8, 0x64, 0xF6, 0xFF, 0xFF, 0x85, 0xC0, 0x74, 0x0F
+    }; */
+    /* static const uint8_t sig_enumpoll_21042[] = {
+        0xE8, 0xEF, 0xF1, 0xFF, 0xFF, 0x85, 0xC0, 0x0F, 0x85
+    }; */
+    /* static const uint8_t sig_classdrv[] = {
+        0xE8, 0x27, 0x54, 0x00, 0x00, 0x85, 0xC0, 0x74, 0x0F
+    }; */
+    /* static const uint8_t sig_classdrv_21042[] = {
+        0xE8, 0x33, 0x95, 0x00, 0x00, 0x85, 0xC0, 0x74, 0x0F
+    }; */
 
     /*
      * Patch 3: GetQcStatusByte0 (VA 0x3AD80)
@@ -1549,27 +1547,28 @@ static void chihiro_usb_poll_patch_cb(void *opaque)
      * NV2A for progressive scan 31kHz. SEGABOOT's video check passes naturally. */
 
     /* v207b: TDBuilder NOP patches REMOVED — diagnostic only, proven ineffective
-     * in v206. With UsbEnumPoll/RegisterClassDriver skipped, this code path
-     * is bypassed anyway. Kept as documentation of the RE finding. */
+     * in v206. Kept as documentation of the RE finding. */
 
     /* Patch byte arrays */
-    static const uint8_t patch_jmp[]   = { 0xEB };
+    /* v274: patch_jmp removed — was only used by UsbEnumPoll/RegisterClassDriver patches */
+    /* static const uint8_t patch_jmp[] = { 0xEB }; */
     static const uint8_t patch_and0[]  = { 0x00 };
     static const uint8_t patch_xor_ret[] = { 0x31, 0xC0, 0xC3 };
     /* v200: patch_xor_ret4 removed — was only used by UsbPollQC/SC patches */
     /* static const uint8_t patch_xor_ret4[] = { 0x31, 0xC0, 0xC2, 0x04, 0x00 }; */
     static const uint8_t patch_xor_nop3[]  = { 0x31, 0xC0, 0x90, 0x90, 0x90 }; /* xor eax, eax; nop*3 */
-    static const uint8_t patch_nop6[] = { 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 }; /* NOP JNE 32-bit */
+    /* v274: patch_nop6 removed — was only used by UsbEnumPoll 21042 patch */
+    /* static const uint8_t patch_nop6[] = { 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 }; */
+    /* v269: REMOVED patch_xor_ret8 + patch_mov1_ret — mbcom bypass patches reverted.
+     * mbcom_main_init must run LLE. Baseboard emulation handles its IDE commands. */
 
     ChihiroPatch patches[] = {
-        /* v207b: Both UsbEnumPoll + RegisterClassDriver skips re-enabled.
-         * Circular dependency: kernel doesn't SET_CONFIG for class 0x60,
-         * so SEGABOOT's USB handler can't enumerate → both functions fail.
-         * Post-init code (mbcom, USB thread, OHCI handler) runs full LLE. */
-        { sig_enumpoll, sizeof(sig_enumpoll), 7,  patch_jmp,     1, 0x41F57, "UsbEnumPoll check (je->jmp)",         false },
-        { sig_enumpoll_21042, sizeof(sig_enumpoll_21042), 7, patch_nop6, 6, 0x3056C, "UsbEnumPoll check (nop jne32) [21042]", false },
-        { sig_classdrv, sizeof(sig_classdrv), 7,  patch_jmp,     1, 0x41F74, "RegisterClassDriver check (je->jmp)", false },
-        { sig_classdrv_21042, sizeof(sig_classdrv_21042), 7, patch_jmp, 1, 0x305A8, "RegisterClassDriver check (je->jmp) [21042]", false },
+        /* v274: UsbEnumPoll + RegisterClassDriver patches REMOVED — broke USB enumeration.
+         * SEGABOOT runs unmodified; USB devices handle OHCI natively. */
+        /* { sig_enumpoll, ..., "UsbEnumPoll check (je->jmp)", false }, */
+        /* { sig_enumpoll_21042, ..., "UsbEnumPoll check (nop jne32) [21042]", false }, */
+        /* { sig_classdrv, ..., "RegisterClassDriver check (je->jmp)", false }, */
+        /* { sig_classdrv_21042, ..., "RegisterClassDriver check (je->jmp) [21042]", false }, */
         { sig_qcbyte0,  sizeof(sig_qcbyte0),  0,  patch_xor_ret, 3, 0x3AD80, "GetQcStatusByte0 (xor eax,eax; ret)", false },
         { sig_qcbyte0_21042, sizeof(sig_qcbyte0_21042), 0, patch_xor_ret, 3, 0x2AD70, "GetQcStatusByte0 (xor eax,eax; ret) [21042]", false },
         /* v201: CreateThread patch REMOVED — let USB poll thread be created */
@@ -1619,11 +1618,11 @@ static void chihiro_usb_poll_patch_cb(void *opaque)
         }
     }
 
-    if (applied >= 7) {
+    if (applied >= 3) {
         s->usb_poll_patched = true;
-        printf("[%07lld] Chihiro: %d/%d SEGABOOT patches applied\n", TS_MS, applied, num_patches);
-        printf("[%07lld] Chihiro: UsbEnumPoll+RegisterClassDriver "
-               "skipped (circular dep). Post-init USB/mbcom in LLE.\n", TS_MS);
+        printf("[%07lld] Chihiro: %d/%d SEGABOOT patches applied. "
+               "USB enumeration runs natively (no UsbEnumPoll bypass).\n",
+               TS_MS, applied, num_patches);
 
         /* RAM dump for offline RE — page tables, SEGABOOT BSS, slot analysis */
         {
@@ -1749,6 +1748,9 @@ static uint64_t chihiro_lpc_io_read(void *opaque, hwaddr addr,
         case 0x80000160: r = 0x01; break;       /* PCI status */
         case 0xA0001E60: r = 0x00000020; break; /* DMA mode 6 */
         case 0xA0000000: r = s->lpc_reg_data; break; /* indirect read data */
+        case 0x90000000: r = 0x01; break; /* shared memory status = ready */
+        case 0xA0000020: r = 0; break;    /* DMA transfer count */
+        case 0xA0000040: r = 0; break;    /* DMA status flags */
         default: r = 0; break;
         }
         if (CHIHIRO_LOG) {
@@ -1775,16 +1777,14 @@ static uint64_t chihiro_lpc_io_read(void *opaque, hwaddr addr,
         r = 0x4D41;     /* "MA" → full string reads as "XBAM" */
         break;
     case SEGA_CHIP_REVISION:
-        /* Port 0x40F0 — three phases:
-         * 1. Kernel boot (first 2 reads): 0x0000 (mediaboard present)
-         * 2. SEGABOOT negotiation: 0x0001 (ready for mbcom)
-         * 3. Game kernel (after boot=3): 0x0000 (mediaboard present)
-         * v209b: must use boot3_reached (set 4s earlier), NOT game_running
-         * (set during THIS read — too late for the return value). */
         if (chihiro_boot3_reached) {
             r = 0x0000;  /* Game kernel: mediaboard present */
+        } else if (s->lpc_40f0_reads < 2) {
+            r = 0x0000;  /* Kernel boot: mediaboard present */
+        } else if (s->mbcom_handshake_done) {
+            r = 0x0100;  /* Handshake complete: upper byte=1 = MediaBoard READY */
         } else {
-            r = (s->lpc_40f0_reads < 2) ? 0x0000 : 0x0001;
+            r = 0x0000;  /* Handshake not yet done: upper byte=0 = init phase */
         }
         s->lpc_40f0_reads++;
         /* Detect game XBE reboot: if SEGABOOT already reached boot=3
@@ -1947,7 +1947,13 @@ static uint64_t chihiro_lpc_io_read(void *opaque, hwaddr addr,
         }
         break;
     case SEGA_DIMM_SIZE:
-        r = SEGA_DIMM_SIZE_512M;        /* 512MB DIMM (matches MAME default) */
+        r = SEGA_DIMM_SIZE_1024M;       /* 1024MB DIMM (matches Cxbx) */
+        break;
+    case 0x26:  /* Port 0x4026: scratch register (read-write) */
+        r = s->lpc_scratch_4026;
+        break;
+    case 0xE0:  /* Port 0x40E0: DMA status / data ready */
+        r = s->mbcom_e0_status;
         break;
     case 0x84:  /* Port 0x4084 — MbcomCommand session handle */
         r = 0x0000;
@@ -1957,12 +1963,15 @@ static uint64_t chihiro_lpc_io_read(void *opaque, hwaddr addr,
         break;
     }
 
-    if (CHIHIRO_LOG) {
+    if (CHIHIRO_LOG && addr != 0x26 && addr != 0xE0 && addr != 0xF0) {
         printf("[%07lld] chihiro lpc read  [0x%04x] -> 0x%04x (size=%d)\n", TS_MS,
                (unsigned)(addr + 0x4000), (unsigned)r, size);
     }
     return r;
 }
+
+static uint8_t chihiro_mbcom_command[512];
+static void chihiro_mbcom_process(void);
 
 static void chihiro_lpc_io_write(void *opaque, hwaddr addr, uint64_t val,
                                  unsigned size)
@@ -1970,10 +1979,18 @@ static void chihiro_lpc_io_write(void *opaque, hwaddr addr, uint64_t val,
 
     ChihiroLPCState *s = CHIHIRO_LPC_DEVICE(opaque);
 
-    /* Log writes (suppress 0x4026 IRQ ACK spam and 0x40E1 polling spam) */
-    if (addr != 0x26 && addr != 0xE1) {
+    /* Log writes (suppress polling spam: 0x4026 scratch, 0x40E0 ack, 0x40E1 trigger) */
+    if (addr != 0x26 && addr != 0xE0 && addr != 0xE1) {
         printf("[%07lld] chihiro lpc write [0x%04x] <- 0x%04x (size=%d)\n", TS_MS,
                (unsigned)(addr + 0x4000), (unsigned)val, size);
+    }
+    if (addr == 0xE1) {
+        static uint32_t e1_write_count = 0;
+        e1_write_count++;
+        if (e1_write_count <= 3 || e1_write_count % 100 == 0) {
+            printf("[%07lld] chihiro lpc write [0x40e1] <- 0x%04x (#%u)\n",
+                   TS_MS, (unsigned)val, e1_write_count);
+        }
     }
 
     switch (addr) {
@@ -1987,58 +2004,41 @@ static void chihiro_lpc_io_write(void *opaque, hwaddr addr, uint64_t val,
         return;
     case 0x08: /* Port 0x4008: command/clear */
         return;
-    case SEGA_IRQ10_ACK:  /* 0xE0 */
-    case 0xE2:            /* 0x40E2 — part of mbcom register block */
+    case 0x26:  /* Port 0x4026: scratch register */
+        s->lpc_scratch_4026 = (uint16_t)val;
+        if (val == 0x0102) {
+            s->mbcom_handshake_done = true;
+            printf("[%07lld] Chihiro: Handshake complete (0x4026 <- 0x0102)\n", TS_MS);
+        }
+        break;
+    case SEGA_IRQ10_ACK:  /* 0xE0 — ack: clear specific bits */
+        s->mbcom_e0_status &= ~(uint8_t)val;
+        if (s->mbcom_e0_status == 0)
+            qemu_irq_lower(s->irq10);
+        break;
+    case 0xE2:            /* 0x40E2 — IRQ10 deassert only, do NOT clear data ready */
         qemu_irq_lower(s->irq10);
         break;
     case 0xE1:            /* 0x40E1 — mbcom trigger / IRQ10 deassert */
-        if (val != 0 && !chihiro_game_running) {
-            /* fpr-21042 SEGABOOT writes 0x0F to 0x40E1 as a DMA trigger.
-             * On real hardware the MediaBoard receives this, fills DMA
-             * slots in RAM with mbcom responses, then asserts IRQ10.
-             * We emulate this by writing responses directly to the slot
-             * physical addresses and raising IRQ10. */
-            static bool lpc_trigger_logged = false;
-            uint32_t meta_pa = chihiro_va_to_pa(0xAA790);
-            if (meta_pa != 0xFFFFFFFF && meta_pa < 0x800000) {
-                static const struct {
-                    uint8_t  type;
-                    uint16_t cmd;
-                    uint32_t resp;
-                    uint32_t resp2;
-                } mbcom_init_responses[] = {
-                    { 1, 0x0001, 0x00F00000, 0   },  /* DIMM_SIZE */
-                    { 2, 0x0101, 0x45671234, 0   },  /* FW_VERSION */
-                    { 3, 0x0103, 0x6261632D, 0   },  /* SERIAL (partial) */
-                    { 4, 0x0102, 0x00010000, 0   },  /* SYSTEM_TYPE (devel) */
-                    { 5, 0x0100, 0x00000005, 100 },  /* STATUS=READY, 100% */
-                };
-                for (int i = 0; i < 5; i++) {
-                    uint32_t entry = meta_pa + i * 0x60;
-                    uint32_t data  = entry + 0x20;
-                    if (entry + 0x60 > 0x800000) break;
-
-                    uint8_t  type = mbcom_init_responses[i].type;
-                    uint16_t cmd  = mbcom_init_responses[i].cmd;
-                    uint16_t marker = 0x0001;
-
-                    cpu_physical_memory_write(data,      &type, 1);
-                    cpu_physical_memory_write(data + 2,   &cmd, 2);
-                    cpu_physical_memory_write(entry + 2,  &marker, 2);
-                    cpu_physical_memory_write(entry + 4,
-                            &mbcom_init_responses[i].resp, 4);
-                    if (mbcom_init_responses[i].resp2)
-                        cpu_physical_memory_write(entry + 8,
-                                &mbcom_init_responses[i].resp2, 4);
-                }
-                if (!lpc_trigger_logged) {
-                    printf("[%07lld] Chihiro: LPC trigger 0x40E1=0x%04X — "
-                           "filled 5 DMA slots at PA 0x%05X, asserting IRQ10\n",
-                           TS_MS, (unsigned)val, meta_pa);
-                    lpc_trigger_logged = true;
+        if (val != 0) {
+            static int e1_trigger_count = 0;
+            e1_trigger_count++;
+            if (chihiro_mbcom_command[0] != 0 || chihiro_mbcom_command[1] != 0) {
+                chihiro_mbcom_process();
+                s->mbcom_e0_status |= 0x01;
+                qemu_irq_raise(s->irq10);
+                printf("[%07lld] Chihiro: LPC trigger 0x40E1=0x%04X → "
+                       "PROCESS cmd=%02X%02X status=0x%02X + IRQ10 (#%d)\n",
+                       TS_MS, (unsigned)val,
+                       chihiro_mbcom_command[0], chihiro_mbcom_command[1],
+                       s->mbcom_e0_status, e1_trigger_count);
+            } else {
+                if (e1_trigger_count <= 3 || e1_trigger_count % 500 == 0) {
+                    printf("[%07lld] Chihiro: LPC trigger 0x40E1=0x%04X → "
+                           "no pending cmd, skip (#%d)\n",
+                           TS_MS, (unsigned)val, e1_trigger_count);
                 }
             }
-            qemu_irq_raise(s->irq10);
         } else {
             qemu_irq_lower(s->irq10);
         }
@@ -2067,9 +2067,9 @@ static qemu_irq chihiro_irq10_global = NULL;
  * We pulse it periodically since we pre-fill the response sector.
  */
 
-/* mbcom state — defined here (before IRQ10 timer that uses them) */
+/* mbcom state — chihiro_mbcom_command declared earlier (forward decl for LPC handler) */
 static uint8_t chihiro_mbcom_response[512];
-static uint8_t chihiro_mbcom_command[512];
+/* chihiro_mbcom_command[512] is forward-declared before chihiro_lpc_io_write */
 static bool chihiro_mbcom_enabled = false;
 
 /* Flash ROM (SEGABOOT) loaded from file — serves mbrom0/mbrom1 reads.
@@ -2133,7 +2133,6 @@ void chihiro_load_flash_rom(const char *bios_path)
     printf("[%07lld] Chihiro: No flash ROM found (fpr-23887/fpr21042). "
            "Will fall through to baseboard.img for mbrom reads.\n", TS_MS);
 }
-static void chihiro_mbcom_process(void);
 
 static void chihiro_irq10_timer_cb(void *opaque)
 {
@@ -2228,13 +2227,12 @@ static void chihiro_irq10_timer_cb(void *opaque)
                     cpu_physical_memory_read(data_pa, &data_byte0, 1);
                     cpu_physical_memory_read(meta_pa + 2, &meta_marker, 2);
 
-                    /* Only process if type is set (1-5) and marker is clear */
-                    if (data_byte0 < 1 || data_byte0 > 5 || meta_marker != 0) continue;
+                    /* Only process if type is set and marker is clear */
+                    if (data_byte0 == 0 || meta_marker != 0) continue;
 
                     uint16_t cmd_opcode = 0;
                     cpu_physical_memory_read(data_pa + 2, &cmd_opcode, 2);
 
-                    /* Strict: only known mbcom commands */
                     uint32_t resp_data = 0, resp_data2 = 0;
                     switch (cmd_opcode) {
                     case 0x0001: resp_data = 0x00F00000; break;
@@ -2242,7 +2240,12 @@ static void chihiro_irq10_timer_cb(void *opaque)
                     case 0x0101: resp_data = 0x45671234; break;
                     case 0x0102: resp_data = 0x00010000; break;
                     case 0x0103: resp_data = 0x6261632D; break;
-                    default: continue; /* Unknown → skip, do NOT write */
+                    default:
+                        printf("[%07lld] Chihiro DMA: UNKNOWN cmd=0x%04X type=%u slot=%d "
+                               "PA=0x%05X meta=0x%05X — responding with 0\n",
+                               TS_MS, cmd_opcode, data_byte0, sl, data_pa, meta_pa);
+                        resp_data = 0;
+                        break;
                     }
 
                     meta_marker = 0x0001;
@@ -2250,6 +2253,8 @@ static void chihiro_irq10_timer_cb(void *opaque)
                     cpu_physical_memory_write(meta_pa + 4, &resp_data, 4);
                     if (cmd_opcode == 0x0100)
                         cpu_physical_memory_write(meta_pa + 8, &resp_data2, 4);
+                    s->mbcom_e0_status |= 0x05;
+                    qemu_irq_raise(s->irq10);
 
                     static uint16_t last_dma_cmd = 0xFFFF;
                     static uint32_t dma_repeat_count = 0;
@@ -2266,6 +2271,198 @@ static void chihiro_irq10_timer_cb(void *opaque)
                     }
                 }
                 break; /* Use first working layout */
+            }
+        }
+    }
+
+    /* MBCOM-STATUS: track mbcom_main_init progress through all 12 steps */
+    {
+        static int mbcom_alive_log = 0;
+        if (mbcom_alive_log++ % 310 == 0) {
+            uint32_t alive_pa = chihiro_va_to_pa(0xAAE98);
+            uint32_t state_pa = chihiro_va_to_pa(0xAAEA8);
+            uint32_t sem_a_pa = chihiro_va_to_pa(0xAAD9C);
+            uint32_t sem_b_pa = chihiro_va_to_pa(0xAAE1C);
+            uint32_t cmd_pa   = chihiro_va_to_pa(0xC57F0);
+            uint32_t dirty1_pa = chihiro_va_to_pa(0xAAEA0);
+            uint32_t dirty2_pa = chihiro_va_to_pa(0xAAEA4);
+            uint32_t cmdcnt_pa = chihiro_va_to_pa(0xAA758);
+            uint32_t init_flag_pa = chihiro_va_to_pa(0xC8F18);
+            uint32_t ready_cnt_pa = chihiro_va_to_pa(0xC8F28);
+            if (alive_pa != 0xFFFFFFFF && state_pa != 0xFFFFFFFF) {
+                uint32_t alive = 0, state = 0;
+                uint32_t sem_a = 0, sem_b = 0, cmd_flag = 0;
+                uint32_t dirty1 = 0, dirty2 = 0, cmdcnt = 0;
+                uint32_t init_flag = 0, ready_cnt = 0;
+                cpu_physical_memory_read(alive_pa, &alive, 4);
+                cpu_physical_memory_read(state_pa, &state, 4);
+                if (sem_a_pa != 0xFFFFFFFF) cpu_physical_memory_read(sem_a_pa, &sem_a, 4);
+                if (sem_b_pa != 0xFFFFFFFF) cpu_physical_memory_read(sem_b_pa, &sem_b, 4);
+                if (cmd_pa != 0xFFFFFFFF) cpu_physical_memory_read(cmd_pa, &cmd_flag, 4);
+                if (dirty1_pa != 0xFFFFFFFF) cpu_physical_memory_read(dirty1_pa, &dirty1, 4);
+                if (dirty2_pa != 0xFFFFFFFF) cpu_physical_memory_read(dirty2_pa, &dirty2, 4);
+                if (cmdcnt_pa != 0xFFFFFFFF) cpu_physical_memory_read(cmdcnt_pa, &cmdcnt, 4);
+                if (init_flag_pa != 0xFFFFFFFF) cpu_physical_memory_read(init_flag_pa, &init_flag, 4);
+                if (ready_cnt_pa != 0xFFFFFFFF) cpu_physical_memory_read(ready_cnt_pa, &ready_cnt, 4);
+                printf("[%07lld] MBCOM-STATUS: alive=%u state=%u | "
+                       "semA=0x%X semB=0x%X cmd=0x%X dirty=%u/%u cmdcnt=%u "
+                       "| init=%u ready_cnt=%u\n",
+                       TS_MS, alive, state, sem_a, sem_b,
+                       cmd_flag, dirty1, dirty2, cmdcnt,
+                       init_flag, ready_cnt);
+                uint32_t handle_pa = chihiro_va_to_pa(0xAA74C);
+                if (handle_pa != 0xFFFFFFFF) {
+                    uint32_t handle = 0;
+                    cpu_physical_memory_read(handle_pa, &handle, 4);
+                    printf("[%07lld] MBCOM-HANDLE: 0x%08X\n", TS_MS, handle);
+                }
+                {
+                    CPUState *cs = first_cpu;
+                    if (cs) {
+                        X86CPU *x86cpu = X86_CPU(cs);
+                        printf("[%07lld] MBCOM-EIP: 0x%08X\n",
+                               TS_MS, (uint32_t)x86cpu->env.eip);
+                    }
+                }
+                /* One-shot: dump XboxHardwareInfo via thunk at VA 0x1111C */
+                {
+                    static int hwinfo_dumped = 0;
+                    if (!hwinfo_dumped) {
+                        uint32_t thunk_pa = chihiro_va_to_pa(0x1111C);
+                        if (thunk_pa != 0xFFFFFFFF) {
+                            uint32_t hwinfo_va = 0;
+                            cpu_physical_memory_read(thunk_pa, &hwinfo_va, 4);
+                            if (hwinfo_va > 0x80000000 && hwinfo_va < 0x80100000) {
+                                uint32_t hwinfo_pa = chihiro_va_to_pa(hwinfo_va);
+                                if (hwinfo_pa != 0xFFFFFFFF) {
+                                    uint8_t hw[8];
+                                    cpu_physical_memory_read(hwinfo_pa, hw, 8);
+                                    printf("[%07lld] XBOX-HW-INFO @VA=0x%08X: "
+                                           "Flags=%02X%02X%02X%02X GpuRev=0x%02X "
+                                           "McpRev=0x%02X [%s] unk=%02X %02X\n",
+                                           TS_MS, hwinfo_va,
+                                           hw[3],hw[2],hw[1],hw[0],
+                                           hw[4], hw[5],
+                                           (hw[5] == 0xA1) ? "OHCI INIT SKIPPED!" : "OHCI INIT OK",
+                                           hw[6], hw[7]);
+                                    hwinfo_dumped = 1;
+                                } else {
+                                    printf("[%07lld] XBOX-HW-INFO: VA=0x%08X PA unmapped\n",
+                                           TS_MS, hwinfo_va);
+                                }
+                            } else if (hwinfo_va != 0 && (hwinfo_va & 0x80000000)) {
+                                printf("[%07lld] XBOX-HW-INFO: thunk unresolved (0x%08X)\n",
+                                       TS_MS, hwinfo_va);
+                            }
+                        }
+                    }
+                }
+                /* Ring buffer diagnostic: read DAT_00076878 structure */
+                {
+                    uint32_t dat_pa = chihiro_va_to_pa(0x76878);
+                    if (dat_pa != 0xFFFFFFFF && dat_pa < 0x800000) {
+                        uint32_t struct_ptr = 0;
+                        cpu_physical_memory_read(dat_pa, &struct_ptr, 4);
+                        if (struct_ptr != 0) {
+                            uint32_t sp_pa = chihiro_va_to_pa(struct_ptr + 0x2C);
+                            uint32_t tp_pa = chihiro_va_to_pa(struct_ptr + 0x30);
+                            if (sp_pa != 0xFFFFFFFF && tp_pa != 0xFFFFFFFF) {
+                                uint32_t head = 0, tail_ptr = 0, tail = 0;
+                                cpu_physical_memory_read(sp_pa, &head, 4);
+                                cpu_physical_memory_read(tp_pa, &tail_ptr, 4);
+                                if (tail_ptr != 0) {
+                                    uint32_t tailv_pa = chihiro_va_to_pa(tail_ptr);
+                                    if (tailv_pa != 0xFFFFFFFF)
+                                        cpu_physical_memory_read(tailv_pa, &tail, 4);
+                                }
+                                printf("[%07lld] RINGBUF: struct=0x%08X head=%u "
+                                       "tail_ptr=0x%08X tail=%u (delta=%d)\n",
+                                       TS_MS, struct_ptr, head, tail_ptr, tail,
+                                       (int)(head - tail));
+                            }
+                        }
+                    }
+                }
+                /* Dump first 6 DMA slot headers to see pending commands */
+                uint32_t slot_base = chihiro_va_to_pa(0xAA7B0);
+                uint32_t meta_base = chihiro_va_to_pa(0xAA790);
+                if (slot_base != 0xFFFFFFFF && meta_base != 0xFFFFFFFF) {
+                    printf("[%07lld] DMA-SLOTS:", TS_MS);
+                    for (int ds = 0; ds < 6; ds++) {
+                        uint8_t dtype = 0; uint16_t dcmd = 0, dmark = 0;
+                        uint32_t dresp = 0;
+                        uint32_t dp = slot_base + ds * 0x60;
+                        uint32_t mp = meta_base + ds * 0x60;
+                        if (dp + 4 < 0x800000 && mp + 6 < 0x800000) {
+                            cpu_physical_memory_read(dp, &dtype, 1);
+                            cpu_physical_memory_read(dp + 2, &dcmd, 2);
+                            cpu_physical_memory_read(mp + 2, &dmark, 2);
+                            cpu_physical_memory_read(mp + 4, &dresp, 4);
+                            printf(" [%d]t=%u/c=%04X/m=%u/r=%08X",
+                                   ds, dtype, dcmd, dmark, dresp);
+                        }
+                    }
+                    printf("\n");
+                }
+                /* DMA channel table: DAT_000aa6a0 = count, DAT_000aa6a4 = entries (16B each) */
+                {
+                    uint32_t cnt_pa = chihiro_va_to_pa(0xAA6A0);
+                    if (cnt_pa != 0xFFFFFFFF && cnt_pa < 0x800000) {
+                        uint32_t tbl_count = 0;
+                        cpu_physical_memory_read(cnt_pa, &tbl_count, 4);
+                        printf("[%07lld] DMA-TABLE: count=%u", TS_MS, tbl_count);
+                        uint32_t ent_pa = chihiro_va_to_pa(0xAA6A4);
+                        if (ent_pa != 0xFFFFFFFF && tbl_count > 0 && tbl_count <= 8) {
+                            for (uint32_t e = 0; e < tbl_count && e < 4; e++) {
+                                uint8_t entry[16];
+                                cpu_physical_memory_read(ent_pa + e * 16, entry, 16);
+                                printf(" [%u]=%02X/%02X%02X%02X%02X/%02X%02X%02X%02X",
+                                       e, entry[0],
+                                       entry[4],entry[5],entry[6],entry[7],
+                                       entry[8],entry[9],entry[10],entry[11]);
+                            }
+                        }
+                        printf("\n");
+                    }
+                }
+                /* Kernel state: DIMM size, FPGA flag, CreateQuick marker */
+                {
+                    uint32_t dimm_val = 0, fpga = 0, dimm_top = 0;
+                    cpu_physical_memory_read(0x3B3CC, &dimm_val, 4);
+                    cpu_physical_memory_read(0x3B3C8, &fpga, 1);
+                    cpu_physical_memory_read(0x3AF2C, &dimm_top, 1);
+                    printf("[%07lld] KERNEL: DIMM_sz=0x%08X FPGA=%u "
+                           "CreateQuickDone=%u 40F0_reads=%u\n",
+                           TS_MS, dimm_val, fpga, dimm_top,
+                           s->lpc_40f0_reads);
+                }
+                /* USB state machine globals at 0xC3F10 */
+                {
+                    uint32_t sm_pa = chihiro_va_to_pa(0xC3F10);
+                    if (chihiro_usb_sm_pa == 0 && sm_pa != 0xFFFFFFFF)
+                        chihiro_usb_sm_pa = sm_pa;
+                    if (sm_pa != 0xFFFFFFFF && sm_pa < 0x800000) {
+                        uint8_t sm[4];
+                        uint32_t sm88 = 0, sm8c = 0, sm90 = 0;
+                        cpu_physical_memory_read(sm_pa, sm, 4);
+                        uint32_t pa88 = chihiro_va_to_pa(0xC3F88);
+                        uint32_t pa8c = chihiro_va_to_pa(0xC3F8C);
+                        uint32_t pa90 = chihiro_va_to_pa(0xC3F90);
+                        if (pa88 != 0xFFFFFFFF)
+                            cpu_physical_memory_read(pa88, &sm88, 1);
+                        if (pa8c != 0xFFFFFFFF)
+                            cpu_physical_memory_read(pa8c, &sm8c, 4);
+                        if (pa90 != 0xFFFFFFFF)
+                            cpu_physical_memory_read(pa90, &sm90, 4);
+                        printf("[%07lld] USB-SM: active=%u sub=%u state=%u "
+                               "flags=0x%02X cnt=%u queue=0x%08X req=0x%08X\n",
+                               TS_MS, sm[0], sm[1], sm[2], sm[3],
+                               sm88, sm8c, sm90);
+                    }
+                }
+            } else {
+                printf("[%07lld] MBCOM-STATUS: VA unmapped (alive_pa=0x%X state_pa=0x%X)\n",
+                       TS_MS, alive_pa, state_pa);
             }
         }
     }
@@ -2313,6 +2510,44 @@ static void chihiro_eeprom_hack_cb(void *opaque)
             s->eeprom_hack_applied = true;
             printf("[%07lld] Chihiro: Applied EEPROM validation hack "
                    "(arcdkrnl @ 0x8003B744)\n", TS_MS);
+
+            /* Apply MediaBoard kernel patches NOW, before IdexChannelCreate
+             * calls IdexMediaBoardCreateQuick. These NOP gate checks that
+             * skip mbcom:/D:\ symlink creation when MB_FLAG=1.
+             * Without these, NtCreateFile("mbcom:") fails → handle=-1. */
+            {
+                uint8_t nop2k[2] = {0x90, 0x90};
+                uint8_t chk[2];
+
+                cpu_physical_memory_read(0x25AAB, chk, 2);
+                if (chk[0] == 0x75 && chk[1] == 0x18) {
+                    cpu_physical_memory_write(0x25AAB, nop2k, 2);
+                    printf("[%07lld] Chihiro: Kernel early patch: NOP JNE @ PA 0x25AAB "
+                           "(force mbcom partition)\n", TS_MS);
+                }
+
+                cpu_physical_memory_read(0x25B1B, chk, 2);
+                if (chk[0] == 0x75 && chk[1] == 0x17) {
+                    cpu_physical_memory_write(0x25B1B, nop2k, 2);
+                    printf("[%07lld] Chihiro: Kernel early patch: NOP JNE @ PA 0x25B1B "
+                           "(force D:\\ symlink)\n", TS_MS);
+                }
+
+                cpu_physical_memory_read(0x30905, chk, 2);
+                if (chk[0] == 0x75 && chk[1] == 0x25) {
+                    cpu_physical_memory_write(0x30905, nop2k, 2);
+                    printf("[%07lld] Chihiro: Kernel early patch: NOP JNE @ PA 0x30905 "
+                           "(force symlinks)\n", TS_MS);
+                }
+
+                cpu_physical_memory_read(0x309AD, chk, 2);
+                if (chk[0] == 0x75 && chk[1] == 0x0A) {
+                    cpu_physical_memory_write(0x309AD, nop2k, 2);
+                    printf("[%07lld] Chihiro: Kernel early patch: NOP JNE @ PA 0x309AD "
+                           "(force partition init)\n", TS_MS);
+                }
+            }
+
             return;
         }
         /* Retry until kernel is decrypted */
@@ -2472,8 +2707,8 @@ static void chihiro_mbcom_process(void)
     }
 
     switch (cmd_code) {
-    case 0x0001: /* DIMM_SIZE — MAME: dword_write_le(r+4, 0x00f00000) */
-        r[4] = 0x00; r[5] = 0x00; r[6] = 0xF0; r[7] = 0x00;
+    case 0x0001: /* DIMM_SIZE — Cxbx: 1073741824 (1GB = 0x40000000) */
+        r[4] = 0x00; r[5] = 0x00; r[6] = 0x00; r[7] = 0x40;
         break;
     case 0x0100: /* STATUS — phase=5 (READY), completion=100%
                   * CXBX: MB_STATUS_READY=5, percentage=100 */
@@ -2583,12 +2818,12 @@ bool chihiro_ide_read_sector(uint32_t lba, void *buffer)
         return true;
     }
     if (lba == CHIHIRO_MBCOM_COMMAND) {
-        /* MAME: FC801 READ returns write_buffer (the command slot).
-         * After processing, command bytes [0-3] are cleared to zero.
-         * SEGABOOT reads FC801 to check slot-clear (expects zeros = ready).
-         * Bug was: returning response instead → non-zero → infinite poll. */
         memset(buffer, 0, 512);
         memcpy(buffer, chihiro_mbcom_command, 32);
+        const uint8_t *d = (const uint8_t *)buffer;
+        printf("[%07lld] MBCOM-IDE-READ FC801 slot=%02X%02X%02X%02X "
+               "%02X%02X%02X%02X\n",
+               TS_MS, d[0],d[1],d[2],d[3],d[4],d[5],d[6],d[7]);
         return true;
     }
 
@@ -2609,7 +2844,8 @@ bool chihiro_ide_read_sector(uint32_t lba, void *buffer)
         }
         return true;
     }
-    return false;
+    memset(buffer, 0, 512);
+    return true;
 }
 
 /*
@@ -2626,6 +2862,10 @@ bool chihiro_ide_write_sector(uint32_t lba, const void *buffer)
         return true;
     }
     if (lba == CHIHIRO_MBCOM_COMMAND) {
+        const uint8_t *d = (const uint8_t *)buffer;
+        printf("[%07lld] MBCOM-IDE-WRITE FC801 cmd=%02X%02X sub=%02X%02X "
+               "data=%02X%02X%02X%02X %02X%02X%02X%02X\n",
+               TS_MS, d[0],d[1],d[2],d[3],d[4],d[5],d[6],d[7],d[8],d[9],d[10],d[11]);
         memcpy(chihiro_mbcom_command, buffer, 32);
         if (chihiro_mbcom_command[0] != 0 || chihiro_mbcom_command[1] != 0) {
             chihiro_mbcom_process();
@@ -2634,6 +2874,10 @@ bool chihiro_ide_write_sector(uint32_t lba, const void *buffer)
             }
         }
         return true;
+    }
+    if (lba >= CHIHIRO_MBCOM_BASE && lba <= CHIHIRO_MBCOM_BASE + 0x5000) {
+        printf("[%07lld] MBCOM-IDE-WRITE lba=0x%X (base+0x%X)\n",
+               TS_MS, lba, lba - CHIHIRO_MBCOM_BASE);
     }
     return false;
 }
@@ -2650,6 +2894,9 @@ void chihiro_ide_dma_write_done(BlockBackend *blk, int64_t sector_num)
 
     int64_t cmd_lba = CHIHIRO_MBCOM_COMMAND;
     int64_t resp_lba = CHIHIRO_MBCOM_RESPONSE;
+
+    printf("[%07lld] MBCOM-DMA-WRITE-DONE sector_num=0x%llX (cmd_lba=0x%llX)\n",
+           TS_MS, (long long)sector_num, (long long)cmd_lba);
 
     if (sector_num <= cmd_lba) return;
     if (sector_num > cmd_lba + 256) return;

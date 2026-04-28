@@ -1565,6 +1565,17 @@ static bool cmd_identify(IDEState *s, uint8_t cmd)
             put_le16(p + 55, 255);   /* current heads */
             put_le16(p + 56, 255);   /* current sectors */
             padstr((char *)(p + 27), "SEGA CHIHIRO BASEBOARD", 40);
+            /* Report 512MB capacity (0x100000 sectors) so kernel can map
+             * all MediaBoard partitions: mbfs (0xF8000 sectors) + mbcom.
+             * The stub backing file is only 1MB but our IDE hooks intercept
+             * all reads/writes to mbcom/mbrom LBAs beyond the real file. */
+            int64_t bb_sectors = 0x100000;  /* 512MB */
+            put_le16(p + 60, bb_sectors);
+            put_le16(p + 61, bb_sectors >> 16);
+            put_le16(p + 100, bb_sectors);
+            put_le16(p + 101, bb_sectors >> 16);
+            put_le16(p + 102, 0);
+            put_le16(p + 103, 0);
         }
 
         s->status = READY_STAT | SEEK_STAT;
