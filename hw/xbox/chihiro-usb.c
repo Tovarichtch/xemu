@@ -440,22 +440,29 @@ static void handle_control(USBDevice *dev, USBPacket *p,
         data[5] = 0;  /* IRQ counter */
         printf("[%07lld] chihiro-usb [%s]: EXT IRQ control val=%d\n", TS_MS, id, value);
         break;
-    case 0x1C: /* Read RTC — return host time in BCD (Cxbx: JvsRTC_Read) */
+    case 0x1C: /* Read RTC — queue BCD time for bulk IN EP4 (data[0]=0 success status) */
     {
         time_t now = time(NULL);
         struct tm *t = localtime(&now);
         #define TO_BCD(v) ((uint8_t)((v) + 6 * ((v) / 10)))
-        data[0] = TO_BCD(t->tm_sec);
-        data[1] = TO_BCD(t->tm_min);
-        data[2] = TO_BCD(t->tm_hour);
-        data[3] = 0;
-        data[4] = TO_BCD(t->tm_mday);
-        data[5] = TO_BCD(t->tm_mon + 1);
-        data[6] = TO_BCD(t->tm_year - 100);
-        data[7] = 0;
+        int rtc_count = index;
+        if (rtc_count > 256) rtc_count = 256;
+        memset(s->bulk_buf, 0, rtc_count);
+        s->bulk_buf[0] = TO_BCD(t->tm_sec);
+        s->bulk_buf[1] = TO_BCD(t->tm_min);
+        s->bulk_buf[2] = TO_BCD(t->tm_hour);
+        s->bulk_buf[3] = 0;
+        s->bulk_buf[4] = TO_BCD(t->tm_mday);
+        s->bulk_buf[5] = TO_BCD(t->tm_mon + 1);
+        s->bulk_buf[6] = TO_BCD(t->tm_year - 100);
+        s->bulk_buf[7] = 0;
+        s->bulk_pending = rtc_count;
+        s->bulk_offset = 0;
+        s->bulk_ep = 5;
         #undef TO_BCD
-        printf("[%07lld] chihiro-usb [%s]: RTC READ → %02X:%02X:%02X %02X/%02X/%02X\n",
-               TS_MS, id, data[2], data[1], data[0], data[4], data[5], data[6]);
+        printf("[%07lld] chihiro-usb [%s]: RTC READ → %02X:%02X:%02X %02X/%02X/%02X (%d bytes queued EP5)\n",
+               TS_MS, id, s->bulk_buf[2], s->bulk_buf[1], s->bulk_buf[0],
+               s->bulk_buf[4], s->bulk_buf[5], s->bulk_buf[6], rtc_count);
         break;
     }
     case 0x1D: /* Write ic10 EEPROM #1 — accept */
@@ -577,8 +584,11 @@ static void handle_data(USBDevice *dev, USBPacket *p)
             printf("[%07lld] chihiro-usb [%s]: bulk IN ep%d %d bytes (%d remaining)\n", TS_MS,
                    id, ep, len, s->bulk_pending);
         } else {
-            /* No data pending — return NAK (not ready, try later) */
             s->nak_count++;
+            if (s->bulk_pending > 0) {
+                printf("[%07lld] chihiro-usb [%s]: NAK ep%d (data queued on ep%d, %d bytes)\n",
+                       TS_MS, id, ep, s->bulk_ep, s->bulk_pending);
+            }
             p->status = USB_RET_NAK;
         }
     } else {
@@ -627,9 +637,9 @@ static void chihiro_an2131qc_realize(USBDevice *dev, Error **errp)
                    "ic10 firmware must be exactly 8KB");
     memcpy(s->eeprom, hotd3_ic10_g24lc64, sizeof(s->eeprom));
 
-    /* Override region to USA (0x02) for compatibility.
-     * Original HOD3 ic10 has 0x01 (Japan).
-     * CXBX does the same auto-patch at JVS_Init(). */
+    /* Override region to USA (0x02) to match game's bootid regionFlags.
+     * HOD3 bootid has regionFlags=0xFFFFFF0E (US+EXP, no JP).
+     * Original ic10 EEPROM has 0x01 (Japan) which would cause ERROR 31. */
     s->eeprom[0x1F00] = 0x02;  /* Region: 01=JPN, 02=USA, 03=EXP */
 
     /* Initialize bulk transfer state */

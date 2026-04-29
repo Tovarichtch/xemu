@@ -404,7 +404,10 @@ void xbox_init_common(MachineState *machine,
                         if (slash) *slash = '\0';
                     }
                     uint32_t fatx_size = 0;
-                    uint8_t *fatx = chihiro_fatx_build(game_dir, &fatx_size);
+                    /* mbfs: partition = DIMM_sectors - 0x8000 (512MB → 0xF8000) */
+                    uint32_t mbfs_sectors = 0x100000 - 0x8000;
+                    uint8_t *fatx = chihiro_fatx_build(game_dir, &fatx_size,
+                                                       mbfs_sectors);
                     if (fatx) {
                         printf("Chihiro: FATX built from '%s' (%u MB)\n",
                                game_dir, fatx_size / (1024*1024));

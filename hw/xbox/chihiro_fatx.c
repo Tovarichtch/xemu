@@ -68,10 +68,10 @@ static uint32_t fatx_alloc_chain(uint32_t size)
     return first;
 }
 
-/* Get byte offset in image for a given cluster */
+/* Get byte offset in image for a given cluster (1-indexed: cluster 1 = first data cluster) */
 static uint32_t fatx_cluster_offset(uint32_t cluster)
 {
-    return fatx_data_offset + cluster * FATX_CLUSTER_SIZE;
+    return fatx_data_offset + (cluster - 1) * FATX_CLUSTER_SIZE;
 }
 
 /* Write a directory entry into the image */
@@ -154,7 +154,8 @@ static int fatx_scan_dir(const char *host_dir, int parent_idx)
  * Returns pointer to image data and sets *out_size.
  * Caller must g_free() the returned pointer.
  */
-uint8_t *chihiro_fatx_build(const char *game_dir, uint32_t *out_size)
+uint8_t *chihiro_fatx_build(const char *game_dir, uint32_t *out_size,
+                            uint32_t partition_sectors)
 {
     fatx_file_count = 0;
     fatx_next_cluster = 1;
@@ -167,23 +168,33 @@ uint8_t *chihiro_fatx_build(const char *game_dir, uint32_t *out_size)
     }
     printf("[FATX] Found %d files/dirs\n", fatx_file_count);
 
-    /* Phase 2: Calculate total size */
-    uint64_t total_data = 0;
-    for (int i = 0; i < fatx_file_count; i++) {
-        if (!fatx_files[i].is_dir) {
-            total_data += fatx_files[i].size;
-        }
-        total_data += FATX_CLUSTER_SIZE; /* directory entry cluster overhead */
-    }
-    total_data += FATX_CLUSTER_SIZE * 16; /* padding */
+    /* Phase 2: Calculate layout to match kernel expectations.
+     * The kernel calculates FAT size from the FULL partition, not file data.
+     * We must match its layout exactly or the root directory won't be found. */
+    uint64_t partition_bytes = (uint64_t)partition_sectors * FATX_SECTOR_SIZE;
+    uint32_t kernel_total_clusters =
+        (uint32_t)(partition_bytes / FATX_CLUSTER_SIZE) + 1;
 
-    fatx_total_clusters = (uint32_t)(total_data / FATX_CLUSTER_SIZE) + 256;
+    fatx_total_clusters = kernel_total_clusters;
     uint32_t fat_bytes = fatx_total_clusters * 2;  /* FAT16 */
-    uint32_t fat_sectors = (fat_bytes + FATX_SECTOR_SIZE - 1) / FATX_SECTOR_SIZE;
+    uint32_t fat_aligned = (fat_bytes + FATX_SUPERBLOCK_SIZE - 1)
+                           & ~(FATX_SUPERBLOCK_SIZE - 1);
 
     fatx_fat_offset = FATX_SUPERBLOCK_SIZE;
-    fatx_data_offset = FATX_SUPERBLOCK_SIZE + fat_sectors * FATX_SECTOR_SIZE;
-    fatx_image_size = fatx_data_offset + fatx_total_clusters * FATX_CLUSTER_SIZE;
+    fatx_data_offset = FATX_SUPERBLOCK_SIZE + fat_aligned;
+
+    /* Image only needs space for actual file data, not the whole partition */
+    uint64_t file_data = 0;
+    for (int i = 0; i < fatx_file_count; i++) {
+        if (!fatx_files[i].is_dir) {
+            file_data += fatx_files[i].size;
+        }
+        file_data += FATX_CLUSTER_SIZE;
+    }
+    file_data += FATX_CLUSTER_SIZE * 16;
+    uint32_t needed_clusters =
+        (uint32_t)(file_data / FATX_CLUSTER_SIZE) + 256;
+    fatx_image_size = fatx_data_offset + needed_clusters * FATX_CLUSTER_SIZE;
 
     printf("[FATX] Clusters: %u, FAT: %u bytes, Image: %u bytes (%.1f MB)\n",
            fatx_total_clusters, fat_bytes, fatx_image_size,
@@ -326,6 +337,25 @@ uint8_t *chihiro_fatx_build(const char *game_dir, uint32_t *out_size)
 
     printf("[FATX] Built: %d files, root at cluster 1, image %u bytes\n",
            fatx_file_count, fatx_image_size);
+    printf("[FATX] Layout: superblock=0x0, FAT=0x%X (%u bytes), data=0x%X\n",
+           fatx_fat_offset, fat_aligned, fatx_data_offset);
+
+    /* Dump root directory entries for debugging */
+    {
+        uint32_t root_off = fatx_cluster_offset(1);
+        printf("[FATX] Root dir at offset 0x%X (sector %u):\n",
+               root_off, root_off / FATX_SECTOR_SIZE);
+        for (int i = 0; i < 8; i++) {
+            uint8_t *e = fatx_image + root_off + i * FATX_DIRENT_SIZE;
+            if (e[0] == 0xFF || e[0] == 0x00) break;
+            uint8_t namelen = e[0];
+            uint8_t attr = e[1];
+            uint32_t fc = e[44] | (e[45]<<8) | (e[46]<<16) | (e[47]<<24);
+            uint32_t sz = e[48] | (e[49]<<8) | (e[50]<<16) | (e[51]<<24);
+            printf("[FATX]   [%d] namelen=%u attr=0x%02X cluster=%u size=%u name='%.42s'\n",
+                   i, namelen, attr, fc, sz, (char*)(e+2));
+        }
+    }
 
     *out_size = fatx_image_size;
     return fatx_image;
