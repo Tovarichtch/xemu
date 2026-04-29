@@ -970,6 +970,17 @@ static void ide_dma_cb(void *opaque, int ret)
 
     trace_ide_dma_cb(s, sector_num, n, IDE_DMA_CMD_str(s->dma_cmd));
 
+    if (s->unit == 1) {
+        static int64_t last_dma_ts = 0;
+        int64_t now = qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL);
+        if (now != last_dma_ts || sector_num > 0x88) {
+            printf("[%07lld] IDE-DMA-CB: unit=%d cmd=%s LBA=%lu n=%d\n",
+                   now, s->unit, IDE_DMA_CMD_str(s->dma_cmd),
+                   (unsigned long)sector_num, n);
+            last_dma_ts = now;
+        }
+    }
+
     /* Chihiro: intercept IDE reads on baseboard (unit 1) for mbcom/mbrom sectors.
      * Must be BEFORE ide_sect_range_ok — mbcom/mbrom LBAs are beyond
      * the baseboard.img size and would be rejected as out-of-range.
