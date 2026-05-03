@@ -42,6 +42,8 @@ typedef struct {
 } FATXFileEntry;
 
 /* Builder state */
+uint32_t fatx_diag_lba = 0; /* LBA of XBE section 11 critical sector (extern) */
+uint32_t fatx_diag_lba_sec0 = 0; /* LBA of XBE section 0 critical sector (VA 0x135000) */
 static uint8_t *fatx_image = NULL;
 static uint32_t fatx_image_size = 0;
 static FATXFileEntry fatx_files[FATX_MAX_FILES];
@@ -249,6 +251,60 @@ uint8_t *chihiro_fatx_build(const char *game_dir, uint32_t *out_size,
         }
     }
 
+    /* DIAG: verify XBE critical bytes in FATX image after fread */
+    for (int i = 0; i < fatx_file_count; i++) {
+        FATXFileEntry *fe = &fatx_files[i];
+        if (fe->is_dir || fe->size < 0x1BE080) continue;
+        const char *dot = strrchr(fe->name, '.');
+        if (!dot || strcasecmp(dot, ".xbe") != 0) continue;
+        /* Found XBE — check file offsets 0x1BE029 and 0x1BE07E */
+        uint32_t cluster = fe->first_cluster + 111; /* sequential alloc */
+        uint32_t img_off = fatx_cluster_offset(cluster) + 0x2000;
+        if (img_off + 0x80 <= fatx_image_size) {
+            uint8_t b29 = fatx_image[img_off + 0x29];
+            uint8_t b7e = fatx_image[img_off + 0x7E];
+            /* Read original file for comparison */
+            FILE *vf = fopen(fe->host_path, "rb");
+            uint8_t orig29 = 0, orig7e = 0;
+            if (vf) {
+                fseek(vf, 0x1BE029, SEEK_SET); fread(&orig29, 1, 1, vf);
+                fseek(vf, 0x1BE07E, SEEK_SET); fread(&orig7e, 1, 1, vf);
+                fclose(vf);
+            }
+            fatx_diag_lba = (img_off) / FATX_SECTOR_SIZE;
+            printf("[FATX] VERIFY '%s': img[0x1BE029]=%02X(file=%02X) "
+                   "img[0x1BE07E]=%02X(file=%02X) diag_lba=%u %s\n",
+                   fe->name, b29, orig29, b7e, orig7e, fatx_diag_lba,
+                   (b29 == orig29 && b7e == orig7e) ? "OK" : "MISMATCH!");
+        }
+        /* Also verify section 0 data for VA 0x135000 (file offset 0x125000).
+         * 0x125000 / 0x4000 = cluster 73, remainder 0x1000 */
+        {
+            uint32_t cl0 = fe->first_cluster + (0x125000 / FATX_CLUSTER_SIZE);
+            uint32_t cl0_off = fatx_cluster_offset(cl0)
+                             + (0x125000 % FATX_CLUSTER_SIZE);
+            if (cl0_off + 32 <= fatx_image_size) {
+                uint8_t s0[4], f0[4] = {0};
+                memcpy(s0, fatx_image + cl0_off, 4);
+                FILE *vf2 = fopen(fe->host_path, "rb");
+                if (vf2) {
+                    fseek(vf2, 0x125000, SEEK_SET);
+                    fread(f0, 1, 4, vf2);
+                    fclose(vf2);
+                }
+                fatx_diag_lba_sec0 = cl0_off / FATX_SECTOR_SIZE;
+                printf("[FATX] VERIFY-SEC0: img[0x125000]="
+                       "%02X%02X%02X%02X(file=%02X%02X%02X%02X) "
+                       "diag_lba_sec0=%u %s\n",
+                       s0[0],s0[1],s0[2],s0[3],
+                       f0[0],f0[1],f0[2],f0[3],
+                       fatx_diag_lba_sec0,
+                       (memcmp(s0, f0, 4) == 0) ? "OK" : "MISMATCH!");
+            }
+        }
+        break;
+    }
+
     /* Phase 5: Build directory entries */
     /* Root directory: all files with parent_idx == -1 */
     uint32_t root_cluster = fatx_alloc_chain(FATX_CLUSTER_SIZE);
@@ -372,6 +428,16 @@ bool chihiro_fatx_read_sector(uint32_t lba, void *buffer)
     uint32_t offset = lba * FATX_SECTOR_SIZE;
     if (offset + FATX_SECTOR_SIZE <= fatx_image_size) {
         memcpy(buffer, fatx_image + offset, FATX_SECTOR_SIZE);
+        if (fatx_diag_lba && lba == fatx_diag_lba) {
+            uint8_t *b = (uint8_t *)buffer;
+            printf("[FATX] READ-DIAG lba=%u: [0x29]=%02X [0x7E]=%02X\n",
+                   lba, b[0x29], b[0x7E]);
+        }
+        if (fatx_diag_lba_sec0 && lba == fatx_diag_lba_sec0) {
+            uint8_t *b = (uint8_t *)buffer;
+            printf("[FATX] READ-SEC0 lba=%u: %02X %02X %02X %02X %02X\n",
+                   lba, b[0], b[1], b[2], b[3], b[4]);
+        }
         return true;
     }
 

@@ -136,7 +136,7 @@ static int smc_write_data(SMBusDevice *dev, uint8_t *buf, uint8_t len)
         break;
 
     case SMC_REG_POWER:
-        printf("[SMC] POWER write: 0x%02X (%s%s%s)\n", buf[0],
+        if(0) printf("[SMC] POWER write: 0x%02X (%s%s%s)\n", buf[0],
                (buf[0] & SMC_REG_POWER_RESET) ? "RESET " : "",
                (buf[0] & SMC_REG_POWER_CYCLE) ? "CYCLE " : "",
                (buf[0] & SMC_REG_POWER_SHUTDOWN) ? "SHUTDOWN " : "");
@@ -155,10 +155,11 @@ static int smc_write_data(SMBusDevice *dev, uint8_t *buf, uint8_t len)
         break;
 
     case SMC_REG_SCRATCH:
-        printf("[SMC] SCRATCH write: 0x%02X (was 0x%02X)\n", buf[0], smc->scratch_reg);
-        /* Detect QuickReboot: SEGABOOT writes 0x02 before HalReturnToFirmware.
-         * This is the reliable trigger — works regardless of SEGABOOT version. */
-        if (buf[0] == 0x02 && smc->scratch_reg != 0x02) {
+        if(0) printf("[SMC] SCRATCH write: 0x%02X (was 0x%02X)\n", buf[0], smc->scratch_reg);
+        /* Detect QuickReboot: HalReturnToFirmware(QuickReboot) writes 0x04.
+         * Called on EVERY 0x04 write — chihiro_on_quickreboot_signal uses
+         * usb_poll_patched guard to ignore the kernel's first-boot write. */
+        if (buf[0] == 0x04) {
             chihiro_on_quickreboot_signal();
         }
         smc->scratch_reg = buf[0];
@@ -195,13 +196,14 @@ static uint8_t smc_receive_byte(SMBusDevice *dev)
         return smc->traystate_reg;
 
     case SMC_REG_SCRATCH:
+        if(0) printf("[SMC] SCRATCH read: 0x%02X\n", smc->scratch_reg);
         return smc->scratch_reg;
 
     case SMC_REG_AVPACK: {
         static int avpack_log_once = 0;
         if (!avpack_log_once) {
             avpack_log_once = 1;
-            printf("Chihiro SMC: avpack_reg=0x%02X (0=SCART 1=HDTV 2=VGA 4=SVIDEO 6=COMPOSITE)\n",
+            if(0) printf("Chihiro SMC: avpack_reg=0x%02X (0=SCART 1=HDTV 2=VGA 4=SVIDEO 6=COMPOSITE)\n",
                    smc->avpack_reg);
         }
         return smc->avpack_reg;

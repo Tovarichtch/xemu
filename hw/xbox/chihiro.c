@@ -35,6 +35,7 @@
 #include "system/blockdev.h"
 #include "hw/usb.h"
 #include "target/i386/cpu.h"
+#include "exec/watchpoint.h"
 
 /*
  * Chihiro Mediaboard LPC I/O
@@ -44,17 +45,17 @@
  * query firmware version, DIMM size, and board type.
  *
  * Register map (from MAME chihiro.cpp + CXBX MediaBoard.cpp + RE of 0x3DF40):
- *   0x1E: DIMM base address low word (combined with 0x20 for FC800/FC801 offset calc)
- *   0x20: DIMM base address high word (0x0100 → base = 0x01000000)
- *   0x22: XBAM string byte 3-4 (0x4258 = "BX")
- *   0x24: XBAM string byte 5-6 (0x4D41 = "MA")
+ *   0x1E: SEGABOOT: DIMM base low word | Game: "XB" (0x4258) for XBAM check
+ *   0x20: SEGABOOT: DIMM base high word | Game: "AM" (0x4D41) for XBAM check
+ *   0x22: XBAM string "BX" (0x4258) — checked by SEGABOOT
+ *   0x24: XBAM string "MA" (0x4D41) — checked by SEGABOOT
  *   0xE0: IRQ10 acknowledge (write clears IRQ10)
  *   0xF0: Chip revision / board type (0x0000 = Type-1, 0x0100 = Type-3)
  *   0xF4: DIMM size (0=128M, 1=256M, 2=512M, 3=1024M)
  *
- * SEGABOOT 0x3DF40 checks for "XBAM" at ports 0x4022-0x4024 to confirm
- * the mediaboard is present. Ports 0x401E/0x4020 provide the DIMM base
- * address used to compute FC800/FC801 mbcom file offsets.
+ * SEGABOOT checks "XBAM" at 0x4022-0x4024 and uses 0x401E/0x4020 for DIMM
+ * base address. Game XBE checks "XBAM" at 0x401E/0x4020 instead. Values are
+ * switched after QuickReboot via chihiro_game_running flag.
  */
 
 #define SEGA_FIRMWARE_VERSION               0x1E
@@ -142,6 +143,7 @@ typedef struct ChihiroLPCState {
     uint32_t dimm_cmd_count;   /* total commands processed */
     uint16_t dimm_next_seq;    /* next sequence number for unsolicited events */
     QEMUTimer *dimm_event_timer; /* fires after handshake to inject STATUS event */
+
 } ChihiroLPCState;
 
 #define CHIHIRO_LPC_DEVICE(obj) \
@@ -150,11 +152,27 @@ typedef struct ChihiroLPCState {
 static bool chihiro_active;
 bool chihiro_game_running;  /* Set after QuickReboot — disables SEGABOOT DMA scan */
 static bool chihiro_boot3_reached; /* Set when SEGABOOT reaches boot=3 (checks complete) */
+static bool chihiro_quickreboot_pending; /* Set at QuickReboot, consumed by port 0x40F0 handler */
+static int chihiro_quickreboot_fast_diag; /* >0: diag timer runs at 50ms for high-res LDP tracking */
 static char chihiro_game_filename[64]; /* Game XBE filename saved at boot=3 */
 char chihiro_game_dir[1024];   /* Game directory path (from dvd_path) */
-static uint32_t chihiro_ldp_pa;  /* v208: LDP physical address, captured at boot=3 */
 static ChihiroLPCState *chihiro_lpc_global;
 uint32_t chihiro_usb_sm_pa;  /* PA of USB state machine globals at VA 0xC3F10 */
+
+/* v450: Performance counters — find the hot path causing lag */
+#include <time.h>
+uint64_t perf_cnt_irq10_cb = 0;
+uint64_t perf_cnt_diag_cb = 0;
+uint64_t perf_cnt_dimm_cb = 0;
+uint64_t perf_cnt_lpc_read = 0;
+uint64_t perf_cnt_lpc_write = 0;
+uint64_t perf_cnt_ide_read = 0;
+uint64_t perf_cnt_ohci_frame = 0;
+uint64_t perf_cnt_ohci_td = 0;
+uint64_t perf_cnt_usb_handle = 0;
+uint64_t perf_cnt_usb_control = 0;
+static time_t perf_start_time = 0;
+static bool perf_dumped = false;
 
 /* USB devices for delayed hotplug (simulates AN2131 I2C firmware boot) */
 static USBDevice *chihiro_usb_qc = NULL;
@@ -193,7 +211,7 @@ void chihiro_on_ohci_bus_start(void)
     chihiro_usb_hotplug_scheduled = true;
     int64_t now = qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL);
 
-    printf("[%07lld] Chihiro USB: OHCI BUS START detected — scheduling hotplug "
+    if(0) printf("[%07lld] Chihiro USB: OHCI BUS START detected — scheduling hotplug "
            "QC at +50ms, SC at +100ms\n", TS_MS);
 
     /* Schedule QC hotplug at BUS_START + 50ms */
@@ -226,11 +244,11 @@ void chihiro_usb_set_devices(USBDevice *qc, USBDevice *sc)
  */
 static void chihiro_usb_hotplug_qc_cb(void *opaque)
 {
-    printf("[%07lld] Chihiro USB HOTPLUG: QC firmware boot complete\n", TS_MS);
+    if(0) printf("[%07lld] Chihiro USB HOTPLUG: QC firmware boot complete\n", TS_MS);
 
     if (chihiro_usb_qc && !chihiro_usb_qc->attached) {
         usb_device_attach(chihiro_usb_qc, &error_abort);
-        printf("[%07lld] Chihiro USB HOTPLUG: QC attached to port %d\n", TS_MS,
+        if(0) printf("[%07lld] Chihiro USB HOTPLUG: QC attached to port %d\n", TS_MS,
                chihiro_usb_qc->port ? chihiro_usb_qc->port->index : -1);
     }
 }
@@ -244,11 +262,11 @@ static void chihiro_usb_hotplug_qc_cb(void *opaque)
  */
 static void chihiro_usb_hotplug_sc_cb(void *opaque)
 {
-    printf("[%07lld] Chihiro USB HOTPLUG: SC firmware boot complete\n", TS_MS);
+    if(0) printf("[%07lld] Chihiro USB HOTPLUG: SC firmware boot complete\n", TS_MS);
 
     if (chihiro_usb_sc && !chihiro_usb_sc->attached) {
         usb_device_attach(chihiro_usb_sc, &error_abort);
-        printf("[%07lld] Chihiro USB HOTPLUG: SC attached to port %d\n", TS_MS,
+        if(0) printf("[%07lld] Chihiro USB HOTPLUG: SC attached to port %d\n", TS_MS,
                chihiro_usb_sc->port ? chihiro_usb_sc->port->index : -1);
     }
 }
@@ -310,6 +328,41 @@ uint32_t chihiro_va_to_pa(uint32_t va)
     return (pte & 0xFFFFF000) | (va & 0xFFF);
 }
 
+uint32_t chihiro_read_pte_raw(uint32_t va)
+{
+    CPUState *cpu = first_cpu;
+    if (!cpu) return 0;
+    X86CPU *x86 = X86_CPU(cpu);
+    uint32_t cr3 = x86->env.cr[3] & 0xFFFFF000;
+    uint32_t pde;
+    cpu_physical_memory_read(cr3 + ((va >> 22) * 4), &pde, 4);
+    if (!(pde & 1)) return 0;
+    if (pde & 0x80) return (pde & 0xFFC00000) | (va & 0x003FFFFF) | 1;
+    uint32_t pte;
+    cpu_physical_memory_read((pde & 0xFFFFF000) + (((va >> 12) & 0x3FF) * 4),
+                             &pte, 4);
+    return pte;
+}
+
+void chihiro_pte_dump(uint32_t va, const char *label, unsigned long lba)
+{
+    CPUState *cpu = first_cpu;
+    if (!cpu) return;
+    X86CPU *x86 = X86_CPU(cpu);
+    uint32_t cr3 = x86->env.cr[3] & 0xFFFFF000;
+    uint32_t pde_addr = cr3 + ((va >> 22) * 4);
+    uint32_t pde;
+    cpu_physical_memory_read(pde_addr, &pde, 4);
+    uint32_t pte_addr = (pde & 0xFFFFF000) + (((va >> 12) & 0x3FF) * 4);
+    uint32_t pte;
+    cpu_physical_memory_read(pte_addr, &pte, 4);
+    uint32_t pa = (pte & 0xFFFFF000) | (va & 0xFFF);
+    if(0) printf("[PTE-MON] %s LBA=%lu CR3=0x%X PDE=0x%08X @PA0x%X "
+           "PTE=0x%08X @PA0x%X VA0x%X→PA0x%X EIP=0x%08X\n",
+           label, lba, cr3, pde, pde_addr, pte, pte_addr,
+           va, pa, (uint32_t)x86->env.eip);
+}
+
 /*
  * Diagnostic: periodically dump CheckErrors state machine variables.
  * PAs are computed via x86 page table walk at patch time.
@@ -317,9 +370,491 @@ uint32_t chihiro_va_to_pa(uint32_t va)
  *   VA [0x87AE8] = counter
  *   VA [0x87AF8] = ready flag
  */
+int sec11_watchpoint_armed = 0;
+static uint8_t sec11_watch_prev[2] = {0x43, 0x13};
+static int wp_remove_pending = 0;
+extern void (*chihiro_wp_cb)(CPUState *, vaddr, vaddr);
+int sec0_pa_tracking = 0;
+uint32_t sec0_last_pa = 0;
+uint32_t pte_mon_last_pte = 0;
+int pte_mon_active = 0;
+
+static int data_wp_hit_count = 0;
+static int data_wp_armed = 0;
+
+void chihiro_watchpoint_handler(CPUState *cpu, vaddr addr, vaddr len)
+{
+    X86CPU *x86 = X86_CPU(cpu);
+    CPUX86State *env = &x86->env;
+    uint32_t eip = (uint32_t)env->eip;
+
+    if (data_wp_armed &&
+        ((addr >= 0x80180000 && addr < 0x80181000) ||
+         (addr >= 0x135000 && addr < 0x136000))) {
+        data_wp_hit_count++;
+        uint8_t cur[16];
+        cpu_physical_memory_read(0x180000, cur, 16);
+        if(0) printf("[DATA-WP] #%d VA=0x%08lX EIP=0x%08X\n"
+               "  PA 0x180000 before write: %02X %02X %02X %02X %02X %02X %02X %02X\n"
+               "  EAX=%08X EBX=%08X ECX=%08X EDX=%08X\n"
+               "  ESI=%08X EDI=%08X EBP=%08X ESP=%08X\n",
+               data_wp_hit_count, (unsigned long)addr, eip,
+               cur[0],cur[1],cur[2],cur[3],cur[4],cur[5],cur[6],cur[7],
+               (uint32_t)env->regs[R_EAX], (uint32_t)env->regs[R_EBX],
+               (uint32_t)env->regs[R_ECX], (uint32_t)env->regs[R_EDX],
+               (uint32_t)env->regs[R_ESI], (uint32_t)env->regs[R_EDI],
+               (uint32_t)env->regs[R_EBP], (uint32_t)env->regs[R_ESP]);
+        uint32_t esp = (uint32_t)env->regs[R_ESP];
+        if (esp >= 0x80000000) {
+            uint32_t esp_pa = esp & 0x0FFFFFFF;
+            uint32_t stk[6];
+            cpu_physical_memory_read(esp_pa, stk, 24);
+            if(0) printf("  STACK: %08X %08X %08X %08X %08X %08X\n",
+                   stk[0], stk[1], stk[2], stk[3], stk[4], stk[5]);
+        }
+        uint8_t code[16];
+        uint32_t eip_pa = eip & 0x0FFFFFFF;
+        cpu_physical_memory_read(eip_pa, code, 16);
+        if(0) printf("  CODE@EIP: %02X %02X %02X %02X %02X %02X %02X %02X "
+               "%02X %02X %02X %02X\n",
+               code[0],code[1],code[2],code[3],code[4],code[5],
+               code[6],code[7],code[8],code[9],code[10],code[11]);
+        if (data_wp_hit_count >= 15) {
+            if(0) printf("[DATA-WP] hit limit, disarming\n");
+            wp_remove_pending = 1;
+            chihiro_wp_cb = NULL;
+            data_wp_armed = 0;
+        }
+        return;
+    }
+
+    static int wp_hit_count = 0;
+    if (++wp_hit_count > 5) {
+        wp_remove_pending = 1;
+        chihiro_wp_cb = NULL;
+        return;
+    }
+    if(0) printf("[%07lld] WP-HIT #%d VA 0x%08lX EIP=0x%08X\n",
+           TS_MS, wp_hit_count, (unsigned long)addr, eip);
+}
+
+void chihiro_arm_pa180_watchpoint(void)
+{
+    CPUState *cpu0 = first_cpu;
+    if (!cpu0 || data_wp_armed) return;
+    cpu_watchpoint_remove_all(cpu0, BP_MEM_WRITE);
+    cpu_watchpoint_insert(cpu0, 0x80180000, 0x1000, BP_MEM_WRITE, NULL);
+    cpu_watchpoint_insert(cpu0, 0x135000, 0x1000, BP_MEM_WRITE, NULL);
+    extern void chihiro_watchpoint_handler(CPUState *, vaddr, vaddr);
+    chihiro_wp_cb = chihiro_watchpoint_handler;
+    data_wp_armed = 1;
+    data_wp_hit_count = 0;
+    if(0) printf("[DATA-WP] Armed on VA 0x80180000 + VA 0x135000 (full page)\n");
+}
+
+void (*chihiro_wp_cb)(CPUState *, vaddr, vaddr) = NULL;
+
 static void chihiro_diag_timer_cb(void *opaque)
 {
+    perf_cnt_diag_cb++;
     ChihiroLPCState *s = (ChihiroLPCState *)opaque;
+
+    if (wp_remove_pending) {
+        wp_remove_pending = 0;
+        CPUState *cpu0 = first_cpu;
+        if (cpu0) {
+            cpu_watchpoint_remove_all(cpu0, BP_MEM_WRITE);
+            if(0) printf("[%07lld] *** ALL WATCHPOINTS REMOVED (hit limit) ***\n", TS_MS);
+        }
+    }
+
+    /* PA tracking moved to PTE-MON in IDE DMA callback (core.c) — much more precise */
+
+    /* === SEC11 WATCHPOINT — catch the exact moment of corruption === */
+    if (sec11_watchpoint_armed) {
+        uint32_t pa29 = chihiro_va_to_pa(0x1CB189);
+        uint32_t pa7e = chihiro_va_to_pa(0x1CB1DE);
+        if (pa29 != 0xFFFFFFFF) {
+            uint8_t b29 = 0, b7e = 0;
+            cpu_physical_memory_read(pa29, &b29, 1);
+            cpu_physical_memory_read(pa7e, &b7e, 1);
+            if (b29 != sec11_watch_prev[0] || b7e != sec11_watch_prev[1]) {
+                CPUState *cpu = first_cpu;
+                CPUX86State *env = cpu ? &X86_CPU(cpu)->env : NULL;
+                if(0) printf("[%07lld] *** WATCHPOINT HIT ***\n", TS_MS);
+                if(0) printf("  VA 0x1CB189: %02X → %02X (expect 0x43)\n",
+                       sec11_watch_prev[0], b29);
+                if(0) printf("  VA 0x1CB1DE: %02X → %02X (expect 0x13)\n",
+                       sec11_watch_prev[1], b7e);
+                if (env) {
+                    if(0) printf("  CPU: EIP=0x%08X ESP=0x%08X "
+                           "EAX=0x%08X ECX=0x%08X EDX=0x%08X\n",
+                           (uint32_t)env->eip, (uint32_t)env->regs[R_ESP],
+                           (uint32_t)env->regs[R_EAX],
+                           (uint32_t)env->regs[R_ECX],
+                           (uint32_t)env->regs[R_EDX]);
+                    if(0) printf("  EBX=0x%08X ESI=0x%08X EDI=0x%08X EBP=0x%08X\n",
+                           (uint32_t)env->regs[R_EBX],
+                           (uint32_t)env->regs[R_ESI],
+                           (uint32_t)env->regs[R_EDI],
+                           (uint32_t)env->regs[R_EBP]);
+                    /* Stack peek */
+                    uint32_t esp_pa = chihiro_va_to_pa(
+                        (uint32_t)env->regs[R_ESP]);
+                    if (esp_pa != 0xFFFFFFFF) {
+                        uint32_t stk[16];
+                        cpu_physical_memory_read(esp_pa, stk, 64);
+                        if(0) printf("  STACK:");
+                        for (int j = 0; j < 16; j++)
+                            if(0) printf(" %08X", stk[j]);
+                        if(0) printf("\n");
+                    }
+                }
+                /* Read 32 bytes around each corruption point */
+                uint8_t ctx29[32], ctx7e[32];
+                cpu_physical_memory_read(pa29 - 8, ctx29, 32);
+                cpu_physical_memory_read(pa7e - 8, ctx7e, 32);
+                if(0) printf("  CONTEXT @VA 0x1CB181 (32b):");
+                if(0) for (int j = 0; j < 32; j++) printf(" %02X", ctx29[j]);
+                if(0) printf("\n  CONTEXT @VA 0x1CB1D6 (32b):");
+                if(0) for (int j = 0; j < 32; j++) printf(" %02X", ctx7e[j]);
+                if(0) printf("\n");
+                sec11_watch_prev[0] = b29;
+                sec11_watch_prev[1] = b7e;
+                if (b29 == 0x8E && b7e == 0xD0) {
+                    sec11_watchpoint_armed = 0;
+                    if(0) printf("  (watchpoint disarmed — both corrupted)\n");
+                }
+            }
+        }
+    }
+
+    /* === CONTINUOUS LDP MONITOR — track STICKY page integrity === */
+    {
+        static uint32_t prev_ldp = 0xDEADBEEF;
+        static uint32_t prev_canary = 0xDEADBEEF;
+        uint32_t cur_ldp = 0, cur_canary = 0;
+        cpu_physical_memory_read(0x3B3D8, &cur_ldp, 4);
+        cpu_physical_memory_read(0x3B400, &cur_canary, 4);
+        if (cur_ldp != prev_ldp || cur_canary != prev_canary) {
+            if(0) printf("[%07lld] LDP-MON: LDP=0x%08X(was 0x%08X) "
+                   "canary=0x%08X(was 0x%08X)\n",
+                   TS_MS, cur_ldp, prev_ldp, cur_canary, prev_canary);
+            if (cur_ldp != prev_ldp && cur_ldp != 0) {
+                uint32_t ldp_pa = cur_ldp & 0x0FFFFFFF;
+                uint8_t pg[0x410];
+                cpu_physical_memory_read(ldp_pa, pg, sizeof(pg));
+                char p[256]; memset(p, 0, sizeof(p));
+                memcpy(p, pg + 8, 255);
+                uint32_t lt = *(uint32_t*)pg;
+                if(0) printf("[%07lld] LDP-MON: new LDP@PA0x%X type=%u "
+                       "path='%s'\n", TS_MS, ldp_pa, lt, p);
+            }
+            if (cur_ldp != prev_ldp && cur_ldp == 0 && prev_ldp != 0xDEADBEEF) {
+                uint32_t old_pa = prev_ldp & 0x0FFFFFFF;
+                uint8_t pg[0x410];
+                cpu_physical_memory_read(old_pa, pg, sizeof(pg));
+                uint32_t lt = *(uint32_t*)pg;
+                if(0) printf("[%07lld] LDP-MON: LDP→NULL, old page@PA0x%X: "
+                       "type=%u\n", TS_MS, old_pa, lt);
+                if (lt == 1) {
+                    uint32_t ec = *(uint32_t*)(pg + 0x400);
+                    uint32_t et = *(uint32_t*)(pg + 0x408);
+                    if(0) printf("  ERROR INFO: ctx=%u typ=%u "
+                           "(1=generic 3=region 5=media)\n", ec, et);
+                }
+            }
+            prev_ldp = cur_ldp;
+            prev_canary = cur_canary;
+        }
+    }
+
+    /* High-frequency mode during QuickReboot window */
+    if (chihiro_quickreboot_fast_diag > 0) {
+        chihiro_quickreboot_fast_diag--;
+
+        /* Multi-tick XBE snapshot during QuickReboot window */
+        if (chihiro_quickreboot_fast_diag >= 195) {
+            int tick_num = 200 - chihiro_quickreboot_fast_diag;
+            uint32_t xbe_pa = chihiro_va_to_pa(0x10000);
+            if (xbe_pa != 0xFFFFFFFF) {
+                uint8_t hdr[0x180];
+                cpu_physical_memory_read(xbe_pa, hdr, sizeof(hdr));
+                uint32_t entry = *(uint32_t*)(hdr + 0x128);
+                uint32_t base = *(uint32_t*)(hdr + 0x104);
+                uint32_t thunk_va = *(uint32_t*)(hdr + 0x158);
+                uint32_t nsec = *(uint32_t*)(hdr + 0x11C);
+                uint32_t initflags = *(uint32_t*)(hdr + 0x124);
+                if(0) printf("[%07lld] FAST-DIAG #%d: VA0x10000→PA0x%X "
+                       "magic=%c%c%c%c entry=0x%08X thunk=0x%08X "
+                       "sec=%u flags=0x%X\n",
+                       TS_MS, tick_num, xbe_pa,
+                       hdr[0], hdr[1], hdr[2], hdr[3],
+                       entry, thunk_va, nsec, initflags);
+
+                /* Tick #1: dump LDP state and kernel flags */
+                if (tick_num == 1) {
+                    uint32_t ldp_val = 0, region_val = 0;
+                    cpu_physical_memory_read(0x3B3D8, &ldp_val, 4);
+                    cpu_physical_memory_read(0x3B1D8, &region_val, 4);
+                    uint8_t khqb = 0, f8f2 = 0;
+                    cpu_physical_memory_read(0x3A93C, &khqb, 1);
+                    cpu_physical_memory_read(0x368F2, &f8f2, 1);
+                    if(0) printf("[%07lld] FAST-DIAG: LDP=0x%08X "
+                           "XboxGameRegion=0x%08X KHQB=%u "
+                           "DAT_800368f2=%u\n",
+                           TS_MS, ldp_val, region_val, khqb, f8f2);
+                    if (ldp_val && ldp_val != 0xFFFFFFFF) {
+                        uint32_t pa = ldp_val & 0x0FFFFFFF;
+                        uint8_t pg[0x410];
+                        cpu_physical_memory_read(pa, pg, sizeof(pg));
+                        uint32_t lt = *(uint32_t*)pg;
+                        char p[256]; memset(p, 0, sizeof(p));
+                        memcpy(p, pg + 8, 255);
+                        if(0) printf("  LDP@PA0x%X: type=%u path='%s'\n",
+                               pa, lt, p);
+                        if (lt == 1) {
+                            uint32_t ec = *(uint32_t*)(pg + 0x400);
+                            uint32_t et = *(uint32_t*)(pg + 0x408);
+                            if(0) printf("  LDP ERROR: ctx=%u typ=%u\n", ec, et);
+                        }
+                    }
+                }
+
+                /* Deep dive on tick #3 (~150ms) */
+                if (tick_num == 3) {
+                    if(0) printf("[%07lld] FAST-DIAG: === DEEP XBE ANALYSIS ===\n", TS_MS);
+
+                    /* Entry point mapping */
+                    if (entry && entry < 0x08000000) {
+                        uint32_t ep_pa = chihiro_va_to_pa(entry);
+                        if(0) printf("  Entry@0x%08X → PA=0x%08X %s\n",
+                               entry, ep_pa,
+                               ep_pa == 0xFFFFFFFF ? "UNMAPPED" : "mapped");
+                        if (ep_pa != 0xFFFFFFFF) {
+                            uint8_t code[16];
+                            cpu_physical_memory_read(ep_pa, code, 16);
+                            if(0) printf("  Code: %02X %02X %02X %02X %02X %02X %02X %02X\n",
+                                   code[0],code[1],code[2],code[3],
+                                   code[4],code[5],code[6],code[7]);
+                        }
+                    }
+
+                    /* Thunk table — resolved or raw ordinals? */
+                    if (thunk_va && thunk_va < 0x08000000) {
+                        uint32_t tk_pa = chihiro_va_to_pa(thunk_va);
+                        if (tk_pa != 0xFFFFFFFF) {
+                            uint32_t t[16];
+                            cpu_physical_memory_read(tk_pa, t, 64);
+                            if(0) printf("  Thunk@0x%08X (PA=0x%08X):\n", thunk_va, tk_pa);
+                            for (int i = 0; i < 16 && t[i]; i++)
+                                if(0) printf("    [%d]=0x%08X %s\n", i, t[i],
+                                       (t[i] & 0x80000000) ? "(kernel VA)" : "(ordinal?)");
+                        } else {
+                            if(0) printf("  Thunk@0x%08X: UNMAPPED\n", thunk_va);
+                        }
+                    }
+
+                    /* XboxGameRegion — region match check
+                     * Real address: VA 0x8003B1D8 (PA 0x3B1D8) in STICKY section
+                     * ROM value: 0x80000000 (manufacturing bit) */
+                    uint32_t sys_region = 0;
+                    cpu_physical_memory_read(0x3B1D8, &sys_region, 4);
+                    if(0) printf("  XboxGameRegion@0x8003B1D8 = 0x%08X\n", sys_region);
+
+                    /* Game cert region (offset 0xA0 from certificate) */
+                    uint32_t cert_va = *(uint32_t*)(hdr + 0x118);
+                    if (cert_va && cert_va < 0x08000000) {
+                        uint32_t cert_pa = chihiro_va_to_pa(cert_va);
+                        if (cert_pa != 0xFFFFFFFF) {
+                            uint32_t game_region;
+                            cpu_physical_memory_read(cert_pa + 0xA0, &game_region, 4);
+                            if(0) printf("  GameRegion@cert+0xA0 = 0x%08X\n", game_region);
+                        }
+                    }
+
+                    /* Error LDP page at PA 0x0E000 */
+                    uint8_t erp[16];
+                    cpu_physical_memory_read(0x0E000, erp, 16);
+                    if(0) printf("  ErrorPage@PA0xE000: %02X%02X%02X%02X "
+                           "%02X%02X%02X%02X %02X%02X%02X%02X\n",
+                           erp[0],erp[1],erp[2],erp[3],erp[4],erp[5],
+                           erp[6],erp[7],erp[8],erp[9],erp[10],erp[11]);
+
+                    /* CPU state */
+                    CPUState *cpu = first_cpu;
+                    if (cpu) {
+                        X86CPU *x86 = X86_CPU(cpu);
+                        CPUX86State *env = &x86->env;
+                        uint32_t eip = (uint32_t)env->eip;
+                        if(0) printf("  CPU: EIP=0x%08X ESP=0x%08X CR3=0x%08X\n",
+                               eip, (uint32_t)env->regs[R_ESP],
+                               (uint32_t)env->cr[3]);
+                        if (eip >= 0x80015551 && eip <= 0x80015554) {
+                            uint32_t bc[5];
+                            cpu_physical_memory_read(0x3ABE0, bc, 20);
+                            if(0) printf("  *** BUGCHECK: code=0x%08X "
+                                   "p1=0x%08X p2=0x%08X p3=0x%08X p4=0x%08X\n",
+                                   bc[0], bc[1], bc[2], bc[3], bc[4]);
+                            if (bc[0] == 0x1E && bc[1] == 0xC0000005) {
+                                uint32_t fault_va = bc[2];
+                                uint32_t fault_pa = chihiro_va_to_pa(fault_va);
+                                if(0) printf("  FAULT-CODE @VA 0x%08X → PA 0x%X: ",
+                                       fault_va, fault_pa);
+                                if (fault_pa != 0xFFFFFFFF) {
+                                    uint8_t code[32];
+                                    cpu_physical_memory_read(fault_pa, code, 32);
+                                    for (int i = 0; i < 32; i++)
+                                        if(0) printf("%02X ", code[i]);
+                                    if(0) printf("\n");
+                                } else {
+                                    if(0) printf("UNMAPPED!\n");
+                                }
+                                uint32_t esp_val = (uint32_t)env->regs[R_ESP];
+                                uint32_t esp_pa = chihiro_va_to_pa(esp_val);
+                                if (esp_pa != 0xFFFFFFFF) {
+                                    uint32_t scan[768];
+                                    cpu_physical_memory_read(esp_pa, scan, 3072);
+                                    if(0) printf("  STACK @0x%08X (128 dwords):", esp_val);
+                                    for (int i = 0; i < 128; i++) {
+                                        if (i % 8 == 0)
+                                            if(0) printf("\n    +%03X:", i * 4);
+                                        if(0) printf(" %08X", scan[i]);
+                                    }
+                                    if(0) printf("\n");
+                                    int found_tf = 0;
+                                    for (int i = 0; i < 768 - 32; i++) {
+                                        if (scan[i] == fault_va &&
+                                            i >= 26 &&
+                                            (scan[i+1] & 0xFFFF) <= 0x0030) {
+                                            int fs = i - 26;
+                                            uint32_t *tf = &scan[fs];
+                                            uint32_t tf_va = esp_val + fs * 4;
+                                            if(0) printf("  KTRAP_FRAME @VA 0x%08X:\n", tf_va);
+                                            if(0) printf("    OrigEAX=%08X OrigECX=%08X OrigEDX=%08X\n",
+                                                   tf[0x44/4], tf[0x40/4], tf[0x3C/4]);
+                                            if(0) printf("    OrigEBX=%08X OrigESI=%08X OrigEDI=%08X OrigEBP=%08X\n",
+                                                   tf[0x5C/4], tf[0x58/4], tf[0x54/4], tf[0x60/4]);
+                                            if(0) printf("    OrigEIP=%08X CS=%04X EFLAGS=%08X\n",
+                                                   tf[0x68/4], tf[0x6C/4] & 0xFFFF, tf[0x70/4]);
+                                            if(0) printf("    OrigESP=%08X ErrCode=%08X\n",
+                                                   tf[0x74/4], tf[0x64/4]);
+                                            uint32_t game_esp = tf[0x74/4];
+                                            uint32_t game_esp_pa = chihiro_va_to_pa(game_esp);
+                                            if (game_esp_pa != 0xFFFFFFFF) {
+                                                uint32_t gstk[32];
+                                                cpu_physical_memory_read(game_esp_pa, gstk, 128);
+                                                if(0) printf("    GAME-STACK @0x%08X:", game_esp);
+                                                for (int j = 0; j < 32; j++) {
+                                                    if (j % 8 == 0 && j > 0)
+                                                        if(0) printf("\n                          ");
+                                                    if(0) printf(" %08X", gstk[j]);
+                                                }
+                                                if(0) printf("\n");
+                                            }
+                                            if(0) printf("    RAW around EIP (dwords i-12..i+5):");
+                                            for (int k = -12; k <= 5; k++) {
+                                                if (i+k >= 0 && i+k < 768)
+                                                    if(0) printf(" %08X", scan[i+k]);
+                                            }
+                                            if(0) printf("\n");
+                                            found_tf = 1;
+                                            break;
+                                        }
+                                    }
+                                    if (!found_tf)
+                                        if(0) printf("  KTRAP_FRAME: not found in 3KB scan\n");
+                                    uint32_t cinit_tbl_pa = chihiro_va_to_pa(0x1CB1C0);
+                                    if (cinit_tbl_pa != 0xFFFFFFFF) {
+                                        uint32_t tbl[16];
+                                        cpu_physical_memory_read(cinit_tbl_pa, tbl, 64);
+                                        if(0) printf("  CINIT-TABLE @VA 0x1CB1C0 (runtime):");
+                                        for (int j = 0; j < 16; j++)
+                                            if(0) printf(" %08X", tbl[j]);
+                                        if(0) printf("\n");
+                                    }
+                                    uint32_t fn_pa = chihiro_va_to_pa(0x135020);
+                                    if (fn_pa != 0xFFFFFFFF) {
+                                        uint8_t fn_code[16];
+                                        cpu_physical_memory_read(fn_pa, fn_code, 16);
+                                        if(0) printf("  FN@0x135020 (runtime):");
+                                        for (int j = 0; j < 16; j++)
+                                            if(0) printf(" %02X", fn_code[j]);
+                                        if(0) printf("\n");
+                                    }
+                                    uint32_t s11_pa = chihiro_va_to_pa(0x1CB160);
+                                    if (s11_pa != 0xFFFFFFFF) {
+                                        uint8_t s11[256];
+                                        cpu_physical_memory_read(s11_pa, s11, 256);
+                                        if(0) printf("  SEC11 @VA 0x1CB160 (first 256 bytes):\n");
+                                        for (int r = 0; r < 16; r++) {
+                                            if(0) printf("    +%02X:", r * 16);
+                                            for (int c = 0; c < 16; c++)
+                                                if(0) printf(" %02X", s11[r * 16 + c]);
+                                            if(0) printf("\n");
+                                        }
+                                    }
+                                    uint32_t bss_pa = chihiro_va_to_pa(0x21B180);
+                                    if (bss_pa != 0xFFFFFFFF) {
+                                        uint8_t bss[64];
+                                        cpu_physical_memory_read(bss_pa, bss, 64);
+                                        if(0) printf("  BSS @VA 0x21B180 (first 64 bytes):");
+                                        int nz = 0;
+                                        for (int j = 0; j < 64; j++) {
+                                            if (bss[j]) nz++;
+                                        }
+                                        if(0) printf(" %d non-zero bytes", nz);
+                                        if (nz > 0) {
+                                            if(0) printf(":");
+                                            for (int j = 0; j < 64; j++)
+                                                if(0) printf(" %02X", bss[j]);
+                                        }
+                                        if(0) printf("\n");
+                                    }
+                                    uint32_t obj_pa = chihiro_va_to_pa(0x2CB8BC);
+                                    if (obj_pa != 0xFFFFFFFF) {
+                                        uint32_t obj[8];
+                                        cpu_physical_memory_read(obj_pa, obj, 32);
+                                        if(0) printf("  THIS@0x2CB8BC (runtime):");
+                                        for (int j = 0; j < 8; j++)
+                                            if(0) printf(" %08X", obj[j]);
+                                        if(0) printf("\n");
+                                    }
+                                    static const uint32_t spot_va[] = {
+                                        0x1CB160, 0x1CF160, 0x1D7160,
+                                        0x1E3160, 0x1F3160, 0x203160,
+                                        0x20D160, 0x218160
+                                    };
+                                    if(0) printf("  SEC11-SPOT-CHECK (16 bytes each):\n");
+                                    for (int s = 0; s < 8; s++) {
+                                        uint32_t spa = chihiro_va_to_pa(spot_va[s]);
+                                        if (spa != 0xFFFFFFFF) {
+                                            uint8_t sb[16];
+                                            cpu_physical_memory_read(spa, sb, 16);
+                                            if(0) printf("    VA 0x%06X:", spot_va[s]);
+                                            for (int j = 0; j < 16; j++)
+                                                if(0) printf(" %02X", sb[j]);
+                                            if(0) printf("\n");
+                                        } else {
+                                            if(0) printf("    VA 0x%06X: UNMAPPED\n",
+                                                   spot_va[s]);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                if(0) printf("[%07lld] FAST-DIAG #%d: VA 0x10000 UNMAPPED\n",
+                       TS_MS, tick_num);
+            }
+        }
+
+        timer_mod(s->diag_timer,
+                  qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 50);
+        return;
+    }
 
     /* After QuickReboot — comprehensive game XBE diagnostics.
      * No patches, only measurement. */
@@ -329,18 +864,18 @@ static void chihiro_diag_timer_cb(void *opaque)
 
         /* === ONE-TIME DEEP ANALYSIS (first 2 ticks) === */
         if (game_diag_count <= 2) {
-            printf("[%07lld] ====== GAME DIAG DEEP #%d ======\n", TS_MS, game_diag_count);
+            if(0) printf("[%07lld] ====== GAME DIAG DEEP #%d ======\n", TS_MS, game_diag_count);
 
             /* 1. XBE HEADER at VA 0x10000 */
             uint32_t hdr_pa = chihiro_va_to_pa(0x10000);
-            printf("  XBE header: VA=0x10000 PA=0x%08X\n", hdr_pa);
+            if(0) printf("  XBE header: VA=0x10000 PA=0x%08X\n", hdr_pa);
             uint32_t entry_addr = 0, thunk_addr = 0, base_addr = 0;
             uint32_t section_hdr_va = 0, num_sections = 0;
             uint32_t tls_va = 0;
             if (hdr_pa != 0xFFFFFFFF) {
                 uint8_t hdr[0x180];
                 cpu_physical_memory_read(hdr_pa, hdr, sizeof(hdr));
-                printf("  Magic: %c%c%c%c\n", hdr[0], hdr[1], hdr[2], hdr[3]);
+                if(0) printf("  Magic: %c%c%c%c\n", hdr[0], hdr[1], hdr[2], hdr[3]);
                 base_addr       = *(uint32_t*)(hdr + 0x104);
                 entry_addr      = *(uint32_t*)(hdr + 0x128);
                 thunk_addr      = *(uint32_t*)(hdr + 0x158);
@@ -348,9 +883,9 @@ static void chihiro_diag_timer_cb(void *opaque)
                 num_sections    = *(uint32_t*)(hdr + 0x11C);
                 tls_va          = *(uint32_t*)(hdr + 0x154);
                 uint32_t init_flags = *(uint32_t*)(hdr + 0x10C);
-                printf("  Base=0x%08X Entry=0x%08X Thunk=0x%08X Flags=0x%08X\n",
+                if(0) printf("  Base=0x%08X Entry=0x%08X Thunk=0x%08X Flags=0x%08X\n",
                        base_addr, entry_addr, thunk_addr, init_flags);
-                printf("  Sections: %u at VA=0x%08X, TLS=0x%08X\n",
+                if(0) printf("  Sections: %u at VA=0x%08X, TLS=0x%08X\n",
                        num_sections, section_hdr_va, tls_va);
             }
 
@@ -360,17 +895,17 @@ static void chihiro_diag_timer_cb(void *opaque)
                 if (ep_pa != 0xFFFFFFFF) {
                     uint8_t code[32];
                     cpu_physical_memory_read(ep_pa, code, 32);
-                    printf("  ENTRY @0x%08X (PA=0x%08X):\n", entry_addr, ep_pa);
-                    printf("    %02X %02X %02X %02X %02X %02X %02X %02X"
+                    if(0) printf("  ENTRY @0x%08X (PA=0x%08X):\n", entry_addr, ep_pa);
+                    if(0) printf("    %02X %02X %02X %02X %02X %02X %02X %02X"
                            " %02X %02X %02X %02X %02X %02X %02X %02X\n",
                            code[0],code[1],code[2],code[3],code[4],code[5],code[6],code[7],
                            code[8],code[9],code[10],code[11],code[12],code[13],code[14],code[15]);
-                    printf("    %02X %02X %02X %02X %02X %02X %02X %02X"
+                    if(0) printf("    %02X %02X %02X %02X %02X %02X %02X %02X"
                            " %02X %02X %02X %02X %02X %02X %02X %02X\n",
                            code[16],code[17],code[18],code[19],code[20],code[21],code[22],code[23],
                            code[24],code[25],code[26],code[27],code[28],code[29],code[30],code[31]);
                 } else {
-                    printf("  ENTRY @0x%08X: UNMAPPED!\n", entry_addr);
+                    if(0) printf("  ENTRY @0x%08X: UNMAPPED!\n", entry_addr);
                 }
             }
 
@@ -380,16 +915,16 @@ static void chihiro_diag_timer_cb(void *opaque)
                 if (tk_pa != 0xFFFFFFFF) {
                     uint32_t thunks[8];
                     cpu_physical_memory_read(tk_pa, thunks, 32);
-                    printf("  THUNK @0x%08X (PA=0x%08X):\n", thunk_addr, tk_pa);
-                    printf("    [0]=0x%08X [1]=0x%08X [2]=0x%08X [3]=0x%08X\n",
+                    if(0) printf("  THUNK @0x%08X (PA=0x%08X):\n", thunk_addr, tk_pa);
+                    if(0) printf("    [0]=0x%08X [1]=0x%08X [2]=0x%08X [3]=0x%08X\n",
                            thunks[0], thunks[1], thunks[2], thunks[3]);
-                    printf("    [4]=0x%08X [5]=0x%08X [6]=0x%08X [7]=0x%08X\n",
+                    if(0) printf("    [4]=0x%08X [5]=0x%08X [6]=0x%08X [7]=0x%08X\n",
                            thunks[4], thunks[5], thunks[6], thunks[7]);
                     /* Thunks should be 0x80xxxxxx (kernel VA) if resolved */
                     int resolved = 0;
                     for (int i = 0; i < 8; i++)
                         if ((thunks[i] & 0x80000000) && thunks[i] != 0xFFFFFFFF) resolved++;
-                    printf("    %d/8 resolved to kernel VA\n", resolved);
+                    if(0) printf("    %d/8 resolved to kernel VA\n", resolved);
                 }
             }
 
@@ -397,7 +932,7 @@ static void chihiro_diag_timer_cb(void *opaque)
             if (section_hdr_va && num_sections > 0 && num_sections <= 64) {
                 uint32_t sh_pa = chihiro_va_to_pa(section_hdr_va);
                 if (sh_pa != 0xFFFFFFFF) {
-                    printf("  SECTIONS:\n");
+                    if(0) printf("  SECTIONS:\n");
                     for (uint32_t si = 0; si < num_sections && si < 8; si++) {
                         uint8_t sec[56];
                         cpu_physical_memory_read(sh_pa + si * 56, sec, 56);
@@ -412,7 +947,7 @@ static void chihiro_diag_timer_cb(void *opaque)
                         uint8_t peek[8] = {0};
                         if (sva_pa != 0xFFFFFFFF)
                             cpu_physical_memory_read(sva_pa, peek, 8);
-                        printf("    [%u] VA=0x%08X sz=0x%X raw=0x%X flags=0x%X name@0x%X"
+                        if(0) printf("    [%u] VA=0x%08X sz=0x%X raw=0x%X flags=0x%X name@0x%X"
                                " peek=%02X%02X%02X%02X%02X%02X%02X%02X %s\n",
                                si, sec_va, sec_vsz, sec_rsz, sec_flags, sec_name,
                                peek[0],peek[1],peek[2],peek[3],
@@ -425,7 +960,7 @@ static void chihiro_diag_timer_cb(void *opaque)
             /* 5. STACK — check if any thread has used the stack */
             /* Xbox default stack top is around 0x00B7xxxx for game threads */
             uint32_t stack_probes[] = {0x00B70000, 0x00B6F000, 0x00400000, 0x00300000};
-            printf("  STACK probes:\n");
+            if(0) printf("  STACK probes:\n");
             for (int sp = 0; sp < 4; sp++) {
                 uint32_t sp_pa = chihiro_va_to_pa(stack_probes[sp]);
                 if (sp_pa != 0xFFFFFFFF) {
@@ -433,12 +968,12 @@ static void chihiro_diag_timer_cb(void *opaque)
                     cpu_physical_memory_read(sp_pa, stk, 16);
                     int nonzero = 0;
                     for (int j = 0; j < 16; j++) if (stk[j]) nonzero++;
-                    printf("    0x%08X: %02X%02X%02X%02X %02X%02X%02X%02X %s\n",
+                    if(0) printf("    0x%08X: %02X%02X%02X%02X %02X%02X%02X%02X %s\n",
                            stack_probes[sp],
                            stk[0],stk[1],stk[2],stk[3],stk[4],stk[5],stk[6],stk[7],
                            nonzero ? "HAS DATA" : "ZEROS");
                 } else {
-                    printf("    0x%08X: UNMAPPED\n", stack_probes[sp]);
+                    if(0) printf("    0x%08X: UNMAPPED\n", stack_probes[sp]);
                 }
             }
 
@@ -450,7 +985,7 @@ static void chihiro_diag_timer_cb(void *opaque)
             if (ke_tick_pa != 0xFFFFFFFF) {
                 uint32_t ticks;
                 cpu_physical_memory_read(ke_tick_pa, &ticks, 4);
-                printf("  KeTickCount@0x%08X = %u\n", ke_tick_va, ticks);
+                if(0) printf("  KeTickCount@0x%08X = %u\n", ke_tick_va, ticks);
             }
             /* Try to find LaunchDataPage — scan for signature */
             uint32_t ldp_va = 0x80067A20; /* approximate for arcdkrnl */
@@ -458,13 +993,13 @@ static void chihiro_diag_timer_cb(void *opaque)
             if (ldp_pa != 0xFFFFFFFF) {
                 uint32_t ldp_ptr;
                 cpu_physical_memory_read(ldp_pa, &ldp_ptr, 4);
-                printf("  LaunchDataPage@0x%08X ptr=0x%08X\n", ldp_va, ldp_ptr);
+                if(0) printf("  LaunchDataPage@0x%08X ptr=0x%08X\n", ldp_va, ldp_ptr);
                 if (ldp_ptr && ldp_ptr < 0x08000000) {
                     uint32_t ldp_data_pa = chihiro_va_to_pa(ldp_ptr);
                     if (ldp_data_pa != 0xFFFFFFFF) {
                         uint8_t ldp[64];
                         cpu_physical_memory_read(ldp_data_pa, ldp, 64);
-                        printf("  LDP data: %02X%02X%02X%02X %02X%02X%02X%02X"
+                        if(0) printf("  LDP data: %02X%02X%02X%02X %02X%02X%02X%02X"
                                " %02X%02X%02X%02X %02X%02X%02X%02X\n",
                                ldp[0],ldp[1],ldp[2],ldp[3],ldp[4],ldp[5],ldp[6],ldp[7],
                                ldp[8],ldp[9],ldp[10],ldp[11],ldp[12],ldp[13],ldp[14],ldp[15]);
@@ -487,19 +1022,19 @@ static void chihiro_diag_timer_cb(void *opaque)
             address_space_read(&address_space_memory, 0xFD400100, MEMTXATTRS_UNSPECIFIED, &pgraph_intr, 4);
             address_space_read(&address_space_memory, 0xFD000200, MEMTXATTRS_UNSPECIFIED, &pmc_enable, 4);
             address_space_read(&address_space_memory, 0xFD000100, MEMTXATTRS_UNSPECIFIED, &pmc_intr, 4);
-            printf("  NV2A PMC: enable=0x%08X intr=0x%08X\n", pmc_enable, pmc_intr);
-            printf("  NV2A PFB: CFG0=0x%08X CSTATUS=0x%08X(%uMB) NVM=0x%08X\n",
+            if(0) printf("  NV2A PMC: enable=0x%08X intr=0x%08X\n", pmc_enable, pmc_intr);
+            if(0) printf("  NV2A PFB: CFG0=0x%08X CSTATUS=0x%08X(%uMB) NVM=0x%08X\n",
                    pfb_cfg0, pfb_cstatus, pfb_cstatus/(1024*1024), pfb_nvm);
-            printf("  NV2A PFIFO: mode=0x%08X enable=0x%08X reassign=0x%08X\n",
+            if(0) printf("  NV2A PFIFO: mode=0x%08X enable=0x%08X reassign=0x%08X\n",
                    pfifo_mode, pfifo_enable, pfifo_reassign);
-            printf("  NV2A PGRAPH: status=0x%08X intr=0x%08X\n", pgraph_status, pgraph_intr);
+            if(0) printf("  NV2A PGRAPH: status=0x%08X intr=0x%08X\n", pgraph_status, pgraph_intr);
 
             /* 8. FRAMEBUFFER content */
             uint32_t pcrtc_start = 0;
             address_space_read(&address_space_memory, 0xFD600800, MEMTXATTRS_UNSPECIFIED, &pcrtc_start, 4);
             uint8_t fb[16];
             cpu_physical_memory_read(pcrtc_start, fb, 16);
-            printf("  FB@0x%08X: %02X%02X%02X%02X %02X%02X%02X%02X"
+            if(0) printf("  FB@0x%08X: %02X%02X%02X%02X %02X%02X%02X%02X"
                    " %02X%02X%02X%02X %02X%02X%02X%02X\n",
                    pcrtc_start,
                    fb[0],fb[1],fb[2],fb[3],fb[4],fb[5],fb[6],fb[7],
@@ -512,23 +1047,23 @@ static void chihiro_diag_timer_cb(void *opaque)
             if (xeimg_pa != 0xFFFFFFFF) {
                 uint8_t xeimg[64];
                 cpu_physical_memory_read(xeimg_pa, xeimg, 64);
-                printf("  XeImageFileName@0x80060080: ");
-                for (int i = 0; i < 48 && xeimg[i]; i++) printf("%c", xeimg[i] >= 0x20 ? xeimg[i] : '.');
-                printf("\n");
+                if(0) printf("  XeImageFileName@0x80060080: ");
+                if(0) for (int i = 0; i < 48 && xeimg[i]; i++) printf("%c", xeimg[i] >= 0x20 ? xeimg[i] : '.');
+                if(0) printf("\n");
             }
 
             /* 10. VA map for game address range */
-            printf("  VA map: ");
+            if(0) printf("  VA map: ");
             uint32_t va_probes[] = {0x10000, 0xB8BAC, 0x100000, 0x150000, 0x1A0000,
                                     0x200000, 0x80010000, 0xD0000000, 0xD0010000, 0xFD000000};
             for (int v = 0; v < 10; v++) {
                 uint32_t pa = chihiro_va_to_pa(va_probes[v]);
                 if (pa != 0xFFFFFFFF)
-                    printf("%X→%X ", va_probes[v], pa);
+                    if(0) printf("%X→%X ", va_probes[v], pa);
                 else
-                    printf("%X→X ", va_probes[v]);
+                    if(0) printf("%X→X ", va_probes[v]);
             }
-            printf("\n");
+            if(0) printf("\n");
 
             /* 11. CPU STATE — where is the CPU right now? */
             {
@@ -536,13 +1071,13 @@ static void chihiro_diag_timer_cb(void *opaque)
                 if (cpu) {
                     X86CPU *x86 = X86_CPU(cpu);
                     CPUX86State *env = &x86->env;
-                    printf("  CPU: EIP=0x%08X ESP=0x%08X EBP=0x%08X\n",
+                    if(0) printf("  CPU: EIP=0x%08X ESP=0x%08X EBP=0x%08X\n",
                            (uint32_t)env->eip, (uint32_t)env->regs[R_ESP],
                            (uint32_t)env->regs[R_EBP]);
-                    printf("  EAX=0x%08X EBX=0x%08X ECX=0x%08X EDX=0x%08X\n",
+                    if(0) printf("  EAX=0x%08X EBX=0x%08X ECX=0x%08X EDX=0x%08X\n",
                            (uint32_t)env->regs[R_EAX], (uint32_t)env->regs[R_EBX],
                            (uint32_t)env->regs[R_ECX], (uint32_t)env->regs[R_EDX]);
-                    printf("  ESI=0x%08X EDI=0x%08X CR0=0x%08X CR3=0x%08X\n",
+                    if(0) printf("  ESI=0x%08X EDI=0x%08X CR0=0x%08X CR3=0x%08X\n",
                            (uint32_t)env->regs[R_ESI], (uint32_t)env->regs[R_EDI],
                            (uint32_t)env->cr[0], (uint32_t)env->cr[3]);
 
@@ -552,17 +1087,17 @@ static void chihiro_diag_timer_cb(void *opaque)
                     if (esp_pa != 0xFFFFFFFF) {
                         uint32_t stack[16];
                         cpu_physical_memory_read(esp_pa, stack, 64);
-                        printf("  STACK @0x%08X (PA=0x%08X):\n", esp, esp_pa);
-                        printf("    +00: %08X %08X %08X %08X\n",
+                        if(0) printf("  STACK @0x%08X (PA=0x%08X):\n", esp, esp_pa);
+                        if(0) printf("    +00: %08X %08X %08X %08X\n",
                                stack[0], stack[1], stack[2], stack[3]);
-                        printf("    +10: %08X %08X %08X %08X\n",
+                        if(0) printf("    +10: %08X %08X %08X %08X\n",
                                stack[4], stack[5], stack[6], stack[7]);
-                        printf("    +20: %08X %08X %08X %08X\n",
+                        if(0) printf("    +20: %08X %08X %08X %08X\n",
                                stack[8], stack[9], stack[10], stack[11]);
-                        printf("    +30: %08X %08X %08X %08X\n",
+                        if(0) printf("    +30: %08X %08X %08X %08X\n",
                                stack[12], stack[13], stack[14], stack[15]);
                     } else {
-                        printf("  STACK @0x%08X: UNMAPPED\n", esp);
+                        if(0) printf("  STACK @0x%08X: UNMAPPED\n", esp);
                     }
 
                     /* Code at EIP — what instruction is executing? */
@@ -571,7 +1106,7 @@ static void chihiro_diag_timer_cb(void *opaque)
                     if (eip_pa != 0xFFFFFFFF) {
                         uint8_t code[16];
                         cpu_physical_memory_read(eip_pa, code, 16);
-                        printf("  CODE @EIP=0x%08X (PA=0x%08X): "
+                        if(0) printf("  CODE @EIP=0x%08X (PA=0x%08X): "
                                "%02X %02X %02X %02X %02X %02X %02X %02X "
                                "%02X %02X %02X %02X %02X %02X %02X %02X\n",
                                eip, eip_pa,
@@ -582,30 +1117,30 @@ static void chihiro_diag_timer_cb(void *opaque)
                     }
 
                     /* EBP chain — walk frame pointers */
-                    printf("  FRAMES: ");
+                    if(0) printf("  FRAMES: ");
                     uint32_t ebp = (uint32_t)env->regs[R_EBP];
                     for (int f = 0; f < 8 && ebp > 0x10000 && ebp < 0x08000000; f++) {
                         uint32_t ebp_pa = chihiro_va_to_pa(ebp);
-                        if (ebp_pa == 0xFFFFFFFF) { printf("(unmapped@%X) ", ebp); break; }
+                        if(0) if (ebp_pa == 0xFFFFFFFF) { printf("(unmapped@%X) ", ebp); break; }
                         uint32_t frame[2]; /* saved_ebp, return_addr */
                         cpu_physical_memory_read(ebp_pa, frame, 8);
-                        printf("%X→%X ", ebp, frame[1]);
+                        if(0) printf("%X→%X ", ebp, frame[1]);
                         ebp = frame[0];
                     }
-                    printf("\n");
+                    if(0) printf("\n");
                 }
             }
 
             /* 12. CONTIGUOUS MEMORY — D0000000 range detail */
-            printf("  CONTIGUOUS D0xxxxxx: ");
+            if(0) printf("  CONTIGUOUS D0xxxxxx: ");
             for (uint32_t d = 0xD0000000; d <= 0xD0080000; d += 0x10000) {
                 uint32_t pa = chihiro_va_to_pa(d);
                 if (pa != 0xFFFFFFFF)
-                    printf("%X→%X ", d & 0xFFFFF, pa);
+                    if(0) printf("%X→%X ", d & 0xFFFFF, pa);
                 else
-                    printf("%X→X ", d & 0xFFFFF);
+                    if(0) printf("%X→X ", d & 0xFFFFF);
             }
-            printf("\n");
+            if(0) printf("\n");
 
             /* 13. PFN DATABASE — kernel MmPfnDatabase location */
             /* Xbox kernel stores MmPfnDatabase at ~0x8003FE00 area */
@@ -622,17 +1157,17 @@ static void chihiro_diag_timer_cb(void *opaque)
                     if (!found_3fdf && memcmp(buf, pat64, 4) == 0) {
                         uint8_t prev;
                         cpu_physical_memory_read(pa - 1, &prev, 1);
-                        printf("  PFN: found 0x3FDF (64MB limit) at PA 0x%05X (prev_byte=0x%02X)\n", pa, prev);
+                        if(0) printf("  PFN: found 0x3FDF (64MB limit) at PA 0x%05X (prev_byte=0x%02X)\n", pa, prev);
                         found_3fdf = 1;
                     }
                     if (!found_7fbf && memcmp(buf, pat128, 4) == 0) {
                         uint8_t prev;
                         cpu_physical_memory_read(pa - 1, &prev, 1);
-                        printf("  PFN: found 0x7FBF (128MB limit) at PA 0x%05X (prev_byte=0x%02X)\n", pa, prev);
+                        if(0) printf("  PFN: found 0x7FBF (128MB limit) at PA 0x%05X (prev_byte=0x%02X)\n", pa, prev);
                         found_7fbf = 1;
                     }
                 }
-                if (!found_3fdf && !found_7fbf) printf("  PFN: neither 0x3FDF nor 0x7FBF found in kernel\n");
+                if(0) if (!found_3fdf && !found_7fbf) printf("  PFN: neither 0x3FDF nor 0x7FBF found in kernel\n");
             }
 
             /* 14. HDD PARTITION TABLE — check if kernel found partitions */
@@ -643,7 +1178,7 @@ static void chihiro_diag_timer_cb(void *opaque)
             if (part_pa != 0xFFFFFFFF) {
                 uint8_t kdata[32];
                 cpu_physical_memory_read(part_pa, kdata, 32);
-                printf("  KernData@0x%08X: %02X%02X%02X%02X %02X%02X%02X%02X"
+                if(0) printf("  KernData@0x%08X: %02X%02X%02X%02X %02X%02X%02X%02X"
                        " %02X%02X%02X%02X %02X%02X%02X%02X\n",
                        part_check_va,
                        kdata[0],kdata[1],kdata[2],kdata[3],
@@ -654,7 +1189,7 @@ static void chihiro_diag_timer_cb(void *opaque)
 
             /* 15. SCAN KERNEL DATA for XeImageFileName ("hod3" or ".xbe") */
             {
-                printf("  KERNEL STRING SCAN:\n");
+                if(0) printf("  KERNEL STRING SCAN:\n");
                 /* Scan kernel data area (PA 0x30000-0x70000) for key strings */
                 int found_xbe = 0, found_cdrom = 0, found_mbfs = 0, found_launch = 0;
                 for (uint32_t pa = 0x30000; pa < 0x70000 - 32; pa += 4) {
@@ -667,42 +1202,42 @@ static void chihiro_diag_timer_cb(void *opaque)
                             uint8_t ctx[64];
                             uint32_t ctx_pa = (pa + i > 16) ? pa + i - 16 : pa + i;
                             cpu_physical_memory_read(ctx_pa, ctx, 64);
-                            printf("    'hod3' at PA 0x%05X: ", pa + i);
+                            if(0) printf("    'hod3' at PA 0x%05X: ", pa + i);
                             for (int c = 0; c < 48 && ctx[c+16]; c++) 
-                                printf("%c", ctx[c+16] >= 0x20 && ctx[c+16] < 0x7F ? ctx[c+16] : '.');
-                            printf("\n");
+                                if(0) printf("%c", ctx[c+16] >= 0x20 && ctx[c+16] < 0x7F ? ctx[c+16] : '.');
+                            if(0) printf("\n");
                             found_xbe = 1;
                         }
                         if (buf[i]=='C' && buf[i+1]=='d' && buf[i+2]=='R' && buf[i+3]=='o' && !found_cdrom) {
                             uint8_t ctx[48];
                             cpu_physical_memory_read(pa + i, ctx, 48);
-                            printf("    'CdRo' at PA 0x%05X: ", pa + i);
+                            if(0) printf("    'CdRo' at PA 0x%05X: ", pa + i);
                             for (int c = 0; c < 48 && ctx[c]; c++)
-                                printf("%c", ctx[c] >= 0x20 && ctx[c] < 0x7F ? ctx[c] : '.');
-                            printf("\n");
+                                if(0) printf("%c", ctx[c] >= 0x20 && ctx[c] < 0x7F ? ctx[c] : '.');
+                            if(0) printf("\n");
                             found_cdrom = 1;
                         }
                         if (buf[i]=='m' && buf[i+1]=='b' && buf[i+2]=='f' && buf[i+3]=='s' && !found_mbfs) {
                             uint8_t ctx[48];
                             cpu_physical_memory_read(pa + i, ctx, 48);
-                            printf("    'mbfs' at PA 0x%05X: ", pa + i);
+                            if(0) printf("    'mbfs' at PA 0x%05X: ", pa + i);
                             for (int c = 0; c < 48 && ctx[c]; c++)
-                                printf("%c", ctx[c] >= 0x20 && ctx[c] < 0x7F ? ctx[c] : '.');
-                            printf("\n");
+                                if(0) printf("%c", ctx[c] >= 0x20 && ctx[c] < 0x7F ? ctx[c] : '.');
+                            if(0) printf("\n");
                             found_mbfs = 1;
                         }
                     }
                 }
-                if (!found_xbe) printf("    'hod3': NOT FOUND in kernel data\n");
-                if (!found_cdrom) printf("    'CdRo': NOT FOUND\n");
-                if (!found_mbfs) printf("    'mbfs': NOT FOUND\n");
+                if(0) if (!found_xbe) printf("    'hod3': NOT FOUND in kernel data\n");
+                if(0) if (!found_cdrom) printf("    'CdRo': NOT FOUND\n");
+                if(0) if (!found_mbfs) printf("    'mbfs': NOT FOUND\n");
             }
 
             /* 16. XboxHardwareInfo — search for the structure
              * On retail Xbox: flags=0x00000000, on Chihiro: flags should have 0x08 (ARCADE)
              * The structure is at a kernel export, typically 0x80036000-0x80038000 area */
             {
-                printf("  XboxHardwareInfo scan:\n");
+                if(0) printf("  XboxHardwareInfo scan:\n");
                 /* Known Xbox kernel exports XboxHardwareInfo. It contains:
                  * ULONG Flags, UCHAR GpuRevision, UCHAR McpRevision, UCHAR Unknown1, UCHAR Unknown2 */
                 for (uint32_t va = 0x80035000; va < 0x8003A000; va += 4) {
@@ -714,7 +1249,7 @@ static void chihiro_diag_timer_cb(void *opaque)
                     if ((val & 0x08) && (val & 0xFFFFFF00) == 0) {
                         uint8_t hw[8];
                         cpu_physical_memory_read(pa, hw, 8);
-                        printf("    Candidate @0x%08X(PA=0x%05X): flags=0x%08X GPU=%02X MCP=%02X\n",
+                        if(0) printf("    Candidate @0x%08X(PA=0x%05X): flags=0x%08X GPU=%02X MCP=%02X\n",
                                va, pa, val, hw[4], hw[5]);
                     }
                 }
@@ -723,7 +1258,7 @@ static void chihiro_diag_timer_cb(void *opaque)
                 if (hwinfo_pa != 0xFFFFFFFF) {
                     uint8_t hw[16];
                     cpu_physical_memory_read(hwinfo_pa, hw, 16);
-                    printf("    @0x80036000: %02X%02X%02X%02X %02X%02X%02X%02X"
+                    if(0) printf("    @0x80036000: %02X%02X%02X%02X %02X%02X%02X%02X"
                            " %02X%02X%02X%02X %02X%02X%02X%02X\n",
                            hw[0],hw[1],hw[2],hw[3],hw[4],hw[5],hw[6],hw[7],
                            hw[8],hw[9],hw[10],hw[11],hw[12],hw[13],hw[14],hw[15]);
@@ -742,25 +1277,25 @@ static void chihiro_diag_timer_cb(void *opaque)
                     if (scan_pa != 0xFFFFFFFF) {
                         uint32_t stk[128]; /* 512 bytes */
                         cpu_physical_memory_read(scan_pa, stk, 512);
-                        printf("  STACK SCAN (ESP-256 to ESP+256):\n");
-                        printf("    NTSTATUS candidates: ");
+                        if(0) printf("  STACK SCAN (ESP-256 to ESP+256):\n");
+                        if(0) printf("    NTSTATUS candidates: ");
                         int ns_count = 0;
                         for (int i = 0; i < 128; i++) {
                             /* NTSTATUS: 0xC0xxxxxx = error, 0x80xxxxxx = warning (but also kernel VA) */
                             if ((stk[i] & 0xF0000000) == 0xC0000000) {
-                                printf("0x%08X(@+%X) ", stk[i], (i*4) - 256);
+                                if(0) printf("0x%08X(@+%X) ", stk[i], (i*4) - 256);
                                 if (++ns_count >= 8) break;
                             }
                         }
-                        if (ns_count == 0) printf("none");
-                        printf("\n");
+                        if(0) if (ns_count == 0) printf("none");
+                        if(0) printf("\n");
                     }
                 }
             }
 
             /* 18. LaunchDataPage — scan for pointer in kernel exports area */
             {
-                printf("  LaunchDataPage scan:\n");
+                if(0) printf("  LaunchDataPage scan:\n");
                 /* The kernel stores LaunchDataPage pointer at export #164 (varies by kernel).
                  * Scan kernel data for a pointer to low memory that could be the LDP.
                  * LDP starts with dwLaunchDataType (usually 1=QuickReboot or 2=Dashboard) */
@@ -777,12 +1312,12 @@ static void chihiro_diag_timer_cb(void *opaque)
                             if (ldp_type == 1 || ldp_type == 2 || ldp_type == 0) {
                                 uint8_t ldp[80];
                                 cpu_physical_memory_read(ldp_pa, ldp, 80);
-                                printf("    LDP candidate: kern_PA=0x%05X ptr=0x%08X type=%u\n", pa, ptr, ldp_type);
-                                printf("    Path: ");
+                                if(0) printf("    LDP candidate: kern_PA=0x%05X ptr=0x%08X type=%u\n", pa, ptr, ldp_type);
+                                if(0) printf("    Path: ");
                                 /* LaunchPath starts at offset 4, ASCII, 520 bytes max */
                                 for (int c = 4; c < 76 && ldp[c]; c++)
-                                    printf("%c", ldp[c] >= 0x20 && ldp[c] < 0x7F ? ldp[c] : '.');
-                                printf("\n");
+                                    if(0) printf("%c", ldp[c] >= 0x20 && ldp[c] < 0x7F ? ldp[c] : '.');
+                                if(0) printf("\n");
                                 break; /* show first match only */
                             }
                         }
@@ -796,14 +1331,14 @@ static void chihiro_diag_timer_cb(void *opaque)
                 if (tls_pa != 0xFFFFFFFF) {
                     uint32_t tls[4];
                     cpu_physical_memory_read(tls_pa, tls, 16);
-                    printf("  TLS @0x%08X: RawStart=0x%08X RawEnd=0x%08X IdxAddr=0x%08X Callbacks=0x%08X\n",
+                    if(0) printf("  TLS @0x%08X: RawStart=0x%08X RawEnd=0x%08X IdxAddr=0x%08X Callbacks=0x%08X\n",
                            tls_va, tls[0], tls[1], tls[2], tls[3]);
                 }
             }
 
             /* 20. FULL DEVICE STRING SCAN — find ALL \Device\ paths in kernel memory */
             {
-                printf("  DEVICE PATHS (PA 0x10000-0x80000):\n");
+                if(0) printf("  DEVICE PATHS (PA 0x10000-0x80000):\n");
                 int dev_count = 0;
                 for (uint32_t pa = 0x10000; pa < 0x800000 - 16; pa++) {
                     uint8_t buf[8];
@@ -814,20 +1349,20 @@ static void chihiro_diag_timer_cb(void *opaque)
                         (buf[0]=='\\' && buf[1]=='D' && buf[2]=='E' && buf[3]=='V')) {
                         uint8_t path[80];
                         cpu_physical_memory_read(pa, path, 80);
-                        printf("    PA 0x%05X: ", pa);
+                        if(0) printf("    PA 0x%05X: ", pa);
                         for (int c = 0; c < 78 && path[c] >= 0x20 && path[c] < 0x7F; c++)
-                            printf("%c", path[c]);
-                        printf("\n");
-                        if (++dev_count >= 20) { printf("    ... (truncated)\n"); break; }
+                            if(0) printf("%c", path[c]);
+                        if(0) printf("\n");
+                        if(0) if (++dev_count >= 20) { printf("    ... (truncated)\n"); break; }
                         pa += 8; /* skip past this match */
                     }
                 }
-                if (dev_count == 0) printf("    NONE FOUND\n");
+                if(0) if (dev_count == 0) printf("    NONE FOUND\n");
             }
 
             /* 21. DRIVE LETTER & SYMLINK SCAN — look for D:\, T:\, mbfs:, etc */
             {
-                printf("  DRIVE LETTERS / SYMLINKS:\n");
+                if(0) printf("  DRIVE LETTERS / SYMLINKS:\n");
                 const char *needles[] = {"D:\\", "T:\\", "U:\\", "Z:\\", "E:\\", "mbfs:", "mbcom:", "mbrom:", "\\??\\", NULL};
                 for (int n = 0; needles[n]; n++) {
                     int nlen = strlen(needles[n]);
@@ -838,10 +1373,10 @@ static void chihiro_diag_timer_cb(void *opaque)
                         if (memcmp(buf, needles[n], nlen) == 0) {
                             uint8_t ctx[64];
                             cpu_physical_memory_read(pa, ctx, 64);
-                            printf("    '%s' at PA 0x%05X: ", needles[n], pa);
+                            if(0) printf("    '%s' at PA 0x%05X: ", needles[n], pa);
                             for (int c = 0; c < 60 && ctx[c] >= 0x20 && ctx[c] < 0x7F; c++)
-                                printf("%c", ctx[c]);
-                            printf("\n");
+                                if(0) printf("%c", ctx[c]);
+                            if(0) printf("\n");
                             found = 1;
                         }
                     }
@@ -850,7 +1385,7 @@ static void chihiro_diag_timer_cb(void *opaque)
 
             /* 22. WIDE STRING DEVICE SCAN — kernel uses Unicode (UTF-16LE) for object names */
             {
-                printf("  UNICODE DEVICE SCAN (\\0D\\0e\\0v\\0i):\n");
+                if(0) printf("  UNICODE DEVICE SCAN (\\0D\\0e\\0v\\0i):\n");
                 int udev_count = 0;
                 for (uint32_t pa = 0x10000; pa < 0x800000 - 20; pa += 2) {
                     uint8_t buf[16];
@@ -861,25 +1396,25 @@ static void chihiro_diag_timer_cb(void *opaque)
                         buf[8]==0x69 && buf[9]==0x00) {
                         uint8_t wpath[128];
                         cpu_physical_memory_read(pa, wpath, 128);
-                        printf("    PA 0x%05X: ", pa);
+                        if(0) printf("    PA 0x%05X: ", pa);
                         for (int c = 0; c < 126; c += 2) {
                             if (wpath[c] == 0 && wpath[c+1] == 0) break;
                             if (wpath[c] >= 0x20 && wpath[c] < 0x7F && wpath[c+1] == 0)
-                                printf("%c", wpath[c]);
+                                if(0) printf("%c", wpath[c]);
                             else
-                                printf("?");
+                                if(0) printf("?");
                         }
-                        printf("\n");
-                        if (++udev_count >= 20) { printf("    ... (truncated)\n"); break; }
+                        if(0) printf("\n");
+                        if(0) if (++udev_count >= 20) { printf("    ... (truncated)\n"); break; }
                         pa += 16;
                     }
                 }
-                if (udev_count == 0) printf("    NONE FOUND\n");
+                if(0) if (udev_count == 0) printf("    NONE FOUND\n");
             }
 
             /* 23. UNICODE CdRom + Harddisk scan — specifically look for these */
             {
-                printf("  UNICODE KEY STRINGS:\n");
+                if(0) printf("  UNICODE KEY STRINGS:\n");
                 /* CdRom in UTF-16LE: 43006400520068006F006D00 */
                 uint8_t cdrom_u16[] = {0x43,0x00,0x64,0x00,0x52,0x00,0x6F,0x00,0x6D,0x00};
                 /* Harddisk: 48006100720064006400 */
@@ -891,33 +1426,33 @@ static void chihiro_diag_timer_cb(void *opaque)
                     if (!found_cd && memcmp(buf, cdrom_u16, 10) == 0) {
                         uint8_t ctx[64];
                         cpu_physical_memory_read(pa, ctx, 64);
-                        printf("    'CdRom'(u16) PA 0x%05X: ", pa);
+                        if(0) printf("    'CdRom'(u16) PA 0x%05X: ", pa);
                         for (int c = 0; c < 62; c += 2) {
                             if (ctx[c]==0 && ctx[c+1]==0) break;
-                            printf("%c", (ctx[c]>=0x20 && ctx[c]<0x7F && ctx[c+1]==0) ? ctx[c] : '.');
+                            if(0) printf("%c", (ctx[c]>=0x20 && ctx[c]<0x7F && ctx[c+1]==0) ? ctx[c] : '.');
                         }
-                        printf("\n");
+                        if(0) printf("\n");
                         found_cd = 1;
                     }
                     if (!found_hd && memcmp(buf, hddisk_u16, 10) == 0) {
                         uint8_t ctx[64];
                         cpu_physical_memory_read(pa, ctx, 64);
-                        printf("    'Hardd'(u16) PA 0x%05X: ", pa);
+                        if(0) printf("    'Hardd'(u16) PA 0x%05X: ", pa);
                         for (int c = 0; c < 62; c += 2) {
                             if (ctx[c]==0 && ctx[c+1]==0) break;
-                            printf("%c", (ctx[c]>=0x20 && ctx[c]<0x7F && ctx[c+1]==0) ? ctx[c] : '.');
+                            if(0) printf("%c", (ctx[c]>=0x20 && ctx[c]<0x7F && ctx[c+1]==0) ? ctx[c] : '.');
                         }
-                        printf("\n");
+                        if(0) printf("\n");
                         found_hd = 1;
                     }
                 }
-                if (!found_cd) printf("    'CdRom'(u16): NOT FOUND\n");
-                if (!found_hd) printf("    'Hardd'(u16): NOT FOUND\n");
+                if(0) if (!found_cd) printf("    'CdRom'(u16): NOT FOUND\n");
+                if(0) if (!found_hd) printf("    'Hardd'(u16): NOT FOUND\n");
             }
 
             /* 24. QuickReboot / HalReturnToFirmware state */
             {
-                printf("  REBOOT STATE:\n");
+                if(0) printf("  REBOOT STATE:\n");
                 /* SMC scratch register (HalReturnToFirmware writes here) */
                 /* Check PA 0x00050000-0x00060000 for QuickReboot magic */
                 /* Xbox LaunchDataPage is at a fixed kernel export address */
@@ -933,7 +1468,7 @@ static void chihiro_diag_timer_cb(void *opaque)
                         int nz = 0;
                         for (int i = 0; i < 16; i++) if (rd[i]) nz = 1;
                         if (nz) {
-                            printf("    @0x%08X: %02X%02X%02X%02X %02X%02X%02X%02X"
+                            if(0) printf("    @0x%08X: %02X%02X%02X%02X %02X%02X%02X%02X"
                                    " %02X%02X%02X%02X %02X%02X%02X%02X\n",
                                    reboot_vas[rv],
                                    rd[0],rd[1],rd[2],rd[3],rd[4],rd[5],rd[6],rd[7],
@@ -945,7 +1480,7 @@ static void chihiro_diag_timer_cb(void *opaque)
 
             /* 25. IDE drive identity — what does the kernel see on IDE1? */
             {
-                printf("  IDE1 IDENTITY CHECK:\n");
+                if(0) printf("  IDE1 IDENTITY CHECK:\n");
                 /* Read the IDE status registers directly from PCI config space */
                 /* BAR4 for IDE is at PCI 0:9.0 offset 0x20 */
                 /* Check IDE secondary status at I/O 0x170-0x177 */
@@ -960,18 +1495,18 @@ static void chihiro_diag_timer_cb(void *opaque)
                     if (buf[0]=='Q' && buf[1]=='E' && buf[2]=='M' && buf[3]=='U') {
                         uint8_t ctx[48];
                         cpu_physical_memory_read(pa, ctx, 48);
-                        printf("    'QEMU' at PA 0x%05X: ", pa);
+                        if(0) printf("    'QEMU' at PA 0x%05X: ", pa);
                         for (int c = 0; c < 44; c++)
-                            printf("%c", ctx[c] >= 0x20 && ctx[c] < 0x7F ? ctx[c] : '.');
-                        printf("\n");
+                            if(0) printf("%c", ctx[c] >= 0x20 && ctx[c] < 0x7F ? ctx[c] : '.');
+                        if(0) printf("\n");
                         found_ident = 1;
                         break;
                     }
                 }
-                if (!found_ident) printf("    'QEMU' ident string: NOT FOUND\n");
+                if(0) if (!found_ident) printf("    'QEMU' ident string: NOT FOUND\n");
             }
 
-            printf("============================\n");
+            if(0) printf("============================\n");
         }
 
         /* === PERIODIC SUMMARY === */
@@ -983,7 +1518,7 @@ static void chihiro_diag_timer_cb(void *opaque)
             address_space_read(&address_space_memory, 0xFD600100, MEMTXATTRS_UNSPECIFIED, &pcrtc_intr, 4);
             address_space_read(&address_space_memory, 0xFD680800, MEMTXATTRS_UNSPECIFIED, &pramdac_vdisp, 4);
             address_space_read(&address_space_memory, 0xFD680820, MEMTXATTRS_UNSPECIFIED, &pramdac_hdisp, 4);
-            printf("[%07lld] GAME DIAG #%d: PGRAPH=0x%08X PCRTC=0x%08X/%u VIDEO=%ux%u\n",
+            if(0) printf("[%07lld] GAME DIAG #%d: PGRAPH=0x%08X PCRTC=0x%08X/%u VIDEO=%ux%u\n",
                    TS_MS, game_diag_count, pgraph_status, pcrtc_start, pcrtc_intr,
                    (pramdac_hdisp & 0xFFF) + 1, (pramdac_vdisp & 0xFFF) + 1);
         }
@@ -1013,7 +1548,7 @@ static void chihiro_diag_timer_cb(void *opaque)
 
     /* Log if any PA changed since last tick */
     if (s->diag_bootstate_pa && bootstate_pa != s->diag_bootstate_pa) {
-        printf("[%07lld] DIAG: PA CHANGED! boot PA=0x%X→0x%X\n", TS_MS,
+        if(0) printf("[%07lld] DIAG: PA CHANGED! boot PA=0x%X→0x%X\n", TS_MS,
                s->diag_bootstate_pa, bootstate_pa);
     }
 
@@ -1064,7 +1599,7 @@ static void chihiro_diag_timer_cb(void *opaque)
 
     /* Detect bootstate changes between ticks (guard against garbage VAs) */
     if (bootstate != s->last_bootstate && bootstate < 100 && s->last_bootstate < 100) {
-        printf("[%07lld] DIAG: *** BOOTSTATE CHANGED %u → %u ***\n", TS_MS,
+        if(0) printf("[%07lld] DIAG: *** BOOTSTATE CHANGED %u → %u ***\n", TS_MS,
                s->last_bootstate, bootstate);
         if (bootstate == 3) {
             chihiro_boot3_reached = true;
@@ -1089,7 +1624,7 @@ static void chihiro_diag_timer_cb(void *opaque)
                         if (name[0] && strlen(name) < 60) {
                             strncpy(chihiro_game_filename, name, 63);
                             chihiro_game_filename[63] = 0;
-                            printf("[%07lld] Chihiro: game filename from boot.id: '%s'\n",
+                            if(0) printf("[%07lld] Chihiro: game filename from boot.id: '%s'\n",
                                    TS_MS, chihiro_game_filename);
                         }
                     }
@@ -1121,7 +1656,7 @@ static void chihiro_diag_timer_cb(void *opaque)
                             int len = start + 4;
                             if (len > 4 && len < 60) {
                                 memcpy(chihiro_game_filename, fname, len + 1);
-                                printf("[%07lld] Chihiro: game filename from scan: '%s'\n",
+                                if(0) printf("[%07lld] Chihiro: game filename from scan: '%s'\n",
                                        TS_MS, chihiro_game_filename);
                                 break;
                             }
@@ -1130,68 +1665,16 @@ static void chihiro_diag_timer_cb(void *opaque)
                 }
             }
             if (!chihiro_game_filename[0]) {
-                printf("[%07lld] Chihiro: WARNING — could not find game "
+                if(0) printf("[%07lld] Chihiro: WARNING — could not find game "
                        "filename in RAM at boot=3\n", TS_MS);
             }
 
-            /* v208: Capture LaunchDataPage PA NOW while page tables are valid.
-             * v209b: Create the LDP PTE NOW so XLaunchNewImage can write to it.
-             * SEGABOOT calls XLaunchNewImage after boot=3. Without the PTE,
-             * the write page-faults → XLaunchNewImage fails → kernel falls
-             * back to xboxdash.xbe → doesn't exist → black screen. */
-            {
-                uint32_t ldp_va = 0;
-                cpu_physical_memory_read(0x30A10, &ldp_va, 4);
-                if (ldp_va) {
-                    uint32_t ldp_page = ldp_va & ~0xFFF;
-                    uint32_t pte_idx = (ldp_va >> 12) & 0x3FF;
-                    uint32_t pde;
-                    cpu_physical_memory_read(0xF000, &pde, 4);
-                    uint32_t pt_base = pde & 0xFFFFF000;
-                    uint32_t pte_addr = pt_base + pte_idx * 4;
-                    uint32_t pte_val;
-                    cpu_physical_memory_read(pte_addr, &pte_val, 4);
+            /* LLE: SEGABOOT calls XLaunchNewImageA which allocates LDP,
+             * marks it persistent, and fills launch data. Kernel's STICKY
+             * section preserves LaunchDataPage pointer across QuickReboot. */
 
-                    if (!(pte_val & 1)) {
-                        uint32_t new_pte = ldp_page | 0x067;
-                        cpu_physical_memory_write(pte_addr, &new_pte, 4);
-                        uint8_t zeros[4096] = {0};
-                        cpu_physical_memory_write(ldp_page, zeros, 4096);
-                        chihiro_ldp_pa = ldp_page + (ldp_va & 0xFFF);
-                        printf("[%07lld] Chihiro: Created LDP PTE 0x%08X @ PA 0x%05X "
-                               "(VA 0x%08X → PA 0x%08X)\n",
-                               TS_MS, new_pte, pte_addr, ldp_va, chihiro_ldp_pa);
-
-                        /* v209c: Fill the LDP NOW at boot=3, BEFORE QuickReboot.
-                         * The kernel reads LDP within microseconds of reboot.
-                         * If we wait until game-detect (port 0x40F0), it's 4.5s
-                         * too late — kernel already fell back to xboxdash.xbe. */
-                        if (chihiro_game_filename[0]) {
-                            uint32_t launch_type = 1;
-                            cpu_physical_memory_write(chihiro_ldp_pa, &launch_type, 4);
-                            uint32_t title_id = 0;
-                            cpu_physical_memory_write(chihiro_ldp_pa + 4, &title_id, 4);
-                            char launch_path[520] = {0};
-                            snprintf(launch_path, sizeof(launch_path),
-                                     "D:\\%s", chihiro_game_filename);
-                            cpu_physical_memory_write(chihiro_ldp_pa + 8, launch_path, 520);
-                            printf("[%07lld] Chihiro: Pre-filled LDP at boot=3: "
-                                   "type=1 path='%s'\n", TS_MS, launch_path);
-                        }
-                    } else {
-                        chihiro_ldp_pa = (pte_val & 0xFFFFF000) | (ldp_va & 0xFFF);
-                        printf("[%07lld] Chihiro: LDP already mapped PTE=0x%08X PA=0x%08X\n",
-                               TS_MS, pte_val, chihiro_ldp_pa);
-                    }
-                } else {
-                    chihiro_ldp_pa = 0xFFFFFFFF;
-                    printf("[%07lld] Chihiro: LDP pointer is NULL\n", TS_MS);
-                }
-            }
-
-            /* Dump RAM at boot=3 for offline analysis.
-             * Covers kernel + pool memory (8MB). */
-            {
+            /* RAM dump disabled for performance */
+            if (0) {
                 FILE *f = fopen("/tmp/ram_boot3.bin", "wb");
                 if (f) {
                     uint8_t page[4096];
@@ -1200,7 +1683,7 @@ static void chihiro_diag_timer_cb(void *opaque)
                         fwrite(page, 1, 4096, f);
                     }
                     fclose(f);
-                    printf("[%07lld] Chihiro: RAM dump saved to /tmp/ram_boot3.bin "
+                    if(0) printf("[%07lld] Chihiro: RAM dump saved to /tmp/ram_boot3.bin "
                            "(8MB, PA 0x00000-0x7FFFFF)\n", TS_MS);
                 }
             }
@@ -1208,22 +1691,13 @@ static void chihiro_diag_timer_cb(void *opaque)
         s->last_bootstate = bootstate;
     }
 
-    if (bootstate < 100) {
-        printf("[%07lld] DIAG: CE st=%u cnt=%u rdy=%u | gate=%u boot=%u flag=0x%02X "
-               "slots=%u/s0=0x%02X mflag=%u | 40F0=%u 401E=%u 4084=%u | tick=%u d7a8=%u ce2=%u %s\n",
-               TS_MS, state, counter, ready, gate, bootstate,
-               bootflag & 0xFF, slotcount, slotflag0, mainflag,
-               s->lpc_40f0_reads, s->lpc_401e_reads, s->lpc_4084_reads,
-               xbe2_d0798, xbe2_d07a8, xbe2_ce_state,
-               (xbe2_ce_pa != 0xFFFFFFFF) ? "xbe2:mapped" : "xbe2:UNMAPPED");
-    } else {
-        static bool diag_va_warned = false;
-        if (!diag_va_warned) {
-            printf("[%07lld] DIAG: VAs invalid (boot=%u) — DIAG output suppressed\n",
-                   TS_MS, bootstate);
-            diag_va_warned = true;
-        }
-    }
+    if(0) printf("[%07lld] DIAG: CE st=%u cnt=%u rdy=%u | gate=%u boot=%u flag=0x%02X "
+           "slots=%u/s0=0x%02X mflag=%u | 40F0=%u 401E=%u 4084=%u | tick=%u d7a8=%u ce2=%u %s\n",
+           TS_MS, state, counter, ready, gate, bootstate,
+           bootflag & 0xFF, slotcount, slotflag0, mainflag,
+           s->lpc_40f0_reads, s->lpc_401e_reads, s->lpc_4084_reads,
+           xbe2_d0798, xbe2_d07a8, xbe2_ce_state,
+           (xbe2_ce_pa != 0xFFFFFFFF) ? "xbe2:mapped" : "xbe2:UNMAPPED");
 
     /* v206b: Read-only monitoring of baseboard_dev[].flags.
      * fpr-23887: baseboard_dev[] at VA 0xA3778, stride 0x218, flags at offset +4.
@@ -1251,7 +1725,7 @@ static void chihiro_diag_timer_cb(void *opaque)
         uint32_t dev0_flags = *(uint32_t *)(dev0_raw + 4);
         uint32_t dev1_flags = *(uint32_t *)(dev1_raw + 4);
 
-        printf("[%07lld] DIAG USB-DEV: dev0[%05X→PA %X] raw=%02X%02X%02X%02X "
+        if(0) printf("[%07lld] DIAG USB-DEV: dev0[%05X→PA %X] raw=%02X%02X%02X%02X "
                "FLAGS=0x%08X %02X%02X%02X%02X %02X%02X%02X%02X | "
                "dev1[%05X→PA %X] FLAGS=0x%08X\n",
                TS_MS,
@@ -1266,7 +1740,7 @@ static void chihiro_diag_timer_cb(void *opaque)
 
     /* v202: Thread + USB counters (only print if any activity or thread exists) */
     if (thread_handle || thread_state || qc_nak || sc_nak || qc_bin || sc_bin || qc_bout || sc_bout) {
-        printf("[%07lld] DIAG USB: thr=0x%X tst=%u | QC nak=%u in=%u out=%u | SC nak=%u in=%u out=%u\n",
+        if(0) printf("[%07lld] DIAG USB: thr=0x%X tst=%u | QC nak=%u in=%u out=%u | SC nak=%u in=%u out=%u\n",
                TS_MS, thread_handle, thread_state,
                qc_nak, qc_bin, qc_bout, sc_nak, sc_bin, sc_bout);
     }
@@ -1283,7 +1757,7 @@ static void chihiro_diag_timer_cb(void *opaque)
         static int boot2_diag_count = 0;
         boot2_diag_count++;
         if (boot2_diag_count <= 5 || (boot2_diag_count % 10) == 0) {
-            printf("[%07lld] DIAG boot=2: initPtr=[896AC]=0x%08X slot0meta=[89740]=0x%08X "
+            if(0) printf("[%07lld] DIAG boot=2: initPtr=[896AC]=0x%08X slot0meta=[89740]=0x%08X "
                    "slot0data=[89760]=0x%08X\n",
                    TS_MS, initptr, slot0_meta, slot0_data);
         }
@@ -1319,7 +1793,7 @@ static void chihiro_diag_timer_cb(void *opaque)
             address_space_read(&address_space_memory, prmcio_base + 0x39,
                                MEMTXATTRS_UNSPECIFIED, &interlace, 1);
 
-            printf("[%07lld] DIAG NV2A VIDEO MODE:\n"
+            if(0) printf("[%07lld] DIAG NV2A VIDEO MODE:\n"
                    "  VDISPLAY_END=0x%X VSYNC_END=0x%X VVALID_END=0x%X\n"
                    "  HDISPLAY_END=0x%X HVALID_END=0x%X\n"
                    "  VPLL_COEFF=0x%08X PCRTC_CONFIG=0x%08X INTERLACE=0x%02X\n",
@@ -1332,7 +1806,7 @@ static void chihiro_diag_timer_cb(void *opaque)
                 if (ds_pa != 0xFFFFFFFF) {
                     uint8_t dsbuf[16];
                     cpu_physical_memory_read(ds_pa, dsbuf, 16);
-                    printf("  DMA DATA slot%d: %02X %02X %02X %02X %02X %02X %02X %02X"
+                    if(0) printf("  DMA DATA slot%d: %02X %02X %02X %02X %02X %02X %02X %02X"
                            " %02X %02X %02X %02X %02X %02X %02X %02X\n",
                            ds, dsbuf[0], dsbuf[1], dsbuf[2], dsbuf[3],
                            dsbuf[4], dsbuf[5], dsbuf[6], dsbuf[7],
@@ -1343,7 +1817,7 @@ static void chihiro_diag_timer_cb(void *opaque)
                 if (ms_pa != 0xFFFFFFFF) {
                     uint8_t msbuf[12];
                     cpu_physical_memory_read(ms_pa, msbuf, 12);
-                    printf("  DMA META slot%d: %02X %02X %02X %02X %02X %02X %02X %02X"
+                    if(0) printf("  DMA META slot%d: %02X %02X %02X %02X %02X %02X %02X %02X"
                            " %02X %02X %02X %02X\n",
                            ds, msbuf[0], msbuf[1], msbuf[2], msbuf[3],
                            msbuf[4], msbuf[5], msbuf[6], msbuf[7],
@@ -1625,7 +2099,7 @@ static void chihiro_usb_poll_patch_cb(void *opaque)
                 patches[p].applied = true;
                 applied++;
 
-                printf("[%07lld] Chihiro: PATCH %d/%d '%s' — "
+                if(0) printf("[%07lld] Chihiro: PATCH %d/%d '%s' — "
                        "sig at PA 0x%08X, patched %d byte(s) at PA 0x%08X\n",
                        TS_MS, applied, num_patches,
                        patches[p].name, pa + i, patches[p].patch_len, patch_pa);
@@ -1636,12 +2110,12 @@ static void chihiro_usb_poll_patch_cb(void *opaque)
 
     if (applied >= 3) {
         s->usb_poll_patched = true;
-        printf("[%07lld] Chihiro: %d/%d SEGABOOT patches applied. "
+        if(0) printf("[%07lld] Chihiro: %d/%d SEGABOOT patches applied. "
                "USB enumeration runs natively (no UsbEnumPoll bypass).\n",
                TS_MS, applied, num_patches);
 
-        /* RAM dump for offline RE — page tables, SEGABOOT BSS, slot analysis */
-        {
+        /* RAM dump disabled for performance */
+        if (0) {
             FILE *f = fopen("/tmp/ram_postpatch.bin", "wb");
             if (f) {
                 uint8_t page[4096];
@@ -1650,7 +2124,6 @@ static void chihiro_usb_poll_patch_cb(void *opaque)
                     fwrite(page, 1, 4096, f);
                 }
                 fclose(f);
-                printf("[%07lld] Chihiro: RAM dump saved to /tmp/ram_postpatch.bin (16MB)\n", TS_MS);
             }
         }
 
@@ -1664,15 +2137,27 @@ static void chihiro_usb_poll_patch_cb(void *opaque)
               qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 50);
 }
 
-/* Called from SMC SCRATCH write handler when value=0x02 (QuickReboot).
- * SEGABOOT writes SCRATCH=0x02 just before HalReturnToFirmware.
- * This is the version-independent trigger for QuickReboot detection. */
+/* Called from SMC SCRATCH write handler when value=0x04 (QuickReboot).
+ * HalReturnToFirmware(QuickReboot) writes SCRATCH=0x04 before system reset.
+ * Multiple QuickReboots happen: service menu exit, then game boot.
+ * We DON'T set boot3_reached here — game_running is detected by XBE change. */
 void chihiro_on_quickreboot_signal(void)
 {
-    if (!chihiro_active || chihiro_boot3_reached) return;
+    if (!chihiro_active) return;
 
-    printf("[%07lld] Chihiro: QuickReboot signal detected (SCRATCH=0x02)\n", TS_MS);
-    chihiro_boot3_reached = true;
+    /* Ignore SCRATCH=0x04 during first kernel init — the kernel writes
+     * SCRATCH as part of normal boot before SEGABOOT even loads.
+     * Only react after SEGABOOT has been patched at least once. */
+    if (!chihiro_lpc_global || !chihiro_lpc_global->usb_poll_patched) {
+        if(0) printf("[%07lld] Chihiro: SCRATCH=0x04 ignored (SEGABOOT not yet patched)\n",
+               TS_MS);
+        return;
+    }
+
+    static int quickreboot_count = 0;
+    quickreboot_count++;
+    if(0) printf("[%07lld] Chihiro: QuickReboot #%d detected (SCRATCH=0x04)\n",
+           TS_MS, quickreboot_count);
 
     /* Read boot.id from game directory to get game executable name */
     if (chihiro_game_dir[0] && !chihiro_game_filename[0]) {
@@ -1691,7 +2176,7 @@ void chihiro_on_quickreboot_signal(void)
                 if (*name) {
                     strncpy(chihiro_game_filename, name, 63);
                     chihiro_game_filename[63] = 0;
-                    printf("[%07lld] Chihiro: boot.id → game executable: '%s'\n",
+                    if(0) printf("[%07lld] Chihiro: boot.id → game executable: '%s'\n",
                            TS_MS, chihiro_game_filename);
                 }
             }
@@ -1699,38 +2184,76 @@ void chihiro_on_quickreboot_signal(void)
         }
     }
 
-    /* Walk page tables to find LDP physical address.
-     * LDP pointer is at kernel VA 0x8003B3C8 = PA 0x3B3C8.
-     * But the actual LDP page at VA 0x002625A0 may not be mapped yet.
-     * Save what we can; the post-reboot handler will re-create the PTE. */
-    {
-        uint32_t ldp_va = 0;
-        cpu_physical_memory_read(0x30A10, &ldp_va, 4);  /* XeImageFileName area has LDP ptr */
-        if (ldp_va == 0x002625A0) {
-            uint32_t pa = chihiro_va_to_pa(ldp_va);
-            if (pa != 0xFFFFFFFF) {
-                chihiro_ldp_pa = pa & ~0xFFF;
-                printf("[%07lld] Chihiro: LDP VA 0x%08X → PA 0x%05X\n",
-                       TS_MS, ldp_va, pa);
+    chihiro_quickreboot_pending = true;
 
-                /* Fill LDP now (before reset wipes page tables) */
-                uint32_t launch_type = 1;
-                cpu_physical_memory_write(pa, &launch_type, 4);
-                uint32_t title_id = 0;
-                cpu_physical_memory_write(pa + 4, &title_id, 4);
-                char launch_path[520] = {0};
-                snprintf(launch_path, sizeof(launch_path),
-                         "D:\\%s", chihiro_game_filename);
-                cpu_physical_memory_write(pa + 8, launch_path, 520);
-                printf("[%07lld] Chihiro: LDP filled: path='%s'\n",
-                       TS_MS, launch_path);
-            } else {
-                printf("[%07lld] Chihiro: LDP VA 0x%08X → UNMAPPED "
-                       "(will allocate after reboot)\n", TS_MS, ldp_va);
-                chihiro_ldp_pa = 0x262000;  /* default PA for LDP page */
-            }
+    /* Log LDP and plant canary in STICKY section to test preservation */
+    {
+        uint32_t ldp_ptr = 0;
+        cpu_physical_memory_read(0x3B3D8, &ldp_ptr, 4);
+        if(0) printf("[%07lld] Chihiro: PRE-QUICKREBOOT LDP diag:\n", TS_MS);
+        if(0) printf("  LaunchDataPage @PA 0x3B3D8 = 0x%08X\n", ldp_ptr);
+        if (ldp_ptr && ldp_ptr != 0xFFFFFFFF) {
+            uint32_t ldp_pa = (ldp_ptr & 0x0FFFFFFF);
+            uint8_t d[64];
+            cpu_physical_memory_read(ldp_pa, d, 64);
+            if(0) printf("  LDP page @PA 0x%07X:\n", ldp_pa);
+            if(0) printf("    +00: %02X%02X%02X%02X %02X%02X%02X%02X"
+                   " %02X%02X%02X%02X %02X%02X%02X%02X\n",
+                   d[0],d[1],d[2],d[3],d[4],d[5],d[6],d[7],
+                   d[8],d[9],d[10],d[11],d[12],d[13],d[14],d[15]);
+            if(0) printf("    +10: %02X%02X%02X%02X %02X%02X%02X%02X"
+                   " %02X%02X%02X%02X %02X%02X%02X%02X\n",
+                   d[16],d[17],d[18],d[19],d[20],d[21],d[22],d[23],
+                   d[24],d[25],d[26],d[27],d[28],d[29],d[30],d[31]);
+            if(0) printf("    +20: %02X%02X%02X%02X %02X%02X%02X%02X"
+                   " %02X%02X%02X%02X %02X%02X%02X%02X\n",
+                   d[32],d[33],d[34],d[35],d[36],d[37],d[38],d[39],
+                   d[40],d[41],d[42],d[43],d[44],d[45],d[46],d[47]);
+            if(0) printf("    +30: %02X%02X%02X%02X %02X%02X%02X%02X"
+                   " %02X%02X%02X%02X %02X%02X%02X%02X\n",
+                   d[48],d[49],d[50],d[51],d[52],d[53],d[54],d[55],
+                   d[56],d[57],d[58],d[59],d[60],d[61],d[62],d[63]);
+            char path[56] = {0};
+            memcpy(path, d + 8, 52);
+            if(0) printf("    type=%u path='%.52s'\n",
+                   *(uint32_t*)d, path);
         }
+        /* Canary at PA 0x3B400 (STICKY ends at 0x3B41F, well within range) */
+        uint32_t canary = 0xCAFEBABE;
+        cpu_physical_memory_write(0x3B400, &canary, 4);
+        if(0) printf("  CANARY written: 0xCAFEBABE @PA 0x3B400\n");
     }
+
+    /* Re-arm SEGABOOT patch scanner and reset port counters.
+     * QuickReboot reloads SEGABOOT from flash ROM (patches lost).
+     * Kernel code stays patched (QuickReboot keeps kernel in RAM). */
+    if (chihiro_lpc_global) {
+        ChihiroLPCState *s = chihiro_lpc_global;
+        s->usb_poll_patched = false;
+        timer_mod(s->usb_poll_patch_timer,
+                  qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 50);
+        s->lpc_401e_reads = 0;
+        s->mbcom_handshake_done = false;
+        s->lpc_40f0_reads = 0;
+        s->dimm_cmd_count = 0;
+        s->dimm_next_seq = 1;
+
+        if(0) printf("[%07lld] Chihiro: Re-armed SEGABOOT patch scanner\n", TS_MS);
+
+        chihiro_quickreboot_fast_diag = 0; /* disabled — diagnostics resolved */
+        timer_mod(s->diag_timer,
+                  qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 50);
+    }
+
+    /* PTE monitoring via DMA callbacks + data watchpoint armed after section 0 loads */
+    extern uint32_t pte_mon_last_pte;
+    extern int pte_mon_active;
+    pte_mon_last_pte = 0;
+    pte_mon_active = 0;
+    data_wp_armed = 0;
+    data_wp_hit_count = 0;
+    if(0) printf("[%07lld] PTE-MON: will track PTE for VA 0x135000 at DMA callbacks\n",
+           TS_MS);
 }
 
 /* Called from SMC handler when kernel writes SMC_REG_POWER (QuickReboot).
@@ -1741,7 +2264,7 @@ void chihiro_on_quickreboot_signal(void)
 bool chihiro_intercept_reset(void)
 {
     if (chihiro_active && chihiro_boot3_reached) {
-        printf("[%07lld] Chihiro: QuickReboot — letting real reset proceed "
+        if(0) printf("[%07lld] Chihiro: QuickReboot — letting real reset proceed "
                "(scratch_reg preserved for warm boot)\n", TS_MS);
         /* DON'T set game_running here — 0x40F0 handler sets it
          * AFTER applying kernel device patches. */
@@ -1749,6 +2272,10 @@ bool chihiro_intercept_reset(void)
     }
     return false;
 }
+
+/* warmboot_diag_cb removed — kernel handles QuickReboot natively via
+ * STICKY section (LaunchDataPage) and MmPersistContiguousMemory.
+ * See project_quickreboot_mechanism.md for details. */
 
 /* TEMPORARY: Simulates PIC baseboard (sp5001.bin) periodic STATUS
  * notifications. On real hardware, the PIC continuously reports
@@ -1760,28 +2287,72 @@ bool chihiro_intercept_reset(void)
  * sp5001.bin firmware for upstream LLE integration. */
 static void chihiro_dimm_event_timer_cb(void *opaque)
 {
+    perf_cnt_dimm_cb++;
     ChihiroLPCState *s = CHIHIRO_LPC_DEVICE(opaque);
 
-    if (s->dimm_resp[0] != 0) {
-        timer_mod(s->dimm_event_timer,
-                  qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 50);
-        return;
+    /* Periodic DMA slot scan — same logic as the port 0x40F0 handler.
+     * SEGABOOT's writes_3bc_3d4 sends STATUS commands via DMA slots,
+     * but stops reading port 0x40F0 after initial boot. Without this
+     * timer, those commands go unprocessed and app_obj+0x3BC is never
+     * set, blocking game launch when SERVICE button is released. */
+
+    static const struct { uint32_t slot_va; uint32_t meta_va; uint32_t stride; }
+        layouts[] = {
+            { 0xAA7B0, 0xAA790, 0x60 },  /* fpr-21042 */
+            { 0x89760, 0x89740, 0x40 },  /* fpr-23887 */
+        };
+
+    int processed = 0;
+    for (int layout = 0; layout < 2; layout++) {
+        uint32_t slot_base_pa = chihiro_va_to_pa(layouts[layout].slot_va);
+        if (slot_base_pa == 0xFFFFFFFF) continue;
+        uint32_t meta_base_pa = chihiro_va_to_pa(layouts[layout].meta_va);
+        if (meta_base_pa == 0xFFFFFFFF) continue;
+        if (slot_base_pa >= 0x800000 || meta_base_pa >= 0x800000) continue;
+
+        uint32_t stride = layouts[layout].stride;
+        for (int sl = 0; sl < 16; sl++) {
+            uint32_t data_pa = slot_base_pa + sl * stride;
+            uint32_t meta_pa = meta_base_pa + sl * stride;
+            if (data_pa + 4 >= 0x800000 || meta_pa + 12 >= 0x800000) continue;
+
+            uint8_t data_byte0;
+            uint16_t meta_marker;
+            cpu_physical_memory_read(data_pa, &data_byte0, 1);
+            cpu_physical_memory_read(meta_pa + 2, &meta_marker, 2);
+
+            if (data_byte0 == 0 || meta_marker != 0) continue;
+
+            uint16_t cmd_opcode = 0;
+            cpu_physical_memory_read(data_pa + 2, &cmd_opcode, 2);
+
+            uint32_t resp_data = 0, resp_data2 = 0;
+            switch (cmd_opcode) {
+            case 0x0001: resp_data = 0x20000000; break;
+            case 0x0100: resp_data = 5; resp_data2 = 100; break;
+            case 0x0101: resp_data = 0x0317; break;
+            case 0x0102: resp_data = 0x8002; break;
+            case 0x0103: resp_data = 0x6261632D; break;
+            default: break;
+            }
+
+            meta_marker = 0x0001;
+            cpu_physical_memory_write(meta_pa + 2, &meta_marker, 2);
+            cpu_physical_memory_write(meta_pa + 4, &resp_data, 4);
+            if (cmd_opcode == 0x0100)
+                cpu_physical_memory_write(meta_pa + 8, &resp_data2, 4);
+            s->mbcom_e0_status |= 0x05;
+            qemu_irq_raise(s->irq10);
+
+            if(0) printf("[%07lld] DIMM-SCAN: slot %d cmd=0x%04X resp=0x%08X\n",
+                   TS_MS, sl, cmd_opcode, resp_data);
+            processed++;
+        }
+        break;
     }
 
-    uint16_t seq = s->dimm_next_seq++;
-    memset(s->dimm_resp, 0, sizeof(s->dimm_resp));
-    s->dimm_resp[0] = seq;
-    s->dimm_resp[1] = 0x8100;  /* cmd 0x0100 (STATUS) | 0x8000 */
-    s->dimm_resp[2] = 5;       /* phase = READY */
-    s->dimm_resp[3] = 100;     /* completion = 100% */
-    s->dimm_resp_ready = true;
-
-    printf("[%07lld] DIMM event: injected STATUS (seq=%u phase=5 pct=100)\n",
-           TS_MS, seq);
-
-    /* Reschedule — SEGABOOT polls for fresh STATUS events continuously */
     timer_mod(s->dimm_event_timer,
-              qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 100);
+              qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 50);
 }
 
 static void chihiro_dimm_process_cmd(ChihiroLPCState *s)
@@ -1822,7 +2393,7 @@ static void chihiro_dimm_process_cmd(ChihiroLPCState *s)
     s->dimm_next_seq = seq + 1;
     s->dimm_cmd_count++;
 
-    printf("[%07lld] DIMM mailbox: cmd=0x%04X seq=%u resp[2]=0x%08X\n",
+    if(0) printf("[%07lld] DIMM mailbox: cmd=0x%04X seq=%u resp[2]=0x%08X\n",
            TS_MS, cmd, seq, s->dimm_resp[2]);
 
     /* After the initial 5-command handshake (SIZE, FW_VER, SERIAL,
@@ -1830,7 +2401,7 @@ static void chihiro_dimm_process_cmd(ChihiroLPCState *s)
     if (s->dimm_cmd_count == 5 && s->dimm_event_timer) {
         timer_mod(s->dimm_event_timer,
                   qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 100);
-        printf("[%07lld] DIMM event: scheduled STATUS injection in 100ms\n",
+        if(0) printf("[%07lld] DIMM event: scheduled STATUS injection in 100ms\n",
                TS_MS);
     }
 }
@@ -1838,6 +2409,7 @@ static void chihiro_dimm_process_cmd(ChihiroLPCState *s)
 static uint64_t chihiro_lpc_io_read(void *opaque, hwaddr addr,
                                     unsigned size)
 {
+    perf_cnt_lpc_read++;
     uint64_t r = 0;
 
     ChihiroLPCState *s = CHIHIRO_LPC_DEVICE(opaque);
@@ -1875,21 +2447,27 @@ static uint64_t chihiro_lpc_io_read(void *opaque, hwaddr addr,
         default: r = 0; break;
         }
         if (CHIHIRO_LOG) {
-            printf("[%07lld] chihiro lpc reg read  [0x%08X] -> 0x%08X\n", TS_MS,
+            if(0) printf("[%07lld] chihiro lpc reg read  [0x%08X] -> 0x%08X\n", TS_MS,
                    s->lpc_reg_addr, (unsigned)r);
         }
         return r;
     case SEGA_FIRMWARE_VERSION:
-        /* TEMPORARY: DIMM base address low word. On real hardware, read
-         * from baseboard PIC registers populated by sp5001.bin firmware.
-         * TODO: Replace with PIC16 emulation for upstream LLE. */
-        r = 0x0000;
+        /* SEGABOOT reads these once for DIMM base address calculation.
+         * Game XBE reads them again and checks for "XBAM" signature.
+         * First read pair returns DIMM base, subsequent reads return XBAM. */
+        if (s->lpc_401e_reads > 0) {
+            r = 0x4258;     /* "XB" — game checks CONCAT22(0x4020,0x401E) == "XBAM" */
+        } else {
+            r = 0x0000;     /* DIMM base address low word for SEGABOOT */
+        }
         s->lpc_401e_reads++;
         break;
     case SEGA_XBAM_STRING_0:
-        /* TEMPORARY: DIMM base address high word + XBAM signature.
-         * TODO: Replace with PIC16 emulation for upstream LLE. */
-        r = 0x0100;     /* 0x0100 << 16 = 0x01000000 */
+        if (s->lpc_401e_reads > 1) {
+            r = 0x4D41;     /* "AM" — completes "XBAM" at 0x401E-0x4020 */
+        } else {
+            r = 0x0100;     /* DIMM base address high word for SEGABOOT */
+        }
         break;
     case SEGA_XBAM_STRING_1:
         r = 0x4258;     /* "BX" */
@@ -1911,63 +2489,9 @@ static uint64_t chihiro_lpc_io_read(void *opaque, hwaddr addr,
             r = 0x0000;  /* Handshake not yet done: upper byte=0 = init phase */
         }
         s->lpc_40f0_reads++;
-        /* Detect game XBE reboot: if SEGABOOT already reached boot=3
-         * and the kernel re-reads 0x40F0, the game XBE is initializing.
-         * Disable DMA scan immediately to prevent memory corruption. */
-        if (chihiro_boot3_reached && !chihiro_game_running) {
-            chihiro_game_running = true;
-
-            /* v209d: Re-create the LDP PTE in the kernel's NEW page tables.
-             * QuickReboot re-initializes page tables, wiping our PTE from
-             * boot=3. But the physical data at PA 0x262000 survived.
-             * We must re-map it NOW, before the kernel reads the LDP
-             * (which happens right after this 0x40F0 read). */
-            if (chihiro_ldp_pa != 0xFFFFFFFF && chihiro_ldp_pa != 0) {
-                uint32_t ldp_page = chihiro_ldp_pa & ~0xFFF;
-                uint32_t pte_idx = (0x002625A0 >> 12) & 0x3FF;
-                uint32_t pde;
-                cpu_physical_memory_read(0xF000, &pde, 4);  /* kernel CR3 */
-                uint32_t pt_base = pde & 0xFFFFF000;
-                uint32_t pte_addr = pt_base + pte_idx * 4;
-                uint32_t new_pte = ldp_page | 0x067;
-                cpu_physical_memory_write(pte_addr, &new_pte, 4);
-
-                /* Verify LDP data survived QuickReboot */
-                uint32_t check_type = 0;
-                cpu_physical_memory_read(chihiro_ldp_pa, &check_type, 4);
-                if (check_type == 0) {
-                    /* Data was cleared — re-fill */
-                    uint32_t launch_type = 1;
-                    cpu_physical_memory_write(chihiro_ldp_pa, &launch_type, 4);
-                    uint32_t title_id = 0;
-                    cpu_physical_memory_write(chihiro_ldp_pa + 4, &title_id, 4);
-                    char lp[520] = {0};
-                    snprintf(lp, sizeof(lp), "D:\\%s", chihiro_game_filename);
-                    cpu_physical_memory_write(chihiro_ldp_pa + 8, lp, 520);
-                    printf("[%07lld] Chihiro: Re-created PTE + re-filled LDP "
-                           "after QuickReboot: path='%s'\n", TS_MS, lp);
-                } else {
-                    printf("[%07lld] Chihiro: Re-created PTE (LDP data survived "
-                           "QuickReboot, type=%u)\n", TS_MS, check_type);
-                }
-            }
-
-            /* Set the MediaBoard gate flag [VA 0x8003A93C] = 1.
-             *
-             * The arcdkrnl checks this flag to decide whether to call
-             * MediaBoard partition init (creates \Device\MediaBoard,
-             * CdRom0, D:\). On real hardware, HalReturnToFirmware sets
-             * it during QuickReboot. Our SEGABOOT patches prevent the
-             * proper QuickReboot path, leaving the flag at 0.
-             *
-             * This LPC read happens inside the SAME kernel function that
-             * checks the gate 0x3A bytes later. The write is immediately
-             * visible to the CPU when it reaches the check. */
-            uint8_t gate_val = 1;
-            address_space_write(&address_space_memory, 0x3A93C,
-                                MEMTXATTRS_UNSPECIFIED, &gate_val, 1);
-
-            /* v209d: Patch kernel to force MediaBoard driver init.
+        /* Kernel patches on port 0x40F0 reads. */
+        {
+            /* Patch kernel to force MediaBoard driver init.
              *
              * The MediaBoard driver has two gate checks that SKIP device
              * creation when gate=1 (assumes devices persisted via
@@ -1984,90 +2508,131 @@ static uint64_t chihiro_lpc_io_read(void *opaque, hwaddr addr,
             {
                 uint8_t nop2[2] = {0x90, 0x90};
                 uint8_t check[2];
+                bool kernel_reloaded = false;
 
                 cpu_physical_memory_read(0x30905, check, 2);
                 if (check[0] == 0x75 && check[1] == 0x25) {
                     cpu_physical_memory_write(0x30905, nop2, 2);
-                    printf("[%07lld] Chihiro: Kernel patch 1: NOP JNE @ PA 0x30905 "
+                    kernel_reloaded = true;
+                    if(0) printf("[%07lld] Chihiro: Kernel patch 1: NOP JNE @ PA 0x30905 "
                            "(force MediaBoard device creation)\n", TS_MS);
                 }
 
                 cpu_physical_memory_read(0x309AD, check, 2);
                 if (check[0] == 0x75 && check[1] == 0x0A) {
                     cpu_physical_memory_write(0x309AD, nop2, 2);
-                    printf("[%07lld] Chihiro: Kernel patch 2: NOP JNE @ PA 0x309AD "
+                    kernel_reloaded = true;
+                    if(0) printf("[%07lld] Chihiro: Kernel patch 2: NOP JNE @ PA 0x309AD "
                            "(force partition init)\n", TS_MS);
                 }
 
-                /* Patch 3: create_partitions skips D:\ when MB_FLAG=1.
-                 * The port 0x40F0 handler sets MB_FLAG=1 BEFORE calling
-                 * create_partitions, so D:\ is NEVER created. */
                 cpu_physical_memory_read(0x25B1B, check, 2);
                 if (check[0] == 0x75 && check[1] == 0x17) {
                     cpu_physical_memory_write(0x25B1B, nop2, 2);
-                    printf("[%07lld] Chihiro: Kernel patch 3: NOP JNE @ PA 0x25B1B "
+                    kernel_reloaded = true;
+                    if(0) printf("[%07lld] Chihiro: Kernel patch 3: NOP JNE @ PA 0x25B1B "
                            "(force D:\\ symlink creation)\n", TS_MS);
                 }
 
-                /* Patch 4: create_partitions skips mbcom when MB_FLAG=1 */
                 cpu_physical_memory_read(0x25AAB, check, 2);
                 if (check[0] == 0x75 && check[1] == 0x18) {
                     cpu_physical_memory_write(0x25AAB, nop2, 2);
-                    printf("[%07lld] Chihiro: Kernel patch 4: NOP JNE @ PA 0x25AAB "
+                    kernel_reloaded = true;
+                    if(0) printf("[%07lld] Chihiro: Kernel patch 4: NOP JNE @ PA 0x25AAB "
                            "(force mbcom partition creation)\n", TS_MS);
                 }
-            }
 
-            /* Second RAM dump: after QuickReboot, patches applied.
-             * This captures the GAME state, not SEGABOOT state. */
-            {
-                FILE *f = fopen("/tmp/ram_game.bin", "wb");
-                if (f) {
-                    uint8_t page[4096];
-                    for (uint32_t pa = 0; pa < 0x800000; pa += 4096) {
-                        cpu_physical_memory_read(pa, page, 4096);
-                        fwrite(page, 1, 4096, f);
+                if (kernel_reloaded && s->usb_poll_patched) {
+                    s->usb_poll_patched = false;
+                    timer_mod(s->usb_poll_patch_timer,
+                              qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 50);
+                    s->eeprom_hack_applied = false;
+                    timer_mod(s->eeprom_hack_timer,
+                              qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 1);
+                    if(0) printf("[%07lld] Chihiro: Kernel reloaded — "
+                           "re-arming patches\n", TS_MS);
+                }
+
+                if (chihiro_quickreboot_pending) {
+                    chihiro_quickreboot_pending = false;
+                    uint32_t ldp_ptr = 0;
+                    cpu_physical_memory_read(0x3B3D8, &ldp_ptr, 4);
+                    if(0) printf("[%07lld] Chihiro: POST-QUICKREBOOT LDP diag:\n",
+                           TS_MS);
+                    if(0) printf("  LaunchDataPage @PA 0x3B3D8 = 0x%08X\n",
+                           ldp_ptr);
+                    if (ldp_ptr && ldp_ptr != 0xFFFFFFFF) {
+                        uint32_t ldp_pa = (ldp_ptr & 0x0FFFFFFF);
+                        uint8_t ldp_data[0x410];
+                        cpu_physical_memory_read(ldp_pa, ldp_data, sizeof(ldp_data));
+                        char path[256]; memset(path, 0, sizeof(path));
+                        memcpy(path, ldp_data + 8, 255);
+                        uint32_t lt = *(uint32_t*)ldp_data;
+                        if(0) printf("  LDP@PA0x%07X: type=%u path='%s'\n",
+                               ldp_pa, lt, path);
+                        if (lt == 1) {
+                            uint32_t ec = *(uint32_t*)(ldp_data + 0x400);
+                            uint32_t et = *(uint32_t*)(ldp_data + 0x408);
+                            if(0) printf("  LDP ERROR: ctx=%u typ=%u\n", ec, et);
+                        }
                     }
-                    fclose(f);
-                    printf("[%07lld] Chihiro: Game RAM dump saved to /tmp/ram_game.bin "
-                           "(8MB)\n", TS_MS);
+                    uint8_t khqb = 0;
+                    cpu_physical_memory_read(0x3A93C, &khqb, 1);
+                    if(0) printf("  KeHasQuickBooted @PA 0x3A93C = %u\n", khqb);
+                    /* Check canary in STICKY section */
+                    uint32_t canary = 0;
+                    cpu_physical_memory_read(0x3B400, &canary, 4);
+                    if(0) printf("  CANARY @PA 0x3B400 = 0x%08X (%s)\n",
+                           canary,
+                           canary == 0xCAFEBABE ? "STICKY SURVIVED" :
+                           canary == 0 ? "ZEROED — STICKY NOT PRESERVED" :
+                           "CORRUPTED");
+                    /* Also check LDP page content even though pointer is NULL */
+                    uint8_t page_check[16];
+                    cpu_physical_memory_read(0x7FCD000, page_check, 16);
+                    if(0) printf("  LDP page @PA 0x7FCD000 (raw): "
+                           "%02X%02X%02X%02X %02X%02X%02X%02X "
+                           "%02X%02X%02X%02X %02X%02X%02X%02X\n",
+                           page_check[0], page_check[1],
+                           page_check[2], page_check[3],
+                           page_check[4], page_check[5],
+                           page_check[6], page_check[7],
+                           page_check[8], page_check[9],
+                           page_check[10], page_check[11],
+                           page_check[12], page_check[13],
+                           page_check[14], page_check[15]);
                 }
             }
 
-            /* v209b: Check if XLaunchNewImage filled the LDP (PTE was created
-             * at boot=3). If it did, great. If not, fill it manually. */
             {
-                uint32_t ldp_pa = chihiro_ldp_pa;
-                if (ldp_pa != 0xFFFFFFFF && ldp_pa != 0) {
-                    uint32_t existing_type = 0;
-                    cpu_physical_memory_read(ldp_pa, &existing_type, 4);
-                    if (existing_type != 0) {
-                        char existing_path[64] = {0};
-                        cpu_physical_memory_read(ldp_pa + 8, existing_path, 60);
-                        printf("[%07lld] Chihiro: LDP filled by XLaunchNewImage:"
-                               " type=%u path='%s'\n",
-                               TS_MS, existing_type, existing_path);
-                    } else if (chihiro_game_filename[0]) {
-                        uint32_t launch_type = 1;
-                        cpu_physical_memory_write(ldp_pa, &launch_type, 4);
-                        uint32_t title_id = 0;
-                        cpu_physical_memory_write(ldp_pa + 4, &title_id, 4);
-                        char launch_path[520] = {0};
-                        snprintf(launch_path, sizeof(launch_path),
-                                 "D:\\%s", chihiro_game_filename);
-                        cpu_physical_memory_write(ldp_pa + 8, launch_path, 520);
-                        printf("[%07lld] Chihiro: Filled LDP manually (PA 0x%08X):"
-                               " path='%s'\n", TS_MS, ldp_pa, launch_path);
-                    } else {
-                        printf("[%07lld] Chihiro: WARNING — LDP empty, no filename\n", TS_MS);
+                uint32_t ldp_snap = 0, canary_snap = 0;
+                cpu_physical_memory_read(0x3B3D8, &ldp_snap, 4);
+                cpu_physical_memory_read(0x3B400, &canary_snap, 4);
+                uint32_t region_snap = 0;
+                cpu_physical_memory_read(0x3B1D8, &region_snap, 4);
+                if(0) printf("[%07lld] Chihiro: port 0x40F0 read #%u — "
+                       "LDP=0x%08X canary=0x%08X XboxGameRegion=0x%08X\n",
+                       TS_MS, s->lpc_40f0_reads, ldp_snap, canary_snap,
+                       region_snap);
+                if (ldp_snap && ldp_snap != 0xFFFFFFFF) {
+                    uint32_t ldp_pa = ldp_snap & 0x0FFFFFFF;
+                    uint8_t ldp_full[0x410];
+                    cpu_physical_memory_read(ldp_pa, ldp_full, sizeof(ldp_full));
+                    uint32_t launch_type = *(uint32_t*)ldp_full;
+                    uint32_t launch_flags = *(uint32_t*)(ldp_full + 0x210);
+                    char path[256]; memset(path, 0, sizeof(path));
+                    memcpy(path, ldp_full + 8, 255);
+                    if(0) printf("  LDP@PA0x%07X: type=%u flags=0x%X path='%s'\n",
+                           ldp_pa, launch_type, launch_flags, path);
+                    if (launch_type == 1) {
+                        uint32_t err_ctx = *(uint32_t*)(ldp_full + 0x400);
+                        uint32_t err_typ = *(uint32_t*)(ldp_full + 0x408);
+                        if(0) printf("  LDP ERROR: context=%u type=%u "
+                               "(1=generic 3=region 5=media)\n",
+                               err_ctx, err_typ);
                     }
-                } else {
-                    printf("[%07lld] Chihiro: WARNING — LDP PA unavailable\n", TS_MS);
                 }
             }
-
-            printf("[%07lld] Chihiro: game XBE detected (0x40F0 re-read after boot=3)"
-                   " — set gate [0x8003A93C]=1, DMA scan disabled\n", TS_MS);
         }
         break;
     case SEGA_DIMM_SIZE:
@@ -2096,7 +2661,7 @@ static uint64_t chihiro_lpc_io_read(void *opaque, hwaddr addr,
     }
 
     if (CHIHIRO_LOG && addr != 0x26 && addr != 0xE0 && addr != 0xF0 && addr != 0xF4) {
-        printf("[%07lld] chihiro lpc read  [0x%04x] -> 0x%04x (size=%d)\n", TS_MS,
+        if(0) printf("[%07lld] chihiro lpc read  [0x%04x] -> 0x%04x (size=%d)\n", TS_MS,
                (unsigned)(addr + 0x4000), (unsigned)r, size);
     }
     return r;
@@ -2108,19 +2673,20 @@ static void chihiro_mbcom_process(void);
 static void chihiro_lpc_io_write(void *opaque, hwaddr addr, uint64_t val,
                                  unsigned size)
 {
+    perf_cnt_lpc_write++;
 
     ChihiroLPCState *s = CHIHIRO_LPC_DEVICE(opaque);
 
     /* Log writes (suppress polling spam: 0x4026 scratch, 0x40E0 ack, 0x40E1 trigger) */
     if (addr != 0x26 && addr != 0xE0 && addr != 0xE1) {
-        printf("[%07lld] chihiro lpc write [0x%04x] <- 0x%04x (size=%d)\n", TS_MS,
+        if(0) printf("[%07lld] chihiro lpc write [0x%04x] <- 0x%04x (size=%d)\n", TS_MS,
                (unsigned)(addr + 0x4000), (unsigned)val, size);
     }
     if (addr == 0xE1) {
         static uint32_t e1_write_count = 0;
         e1_write_count++;
         if (e1_write_count <= 3 || e1_write_count % 100 == 0) {
-            printf("[%07lld] chihiro lpc write [0x40e1] <- 0x%04x (#%u)\n",
+            if(0) printf("[%07lld] chihiro lpc write [0x40e1] <- 0x%04x (#%u)\n",
                    TS_MS, (unsigned)val, e1_write_count);
         }
     }
@@ -2171,11 +2737,11 @@ static void chihiro_lpc_io_write(void *opaque, hwaddr addr, uint64_t val,
             break;
         }
         if (s->lpc_reg_addr != 0xA0000000 || s->bb_dma_count <= 8) {
-            printf("[%07lld] chihiro lpc reg write [0x%08X] <- 0x%08X",
+            if(0) printf("[%07lld] chihiro lpc reg write [0x%08X] <- 0x%08X",
                    TS_MS, s->lpc_reg_addr, (unsigned)val);
             if (s->bb_dma_active && s->lpc_reg_addr == 0xA0000000)
-                printf(" (dma #%u)", s->bb_dma_count);
-            printf("\n");
+                if(0) printf(" (dma #%u)", s->bb_dma_count);
+            if(0) printf("\n");
         }
         return;
     case 0x04: /* Port 0x4004: set register address */
@@ -2187,7 +2753,7 @@ static void chihiro_lpc_io_write(void *opaque, hwaddr addr, uint64_t val,
         s->lpc_scratch_4026 = (uint16_t)val;
         if (val == 0x0102) {
             s->mbcom_handshake_done = true;
-            printf("[%07lld] Chihiro: Handshake complete (0x4026 <- 0x0102)\n", TS_MS);
+            if(0) printf("[%07lld] Chihiro: Handshake complete (0x4026 <- 0x0102)\n", TS_MS);
         }
         break;
     case SEGA_IRQ10_ACK:  /* 0xE0 — ack: clear specific bits */
@@ -2206,14 +2772,14 @@ static void chihiro_lpc_io_write(void *opaque, hwaddr addr, uint64_t val,
                 chihiro_mbcom_process();
                 s->mbcom_e0_status |= 0x01;
                 qemu_irq_raise(s->irq10);
-                printf("[%07lld] Chihiro: LPC trigger 0x40E1=0x%04X → "
+                if(0) printf("[%07lld] Chihiro: LPC trigger 0x40E1=0x%04X → "
                        "PROCESS cmd=%02X%02X status=0x%02X + IRQ10 (#%d)\n",
                        TS_MS, (unsigned)val,
                        chihiro_mbcom_command[0], chihiro_mbcom_command[1],
                        s->mbcom_e0_status, e1_trigger_count);
             } else {
                 if (e1_trigger_count <= 3 || e1_trigger_count % 500 == 0) {
-                    printf("[%07lld] Chihiro: LPC trigger 0x40E1=0x%04X → "
+                    if(0) printf("[%07lld] Chihiro: LPC trigger 0x40E1=0x%04X → "
                            "no pending cmd, skip (#%d)\n",
                            TS_MS, (unsigned)val, e1_trigger_count);
                 }
@@ -2298,7 +2864,7 @@ void chihiro_load_flash_rom(const char *bios_path)
                 chihiro_flash_rom = (uint8_t *)g_malloc0(sz);
                 if (fread(chihiro_flash_rom, 1, sz, f) == (size_t)sz) {
                     chihiro_flash_rom_size = sz;
-                    printf("[%07lld] Chihiro: Loaded flash ROM '%s' (%u bytes)\n",
+                    if(0) printf("[%07lld] Chihiro: Loaded flash ROM '%s' (%u bytes)\n",
                            TS_MS, path, (unsigned)sz);
                 } else {
                     g_free(chihiro_flash_rom);
@@ -2309,44 +2875,349 @@ void chihiro_load_flash_rom(const char *bios_path)
             if (chihiro_flash_rom) return;
         }
     }
-    printf("[%07lld] Chihiro: No flash ROM found (fpr-23887/fpr21042). "
+    if(0) printf("[%07lld] Chihiro: No flash ROM found (fpr-23887/fpr21042). "
            "Will fall through to baseboard.img for mbrom reads.\n", TS_MS);
 }
 
 static void chihiro_irq10_timer_cb(void *opaque)
 {
     ChihiroLPCState *s = opaque;
+    perf_cnt_irq10_cb++;
+
+    /* EIP histogram: sample every tick to find spin loops */
+    #define EIP_HIST_SIZE 512
+    static struct { uint32_t eip; uint32_t count; } eip_hist[EIP_HIST_SIZE];
+    static int eip_hist_used = 0;
+    static uint32_t max_frame_func = 0;
+    static uint32_t caller_of_63410 = 0;
+    static uint32_t caller_esp = 0;
+    {
+        CPUState *cs = first_cpu;
+        if (cs) {
+            CPUX86State *env = &X86_CPU(cs)->env;
+            uint32_t eip = (uint32_t)env->eip;
+            uint32_t esp = (uint32_t)env->regs[R_ESP];
+            int found = -1;
+            for (int i = 0; i < eip_hist_used; i++) {
+                if (eip_hist[i].eip == eip) { found = i; break; }
+            }
+            if (found >= 0) {
+                eip_hist[found].count++;
+            } else if (eip_hist_used < EIP_HIST_SIZE) {
+                eip_hist[eip_hist_used].eip = eip;
+                eip_hist[eip_hist_used].count = 1;
+                eip_hist_used++;
+            }
+            /* Track max frame_func_ptr across all ticks */
+            uint32_t ffp_pa = chihiro_va_to_pa(0x00279f94);
+            if (ffp_pa != 0xFFFFFFFF) {
+                uint32_t ffp = 0;
+                cpu_physical_memory_read(ffp_pa, &ffp, 4);
+                if (ffp > max_frame_func) max_frame_func = ffp;
+            }
+            /* When EIP is in FUN_00063410, capture context */
+            if (eip >= 0x63410 && eip < 0x63500 && caller_of_63410 == 0) {
+                caller_esp = esp;
+                /* Try both ESP+4 and translating through 0x80000000 mask */
+                uint32_t try_esp = esp & 0x7FFFFFFF;
+                uint32_t esp_pa = chihiro_va_to_pa(try_esp + 4);
+                if (esp_pa == 0xFFFFFFFF) {
+                    esp_pa = chihiro_va_to_pa(esp + 4);
+                }
+                if (esp_pa != 0xFFFFFFFF) {
+                    cpu_physical_memory_read(esp_pa, &caller_of_63410, 4);
+                } else {
+                    /* Direct physical read: strip D0 prefix */
+                    uint32_t phys = (esp & 0x0FFFFFFF) + 4;
+                    if (phys < 0x08000000) {
+                        cpu_physical_memory_read(phys, &caller_of_63410, 4);
+                    }
+                }
+            }
+        }
+    }
+
+    if (!perf_dumped && chihiro_game_running) {
+        if (perf_start_time == 0) perf_start_time = time(NULL);
+        if (time(NULL) - perf_start_time >= 20) {
+            perf_dumped = true;
+            extern uint64_t perf_cnt_vblank;
+            extern uint32_t perf_pcrtc_enabled;
+            extern void chihiro_usb_get_jvs_counters(uint64_t *send, uint64_t *recv, uint64_t *recv_data);
+            uint64_t jvs_s = 0, jvs_r = 0, jvs_rd = 0;
+            chihiro_usb_get_jvs_counters(&jvs_s, &jvs_r, &jvs_rd);
+            printf("=== PERF COUNTERS (30s wall-clock, TS=%lld ms) ===\n"
+                   "irq10_cb:    %lu\n"
+                   "diag_cb:     %lu\n"
+                   "dimm_cb:     %lu\n"
+                   "lpc_read:    %lu\n"
+                   "lpc_write:   %lu\n"
+                   "ide_read:    %lu\n"
+                   "ohci_frame:  %lu\n"
+                   "ohci_td:     %lu\n"
+                   "usb_handle:  %lu\n"
+                   "usb_control: %lu\n"
+                   "vblank:      %lu  (pcrtc_en=0x%X)\n"
+                   "game_running: %d\n"
+                   "jvs_send:    %lu\n"
+                   "jvs_recv:    %lu  (with_data=%lu)\n",
+                   TS_MS,
+                   (unsigned long)perf_cnt_irq10_cb,
+                   (unsigned long)perf_cnt_diag_cb,
+                   (unsigned long)perf_cnt_dimm_cb,
+                   (unsigned long)perf_cnt_lpc_read,
+                   (unsigned long)perf_cnt_lpc_write,
+                   (unsigned long)perf_cnt_ide_read,
+                   (unsigned long)perf_cnt_ohci_frame,
+                   (unsigned long)perf_cnt_ohci_td,
+                   (unsigned long)perf_cnt_usb_handle,
+                   (unsigned long)perf_cnt_usb_control,
+                   (unsigned long)perf_cnt_vblank, perf_pcrtc_enabled,
+                   (int)chihiro_game_running,
+                   (unsigned long)jvs_s,
+                   (unsigned long)jvs_r, (unsigned long)jvs_rd);
+            { extern void chihiro_usb_dump_vendor_histogram(void);
+              chihiro_usb_dump_vendor_histogram(); }
+            printf("=== EIP HISTOGRAM (top 10) ===\n");
+            for (int rank = 0; rank < 10 && rank < eip_hist_used; rank++) {
+                int max_idx = -1;
+                uint32_t max_count = 0;
+                for (int i = 0; i < eip_hist_used; i++) {
+                    if (eip_hist[i].count > max_count) {
+                        max_count = eip_hist[i].count;
+                        max_idx = i;
+                    }
+                }
+                if (max_idx >= 0) {
+                    printf("  #%d: EIP=0x%08X  count=%u  (%.1f%%)\n",
+                           rank + 1, eip_hist[max_idx].eip, max_count,
+                           perf_cnt_irq10_cb > 0 ? 100.0 * max_count / perf_cnt_irq10_cb : 0.0);
+                    eip_hist[max_idx].count = 0;
+                }
+            }
+            printf("(%d unique EIPs sampled)\n"
+                   "================================\n", eip_hist_used);
+
+            /* One-shot game state dump: read key addresses from guest RAM */
+            static const struct { uint32_t va; const char *name; int size; } gstate[] = {
+                { 0x0027a410, "state_dispatch", 4 },
+                { 0x0027a188, "game_active",    4 },
+                { 0x0027a180, "pause_flag",     2 },
+                { 0x0027a730, "game_running",   4 },
+                { 0x00276b60, "tick_counter",   4 },
+                { 0x004d2a11, "mediaboard_st",  1 },
+                { 0x0027a124, "task_list_head", 4 },
+                { 0x00279f94, "frame_func_ptr", 4 },
+                { 0x004fc740, "sched_cur_ent",  4 },
+                { 0x002cb8e8, "config_ptr",     4 },
+                { 0x00276404, "error_code",     4 },
+                { 0x0027712c, "render_frames",  4 },
+                { 0x0027a10c, "sync_counter",   4 },
+                { 0x00276450, "sync_counter2",  4 },
+                { 0x002cb4d0, "speed_mode",     4 },
+                { 0x0027a1a0, "player_count",   4 },
+                { 0x00276c30, "post_d3dreset",  4 },
+                { 0x0030cf98, "d3d_device",     4 },
+                { 0x00217fc8, "aclib_ptr",      4 },
+                { 0x004bc540, "ac_thread",      4 },
+                { 0x004bc5dc, "jvs_state",      4 },
+                { 0x004bc5c8, "jvs_succ_cnt",   4 },
+                { 0x004bc5c4, "jvs_err_cnt",    4 },
+                { 0x004be160, "jvs_max_retry",  4 },
+                { 0x004bc5d8, "jvs_done_flag",  4 },
+                { 0x004cbd90, "jvs_usb_ready",  4 },
+            };
+            printf("=== GAME STATE DUMP ===\n");
+            for (int i = 0; i < (int)(sizeof(gstate)/sizeof(gstate[0])); i++) {
+                uint32_t pa = chihiro_va_to_pa(gstate[i].va);
+                uint32_t val = 0;
+                if (pa != 0xFFFFFFFF) {
+                    cpu_physical_memory_read(pa, &val, gstate[i].size);
+                    printf("  [VA=0x%08X PA=0x%08X] %-15s = 0x%X (%d)\n",
+                           gstate[i].va, pa, gstate[i].name, val, (int)val);
+                } else {
+                    printf("  [VA=0x%08X] %-15s = <UNMAPPED>\n",
+                           gstate[i].va, gstate[i].name);
+                }
+            }
+            /* Also dump 16 raw bytes at two key addresses for verification */
+            for (int k = 0; k < 2; k++) {
+                uint32_t check_va = (k == 0) ? 0x0027a410 : 0x004d2a11;
+                uint32_t check_pa = chihiro_va_to_pa(check_va);
+                printf("  RAW[0x%08X]: PA=0x%08X ", check_va, check_pa);
+                if (check_pa != 0xFFFFFFFF) {
+                    uint8_t raw[16];
+                    cpu_physical_memory_read(check_pa, raw, 16);
+                    for (int b = 0; b < 16; b++) printf("%02X ", raw[b]);
+                } else {
+                    printf("UNMAPPED");
+                }
+                printf("\n");
+            }
+            /* Verify runtime code at EIP 0x63430 vs Ghidra */
+            {
+                uint32_t code_pa = chihiro_va_to_pa(0x00063410);
+                printf("  CODE[VA=0x63410 PA=0x%08X]: ", code_pa);
+                if (code_pa != 0xFFFFFFFF) {
+                    uint8_t code[48];
+                    cpu_physical_memory_read(code_pa, code, 48);
+                    for (int b = 0; b < 48; b++) printf("%02X ", code[b]);
+                    /* Ghidra expects: 56 8B F1 E8 B8 F4 FF FF 0F BF 86 80 04 ... */
+                    printf("\n  MATCH: %s",
+                        (code[0]==0x56 && code[1]==0x8B && code[2]==0xF1) ?
+                        "YES (FUN_00063410)" : "NO — DIFFERENT CODE AT RUNTIME!");
+                } else {
+                    printf("UNMAPPED");
+                }
+                printf("\n");
+                /* Also check XBE entry point */
+                uint32_t ep_pa = chihiro_va_to_pa(0x10128);
+                uint32_t ep = 0;
+                if (ep_pa != 0xFFFFFFFF) {
+                    cpu_physical_memory_read(ep_pa, &ep, 4);
+                }
+                printf("  XBE_ENTRY = 0x%08X\n", ep);
+                /* Check game_main_loop (0xb1100) — read first 4 bytes */
+                uint32_t gml_pa = chihiro_va_to_pa(0x000b1100);
+                printf("  game_main_loop[VA=0xB1100 PA=0x%08X]: ", gml_pa);
+                if (gml_pa != 0xFFFFFFFF) {
+                    uint8_t gml[4];
+                    cpu_physical_memory_read(gml_pa, gml, 4);
+                    printf("%02X %02X %02X %02X", gml[0], gml[1], gml[2], gml[3]);
+                    /* Ghidra expects: 83 EC 40 (SUB ESP,0x40) */
+                    printf(" %s", (gml[0]==0x83 && gml[1]==0xEC && gml[2]==0x40) ?
+                        "MATCH" : "MISMATCH");
+                } else {
+                    printf("UNMAPPED");
+                }
+                printf("\n");
+            }
+            printf("  max_frame_func_ptr = 0x%08X\n", max_frame_func);
+            printf("  CALLER of FUN_63410: ret_addr=0x%08X (ESP was 0x%08X)\n",
+                   caller_of_63410, caller_esp);
+            /* Walk stack using physical address (strip 0xD0 prefix if needed) */
+            {
+                uint32_t base_phys = (caller_esp & 0x0FFFFFFF);
+                if (base_phys < 0x08000000) {
+                    printf("  STACK[phys=0x%06X]:", base_phys);
+                    for (int si = 0; si < 32; si++) {
+                        uint32_t slot = 0;
+                        cpu_physical_memory_read(base_phys + si * 4, &slot, 4);
+                        if (slot >= 0x10000 && slot < 0x200000) {
+                            printf(" [+%02X]=0x%08X", si*4, slot);
+                        }
+                    }
+                    printf("\n");
+                }
+            }
+            printf("=======================\n");
+        }
+    }
 
     if (s->eeprom_hack_applied && !chihiro_game_running) {
         qemu_irq_raise(s->irq10);
     }
 
-    /* Kernel probe: watch IRP_MJ_CREATE for MediaBoard (PA of 0x8002535A) */
-    if (chihiro_mbcom_enabled && !chihiro_game_running) {
-        static uint32_t irp_create_hit = 0, ntcreate_hit = 0;
-        static uint32_t eip_rb = 0, eip_w3bc = 0;
-        static int eip_tick = 0;
-        CPUState *cs = first_cpu;
-        if (cs) {
-            uint32_t e = (uint32_t)X86_CPU(cs)->env.eip;
-            if (e >= 0x8002535A && e < 0x80025400) {
-                if (irp_create_hit++ < 5)
-                    printf("[%07lld] KERNEL-IRP-CREATE: hit! EIP=0x%08X #%u\n",
-                           TS_MS, e, irp_create_hit);
+    /* Game XBE detection: compare XBE entry point at VA 0x10000+0x128.
+     * SEGABOOT is loaded multiple times (service menu → game boot).
+     * The game XBE has a DIFFERENT entry point than SEGABOOT.
+     * Only set game_running when the entry point changes. */
+    if (!chihiro_game_running && chihiro_active) {
+        static uint32_t segaboot_entry = 0;
+        static int xbe_check_tick = 0;
+        if (++xbe_check_tick % 31 == 0) { /* ~every 0.5s */
+            uint32_t entry_pa = chihiro_va_to_pa(0x10000 + 0x128);
+            if (entry_pa != 0xFFFFFFFF) {
+                uint32_t cur_entry = 0;
+                cpu_physical_memory_read(entry_pa, &cur_entry, 4);
+                if (cur_entry > 0x10000 && cur_entry < 0x08000000) {
+                    if (segaboot_entry == 0) {
+                        segaboot_entry = cur_entry;
+                        if(0) printf("[%07lld] Chihiro: SEGABOOT entry point: 0x%08X\n",
+                               TS_MS, segaboot_entry);
+                    } else if (cur_entry != segaboot_entry) {
+                        chihiro_game_running = true;
+                        if(0) printf("[%07lld] Chihiro: *** GAME XBE DETECTED *** "
+                               "entry=0x%08X (was SEGABOOT 0x%08X)\n",
+                               TS_MS, cur_entry, segaboot_entry);
+                    }
+                }
             }
-            if (e >= 0x80025000 && e < 0x80026000) {
-                if (ntcreate_hit++ < 5)
-                    printf("[%07lld] KERNEL-MB-DRIVER: EIP=0x%08X #%u\n",
-                           TS_MS, e, ntcreate_hit);
-            }
-            if (e >= 0x63330 && e < 0x63466) eip_rb++;
-            if (e >= 0x2DDD0 && e < 0x2DF44) eip_w3bc++;
         }
-        if (++eip_tick % 62 == 0) {
-            printf("[%07lld] EIP-PROBE: irp_create=%u mb_driver=%u "
-                   "w3bc=%u rb=%u (62 ticks)\n",
-                   TS_MS, irp_create_hit, ntcreate_hit,
-                   eip_w3bc, eip_rb);
+    }
+
+    /* CRI state monitor: read game data structures directly.
+     * Addresses from Ghidra analysis of hod3xb.xbe (CRI ADX middleware). */
+    if (chihiro_game_running) {
+        static int cri_tick = 0;
+        if (++cri_tick % 62 == 0) { /* ~every 1s at 16ms ticks */
+            uint32_t pa;
+            /* 1. EIP: is the game stuck in the ADXF blocking loop? */
+            CPUState *cs = first_cpu;
+            uint32_t eip = 0;
+            if (cs) eip = (uint32_t)X86_CPU(cs)->env.eip;
+
+            /* 2. DAT_00279fd0: drive path (should be "D:\") */
+            char drive_path[8] = {0};
+            pa = chihiro_va_to_pa(0x00279fd0);
+            if (pa != 0xFFFFFFFF) cpu_physical_memory_read(pa, drive_path, 4);
+
+            /* 3. DAT_004ed7c0: CRI drive prefix (BSS, set by FUN_000c5070) */
+            char cri_prefix[8] = {0};
+            pa = chihiro_va_to_pa(0x004ed7c0);
+            if (pa != 0xFFFFFFFF) cpu_physical_memory_read(pa, cri_prefix, 4);
+
+            /* 4. DAT_004f6fe0: ADXF master handle (0 = not initialized) */
+            uint32_t adxf_handle = 0;
+            pa = chihiro_va_to_pa(0x004f6fe0);
+            if (pa != 0xFFFFFFFF) cpu_physical_memory_read(pa, &adxf_handle, 4);
+
+            /* 5. DAT_004f5f80: partition ID being loaded */
+            uint32_t pt_id = 0;
+            pa = chihiro_va_to_pa(0x004f5f80);
+            if (pa != 0xFFFFFFFF) cpu_physical_memory_read(pa, &pt_id, 4);
+
+            /* 6. DAT_004ea2a0: WX handle table (first 16 bytes) */
+            uint32_t wx_tbl[4] = {0};
+            pa = chihiro_va_to_pa(0x004ea2a0);
+            if (pa != 0xFFFFFFFF) cpu_physical_memory_read(pa, wx_tbl, 16);
+
+            /* 7. DAT_0030fdd8: CRI callback table group 5 (WX I/O server) */
+            uint32_t cb_grp5[4] = {0};
+            pa = chihiro_va_to_pa(0x0030fdd8 + 5 * 0x20);
+            if (pa != 0xFFFFFFFF) cpu_physical_memory_read(pa, cb_grp5, 16);
+
+            /* 8. Game thunk for NtCreateFile @ VA 0x11038 */
+            uint32_t ntcf_thunk = 0;
+            pa = chihiro_va_to_pa(0x00011038);
+            if (pa != 0xFFFFFFFF) cpu_physical_memory_read(pa, &ntcf_thunk, 4);
+
+            if(0) printf("[%07lld] CRI-MON: eip=0x%08X drv='%c%c%c%c' prefix='%c%c%c%c' "
+                   "adxf_h=0x%X ptid=%u wx=[%08X %08X %08X %08X] "
+                   "cb5=[%08X %08X] ntcf=0x%08X\n",
+                   TS_MS, eip,
+                   drive_path[0] ? drive_path[0] : '?',
+                   drive_path[1] ? drive_path[1] : '?',
+                   drive_path[2] ? drive_path[2] : '?',
+                   drive_path[3] ? drive_path[3] : '?',
+                   cri_prefix[0] ? cri_prefix[0] : '?',
+                   cri_prefix[1] ? cri_prefix[1] : '?',
+                   cri_prefix[2] ? cri_prefix[2] : '?',
+                   cri_prefix[3] ? cri_prefix[3] : '?',
+                   adxf_handle, pt_id,
+                   wx_tbl[0], wx_tbl[1], wx_tbl[2], wx_tbl[3],
+                   cb_grp5[0], cb_grp5[1], ntcf_thunk);
+
+            if (eip >= 0x80015551 && eip <= 0x80015554) {
+                uint32_t bc[5];
+                cpu_physical_memory_read(0x3ABE0, bc, 20);
+                if(0) printf("[%07lld] CRI-MON: *** BUGCHECK 0x%08X "
+                       "(p1=0x%08X p2=0x%08X p3=0x%08X p4=0x%08X) ***\n",
+                       TS_MS, bc[0], bc[1], bc[2], bc[3], bc[4]);
+            } else if (eip >= 0x000763b8 && eip <= 0x000763ca) {
+                if(0) printf("[%07lld] CRI-MON: *** EIP IN BLOCKING LOOP (ADXF_GetPtStat poll) ***\n",
+                       TS_MS);
+            }
         }
     }
 
@@ -2379,18 +3250,18 @@ static void chihiro_irq10_timer_cb(void *opaque)
                     if (pa && (va_diag_count % 310 == 0)) {
                         /* Dump first 3 slots raw hex every ~5s */
                         uint32_t meta_pa = pa - 0x20; /* META = DATA - 0x20 */
-                        printf("[%07lld] SLOT-DUMP PA=0x%05X (META=0x%05X stride=0x60):\n",
+                        if(0) printf("[%07lld] SLOT-DUMP PA=0x%05X (META=0x%05X stride=0x60):\n",
                                TS_MS, pa, meta_pa);
                         for (int sl = 0; sl < 3; sl++) {
                             uint8_t raw[96];
                             cpu_physical_memory_read(meta_pa + sl * 0x60, raw, 96);
-                            printf("  slot[%d] META: ", sl);
-                            for (int b = 0; b < 32; b++) printf("%02X", raw[b]);
-                            printf("\n         DATA: ");
-                            for (int b = 32; b < 64; b++) printf("%02X", raw[b]);
-                            printf("\n         +40:  ");
-                            for (int b = 64; b < 96; b++) printf("%02X", raw[b]);
-                            printf("\n");
+                            if(0) printf("  slot[%d] META: ", sl);
+                            if(0) for (int b = 0; b < 32; b++) printf("%02X", raw[b]);
+                            if(0) printf("\n         DATA: ");
+                            if(0) for (int b = 32; b < 64; b++) printf("%02X", raw[b]);
+                            if(0) printf("\n         +40:  ");
+                            if(0) for (int b = 64; b < 96; b++) printf("%02X", raw[b]);
+                            if(0) printf("\n");
                         }
                     }
                 }
@@ -2448,7 +3319,7 @@ static void chihiro_irq10_timer_cb(void *opaque)
                     case 0x0102: resp_data = 0x8002; break;
                     case 0x0103: resp_data = 0x6261632D; break;
                     default:
-                        printf("[%07lld] Chihiro DMA: UNKNOWN cmd=0x%04X type=%u slot=%d "
+                        if(0) printf("[%07lld] Chihiro DMA: UNKNOWN cmd=0x%04X type=%u slot=%d "
                                "PA=0x%05X meta=0x%05X — responding with 0\n",
                                TS_MS, cmd_opcode, data_byte0, sl, data_pa, meta_pa);
                         resp_data = 0;
@@ -2466,10 +3337,10 @@ static void chihiro_irq10_timer_cb(void *opaque)
                     if (cmd_opcode == 0x0100) {
                         uint8_t meta_raw[16];
                         cpu_physical_memory_read(meta_pa, meta_raw, 16);
-                        printf("[%07lld] META-STATUS-WRITE: meta_pa=0x%05X data_pa=0x%05X "
+                        if(0) printf("[%07lld] META-STATUS-WRITE: meta_pa=0x%05X data_pa=0x%05X "
                                "slot=%d raw=", TS_MS, meta_pa, data_pa, sl);
-                        for (int b = 0; b < 16; b++) printf("%02X", meta_raw[b]);
-                        printf(" [marker=%04X phase=%u pct=%u]\n",
+                        if(0) for (int b = 0; b < 16; b++) printf("%02X", meta_raw[b]);
+                        if(0) printf(" [marker=%04X phase=%u pct=%u]\n",
                                meta_marker, resp_data, resp_data2);
                     }
 
@@ -2479,9 +3350,9 @@ static void chihiro_irq10_timer_cb(void *opaque)
                         dma_repeat_count++;
                     } else {
                         if (dma_repeat_count > 1)
-                            printf("[%07lld] Chihiro DMA: (prev cmd=0x%04X repeated %u)\n",
+                            if(0) printf("[%07lld] Chihiro DMA: (prev cmd=0x%04X repeated %u)\n",
                                    TS_MS, last_dma_cmd, dma_repeat_count);
-                        printf("[%07lld] Chihiro DMA: slot %d PA=0x%05X cmd=0x%04X resp=0x%08X\n",
+                        if(0) printf("[%07lld] Chihiro DMA: slot %d PA=0x%05X cmd=0x%04X resp=0x%08X\n",
                                TS_MS, sl, data_pa, cmd_opcode, resp_data);
                         last_dma_cmd = cmd_opcode;
                         dma_repeat_count = 1;
@@ -2492,26 +3363,94 @@ static void chihiro_irq10_timer_cb(void *opaque)
         }
     }
 
-    /* STATE MACHINE PROBE: direct read at PA 0x166150 (found by vtable scan) */
+    /* STATE MACHINE PROBE: scan for CheckErrors vtable (0x212B8) in
+     * SEGABOOT's contiguous memory region to find the state object.
+     * Rescans on every QuickReboot when the old PA becomes stale. */
     {
         static int sm_log = 0;
+        static uint32_t sm_obj_pa = 0x166150; /* initial from first boot vtable scan */
         if (sm_log++ % 62 == 0) { /* ~every 1 second */
-            uint32_t sm_state = 0, sm_err = 0, sm_tick = 0, sm_flagc = 0;
-            uint32_t sm_vtable = 0, sm_appobj = 0, sm_done = 0, sm_errtick = 0;
-            cpu_physical_memory_read(0x166150, &sm_vtable, 4);
-            cpu_physical_memory_read(0x166154, &sm_appobj, 4);
-            cpu_physical_memory_read(0x166158, &sm_done, 4);
-            cpu_physical_memory_read(0x16615C, &sm_flagc, 4);
-            cpu_physical_memory_read(0x166160, &sm_err, 4);
-            cpu_physical_memory_read(0x166164, &sm_state, 4);
-            cpu_physical_memory_read(0x166168, &sm_tick, 4);
-            cpu_physical_memory_read(0x16616C, &sm_errtick, 4);
-            printf("[%07lld] SM-REAL: vt=0x%X app=0x%08X state=%u "
-                   "tick=%u err=%u flag_c=%u done=%u errtick=%u\n",
-                   TS_MS, sm_vtable, sm_appobj, sm_state,
-                   sm_tick, sm_err, sm_flagc, sm_done, sm_errtick);
-            /* If app_obj looks valid (contiguous mem 0xD0xxxxxx or heap), read 3BC/3D4 */
-            if (sm_appobj != 0 && sm_appobj != 1) {
+            uint32_t sm_vtable = 0, sm_appobj = 0, sm_state = 0, sm_err = 0;
+            uint32_t sm_tick = 0, sm_flagc = 0, sm_done = 0, sm_errtick = 0;
+            cpu_physical_memory_read(sm_obj_pa, &sm_vtable, 4);
+
+            /* If vtable is garbage, rescan all RAM for 0x212B8 */
+            if (sm_vtable != 0x212B8 && sm_vtable != 0) {
+                static int scan_cooldown = 0;
+                if (scan_cooldown > 0) { scan_cooldown--; goto sm_done_label; }
+                bool found = false;
+                int hit_count = 0;
+                for (uint32_t pa = 0x1000; pa < 0x8000000; pa += 4) {
+                    uint32_t val;
+                    cpu_physical_memory_read(pa, &val, 4);
+                    if (val == 0x212B8) {
+                        uint32_t next;
+                        cpu_physical_memory_read(pa + 4, &next, 4);
+                        hit_count++;
+                        if (hit_count <= 5) {
+                            if(0) printf("[%07lld] SM-SCAN: 0x212B8 at PA 0x%07X next=0x%08X\n",
+                                   TS_MS, pa, next);
+                        }
+                        if (next >= 0xD0000000 || (next >= 0x80000000 && next < 0x88000000)) {
+                            sm_obj_pa = pa;
+                            cpu_physical_memory_read(sm_obj_pa, &sm_vtable, 4);
+                            if(0) printf("[%07lld] SM-REAL: RESCAN found at PA 0x%X (hit %d/%d)\n",
+                                   TS_MS, sm_obj_pa, hit_count, hit_count);
+                            found = true;
+                            break;
+                        }
+                    }
+                }
+                if (!found) {
+                    scan_cooldown = 5;
+                    if(0) printf("[%07lld] SM-REAL: vtable 0x212B8 — %d hits, none valid "
+                           "(old_pa=0x%X old_val=0x%X)\n",
+                           TS_MS, hit_count, sm_obj_pa, sm_vtable);
+                    /* Dump what's at the old PA for debugging */
+                    {
+                        uint8_t old[32];
+                        cpu_physical_memory_read(sm_obj_pa, old, 32);
+                        if(0) printf("[%07lld] SM-REAL: old PA dump: "
+                               "%02X%02X%02X%02X %02X%02X%02X%02X "
+                               "%02X%02X%02X%02X %02X%02X%02X%02X "
+                               "%02X%02X%02X%02X %02X%02X%02X%02X\n",
+                               TS_MS,
+                               old[0],old[1],old[2],old[3],old[4],old[5],old[6],old[7],
+                               old[8],old[9],old[10],old[11],old[12],old[13],old[14],old[15],
+                               old[16],old[17],old[18],old[19],old[20],old[21],old[22],old[23]);
+                        /* Also check XBE header to determine what's running */
+                        uint32_t xbe_pa = chihiro_va_to_pa(0x10000);
+                        uint32_t xbe_entry = 0;
+                        if (xbe_pa != 0xFFFFFFFF) {
+                            uint8_t m[4];
+                            cpu_physical_memory_read(xbe_pa, m, 4);
+                            cpu_physical_memory_read(xbe_pa + 0x128, &xbe_entry, 4);
+                            if(0) printf("[%07lld] SM-REAL: current XBE magic=%c%c%c%c entry=0x%08X\n",
+                                   TS_MS, m[0], m[1], m[2], m[3], xbe_entry);
+                        }
+                    }
+                    goto sm_done_label;
+                }
+            }
+
+            cpu_physical_memory_read(sm_obj_pa + 4, &sm_appobj, 4);
+            cpu_physical_memory_read(sm_obj_pa + 8, &sm_done, 4);
+            cpu_physical_memory_read(sm_obj_pa + 0xC, &sm_flagc, 4);
+            cpu_physical_memory_read(sm_obj_pa + 0x10, &sm_err, 4);
+            cpu_physical_memory_read(sm_obj_pa + 0x14, &sm_state, 4);
+            cpu_physical_memory_read(sm_obj_pa + 0x18, &sm_tick, 4);
+            cpu_physical_memory_read(sm_obj_pa + 0x1C, &sm_errtick, 4);
+            {
+                uint32_t ldp_mon = 0;
+                cpu_physical_memory_read(0x3B3D8, &ldp_mon, 4);
+                if(0) printf("[%07lld] SM-REAL: vt=0x%X app=0x%08X state=%u "
+                       "tick=%u err=%u flag_c=%u done=%u errtick=%u "
+                       "(PA=0x%X) LDP=0x%08X\n",
+                       TS_MS, sm_vtable, sm_appobj, sm_state,
+                       sm_tick, sm_err, sm_flagc, sm_done, sm_errtick,
+                       sm_obj_pa, ldp_mon);
+            }
+            if (sm_appobj >= 0xD0000000 || (sm_appobj >= 0x80000000 && sm_appobj < 0x88000000)) {
                 uint32_t aobj_pa = chihiro_va_to_pa(sm_appobj + 0x3BC);
                 uint32_t aobj_pa2 = chihiro_va_to_pa(sm_appobj + 0x3D4);
                 uint32_t v3bc = 0, v3d4 = 0;
@@ -2519,9 +3458,10 @@ static void chihiro_irq10_timer_cb(void *opaque)
                     cpu_physical_memory_read(aobj_pa, &v3bc, 4);
                 if (aobj_pa2 != 0xFFFFFFFF)
                     cpu_physical_memory_read(aobj_pa2, &v3d4, 4);
-                printf("[%07lld] SM-APP: [+3BC]=%u [+3D4]=0x%X\n",
+                if(0) printf("[%07lld] SM-APP: [+3BC]=%u [+3D4]=0x%X\n",
                        TS_MS, v3bc, v3d4);
             }
+            sm_done_label: ;
         }
     }
 
@@ -2533,7 +3473,7 @@ static void chihiro_irq10_timer_cb(void *opaque)
             if (thunk_pa != 0xFFFFFFFF) {
                 uint32_t thunks[8];
                 cpu_physical_memory_read(thunk_pa - 8, thunks, 32);
-                printf("[%07lld] SEGABOOT-THUNKS @VA 0x11030: "
+                if(0) printf("[%07lld] SEGABOOT-THUNKS @VA 0x11030: "
                        "%08X %08X [NtCreateFile@11038]=%08X %08X "
                        "%08X %08X %08X %08X\n",
                        TS_MS, thunks[0], thunks[1], thunks[2],
@@ -2544,14 +3484,14 @@ static void chihiro_irq10_timer_cb(void *opaque)
                 cpu_physical_memory_read(0x3B3CC, &dimm_sz, 4);
                 cpu_physical_memory_read(0x3B3C8, &fpga, 1);
                 cpu_physical_memory_read(0x3AF2C, &cqd, 1);
-                printf("[%07lld] KERNEL-MB: DIMM_sz=0x%08X FPGABoard=%u "
+                if(0) printf("[%07lld] KERNEL-MB: DIMM_sz=0x%08X FPGABoard=%u "
                        "CreateQuickDone=%u\n", TS_MS, dimm_sz, fpga, cqd);
                 /* Check handle at this exact moment */
                 uint32_t h_pa = chihiro_va_to_pa(0xAA74C);
                 if (h_pa != 0xFFFFFFFF) {
                     uint32_t h = 0;
                     cpu_physical_memory_read(h_pa, &h, 4);
-                    printf("[%07lld] SEGABOOT-HANDLE: 0x%08X\n", TS_MS, h);
+                    if(0) printf("[%07lld] SEGABOOT-HANDLE: 0x%08X\n", TS_MS, h);
                 }
                 /* Init-progress probe: check how far mbcom_main_init got */
                 {
@@ -2590,7 +3530,7 @@ static void chihiro_irq10_timer_cb(void *opaque)
                     uint32_t pa_scs = chihiro_va_to_pa(0x11410);
                     uint32_t scs = 0;
                     if (pa_scs != 0xFFFFFFFF) cpu_physical_memory_read(pa_scs, &scs, 4);
-                    printf("[%07lld] INIT-PROGRESS: aa670=%u 1eb9c=%u "
+                    if(0) printf("[%07lld] INIT-PROGRESS: aa670=%u 1eb9c=%u "
                            "dma_mode(aa750)=%u threadA(aad98)=0x%X "
                            "threadB(aae18)=0x%X | "
                            "JVS_err=0x%08X JVS_str=0x%05X JVS_msg=0x%05X | "
@@ -2644,7 +3584,7 @@ static void chihiro_eeprom_hack_cb(void *opaque)
                                 MEMTXATTRS_UNSPECIFIED, leave_ret, 2);
 
             s->eeprom_hack_applied = true;
-            printf("[%07lld] Chihiro: Applied EEPROM validation hack "
+            if(0) printf("[%07lld] Chihiro: Applied EEPROM validation hack "
                    "(arcdkrnl @ 0x8003B744)\n", TS_MS);
 
             /* Apply MediaBoard kernel patches NOW, before IdexChannelCreate
@@ -2658,29 +3598,81 @@ static void chihiro_eeprom_hack_cb(void *opaque)
                 cpu_physical_memory_read(0x25AAB, chk, 2);
                 if (chk[0] == 0x75 && chk[1] == 0x18) {
                     cpu_physical_memory_write(0x25AAB, nop2k, 2);
-                    printf("[%07lld] Chihiro: Kernel early patch: NOP JNE @ PA 0x25AAB "
+                    if(0) printf("[%07lld] Chihiro: Kernel early patch: NOP JNE @ PA 0x25AAB "
                            "(force mbcom partition)\n", TS_MS);
                 }
 
                 cpu_physical_memory_read(0x25B1B, chk, 2);
                 if (chk[0] == 0x75 && chk[1] == 0x17) {
                     cpu_physical_memory_write(0x25B1B, nop2k, 2);
-                    printf("[%07lld] Chihiro: Kernel early patch: NOP JNE @ PA 0x25B1B "
+                    if(0) printf("[%07lld] Chihiro: Kernel early patch: NOP JNE @ PA 0x25B1B "
                            "(force D:\\ symlink)\n", TS_MS);
                 }
 
                 cpu_physical_memory_read(0x30905, chk, 2);
                 if (chk[0] == 0x75 && chk[1] == 0x25) {
                     cpu_physical_memory_write(0x30905, nop2k, 2);
-                    printf("[%07lld] Chihiro: Kernel early patch: NOP JNE @ PA 0x30905 "
+                    if(0) printf("[%07lld] Chihiro: Kernel early patch: NOP JNE @ PA 0x30905 "
                            "(force symlinks)\n", TS_MS);
                 }
 
                 cpu_physical_memory_read(0x309AD, chk, 2);
                 if (chk[0] == 0x75 && chk[1] == 0x0A) {
                     cpu_physical_memory_write(0x309AD, nop2k, 2);
-                    printf("[%07lld] Chihiro: Kernel early patch: NOP JNE @ PA 0x309AD "
+                    if(0) printf("[%07lld] Chihiro: Kernel early patch: NOP JNE @ PA 0x309AD "
                            "(force partition init)\n", TS_MS);
+                }
+
+                /* Idle loop PAUSE: kernel spins at VA 0x8001B3F4 with NOP NOP CLI.
+                 * Replace NOP NOP with PAUSE (F3 90) to yield host CPU. */
+                cpu_physical_memory_read(0x1B3F4, chk, 2);
+                if (chk[0] == 0x90 && chk[1] == 0x90) {
+                    uint8_t pause_insn[2] = { 0xF3, 0x90 };
+                    cpu_physical_memory_write(0x1B3F4, pause_insn, 2);
+                    printf("[%07lld] Chihiro: Kernel idle loop PAUSE patch @ PA 0x1B3F4\n",
+                           TS_MS);
+                }
+
+                /* Early LDP diagnostic — fires during kernel init,
+                 * BEFORE Phase1Initialization/FUN_8002e8b6 */
+                {
+                    uint32_t ldp_early = 0;
+                    cpu_physical_memory_read(0x3B3D8, &ldp_early, 4);
+                    uint32_t canary_early = 0;
+                    cpu_physical_memory_read(0x3B400, &canary_early, 4);
+                    uint8_t khqb_early = 0;
+                    cpu_physical_memory_read(0x3A93C, &khqb_early, 1);
+                    if(0) printf("[%07lld] Chihiro: EARLY-DIAG: LDP=0x%08X "
+                           "canary=0x%08X KHQB=%u\n",
+                           TS_MS, ldp_early, canary_early, khqb_early);
+                    if (ldp_early && ldp_early != 0xFFFFFFFF) {
+                        uint32_t epa = (ldp_early & 0x0FFFFFFF);
+                        uint8_t ed[16];
+                        cpu_physical_memory_read(epa, ed, 16);
+                        if(0) printf("[%07lld] Chihiro: EARLY-DIAG: LDP page @PA 0x%07X: "
+                               "%02X%02X%02X%02X %02X%02X%02X%02X "
+                               "%02X%02X%02X%02X %02X%02X%02X%02X\n",
+                               TS_MS, epa,
+                               ed[0],ed[1],ed[2],ed[3],
+                               ed[4],ed[5],ed[6],ed[7],
+                               ed[8],ed[9],ed[10],ed[11],
+                               ed[12],ed[13],ed[14],ed[15]);
+                    }
+                }
+            }
+
+            /* XepLoadSection: digest check JE→JMP bypass (0x74→0xEB at PA 0x2E0BF).
+             * Chihiro kernel enforces SHA-1 section digests (unlike Ghidra's
+             * extracted binary which shows 0xEB). Our FATX data doesn't match
+             * the expected digests yet. */
+            {
+                uint8_t dig;
+                cpu_physical_memory_read(0x2E0BF, &dig, 1);
+                if (dig == 0x74) {
+                    dig = 0xEB;
+                    cpu_physical_memory_write(0x2E0BF, &dig, 1);
+                    if(0) printf("[%07lld] Chihiro: Digest check bypass: "
+                           "JE→JMP @ PA 0x2E0BF\n", TS_MS);
                 }
             }
 
@@ -2757,7 +3749,7 @@ static void chihiro_lpc_realize(DeviceState *dev, Error **errp)
     timer_mod(s->usb_poll_patch_timer,
               qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 10);
 
-    printf("[%07lld] Chihiro: Mediaboard LPC I/O initialized at 0x4000-0x40FF\n", TS_MS);
+    if(0) printf("[%07lld] Chihiro: Mediaboard LPC I/O initialized at 0x4000-0x40FF\n", TS_MS);
 }
 
 static void chihiro_lpc_class_init(ObjectClass *klass, const void *data)
@@ -2812,7 +3804,7 @@ void chihiro_mbcom_init(void)
     memset(chihiro_mbcom_response, 0, sizeof(chihiro_mbcom_response));
     memset(chihiro_mbcom_command, 0, sizeof(chihiro_mbcom_command));
     chihiro_mbcom_enabled = true;
-    printf("[%07lld] Chihiro: mbcom protocol handler initialized (v146 MAME-aligned)\n", TS_MS);
+    if(0) printf("[%07lld] Chihiro: mbcom protocol handler initialized (v146 MAME-aligned)\n", TS_MS);
 }
 
 /* TEMPORARY: Process mbcom command and generate hardcoded responses.
@@ -2841,10 +3833,10 @@ static void chihiro_mbcom_process(void)
     /* dedup logging: only log new cmds, count repeats */
     if (cmd_code != mbcom_last_cmd_logged) {
         if (mbcom_cmd_repeat_count > 1) {
-            printf("[%07lld] Chihiro mbcom: (prev cmd=0x%04X repeated %u times)\n",
+            if(0) printf("[%07lld] Chihiro mbcom: (prev cmd=0x%04X repeated %u times)\n",
                    TS_MS, mbcom_last_cmd_logged, mbcom_cmd_repeat_count);
         }
-        printf("[%07lld] Chihiro mbcom: cmd=0x%04X echo=0x%04X\n", TS_MS, cmd_code, cmd_echo);
+        if(0) printf("[%07lld] Chihiro mbcom: cmd=0x%04X echo=0x%04X\n", TS_MS, cmd_code, cmd_echo);
         mbcom_last_cmd_logged = cmd_code;
         mbcom_cmd_repeat_count = 1;
     } else {
@@ -2907,7 +3899,7 @@ static void chihiro_mbcom_process(void)
         r[4] = 1; r[5] = 0; r[6] = 0; r[7] = 10;
         break;
     default:
-        printf("[%07lld] Chihiro mbcom: UNKNOWN cmd=0x%04X\n", TS_MS, cmd_code);
+        if(0) printf("[%07lld] Chihiro mbcom: UNKNOWN cmd=0x%04X\n", TS_MS, cmd_code);
         break;
     }
 
@@ -2917,11 +3909,23 @@ static void chihiro_mbcom_process(void)
     chihiro_mbcom_command[2] = 0;
     chihiro_mbcom_command[3] = 0;
 
-    /* v158: DMA inject into slot array REMOVED.
-     * Writing word[+2] to non-zero pollutes GetMbcomType's empty-slot scan
-     * at 0x3E176 (checks word[+2]==0 for "empty"). ValidateType at 0x3E4A0
-     * already sets word[+2]=1, making PollReady return immediately.
-     * No DMA injection needed — the slot system is self-contained. */
+    /* Start periodic DMA slot scan after initial handshake commands.
+     * SEGABOOT stops reading port 0x40F0 after boot, so the DMA scan
+     * in the 0x40F0 handler stops running. This timer ensures that
+     * STATUS commands from writes_3bc_3d4 (which sets app_obj+0x3BC
+     * gate for game launch) are processed independently.
+     * Counter resets on QuickReboot (modulo 5 check). */
+    {
+        static int mbcom_ide_cmd_count = 0;
+        mbcom_ide_cmd_count++;
+        if ((mbcom_ide_cmd_count % 5) == 0 && chihiro_lpc_global
+            && chihiro_lpc_global->dimm_event_timer) {
+            timer_mod(chihiro_lpc_global->dimm_event_timer,
+                      qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 200);
+            if(0) printf("[%07lld] Chihiro: DMA slot scan timer armed (after cmd #%d)\n",
+                   TS_MS, mbcom_ide_cmd_count);
+        }
+    }
 }
 
 /*
@@ -2932,13 +3936,45 @@ static void chihiro_mbcom_process(void)
  */
 bool chihiro_ide_read_sector(uint32_t lba, void *buffer)
 {
+    perf_cnt_ide_read++;
     if (!chihiro_mbcom_enabled) return false;
 
     static uint32_t ide_meta_cnt = 0, ide_fatx_cnt = 0, ide_mbcom_cnt = 0;
+    static uint32_t ide_game_xbe_cnt = 0;
+    static bool ide_after_quickreboot = false;
+    static uint32_t ide_post_qr_flash_cnt = 0, ide_post_qr_fatx_cnt = 0;
+
+    if (!ide_after_quickreboot) {
+        uint8_t khqb = 0;
+        cpu_physical_memory_read(0x3A93C, &khqb, 1);
+        if (khqb) {
+            ide_after_quickreboot = true;
+            ide_post_qr_flash_cnt = 0;
+            ide_post_qr_fatx_cnt = 0;
+            ide_game_xbe_cnt = 0;
+            if(0) printf("[%07lld] IDE: KeHasQuickBooted=1 — tracking post-QR reads\n", TS_MS);
+
+            /* Install NTSTATUS capture cave NOW — after QuickReboot but
+             * before FUN_8002e8b6 calls XeLoadImage for the game.
+             * Writing to STICKY during first boot corrupts kernel state. */
+            /* (NTSTATUS cave removed — PA 0x3B3E0 is AvSavedDataAddress,
+             * writing there caused BUGCHECK 0x0A after QuickReboot) */
+        }
+    }
+
     if (lba >= 0x89 && lba < CHIHIRO_MBCOM_BASE) {
         ide_fatx_cnt++;
-        printf("[%07lld] IDE-READ: LBA=0x%X (%u) [FATX-DATA] #%u\n",
-               TS_MS, lba, lba, ide_fatx_cnt);
+        if (ide_after_quickreboot) ide_post_qr_fatx_cnt++;
+        /* Game XBE range: cluster 22674 → LBA 725672, ~4280 sectors */
+        if (lba >= 725672 && lba < 730000) {
+            ide_game_xbe_cnt++;
+            if (ide_game_xbe_cnt <= 5 || ide_game_xbe_cnt % 500 == 0)
+                if(0) printf("[%07lld] IDE-GAME-XBE: LBA=0x%X (%u) sector #%u of game\n",
+                       TS_MS, lba, lba, ide_game_xbe_cnt);
+        }
+        if (ide_fatx_cnt <= 5 || ide_fatx_cnt % 500 == 0)
+            if(0) printf("[%07lld] IDE-READ: LBA=0x%X (%u) [FATX-DATA] #%u\n",
+                   TS_MS, lba, lba, ide_fatx_cnt);
     } else if (lba < 0x89) {
         ide_meta_cnt++;
     } else {
@@ -2947,8 +3983,10 @@ bool chihiro_ide_read_sector(uint32_t lba, void *buffer)
     {
         static uint32_t ide_total = 0;
         if (++ide_total % 500 == 0)
-            printf("[%07lld] IDE-STATS: total=%u meta=%u fatx=%u mbcom=%u\n",
-                   TS_MS, ide_total, ide_meta_cnt, ide_fatx_cnt, ide_mbcom_cnt);
+            if(0) printf("[%07lld] IDE-STATS: total=%u meta=%u fatx=%u mbcom=%u "
+                   "(post-QR: flash=%u fatx=%u game_xbe=%u)\n",
+                   TS_MS, ide_total, ide_meta_cnt, ide_fatx_cnt, ide_mbcom_cnt,
+                   ide_post_qr_flash_cnt, ide_post_qr_fatx_cnt, ide_game_xbe_cnt);
     }
 
     /* FATX partition: serve from in-memory image (LBA 0 to ~700K) */
@@ -2963,10 +4001,10 @@ bool chihiro_ide_read_sector(uint32_t lba, void *buffer)
         /* dedup: only log when response signature changes */
         if (memcmp(d, mbcom_last_read_sig, 4) != 0) {
             if (mbcom_read_repeat_count > 1) {
-                printf("[%07lld] Chihiro mbcom: (prev response repeated %u times)\n",
+                if(0) printf("[%07lld] Chihiro mbcom: (prev response repeated %u times)\n",
                        TS_MS, mbcom_read_repeat_count);
             }
-            printf("[%07lld] Chihiro mbcom: read FC800 response=%02X%02X%02X%02X "
+            if(0) printf("[%07lld] Chihiro mbcom: read FC800 response=%02X%02X%02X%02X "
                    "%02X%02X%02X%02X %02X%02X%02X%02X\n",
                    TS_MS, d[0],d[1],d[2],d[3],d[4],d[5],d[6],d[7],d[8],d[9],d[10],d[11]);
             memcpy(mbcom_last_read_sig, d, 4);
@@ -2980,7 +4018,7 @@ bool chihiro_ide_read_sector(uint32_t lba, void *buffer)
         memset(buffer, 0, 512);
         memcpy(buffer, chihiro_mbcom_command, 32);
         const uint8_t *d = (const uint8_t *)buffer;
-        printf("[%07lld] MBCOM-IDE-READ FC801 slot=%02X%02X%02X%02X "
+        if(0) printf("[%07lld] MBCOM-IDE-READ FC801 slot=%02X%02X%02X%02X "
                "%02X%02X%02X%02X\n",
                TS_MS, d[0],d[1],d[2],d[3],d[4],d[5],d[6],d[7]);
         return true;
@@ -2991,6 +4029,49 @@ bool chihiro_ide_read_sector(uint32_t lba, void *buffer)
      * mbrom0 (LBA 0x8000000-0x80007FF): returns zeros (not needed for boot).
      * mbrom1 (LBA 0x8000800+): flash ROM from byte 0. */
     if (lba >= CHIHIRO_MBROM0 && chihiro_flash_rom) {
+        if (ide_after_quickreboot && ide_post_qr_fatx_cnt > 0 &&
+            ide_post_qr_flash_cnt == 0) {
+            if(0) printf("[%07lld] IDE-HOOK: First flash ROM read after QR "
+                   "(game had %u FATX reads). XeLoadImage FAILED.\n",
+                   TS_MS, ide_post_qr_fatx_cnt);
+            uint32_t ldp_val = 0;
+            cpu_physical_memory_read(0x3B3D8, &ldp_val, 4);
+            if(0) printf("  LDP=0x%08X", ldp_val);
+            if (ldp_val && ldp_val != 0xFFFFFFFF) {
+                uint32_t pa = ldp_val & 0x0FFFFFFF;
+                uint8_t pg[0x410];
+                cpu_physical_memory_read(pa, pg, sizeof(pg));
+                uint32_t lt = *(uint32_t*)pg;
+                char p[256]; memset(p, 0, sizeof(p));
+                memcpy(p, pg + 8, 255);
+                if(0) printf(" type=%u path='%s'", lt, p);
+                if (lt == 1) {
+                    uint32_t ec = *(uint32_t*)(pg + 0x400);
+                    uint32_t et = *(uint32_t*)(pg + 0x408);
+                    if(0) printf(" ERR ctx=%u typ=%u", ec, et);
+                }
+            }
+            if(0) printf("\n");
+            uint32_t av_saved = 0;
+            cpu_physical_memory_read(0x3B3E0, &av_saved, 4);
+            if(0) printf("  AvSavedDataAddr@PA0x3B3E0=0x%08X\n", av_saved);
+            uint32_t xbe_pa = 0;
+            cpu_physical_memory_read(0x3B1D8, &xbe_pa, 4);
+            if(0) printf("  XboxGameRegion=0x%08X\n", xbe_pa);
+            /* Check if digest JMP at PA 0x2E0BF is EB (unconditional) or 74 (JE conditional) */
+            uint8_t jmp_byte = 0;
+            cpu_physical_memory_read(0x2E0BF, &jmp_byte, 1);
+            if(0) printf("  DigestJMP @PA 0x2E0BF = 0x%02X (%s)\n", jmp_byte,
+                   jmp_byte == 0xEB ? "JMP=dead code" :
+                   jmp_byte == 0x74 ? "JE=DIGEST CHECK ACTIVE!" : "UNKNOWN");
+            /* Dump XBE header: decrypted entry+thunk after XOR */
+            uint32_t xbe_entry = 0, xbe_thunk = 0;
+            cpu_physical_memory_read(0x10128, &xbe_entry, 4);
+            cpu_physical_memory_read(0x10158, &xbe_thunk, 4);
+            if(0) printf("  XBE entry=0x%08X thunk=0x%08X (post-XOR decrypt)\n",
+                   xbe_entry, xbe_thunk);
+        }
+        ide_post_qr_flash_cnt++;
         memset(buffer, 0, 512);
         /* MAME behavior: (lba & 0x7FF) * 512 for both mbrom0 and mbrom1.
          * Both serve from the same first 1MB of the flash ROM. */
@@ -3022,7 +4103,7 @@ bool chihiro_ide_write_sector(uint32_t lba, const void *buffer)
     }
     if (lba == CHIHIRO_MBCOM_COMMAND) {
         const uint8_t *d = (const uint8_t *)buffer;
-        printf("[%07lld] MBCOM-IDE-WRITE FC801 cmd=%02X%02X sub=%02X%02X "
+        if(0) printf("[%07lld] MBCOM-IDE-WRITE FC801 cmd=%02X%02X sub=%02X%02X "
                "data=%02X%02X%02X%02X %02X%02X%02X%02X\n",
                TS_MS, d[0],d[1],d[2],d[3],d[4],d[5],d[6],d[7],d[8],d[9],d[10],d[11]);
         memcpy(chihiro_mbcom_command, buffer, 32);
@@ -3035,7 +4116,7 @@ bool chihiro_ide_write_sector(uint32_t lba, const void *buffer)
         return true;
     }
     if (lba >= CHIHIRO_MBCOM_BASE && lba <= CHIHIRO_MBCOM_BASE + 0x5000) {
-        printf("[%07lld] MBCOM-IDE-WRITE lba=0x%X (base+0x%X)\n",
+        if(0) printf("[%07lld] MBCOM-IDE-WRITE lba=0x%X (base+0x%X)\n",
                TS_MS, lba, lba - CHIHIRO_MBCOM_BASE);
     }
     return false;
@@ -3054,7 +4135,7 @@ void chihiro_ide_dma_write_done(BlockBackend *blk, int64_t sector_num)
     int64_t cmd_lba = CHIHIRO_MBCOM_COMMAND;
     int64_t resp_lba = CHIHIRO_MBCOM_RESPONSE;
 
-    printf("[%07lld] MBCOM-DMA-WRITE-DONE sector_num=0x%llX (cmd_lba=0x%llX)\n",
+    if(0) printf("[%07lld] MBCOM-DMA-WRITE-DONE sector_num=0x%llX (cmd_lba=0x%llX)\n",
            TS_MS, (long long)sector_num, (long long)cmd_lba);
 
     if (sector_num <= cmd_lba) return;

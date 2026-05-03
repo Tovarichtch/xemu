@@ -280,10 +280,10 @@ static inline void ohci_set_interrupt(OHCIState *ohci, uint32_t intr)
 {
     ohci->intr_status |= intr;
     if ((intr & ~OHCI_INTR_SF) && TS_MS > 5900) {
-        printf("[%07lld] OHCI IRQ: set 0x%08X (status=0x%08X enable=0x%08X)\n", TS_MS,
+        if(0) printf("[%07lld] OHCI IRQ: set 0x%08X (status=0x%08X enable=0x%08X)\n", TS_MS,
                intr, ohci->intr_status, ohci->intr);
         if (intr & OHCI_INTR_WD) {
-            printf("[%07lld]   WDH: done=0x%08X hcca=0x%08X\n",
+            if(0) printf("[%07lld]   WDH: done=0x%08X hcca=0x%08X\n",
                    TS_MS, ohci->done, ohci->hcca);
         }
     }
@@ -301,14 +301,14 @@ static USBDevice *ohci_find_device(OHCIState *ohci, uint8_t addr)
         if (dev != NULL) {
             int pes = (ohci->rhport[i].ctrl & OHCI_PORT_PES) ? 1 : 0;
             if (TS_MS > 5900)
-                printf("[%07lld] OHCI ROUTE: addr=%d -> port%d PES=%d %s\n", TS_MS,
+                if(0) printf("[%07lld] OHCI ROUTE: addr=%d -> port%d PES=%d %s\n", TS_MS,
                        addr, i, pes, pes ? "MATCH" : "fallback");
             if (pes) return dev;
             if (!fallback) fallback = dev;
         }
     }
     if (!fallback && TS_MS > 5900)
-        printf("[%07lld] OHCI ROUTE: addr=%d -> NOT FOUND\n", TS_MS, addr);
+        if(0) printf("[%07lld] OHCI ROUTE: addr=%d -> NOT FOUND\n", TS_MS, addr);
     return fallback;
 }
 
@@ -358,11 +358,11 @@ static void ohci_soft_reset(OHCIState *ohci)
 {
     trace_usb_ohci_reset(ohci->name);
     if (TS_MS > 5900) {
-        printf("[%07lld] OHCI SOFT RESET: ctl=0x%08X ports:", TS_MS, ohci->ctl);
+        if(0) printf("[%07lld] OHCI SOFT RESET: ctl=0x%08X ports:", TS_MS, ohci->ctl);
         for (int i = 0; i < ohci->num_ports; i++) {
-            printf(" P%d=0x%08X", i, ohci->rhport[i].ctrl);
+            if(0) printf(" P%d=0x%08X", i, ohci->rhport[i].ctrl);
         }
-        printf("\n");
+        if(0) printf("\n");
     }
 
     ohci_bus_stop(ohci);
@@ -861,6 +861,7 @@ static int ohci_service_iso_td(OHCIState *ohci, struct ohci_ed *ed)
 
 static void ohci_td_pkt(const char *msg, const uint8_t *buf, size_t len)
 {
+    return;
     bool print16;
     bool printall;
     int i;
@@ -898,6 +899,8 @@ static void ohci_td_pkt(const char *msg, const uint8_t *buf, size_t len)
  */
 static int ohci_service_td(OHCIState *ohci, struct ohci_ed *ed)
 {
+    extern uint64_t perf_cnt_ohci_td;
+    perf_cnt_ohci_td++;
     int dir;
     size_t len = 0, pktlen = 0;
     const char *str = NULL;
@@ -930,7 +933,7 @@ static int ohci_service_td(OHCIState *ohci, struct ohci_ed *ed)
     }
 
     if (TS_MS > 5900)
-        printf("[%07lld] OHCI TD: ed_addr=0x%08X td_addr=0x%08X FA=%d EN=%d "
+        if(0) printf("[%07lld] OHCI TD: ed_addr=0x%08X td_addr=0x%08X FA=%d EN=%d "
                "cbp=0x%08X be=0x%08X flags=0x%08X next=0x%08X\n",
                TS_MS, ed->head & OHCI_DPTR_MASK, addr,
                OHCI_BM(ed->flags, ED_FA), OHCI_BM(ed->flags, ED_EN),
@@ -1016,7 +1019,7 @@ static int ohci_service_td(OHCIState *ohci, struct ohci_ed *ed)
         else if (s[1]==0x06 && wVal==0x0100 && wLen>8) tag = "GET_DESCRIPTOR(DEV_FULL)";
         else if (s[1]==0x06 && wVal==0x0200) tag = "GET_DESCRIPTOR(CONFIG)★";
         else if (s[1]==0x06) tag = "GET_DESCRIPTOR";
-        printf("[%07lld] OHCI SETUP: bmReq=%02X bReq=%02X wVal=%04X wIdx=%04X wLen=%04X "
+        if(0) printf("[%07lld] OHCI SETUP: bmReq=%02X bReq=%02X wVal=%04X wIdx=%04X wLen=%04X "
                "FA=%d EN=%d [%s]\n",
                TS_MS, s[0], s[1], wVal, s[4]|(s[5]<<8), wLen,
                OHCI_BM(ed->flags, ED_FA), OHCI_BM(ed->flags, ED_EN), tag);
@@ -1027,7 +1030,7 @@ static int ohci_service_td(OHCIState *ohci, struct ohci_ed *ed)
             cpu_physical_memory_read(0x0F1D0B, &sub, 1);
             cpu_physical_memory_read(0x0F1D09, &err, 1);
             cpu_physical_memory_read(0x0F1D90, &cls, 1);
-            printf("[%07lld] @SET_ADDR: substate=%d err=%d class=0x%02X wVal=%d\n",
+            if(0) printf("[%07lld] @SET_ADDR: substate=%d err=%d class=0x%02X wVal=%d\n",
                    TS_MS, sub, err, cls, wVal);
         }
     }
@@ -1057,7 +1060,7 @@ static int ohci_service_td(OHCIState *ohci, struct ohci_ed *ed)
         usb_packet_addbuf(&ohci->usb_packet, ohci->usb_buf, pktlen);
         usb_handle_packet(dev, &ohci->usb_packet);
         if (TS_MS > 5900)
-            printf("[%07lld] OHCI TD RESULT: FA=%d EN=%d dir=%s status=%d len=%zd\n", TS_MS,
+            if(0) printf("[%07lld] OHCI TD RESULT: FA=%d EN=%d dir=%s status=%d len=%zd\n", TS_MS,
                    OHCI_BM(ed->flags, ED_FA), OHCI_BM(ed->flags, ED_EN),
                    str, ohci->usb_packet.status,
                    ohci->usb_packet.actual_length);
@@ -1084,11 +1087,11 @@ static int ohci_service_td(OHCIState *ohci, struct ohci_ed *ed)
             ohci_td_pkt("IN", ohci->usb_buf, pktlen);
             if (TS_MS > 5900 && ret > 0 && ret <= 18 &&
                 OHCI_BM(ed->flags, ED_EN) == 0) {
-                printf("[%07lld] OHCI IN-DATA FA=%d ret=%d:",
+                if(0) printf("[%07lld] OHCI IN-DATA FA=%d ret=%d:",
                        TS_MS, OHCI_BM(ed->flags, ED_FA), ret);
                 for (int _i = 0; _i < ret && _i < 18; _i++)
-                    printf(" %02X", ohci->usb_buf[_i]);
-                printf("\n");
+                    if(0) printf(" %02X", ohci->usb_buf[_i]);
+                if(0) printf("\n");
             }
         } else {
             ret = pktlen;
@@ -1134,7 +1137,7 @@ static int ohci_service_td(OHCIState *ohci, struct ohci_ed *ed)
             case USB_RET_NODEV:
                 trace_usb_ohci_td_dev_error();
                 if (TS_MS > 5900)
-                    printf("[%07lld] OHCI TD NODEV: FA=%d EN=%d dir=%s — device not responding!\n",
+                    if(0) printf("[%07lld] OHCI TD NODEV: FA=%d EN=%d dir=%s — device not responding!\n",
                            TS_MS, OHCI_BM(ed->flags, ED_FA), OHCI_BM(ed->flags, ED_EN), str);
                 OHCI_SET_BM(td.flags, TD_CC, OHCI_CC_DEVICENOTRESPONDING);
                 break;
@@ -1145,7 +1148,7 @@ static int ohci_service_td(OHCIState *ohci, struct ohci_ed *ed)
                     static uint32_t ohci_nak_count = 0;
                     ohci_nak_count++;
                     if (TS_MS > 5900 && (ohci_nak_count <= 3 || (ohci_nak_count % 1000) == 0)) {
-                        printf("[%07lld] OHCI TD NAK: FA=%d EN=%d dir=%s (nak#%u)\n",
+                        if(0) printf("[%07lld] OHCI TD NAK: FA=%d EN=%d dir=%s (nak#%u)\n",
                                TS_MS,
                                OHCI_BM(ed->flags, ED_FA),
                                OHCI_BM(ed->flags, ED_EN),
@@ -1156,7 +1159,7 @@ static int ohci_service_td(OHCIState *ohci, struct ohci_ed *ed)
             case USB_RET_STALL:
                 trace_usb_ohci_td_stall();
                 if (TS_MS > 5900)
-                    printf("[%07lld] OHCI TD STALL: FA=%d EN=%d dir=%s — endpoint stalled!\n",
+                    if(0) printf("[%07lld] OHCI TD STALL: FA=%d EN=%d dir=%s — endpoint stalled!\n",
                            TS_MS, OHCI_BM(ed->flags, ED_FA), OHCI_BM(ed->flags, ED_EN), str);
                 OHCI_SET_BM(td.flags, TD_CC, OHCI_CC_STALL);
                 break;
@@ -1189,7 +1192,7 @@ static int ohci_service_td(OHCIState *ohci, struct ohci_ed *ed)
         ohci->done_count = i;
     }
     if (TS_MS > 5900)
-        printf("[%07lld] OHCI TD RETIRE: td=0x%08X CC=%d DI=%d done_count=%d "
+        if(0) printf("[%07lld] OHCI TD RETIRE: td=0x%08X CC=%d DI=%d done_count=%d "
                "ed_FA=%d ed_EN=%d\n",
                TS_MS, addr, OHCI_BM(td.flags, TD_CC), i, ohci->done_count,
                OHCI_BM(ed->flags, ED_FA), OHCI_BM(ed->flags, ED_EN));
@@ -1232,7 +1235,7 @@ static int ohci_service_ed_list(OHCIState *ohci, uint32_t head)
             static uint32_t skip_count = 0;
             skip_count++;
             if (TS_MS > 5900 && (skip_count <= 5 || (skip_count % 100) == 0)) {
-                printf("[%07lld] OHCI ED SKIP: @0x%08X FA=%d EN=%d H=%d K=%d (skip#%u)\n",
+                if(0) printf("[%07lld] OHCI ED SKIP: @0x%08X FA=%d EN=%d H=%d K=%d (skip#%u)\n",
                        TS_MS, cur,
                        OHCI_BM(ed.flags, ED_FA), OHCI_BM(ed.flags, ED_EN),
                        (ed.head & OHCI_ED_H) ? 1 : 0,
@@ -1252,7 +1255,7 @@ static int ohci_service_ed_list(OHCIState *ohci, uint32_t head)
 
         while ((ed.head & OHCI_DPTR_MASK) != ed.tail) {
             if (TS_MS > 5900)
-                printf("[%07lld] OHCI ED: @0x%08X FA=%d EN=%d D=%d K=%d F=%d MPS=%d "
+                if(0) printf("[%07lld] OHCI ED: @0x%08X FA=%d EN=%d D=%d K=%d F=%d MPS=%d "
                        "head=0x%08X tail=0x%08X\n",
                        TS_MS, cur,
                        OHCI_BM(ed.flags, ED_FA), OHCI_BM(ed.flags, ED_EN),
@@ -1311,7 +1314,7 @@ static void ohci_process_lists(OHCIState *ohci)
 {
     if ((ohci->ctl & OHCI_CTL_CLE) && (ohci->status & OHCI_STATUS_CLF)) {
         if (TS_MS > 5900)
-            printf("[%07lld] OHCI: === Processing CONTROL list head=0x%08X ===\n", TS_MS, ohci->ctrl_head);
+            if(0) printf("[%07lld] OHCI: === Processing CONTROL list head=0x%08X ===\n", TS_MS, ohci->ctrl_head);
         if (ohci->ctrl_cur && ohci->ctrl_cur != ohci->ctrl_head) {
             trace_usb_ohci_process_lists(ohci->ctrl_head, ohci->ctrl_cur);
         }
@@ -1323,7 +1326,7 @@ static void ohci_process_lists(OHCIState *ohci)
 
     if ((ohci->ctl & OHCI_CTL_BLE) && (ohci->status & OHCI_STATUS_BLF)) {
         if (TS_MS > 5900)
-            printf("[%07lld] OHCI: === Processing BULK list head=0x%08X ===\n", TS_MS, ohci->bulk_head);
+            if(0) printf("[%07lld] OHCI: === Processing BULK list head=0x%08X ===\n", TS_MS, ohci->bulk_head);
         if (!ohci_service_ed_list(ohci, ohci->bulk_head)) {
             ohci->bulk_cur = 0;
             ohci->status &= ~OHCI_STATUS_BLF;
@@ -1334,6 +1337,17 @@ static void ohci_process_lists(OHCIState *ohci)
 /* Do frame processing on frame boundary */
 static void ohci_frame_boundary(void *opaque)
 {
+    extern uint64_t perf_cnt_ohci_frame;
+    perf_cnt_ohci_frame++;
+
+    /* Generate PCRTC vblank at ~60Hz (every 17 OHCI frames = 17ms) */
+    static int vblank_divider = 0;
+    if (++vblank_divider >= 17) {
+        vblank_divider = 0;
+        extern void nv2a_pcrtc_vblank_tick(void);
+        nv2a_pcrtc_vblank_tick();
+    }
+
     OHCIState *ohci = opaque;
     struct ohci_hcca hcca;
 
@@ -1341,7 +1355,7 @@ static void ohci_frame_boundary(void *opaque)
     static uint32_t prev_ctl = 0xFFFFFFFF;
     static int64_t last_heads_log = 0;
     if (TS_MS > 5900 && ohci->ctl != prev_ctl) {
-        printf("[%07lld] OHCI FRAME: ctl=0x%08X (HCFS=%d CLE=%d BLE=%d PLE=%d) "
+        if(0) printf("[%07lld] OHCI FRAME: ctl=0x%08X (HCFS=%d CLE=%d BLE=%d PLE=%d) "
                "ctrl_head=0x%08X bulk_head=0x%08X hcca=0x%08X\n", TS_MS,
                ohci->ctl, (ohci->ctl >> 6) & 3,
                (ohci->ctl >> 4) & 1, (ohci->ctl >> 5) & 1, (ohci->ctl >> 2) & 1,
@@ -1350,21 +1364,14 @@ static void ohci_frame_boundary(void *opaque)
     }
     if (TS_MS > 5900 && (ohci->ctrl_head || ohci->bulk_head) &&
         TS_MS - last_heads_log > 500) {
-        printf("[%07lld] OHCI ACTIVE: ctrl_head=0x%08X ctrl_cur=0x%08X "
+        if(0) printf("[%07lld] OHCI ACTIVE: ctrl_head=0x%08X ctrl_cur=0x%08X "
                "bulk_head=0x%08X bulk_cur=0x%08X intr=0x%08X\n", TS_MS,
                ohci->ctrl_head, ohci->ctrl_cur,
                ohci->bulk_head, ohci->bulk_cur, ohci->intr_status);
         last_heads_log = TS_MS;
     }
 
-    /* v291: State-change watchers at verified PAs (from page table walk, PD=0xF000).
-     * Event-driven: only logs when a value changes. 3 bytes read per frame.
-     *   DAT_000a6d0b (enum sub-state): VA 0xA6D0B → PA 0x0F1D0B
-     *     Values: 0=idle, 1=GET_DESC submitted, 2=GET_DESC done, 3=SET_ADDR done, 4=state3 entered
-     *   DAT_000a6d09 (error flag): VA 0xA6D09 → PA 0x0F1D09
-     *   DAT_000a6d90 (bDeviceClass): VA 0xA6D90 → PA 0x0F1D90
-     */
-    if (TS_MS > 5900) {
+    if (0 && TS_MS > 5900) {
         static uint8_t prev_substate = 0, prev_errflag = 0, prev_devclass = 0;
         static bool watchers_active = false;
         uint8_t cur_substate, cur_errflag, cur_devclass;
@@ -1372,7 +1379,7 @@ static void ohci_frame_boundary(void *opaque)
         cpu_physical_memory_read(0x0F1D09, &cur_errflag, 1);
         cpu_physical_memory_read(0x0F1D90, &cur_devclass, 1);
         if (!watchers_active) {
-            printf("[%07lld] USB-WATCH: init substate=%d err=%d class=0x%02X\n",
+            if(0) printf("[%07lld] USB-WATCH: init substate=%d err=%d class=0x%02X\n",
                    TS_MS, cur_substate, cur_errflag, cur_devclass);
             prev_substate = cur_substate;
             prev_errflag = cur_errflag;
@@ -1438,7 +1445,7 @@ static void ohci_frame_boundary(void *opaque)
                 if (ent_pa != 0xFFFFFFFF)
                     cpu_physical_memory_read(ent_pa, cde_bytes, 4);
             }
-            printf("[%07lld] USB-WATCH: substate %d→%d (err=%d class=0x%02X ctx=0x%X"
+            if(0) printf("[%07lld] USB-WATCH: substate %d→%d (err=%d class=0x%02X ctx=0x%X"
                    " st=%u addr=%u mps=%u slot=%u hced=0x%X hcb=0x%X cdrv=0x%X"
                    " edfl=0x%X dtf=0x%02X dtc=0x%X)\n",
                    TS_MS, prev_substate, cur_substate, cur_errflag, cur_devclass,
@@ -1465,7 +1472,7 @@ static void ohci_frame_boundary(void *opaque)
                         cpu_physical_memory_read(ipa + 0x14, &i_slot, 4);
                     }
                 }
-                printf("  v299-DUAL: outer_ctx=0x%X inner_ctx=0x%X %s disp=%d"
+                if(0) printf("  v299-DUAL: outer_ctx=0x%X inner_ctx=0x%X %s disp=%d"
                        " inner:[0]=%u [1]=0x%02X [4]=0x%02X slot=0x%X\n",
                        ctx_ptr, inner_ctx,
                        (ctx_ptr == inner_ctx) ? "SAME" : "DIFFER",
@@ -1487,7 +1494,7 @@ static void ohci_frame_boundary(void *opaque)
                 if (cbpa != 0xFFFFFFFF)
                     cpu_physical_memory_read(cbpa, &cb_ptr, 4);
             }
-            printf("  CDT={0x%X,0x%X,0x%X,0x%X,0x%X}"
+            if(0) printf("  CDT={0x%X,0x%X,0x%X,0x%X,0x%X}"
                    " E0=[%02X%02X] E1=[%02X%02X] E2=[%02X%02X] E3=[%02X%02X] E4=[%02X%02X]"
                    " cb1=0x%X\n",
                    cdt[0], cdt[1], cdt[2], cdt[3], cdt[4],
@@ -1515,21 +1522,21 @@ static void ohci_frame_boundary(void *opaque)
                     if (tf_pa != 0xFFFFFFFF)
                         cpu_physical_memory_read(tf_pa, &thunk_flag, 1);
                 }
-                printf("  v295-CHAIN: base=0x%X gflag=%u thunk=0x%X *thunk=0x%02X(%s)\n",
+                if(0) printf("  v295-CHAIN: base=0x%X gflag=%u thunk=0x%X *thunk=0x%02X(%s)\n",
                        base_tbl, gflag, thunk_val, thunk_flag,
                        (thunk_flag & 1) ? "PATH_A" : "PATH_B");
                 uint32_t cur_va = ctx_ptr;
                 for (int hop = 0; hop < 6; hop++) {
                     uint32_t epa = chihiro_va_to_pa(cur_va);
                     if (epa == 0xFFFFFFFF) {
-                        printf("  v295-CHAIN[%d]: va=0x%X → PA fail\n", hop, cur_va);
+                        if(0) printf("  v295-CHAIN[%d]: va=0x%X → PA fail\n", hop, cur_va);
                         break;
                     }
                     uint8_t es = 0, ep = 0x80, espd = 0;
                     cpu_physical_memory_read(epa + 0x00, &es, 1);
                     cpu_physical_memory_read(epa + 0x01, &ep, 1);
                     cpu_physical_memory_read(epa + 0x04, &espd, 1);
-                    printf("  v295-CHAIN[%d]: va=0x%X [0]=%u [1]=%02X [4]=0x%02X\n",
+                    if(0) printf("  v295-CHAIN[%d]: va=0x%X [0]=%u [1]=%02X [4]=0x%02X\n",
                            hop, cur_va, es, ep, espd);
                     if (ep == 0x80) break;
                     if (base_tbl == 0) break;
@@ -1545,13 +1552,13 @@ static void ohci_frame_boundary(void *opaque)
                 uint32_t fl_head = 0;
                 if (fl_va_pa != 0xFFFFFFFF)
                     cpu_physical_memory_read(fl_va_pa, &fl_head, 4);
-                printf("  v297-EDPOOL@132: EDFL_head=0x%X", fl_head);
+                if(0) printf("  v297-EDPOOL@132: EDFL_head=0x%X", fl_head);
                 if (fl_head != 0) {
                     uint32_t fl_head_pa = chihiro_va_to_pa(fl_head);
                     if (fl_head_pa != 0xFFFFFFFF) {
                         uint32_t fe[4] = {0};
                         cpu_physical_memory_read(fl_head_pa, fe, 16);
-                        printf(" → [flags=0x%08X tail=0x%08X head=0x%08X next=0x%08X]",
+                        if(0) printf(" → [flags=0x%08X tail=0x%08X head=0x%08X next=0x%08X]",
                                fe[0], fe[1], fe[2], fe[3]);
                     }
                 }
@@ -1559,17 +1566,17 @@ static void ohci_frame_boundary(void *opaque)
                 uint32_t pool_base = 0;
                 if (pool_base_pa != 0xFFFFFFFF)
                     cpu_physical_memory_read(pool_base_pa, &pool_base, 4);
-                printf(" pool_va_base=0x%X\n", pool_base);
+                if(0) printf(" pool_va_base=0x%X\n", pool_base);
             }
             prev_substate = cur_substate;
         }
         if (cur_errflag != prev_errflag) {
-            printf("[%07lld] USB-WATCH: ERROR FLAG %d→%d (substate=%d)\n",
+            if(0) printf("[%07lld] USB-WATCH: ERROR FLAG %d→%d (substate=%d)\n",
                    TS_MS, prev_errflag, cur_errflag, cur_substate);
             prev_errflag = cur_errflag;
         }
         if (cur_devclass != prev_devclass) {
-            printf("[%07lld] USB-WATCH: devclass 0x%02X→0x%02X (substate=%d)\n",
+            if(0) printf("[%07lld] USB-WATCH: devclass 0x%02X→0x%02X (substate=%d)\n",
                    TS_MS, prev_devclass, cur_devclass, cur_substate);
             prev_devclass = cur_devclass;
         }
@@ -1587,7 +1594,7 @@ static void ohci_frame_boundary(void *opaque)
                     cpu_physical_memory_read(cpa + 0x14, &sv, 4);
                     cpu_physical_memory_read(cpa + 0x00, &stv, 1);
                     if (sv != prev_slot_val || stv != prev_ctx_st) {
-                        printf("[%07lld] SLOT-WATCH: ctx+0x14: 0x%X→0x%X  ctx[0]: %u→%u (substate=%d)\n",
+                        if(0) printf("[%07lld] SLOT-WATCH: ctx+0x14: 0x%X→0x%X  ctx[0]: %u→%u (substate=%d)\n",
                                TS_MS, prev_slot_val, sv, prev_ctx_st, stv, cur_substate);
                         prev_slot_val = sv;
                         prev_ctx_st = stv;
@@ -1607,7 +1614,7 @@ static void ohci_frame_boundary(void *opaque)
                     uint32_t hv = 0;
                     cpu_physical_memory_read(cpa_h + 0x08, &hv, 4);
                     if (hv != prev_hced) {
-                        printf("[%07lld] HCED-WATCH: ctx+0x08: 0x%X→0x%X (substate=%d)\n",
+                        if(0) printf("[%07lld] HCED-WATCH: ctx+0x08: 0x%X→0x%X (substate=%d)\n",
                                TS_MS, prev_hced, hv, cur_substate);
                         prev_hced = hv;
                     }
@@ -1626,7 +1633,7 @@ static void ohci_frame_boundary(void *opaque)
                     uint32_t cv = 0;
                     cpu_physical_memory_read(cpa_c + 0x10, &cv, 4);
                     if (cv != prev_cdrv) {
-                        printf("[%07lld] CDRV-WATCH: ctx+0x10: 0x%X→0x%X (substate=%d)\n",
+                        if(0) printf("[%07lld] CDRV-WATCH: ctx+0x10: 0x%X→0x%X (substate=%d)\n",
                                TS_MS, prev_cdrv, cv, cur_substate);
                         prev_cdrv = cv;
                     }
@@ -1642,7 +1649,7 @@ static void ohci_frame_boundary(void *opaque)
                 uint32_t cur_edfl = 0;
                 cpu_physical_memory_read(fl_pa, &cur_edfl, 4);
                 if (cur_edfl != prev_edfl) {
-                    printf("[%07lld] EDFL-WATCH: 0x%X→0x%X (substate=%d)\n",
+                    if(0) printf("[%07lld] EDFL-WATCH: 0x%X→0x%X (substate=%d)\n",
                            TS_MS, prev_edfl, cur_edfl, cur_substate);
                     prev_edfl = cur_edfl;
                 }
@@ -1659,7 +1666,7 @@ static void ohci_frame_boundary(void *opaque)
                 uint8_t cur_dtf0 = 0;
                 cpu_physical_memory_read(dtf_pa, &cur_dtf0, 1);
                 if (cur_dtf0 != prev_dtf0) {
-                    printf("[%07lld] DTFLAGS-WATCH: slot0 0x%02X→0x%02X (substate=%d)\n",
+                    if(0) printf("[%07lld] DTFLAGS-WATCH: slot0 0x%02X→0x%02X (substate=%d)\n",
                            TS_MS, prev_dtf0, cur_dtf0, cur_substate);
                     prev_dtf0 = cur_dtf0;
                 }
@@ -1669,7 +1676,7 @@ static void ohci_frame_boundary(void *opaque)
                 uint8_t cur_dtf2 = 0;
                 cpu_physical_memory_read(dtf2_pa, &cur_dtf2, 1);
                 if (cur_dtf2 != prev_dtf2) {
-                    printf("[%07lld] DTFLAGS-WATCH: slot2 0x%02X→0x%02X (substate=%d)\n",
+                    if(0) printf("[%07lld] DTFLAGS-WATCH: slot2 0x%02X→0x%02X (substate=%d)\n",
                            TS_MS, prev_dtf2, cur_dtf2, cur_substate);
                     prev_dtf2 = cur_dtf2;
                 }
@@ -1679,7 +1686,7 @@ static void ohci_frame_boundary(void *opaque)
                 uint8_t cur_dtf3 = 0;
                 cpu_physical_memory_read(dtf3_pa, &cur_dtf3, 1);
                 if (cur_dtf3 != prev_dtf3) {
-                    printf("[%07lld] DTFLAGS-WATCH: slot3 0x%02X→0x%02X (substate=%d)\n",
+                    if(0) printf("[%07lld] DTFLAGS-WATCH: slot3 0x%02X→0x%02X (substate=%d)\n",
                            TS_MS, prev_dtf3, cur_dtf3, cur_substate);
                     prev_dtf3 = cur_dtf3;
                 }
@@ -1730,7 +1737,7 @@ static void ohci_frame_boundary(void *opaque)
             ohci->done |= 1;
         }
         if (TS_MS > 5900)
-            printf("[%07lld] OHCI DONE->HCCA: done=0x%08X hcca=0x%08X\n",
+            if(0) printf("[%07lld] OHCI DONE->HCCA: done=0x%08X hcca=0x%08X\n",
                    TS_MS, ohci->done, ohci->hcca);
         hcca.done = cpu_to_le32(ohci->done);
         ohci->done = 0;
@@ -1749,7 +1756,7 @@ static void ohci_frame_boundary(void *opaque)
         if (ohci->intr_status & OHCI_INTR_WD) {
             if (wdh_set_time == 0) wdh_set_time = TS_MS;
             if (!wdh_warned && TS_MS - wdh_set_time > 50) {
-                printf("[%07lld] OHCI WDH-STALL: WDH set for %lldms — "
+                if(0) printf("[%07lld] OHCI WDH-STALL: WDH set for %lldms — "
                        "guest ISR not acknowledging! intr_status=0x%08X "
                        "intr=0x%08X\n", TS_MS, TS_MS - wdh_set_time,
                        ohci->intr_status, ohci->intr);
@@ -1757,7 +1764,7 @@ static void ohci_frame_boundary(void *opaque)
             }
         } else {
             if (wdh_set_time && TS_MS > 5900 && !wdh_warned) {
-                printf("[%07lld] OHCI WDH-ACK: cleared after %lldms\n",
+                if(0) printf("[%07lld] OHCI WDH-ACK: cleared after %lldms\n",
                        TS_MS, TS_MS - wdh_set_time);
             }
             wdh_set_time = 0;
@@ -1845,15 +1852,15 @@ static void ohci_set_ctl(OHCIState *ohci, uint32_t val)
     }
     trace_usb_ohci_set_ctl(ohci->name, new_state);
     if (TS_MS > 5900) {
-        printf("[%07lld] OHCI HcControl: 0x%08X -> 0x%08X (HCFS: %d -> %d) ports:",
+        if(0) printf("[%07lld] OHCI HcControl: 0x%08X -> 0x%08X (HCFS: %d -> %d) ports:",
                TS_MS, old_state | (ohci->ctl & ~OHCI_CTL_HCFS), val,
                old_state >> 6, new_state >> 6);
         for (int i = 0; i < ohci->num_ports; i++) {
-            printf(" P%d=0x%08X[%s%s]", i, ohci->rhport[i].ctrl,
+            if(0) printf(" P%d=0x%08X[%s%s]", i, ohci->rhport[i].ctrl,
                    (ohci->rhport[i].ctrl & OHCI_PORT_CCS) ? "CCS" : "",
                    (ohci->rhport[i].ctrl & OHCI_PORT_PES) ? "+PES" : "");
         }
-        printf("\n");
+        if(0) printf("\n");
     }
     switch (new_state) {
     case OHCI_USB_OPERATIONAL:
@@ -1923,13 +1930,13 @@ static void ohci_set_hub_status(OHCIState *ohci, uint32_t val)
         int i;
 
         if (TS_MS > 5900) {
-            printf("[%07lld] OHCI HcRhStatus LPSC: powering on %d ports\n",
+            if(0) printf("[%07lld] OHCI HcRhStatus LPSC: powering on %d ports\n",
                    TS_MS, ohci->num_ports);
         }
         for (i = 0; i < ohci->num_ports; i++) {
             ohci_port_power(ohci, i, 1);
             if (TS_MS > 5900) {
-                printf("[%07lld]   port%d after power: ctrl=0x%08X [%s%s%s]\n",
+                if(0) printf("[%07lld]   port%d after power: ctrl=0x%08X [%s%s%s]\n",
                        TS_MS, i, ohci->rhport[i].ctrl,
                        (ohci->rhport[i].ctrl & OHCI_PORT_CCS) ? "CCS " : "",
                        (ohci->rhport[i].ctrl & OHCI_PORT_PES) ? "PES " : "",
@@ -2005,7 +2012,7 @@ static void ohci_port_set_status(OHCIState *ohci, int portnum, uint32_t val)
     old_state = port->ctrl;
 
     if (TS_MS > 5900) {
-        printf("[%07lld] OHCI PORT%d WRITE: val=0x%08X before=0x%08X [%s%s%s%s%s%s]\n", TS_MS,
+        if(0) printf("[%07lld] OHCI PORT%d WRITE: val=0x%08X before=0x%08X [%s%s%s%s%s%s]\n", TS_MS,
                portnum, val, old_state,
                (val & (1<<0))  ? "ClearPortEnable " : "",
                (val & (1<<1))  ? "SetPortEnable " : "",
@@ -2028,10 +2035,10 @@ static void ohci_port_set_status(OHCIState *ohci, int portnum, uint32_t val)
         port->ctrl &= ~OHCI_PORT_PES;
         port->ctrl |= OHCI_PORT_PESC;
         extern uint32_t chihiro_usb_sm_pa;
-        if (TS_MS > 5900 && chihiro_usb_sm_pa != 0) {
+        if (0 && TS_MS > 5900 && chihiro_usb_sm_pa != 0) {
             uint8_t sm[4] = {0};
             cpu_physical_memory_read(chihiro_usb_sm_pa, sm, 4);
-            printf("[%07lld]   ClearPE USB-SM: active=%u sub=%u state=%u flags=0x%02X\n",
+            if(0) printf("[%07lld]   ClearPE USB-SM: active=%u sub=%u state=%u flags=0x%02X\n",
                    TS_MS, sm[0], sm[1], sm[2], sm[3]);
         }
     }
@@ -2188,12 +2195,12 @@ static uint64_t ohci_mem_read(void *opaque,
     }
 
     if (TS_MS > 5900 && addr != 0x38 && addr != 0x3C) {
-        printf("[%07lld] OHCI READ  [0x%03X] %-20s = 0x%08X\n", TS_MS,
+        if(0) printf("[%07lld] OHCI READ  [0x%03X] %-20s = 0x%08X\n", TS_MS,
                (uint32_t)addr, ohci_reg_name(addr), retval);
     }
 
-    /* v298: ultra-fine slot+cdrv probe on MMIO read too */
-    if (TS_MS > 7800 && TS_MS < 8100) {
+    /* v298: disabled — per-access monitoring too expensive */
+    if (0 && TS_MS > 7800 && TS_MS < 8100) {
         static uint32_t r_prev_slot = 0xDEAD, r_prev_cdrv = 0xDEAD;
         static uint8_t r_prev_sub = 0xFF;
         uint8_t r_sub = 0;
@@ -2208,7 +2215,7 @@ static uint64_t ohci_mem_read(void *opaque,
                 cpu_physical_memory_read(r_pa + 0x14, &r_sl, 4);
                 cpu_physical_memory_read(r_pa + 0x10, &r_cd, 4);
                 if (r_sl != r_prev_slot || r_cd != r_prev_cdrv || r_sub != r_prev_sub) {
-                    printf("[%07lld] v298-FINE: slot=0x%X→0x%X cdrv=0x%X→0x%X sub=%d→%d @READ[0x%03X]\n",
+                    if(0) printf("[%07lld] v298-FINE: slot=0x%X→0x%X cdrv=0x%X→0x%X sub=%d→%d @READ[0x%03X]\n",
                            TS_MS, r_prev_slot, r_sl, r_prev_cdrv, r_cd, r_prev_sub, r_sub, (uint32_t)addr);
                     r_prev_slot = r_sl;
                     r_prev_cdrv = r_cd;
@@ -2235,12 +2242,12 @@ static void ohci_mem_write(void *opaque,
     }
 
     if (TS_MS > 5900) {
-        printf("[%07lld] OHCI WRITE [0x%03X] %-20s = 0x%08X\n", TS_MS,
+        if(0) printf("[%07lld] OHCI WRITE [0x%03X] %-20s = 0x%08X\n", TS_MS,
                (uint32_t)addr, ohci_reg_name(addr), (uint32_t)val);
     }
 
-    /* v298: ultra-fine slot+cdrv probe on every MMIO write */
-    if (TS_MS > 7800 && TS_MS < 8100) {
+    /* v298: disabled — per-access monitoring too expensive */
+    if (0 && TS_MS > 7800 && TS_MS < 8100) {
         static uint32_t w_prev_slot = 0xDEAD, w_prev_cdrv = 0xDEAD;
         static uint8_t w_prev_sub = 0xFF;
         uint8_t w_sub = 0;
@@ -2255,7 +2262,7 @@ static void ohci_mem_write(void *opaque,
                 cpu_physical_memory_read(w_pa + 0x14, &w_sl, 4);
                 cpu_physical_memory_read(w_pa + 0x10, &w_cd, 4);
                 if (w_sl != w_prev_slot || w_cd != w_prev_cdrv || w_sub != w_prev_sub) {
-                    printf("[%07lld] v298-FINE: slot=0x%X→0x%X cdrv=0x%X→0x%X sub=%d→%d @WRITE[0x%03X]\n",
+                    if(0) printf("[%07lld] v298-FINE: slot=0x%X→0x%X cdrv=0x%X→0x%X sub=%d→%d @WRITE[0x%03X]\n",
                            TS_MS, w_prev_slot, w_sl, w_prev_cdrv, w_cd, w_prev_sub, w_sub, (uint32_t)addr);
                     w_prev_slot = w_sl;
                     w_prev_cdrv = w_cd;
@@ -2281,7 +2288,7 @@ static void ohci_mem_write(void *opaque,
 
     case 2: /* HcCommandStatus */
         if (TS_MS > 5900 && (val & 0x06))
-            printf("[%07lld] OHCI HcCommandStatus: val=0x%08X [%s%s] ctrl_head=0x%08X bulk_head=0x%08X\n",
+            if(0) printf("[%07lld] OHCI HcCommandStatus: val=0x%08X [%s%s] ctrl_head=0x%08X bulk_head=0x%08X\n",
                    TS_MS, val,
                    (val & 0x02) ? "CLF " : "", (val & 0x04) ? "BLF " : "",
                    ohci->ctrl_head, ohci->bulk_head);
@@ -2297,8 +2304,8 @@ static void ohci_mem_write(void *opaque,
         break;
 
     case 3: /* HcInterruptStatus */
-        if (TS_MS > 5900 && (val & OHCI_INTR_WD)) {
-            printf("[%07lld] OHCI WDH ACK: guest clears WDH (val=0x%08lX)\n",
+        if (0 && TS_MS > 5900 && (val & OHCI_INTR_WD)) {
+            if(0) printf("[%07lld] OHCI WDH ACK: guest clears WDH (val=0x%08lX)\n",
                    TS_MS, (unsigned long)val);
             extern uint32_t chihiro_usb_sm_pa;
             if (chihiro_usb_sm_pa != 0) {
@@ -2309,7 +2316,7 @@ static void ohci_mem_write(void *opaque,
                 cpu_physical_memory_read(chihiro_usb_sm_pa + 0x78, &sm88, 1);
                 cpu_physical_memory_read(chihiro_usb_sm_pa + 0x7C, &sm8c, 4);
                 cpu_physical_memory_read(chihiro_usb_sm_pa + 0x80, &sm90, 4);
-                printf("[%07lld]   USB-SM: active=%u sub=%u state=%u "
+                if(0) printf("[%07lld]   USB-SM: active=%u sub=%u state=%u "
                        "flags=0x%02X cnt=%u queue=0x%08X req=0x%08X\n",
                        TS_MS, sm[0], sm[1], sm[2], sm[3],
                        sm88, sm8c, sm90);
@@ -2340,25 +2347,6 @@ static void ohci_mem_write(void *opaque,
     case 8: /* HcControlHeadED */
         {
             uint32_t new_head = val & OHCI_EDPTR_MASK;
-            if (TS_MS > 5900 && new_head != 0) {
-                uint32_t ed_buf[4];
-                cpu_physical_memory_read(new_head, ed_buf, 16);
-                uint32_t fa  = (ed_buf[0] >> OHCI_ED_FA_SHIFT) & 0x7F;
-                uint32_t en  = (ed_buf[0] >> OHCI_ED_EN_SHIFT) & 0xF;
-                uint32_t dir = (ed_buf[0] >> OHCI_ED_D_SHIFT) & 0x3;
-                uint32_t spd = (ed_buf[0] >> 13) & 1;
-                uint32_t mps = (ed_buf[0] >> OHCI_ED_MPS_SHIFT) & 0x7FF;
-                uint32_t skip = (ed_buf[0] >> 14) & 1;
-                printf("[%07lld] CtrlHeadED: 0x%08X→0x%08X  "
-                       "ED@0x%08X: flags=0x%08X FA=%d EN=%d D=%d S=%d K=%d MPS=%d "
-                       "tail=0x%08X head=0x%08X next=0x%08X\n",
-                       TS_MS, ohci->ctrl_head, new_head,
-                       new_head, ed_buf[0], fa, en, dir, spd, skip, mps,
-                       ed_buf[1], ed_buf[2], ed_buf[3]);
-            } else if (TS_MS > 5900) {
-                printf("[%07lld] CtrlHeadED: 0x%08X→0x00000000\n",
-                       TS_MS, ohci->ctrl_head);
-            }
             ohci->ctrl_head = new_head;
         }
         break;
@@ -2370,25 +2358,6 @@ static void ohci_mem_write(void *opaque,
     case 10: /* HcBulkHeadED */
         {
             uint32_t new_bhead = val & OHCI_EDPTR_MASK;
-            if (TS_MS > 5900 && new_bhead != 0) {
-                uint32_t ed_buf[4];
-                cpu_physical_memory_read(new_bhead, ed_buf, 16);
-                uint32_t fa  = (ed_buf[0] >> OHCI_ED_FA_SHIFT) & 0x7F;
-                uint32_t en  = (ed_buf[0] >> OHCI_ED_EN_SHIFT) & 0xF;
-                uint32_t dir = (ed_buf[0] >> OHCI_ED_D_SHIFT) & 0x3;
-                uint32_t spd = (ed_buf[0] >> 13) & 1;
-                uint32_t mps = (ed_buf[0] >> OHCI_ED_MPS_SHIFT) & 0x7FF;
-                uint32_t skip = (ed_buf[0] >> 14) & 1;
-                printf("[%07lld] BulkHeadED: 0x%08X→0x%08X  "
-                       "ED@0x%08X: flags=0x%08X FA=%d EN=%d D=%d S=%d K=%d MPS=%d "
-                       "tail=0x%08X head=0x%08X next=0x%08X\n",
-                       TS_MS, ohci->bulk_head, new_bhead,
-                       new_bhead, ed_buf[0], fa, en, dir, spd, skip, mps,
-                       ed_buf[1], ed_buf[2], ed_buf[3]);
-            } else if (TS_MS > 5900) {
-                printf("[%07lld] BulkHeadED: 0x%08X→0x00000000\n",
-                       TS_MS, ohci->bulk_head);
-            }
             ohci->bulk_head = new_bhead;
         }
         break;

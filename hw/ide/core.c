@@ -43,6 +43,7 @@
 #include "qemu/cutils.h"
 #include "system/replay.h"
 #include "system/runstate.h"
+#include "exec/watchpoint.h"
 #include "ide-internal.h"
 #include "trace.h"
 
@@ -974,7 +975,7 @@ static void ide_dma_cb(void *opaque, int ret)
         static int64_t last_dma_ts = 0;
         int64_t now = qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL);
         if (now != last_dma_ts || sector_num > 0x88) {
-            printf("[%07lld] IDE-DMA-CB: unit=%d cmd=%s LBA=%lu n=%d\n",
+            if(0) printf("[%07lld] IDE-DMA-CB: unit=%d cmd=%s LBA=%lu n=%d\n",
                    now, s->unit, IDE_DMA_CMD_str(s->dma_cmd),
                    (unsigned long)sector_num, n);
             last_dma_ts = now;
@@ -989,7 +990,6 @@ static void ide_dma_cb(void *opaque, int ret)
         extern bool chihiro_ide_read_sector(uint32_t lba, void *buffer);
         uint8_t sector_buf[512];
         if (chihiro_ide_read_sector((uint32_t)sector_num, sector_buf)) {
-            /* First sector handled — serve ALL remaining via scatter-gather */
             int total = n;
             int sg_idx = 0;
             dma_addr_t sg_off = 0;
@@ -997,18 +997,24 @@ static void ide_dma_cb(void *opaque, int ret)
                 if (i > 0) {
                     chihiro_ide_read_sector((uint32_t)(sector_num + i), sector_buf);
                 }
-                /* Walk scatter-gather list properly */
-                while (sg_idx < s->sg.nsg && sg_off >= s->sg.sg[sg_idx].len) {
-                    sg_off -= s->sg.sg[sg_idx].len;
-                    sg_idx++;
-                }
-                if (sg_idx < s->sg.nsg) {
-                    dma_memory_write(&address_space_memory,
-                                     s->sg.sg[sg_idx].base + sg_off,
-                                     sector_buf, 512,
+                int remaining = 512;
+                int buf_pos = 0;
+                while (remaining > 0) {
+                    while (sg_idx < s->sg.nsg && sg_off >= s->sg.sg[sg_idx].len) {
+                        sg_off -= s->sg.sg[sg_idx].len;
+                        sg_idx++;
+                    }
+                    if (sg_idx >= s->sg.nsg) break;
+                    dma_addr_t dest = s->sg.sg[sg_idx].base + sg_off;
+                    dma_addr_t avail = s->sg.sg[sg_idx].len - sg_off;
+                    int chunk = (remaining < (int)avail) ? remaining : (int)avail;
+                    dma_memory_write(&address_space_memory, dest,
+                                     sector_buf + buf_pos, chunk,
                                      MEMTXATTRS_UNSPECIFIED);
+                    sg_off += chunk;
+                    buf_pos += chunk;
+                    remaining -= chunk;
                 }
-                sg_off += 512;
             }
             sector_num += total;
             ide_set_sector(s, sector_num);
@@ -1046,6 +1052,8 @@ static void ide_dma_cb(void *opaque, int ret)
     }
 
     offset = sector_num << BDRV_SECTOR_BITS;
+    if (s->unit == 1 && s->dma_cmd == IDE_DMA_READ) {
+    }
     switch (s->dma_cmd) {
     case IDE_DMA_READ:
         s->bus->dma->aiocb = dma_blk_read(s->blk, &s->sg, offset,
@@ -1438,13 +1446,13 @@ void ide_ioport_write(void *opaque, uint32_t addr, uint32_t val)
             if (unit == 1 && sector == 0xFC801) {
                 fc801_count++;
                 if (fc801_count <= 15) {
-                    printf("[%07lld] IDE cmd=0x%02X unit=%d LBA=0x%llX nsect=%d\n",
+                    if(0) printf("[%07lld] IDE cmd=0x%02X unit=%d LBA=0x%llX nsect=%d\n",
                            TS_MS, val, unit, (long long)sector, nsector);
                 } else if (fc801_count == 16) {
-                    printf("[%07lld] IDE FC801 polling — suppressing further logs\n", TS_MS);
+                    if(0) printf("[%07lld] IDE FC801 polling — suppressing further logs\n", TS_MS);
                 }
             } else {
-                printf("[%07lld] IDE cmd=0x%02X unit=%d LBA=0x%llX nsect=%d\n",
+                if(0) printf("[%07lld] IDE cmd=0x%02X unit=%d LBA=0x%llX nsect=%d\n",
                        TS_MS, val, unit, (long long)sector, nsector);
             }
         }
