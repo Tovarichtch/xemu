@@ -1082,6 +1082,13 @@ void pgraph_vk_render_display(PGRAPHState *pg)
         height *= 2;
     }
 
+    /* Clamp display to surface dimensions when CRTC area exceeds the
+     * framebuffer (e.g. PAL 720x576 CRTC with 640x480 render target).
+     * On real hardware the TV encoder fills the overscan with black;
+     * xemu has no TV encoder so we just match the surface size. */
+    if (width > surface->width)   width  = surface->width;
+    if (height > surface->height) height = surface->height;
+
     pgraph_apply_scaling_factor(pg, &width, &height);
 
     PGRAPHVkDisplayState *disp = &r->display;
