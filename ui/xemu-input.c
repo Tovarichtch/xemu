@@ -35,6 +35,7 @@
 #include <stdlib.h>
 
 #include "system/blockdev.h"
+#include "hw/xbox/chihiro-jvs.h"
 
 extern SDL_Window *m_window;
 extern int viewport_coords[4];
@@ -512,6 +513,69 @@ void xemu_input_update_controller(ControllerState *state)
     state->last_input_updated_ts = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
 }
 
+static void xemu_input_update_jvs_lightgun(void)
+{
+    if (!chihiro_jvs_global) return;
+    ChihiroJVSState *jvs = chihiro_jvs_global;
+
+    const bool *kbd = SDL_GetKeyboardState(NULL);
+    float mx, my;
+    uint32_t mouseBtn = SDL_GetMouseState(&mx, &my);
+
+    int32_t winW, winH;
+    SDL_GetWindowSize(m_window, &winW, &winH);
+
+    if (viewport_coords[2] > 0 && viewport_coords[3] > 0) {
+        int32_t drawW, drawH;
+        SDL_GetWindowSizeInPixels(m_window, &drawW, &drawH);
+        float scaleW = (float)winW / (float)drawW;
+        float scaleH = (float)winH / (float)drawH;
+        mx -= viewport_coords[0] * scaleW;
+        my -= viewport_coords[1] * scaleH;
+        winW = (int)(viewport_coords[2] * scaleW);
+        winH = (int)(viewport_coords[3] * scaleH);
+    }
+
+    bool offscreen = !(mx >= 0 && mx <= winW && my >= 0 && my <= winH);
+    bool trigger = (mouseBtn & SDL_BUTTON_MASK(SDL_BUTTON_LEFT)) != 0;
+    bool reload  = (mouseBtn & SDL_BUTTON_MASK(SDL_BUTTON_RIGHT)) != 0 ||
+                   kbd[SDL_SCANCODE_R];
+
+    uint8_t sw0 = 0;
+
+    if (offscreen) {
+        jvs->analog[0] = 0;
+        jvs->analog[1] = 0;
+    } else {
+        jvs->analog[0] = (uint16_t)(mx * 0xFFFF / winW);
+        jvs->analog[1] = (uint16_t)(my * 0xFFFF / winH);
+    }
+
+    if (trigger) sw0 |= 0x02;
+    if (reload)  sw0 |= 0x01;
+
+    if (kbd[g_config.input.keyboard_controller_scancode_map.start])
+        sw0 |= 0x80;
+    if (kbd[SDL_SCANCODE_9])
+        sw0 |= 0x40;
+
+    jvs->player_switches[0][0] = sw0;
+
+    uint8_t sw1 = 0;
+    if (!offscreen && !reload) {
+        sw1 |= 0x80;  /* SCREEN-IN = IN (byte1 bit7): gun sensor detects screen */
+    }
+    jvs->player_switches[0][1] = sw1;
+
+    jvs->system_switches = kbd[SDL_SCANCODE_F2] ? 0x80 : 0x00;
+
+    static bool coin_prev;
+    bool coin_key = kbd[SDL_SCANCODE_5];
+    if (coin_key && !coin_prev)
+        jvs->coin_count[0]++;
+    coin_prev = coin_key;
+}
+
 void xemu_input_update_controllers(void)
 {
     ControllerState *iter;
@@ -521,6 +585,7 @@ void xemu_input_update_controllers(void)
     QTAILQ_FOREACH (iter, &available_controllers, entry) {
         xemu_input_update_rumble(iter);
     }
+    xemu_input_update_jvs_lightgun();
 }
 
 void xemu_input_update_sdl_kbd_controller_state(ControllerState *state)
@@ -616,6 +681,7 @@ void xemu_input_update_sdl_kbd_controller_state(ControllerState *state)
             state->lg.buttons |= CONTROLLER_BUTTON_DPAD_LEFT;
         if (kbd[g_config.input.keyboard_controller_scancode_map.dpad_right])
             state->lg.buttons |= CONTROLLER_BUTTON_DPAD_RIGHT;
+
     } else {
 #define KBD_STATE(btn) \
         (kbd[g_config.input.keyboard_controller_scancode_map.btn])

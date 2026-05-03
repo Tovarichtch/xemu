@@ -850,6 +850,7 @@ static void chihiro_an2131qc_realize(USBDevice *dev, Error **errp)
     s->ezusb_rebooted = true;  /* v307: reconnect disabled — Path B fix makes it unnecessary */
 
     chihiro_jvs_init(&s->jvs);
+    chihiro_jvs_global = &s->jvs;
 
     printf("[%07lld] Chihiro QC: loaded ic10 firmware (8192B) + ic11 (128B), "
            "region patched to USA (0x02), serial=%.16s\n",

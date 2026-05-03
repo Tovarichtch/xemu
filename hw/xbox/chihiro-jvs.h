@@ -39,6 +39,8 @@ typedef struct {
     int      response_len;
 } ChihiroJVSState;
 
+extern ChihiroJVSState *chihiro_jvs_global;
+
 void chihiro_jvs_init(ChihiroJVSState *s);
 
 /*
