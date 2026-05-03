@@ -193,16 +193,25 @@ int nv2a_get_screen_off(void)
     return g_nv2a->vga.sr[VGA_SEQ_CLOCK_MODE] & VGA_SR01_SCREEN_OFF;
 }
 
+uint64_t perf_cnt_vblank = 0;
+uint32_t perf_pcrtc_enabled = 0;
+
+/* Called from OHCI frame boundary every 17ms virtual (see hcd-ohci.c) */
+void nv2a_pcrtc_vblank_tick(void)
+{
+    NV2AState *d = g_nv2a;
+    if (!d) return;
+    d->pcrtc.pending_interrupts |= NV_PCRTC_INTR_0_VBLANK;
+    d->pcrtc.raster = 0;
+    perf_cnt_vblank++;
+    perf_pcrtc_enabled = d->pcrtc.enabled_interrupts;
+    nv2a_update_irq(d);
+}
+
 static void nv2a_vga_gfx_update(void *opaque)
 {
     VGACommonState *vga = opaque;
     vga->hw_ops->gfx_update(vga);
-
-    NV2AState *d = container_of(vga, NV2AState, vga);
-    d->pcrtc.pending_interrupts |= NV_PCRTC_INTR_0_VBLANK;
-    d->pcrtc.raster = 0;
-
-    nv2a_update_irq(d);
 }
 
 static void nv2a_init_memory(NV2AState *d, MemoryRegion *ram)
@@ -252,6 +261,9 @@ static void nv2a_init_vga(NV2AState *d)
     d->hw_ops = *vga->hw_ops;
     d->hw_ops.gfx_update = nv2a_vga_gfx_update;
     vga->con = graphic_console_init(DEVICE(d), 0, &d->hw_ops, vga);
+
+    /* PCRTC vblank: generated from OHCI frame boundary at ~60Hz.
+     * See nv2a_pcrtc_vblank_tick() called from hcd-ohci.c. */
 
     /* hacky. swap out vga's vram */
     memory_region_destroy(&vga->vram);

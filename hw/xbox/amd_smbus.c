@@ -88,7 +88,7 @@ static void amd756_smb_transaction(AMD756SMBus *s)
     I2CBus *bus  = s->smbus;
     int ret;
 
-    printf("SMBus transaction: addr=0x%02X prot=%d read=%d cmd=0x%02X data=0x%02X\n",
+    if(0) printf("SMBus transaction: addr=0x%02X prot=%d read=%d cmd=0x%02X data=0x%02X\n",
            addr, prot, read, cmd, s->smb_data0);
 
     switch (prot) {
@@ -154,7 +154,7 @@ done:
         goto error;
     }
     s->smb_stat |= GS_HCYC_STS;
-    printf("SMBus transaction: SUCCESS (stat=0x%02X)\n", s->smb_stat);
+    if(0) printf("SMBus transaction: SUCCESS (stat=0x%02X)\n", s->smb_stat);
     goto out;
 out:
     return;

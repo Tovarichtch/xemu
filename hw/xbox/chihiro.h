@@ -18,7 +18,7 @@ void chihiro_usb_set_devices(USBDevice *qc, USBDevice *sc);
 /* Load baseboard flash ROM (SEGABOOT) from file */
 void chihiro_load_flash_rom(const char *bios_path);
 
-/* Called from SMC when SCRATCH=0x02 (QuickReboot signal) */
+/* Called from SMC when SCRATCH=0x04 (QuickReboot signal) */
 void chihiro_on_quickreboot_signal(void);
 
 /* Called from SMC POWER handler to detect QuickReboot */

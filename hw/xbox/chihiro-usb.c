@@ -26,10 +26,11 @@
 
 #include "qemu/timer.h"
 #include "chihiro-firmware.h"
+#include "chihiro-jvs.h"
 #define TS_MS ((long long)(qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL)))
 #define DEBUG_CUSB
 #ifdef DEBUG_CUSB
-#define DPRINTF(s, ...) printf("chihiro-usb: " s, ## __VA_ARGS__)
+#define DPRINTF(s, ...) do { } while(0)
 #else
 #define DPRINTF(...)
 #endif
@@ -43,18 +44,28 @@ typedef struct ChihiroUSBState {
     /* I2C EEPROM data (8KB): ic10 for QC, pc20 for SC — loaded at realize */
     uint8_t eeprom[8192];
 
-    /* Pending bulk transfer (queued by vendor request 0x16/0x17) */
-    uint8_t bulk_buf[256];
-    int bulk_pending;      /* bytes pending for bulk IN */
-    int bulk_offset;       /* current read offset in bulk_buf */
-    int bulk_ep;           /* which EP the data is queued for */
+    /* Per-endpoint bulk IN buffers (EP1–EP5, index 0 unused) */
+    #define CHIHIRO_USB_MAX_EP 6
+    #define CHIHIRO_USB_EP_BUFSZ 1024
+    struct {
+        uint8_t buf[CHIHIRO_USB_EP_BUFSZ];
+        int pending;
+        int offset;
+    } ep_in[CHIHIRO_USB_MAX_EP];
 
     /* EZ-USB firmware download state (ANCHOR_LOAD / bRequest 0xA0) */
     uint32_t fw_bytes_written;  /* total bytes received via 0xA0 */
     bool fw_cpu_held;           /* true if CPUCS register set to hold CPU */
 
-    /* ic11 EEPROM (128 bytes) — baseboard config, "ACBU0001" + game ID */
-    uint8_t ic11[128];
+    /* ic11 EEPROM (512 bytes) — baseboard config, "ACBU0001" + game ID */
+    uint8_t ic11[512];
+
+    /* External memory (64KB, mapped at 0x0000–0xFFFF on the AN2131 8051) */
+    uint8_t extmem[65536];
+
+    /* Pending write tracking for 0x1E (ic11 via EP2) and 0x1F (extmem via EP3) */
+    uint16_t write_1e_addr;
+    uint16_t write_1f_addr;
 
     /* SC UART buffers (for JVS communication) */
     uint8_t uart0_rx[256];  /* UART0 receive buffer */
@@ -73,6 +84,9 @@ typedef struct ChihiroUSBState {
     QEMUTimer *ezusb_disconnect_timer;
     QEMUTimer *ezusb_reconnect_timer;
     bool ezusb_rebooted;
+
+    /* JVS I/O board emulation state (shared between QC and SC paths) */
+    ChihiroJVSState jvs;
 } ChihiroUSBState;
 
 enum chihiro_usb_strings {
@@ -275,11 +289,11 @@ static void ezusb_disconnect_cb(void *opaque)
     const char *id = s->is_qc ? "QC" : "SC";
 
     if (!dev->attached) {
-        printf("[%07lld] chihiro-usb [%s]: v302 disconnect skipped (already detached)\n", TS_MS, id);
+        if(0) printf("[%07lld] chihiro-usb [%s]: v302 disconnect skipped (already detached)\n", TS_MS, id);
         return;
     }
 
-    printf("[%07lld] chihiro-usb [%s]: ★ v302 EZ-USB firmware reboot — DISCONNECT (CSC will fire)\n", TS_MS, id);
+    if(0) printf("[%07lld] chihiro-usb [%s]: ★ v302 EZ-USB firmware reboot — DISCONNECT (CSC will fire)\n", TS_MS, id);
     usb_device_detach(dev);
 
     /* Schedule reconnect 50ms later */
@@ -295,28 +309,35 @@ static void ezusb_reconnect_cb(void *opaque)
     const char *id = s->is_qc ? "QC" : "SC";
 
     if (dev->attached) {
-        printf("[%07lld] chihiro-usb [%s]: v302 reconnect skipped (already attached)\n", TS_MS, id);
+        if(0) printf("[%07lld] chihiro-usb [%s]: v302 reconnect skipped (already attached)\n", TS_MS, id);
         return;
     }
 
-    printf("[%07lld] chihiro-usb [%s]: ★ v302 EZ-USB firmware reboot — RECONNECT (CSC will fire → Phase 2)\n", TS_MS, id);
+    if(0) printf("[%07lld] chihiro-usb [%s]: ★ v302 EZ-USB firmware reboot — RECONNECT (CSC will fire → Phase 2)\n", TS_MS, id);
     usb_device_attach(dev, &error_abort);
 }
 
 static void handle_reset(USBDevice *dev)
 {
     const char *id = ((ChihiroUSBState *)dev)->is_qc ? "QC" : "SC";
-    printf("[%07lld] chihiro-usb [%s]: device reset\n", TS_MS, id);
+    if(0) printf("[%07lld] chihiro-usb [%s]: device reset\n", TS_MS, id);
     fflush(stdout);
 }
+
+static uint64_t jvs_send_count = 0;
+static uint64_t jvs_recv_count = 0;
+static uint64_t jvs_recv_has_data = 0;
+static uint64_t vendor_req_counts[256] = {0};
 
 static void handle_control(USBDevice *dev, USBPacket *p,
                int request, int value, int index, int length, uint8_t *data)
 {
+    extern uint64_t perf_cnt_usb_control;
+    perf_cnt_usb_control++;
     ChihiroUSBState *s = (ChihiroUSBState *)dev;
     const char *id = ((ChihiroUSBState *)dev)->is_qc ? "QC" : "SC";
 
-    printf("[%07lld] chihiro-usb [%s]: control req=0x%04X val=0x%04X idx=0x%04X len=%d [%s]\n", TS_MS,
+    if(0) printf("[%07lld] chihiro-usb [%s]: control req=0x%04X val=0x%04X idx=0x%04X len=%d [%s]\n", TS_MS,
            id, request, value, index, length,
            (request == 0x8006 && (value >> 8) == 1) ? "GET_DESCRIPTOR(DEVICE)" :
            (request == 0x8006 && (value >> 8) == 2) ? "GET_DESCRIPTOR(CONFIG)" :
@@ -335,19 +356,21 @@ static void handle_control(USBDevice *dev, USBPacket *p,
                                       length, data);
     if (ret >= 0) {
         int actual = p->actual_length;
-        printf("[%07lld] chihiro-usb [%s]: → std handled actual=%d addr=%d", TS_MS, id, actual, dev->addr);
-        if (actual > 0) {
-            printf(" data=");
-            for (int i = 0; i < actual && i < 18; i++) printf("%02X", data[i]);
+        if(0) {
+            if(0) printf("[%07lld] chihiro-usb [%s]: std handled actual=%d addr=%d", TS_MS, id, actual, dev->addr);
+            if (actual > 0) {
+                if(0) printf(" data=");
+                if(0) for (int i = 0; i < actual && i < 18; i++) printf("%02X", data[i]);
+            }
+            if(0) printf("\n");
         }
-        printf("\n");
 
         /* v302: After SET_ADDRESS completes, schedule EZ-USB firmware reboot.
          * Real AN2131 loads firmware from EEPROM, then disconnects+reconnects.
          * SEGABOOT waits for the CSC from reconnect to start Phase 2. */
         if (request == (DeviceOutRequest | USB_REQ_SET_ADDRESS) && !s->ezusb_rebooted) {
             s->ezusb_rebooted = true;
-            printf("[%07lld] chihiro-usb [%s]: v302 SET_ADDRESS done (addr=%d) → scheduling EZ-USB reboot in 100ms\n",
+            if(0) printf("[%07lld] chihiro-usb [%s]: v302 SET_ADDRESS done (addr=%d) → scheduling EZ-USB reboot in 100ms\n",
                    TS_MS, id, dev->addr);
             timer_mod(s->ezusb_disconnect_timer,
                       qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 100);
@@ -362,7 +385,7 @@ static void handle_control(USBDevice *dev, USBPacket *p,
         uint8_t reqType = (bmRequestType >> 5) & 0x03;  /* 0=std, 1=class, 2=vendor */
         if (reqType != 2) {
             /* Non-vendor request rejected by usb_desc — could indicate descriptor issue */
-            printf("[%07lld] chihiro-usb [%s]: ⚠ std handler REJECTED req=0x%04X (ret=%d) — "
+            if(0) printf("[%07lld] chihiro-usb [%s]: ⚠ std handler REJECTED req=0x%04X (ret=%d) — "
                    "falling through to vendor handler\n", TS_MS, id, request, ret);
         }
     }
@@ -370,22 +393,44 @@ static void handle_control(USBDevice *dev, USBPacket *p,
     /* Vendor request — extract bRequest from combined field.
      * QEMU encodes: request = (bmRequestType << 8) | bRequest */
     int bRequest = request & 0xFF;
+    vendor_req_counts[(uint8_t)bRequest]++;
+
+    if (0) { /* JVS vendor request logging — enable for debugging */
+        if (bRequest >= 0x15 && bRequest <= 0x20) {
+            printf("[%07lld] chihiro-usb [%s]: VENDOR 0x%02X val=0x%04X idx=0x%04X len=%d",
+                   TS_MS, id, bRequest, value, index, length);
+            if (!((request >> 8) & 0x80) && length > 0) {
+                printf(" OUT_DATA=");
+                for (int i = 0; i < length && i < 32; i++) printf("%02X", data[i]);
+            }
+            printf("\n");
+        }
+    }
+
+    /* Save original host data for OUT (host-to-device) vendor requests.
+     * The default fill below overwrites data[], so we need a copy for
+     * requests like 0x20/0x23 that carry JVS payload. */
+    uint8_t host_data[256];
+    int host_len = MIN(length, (int)sizeof(host_data));
+    if (!((request >> 8) & 0x80)) {
+        memcpy(host_data, data, host_len);
+    }
 
     /* Default response (MAME: every vendor request gets this) */
     for (int n = 0; n < length && n < 6; n++) {
         data[n] = 0x50 ^ n;
     }
     data[0] = 0x00;  /* success */
-    data[1] = 0x6B;  /* PINSA: DIP switches (pull-up: 0=ON, 1=OFF)
-                      * HOD3 setting: DIP 1,2,5=OFF  DIP 3,4=ON
-                      * bit0=1 DIP1 OFF (horizontal monitor)
+    data[1] = 0xCB;  /* PINSA (active low: 0=pressed/ON, 1=released/OFF)
+                      * bit0=1 DIP1 OFF
                       * bit1=1 DIP2 OFF
-                      * bit2=0 DIP3 ON
-                      * bit3=1 CS pin
-                      * bit4=0 DIP4 ON
-                      * bit5=1 DIP5 OFF (was 0 in MAME)
-                      * bit6-7 buttons */
-    data[2] = 0x52;  /* PINSB: JVS sense = all addressed */
+                      * bit2=0 DIP3 ON  (horiz freq — required to avoid CAUTION 51)
+                      * bit3=1 CS pin (ignored)
+                      * bit4=0 DIP4 ON  (horiz freq — required to avoid CAUTION 51)
+                      * bit5=0 DIP5 ON
+                      * bit6=1 TEST released
+                      * bit7=1 SERVICE released */
+    data[2] = 0x52 | (s->jvs.sense & 0x03);  /* PINSB with current JVS sense */
     data[3] = 0x53;  /* OUTB register */
 
     switch (bRequest) {
@@ -393,52 +438,101 @@ static void handle_control(USBDevice *dev, USBPacket *p,
     {
         int addr = value;     /* wValue = start address in ic10 */
         int count = index;    /* wIndex = byte count */
-        if (count > 256) count = 256;
+        if (count > CHIHIRO_USB_EP_BUFSZ) count = CHIHIRO_USB_EP_BUFSZ;
         if (addr + count > 8192) count = 8192 - addr;
         if (addr >= 0 && count > 0) {
-            memcpy(s->bulk_buf, s->eeprom + addr, count);
+            memcpy(s->ep_in[1].buf, s->eeprom + addr, count);
         } else {
-            memset(s->bulk_buf, 0xFF, count);
+            memset(s->ep_in[1].buf, 0xFF, count);
         }
-        s->bulk_pending = count;
-        s->bulk_offset = 0;
-        s->bulk_ep = 1;
-        printf("[%07lld] chihiro-usb [%s]: READ EEPROM1 addr=0x%04X count=%d → queued for EP1\n", TS_MS,
+        s->ep_in[1].pending = count;
+        s->ep_in[1].offset = 0;
+        if(0) printf("[%07lld] chihiro-usb [%s]: READ EEPROM1 addr=0x%04X count=%d → queued for EP1\n", TS_MS,
                id, addr, count);
         break;
     }
-    case 0x17: /* Read baseboard EEPROM ic11 (128 bytes: "ACBU0001" + game config) */
+    case 0x17: /* Read baseboard EEPROM ic11 (512 bytes, 24LC024) */
     {
         int addr = value;
         int count = index;
-        if (count > 256) count = 256;
-        if (addr + count > 128) count = 128 - addr;
-        if (addr >= 0 && addr < 128 && count > 0) {
-            memcpy(s->bulk_buf, s->ic11 + addr, count);
+        if (count > CHIHIRO_USB_EP_BUFSZ) count = CHIHIRO_USB_EP_BUFSZ;
+        if (addr + count > 512) count = 512 - addr;
+        if (addr >= 0 && addr < 512 && count > 0) {
+            memcpy(s->ep_in[2].buf, s->ic11 + addr, count);
         } else {
-            memset(s->bulk_buf, 0xFF, count);
+            memset(s->ep_in[2].buf, 0xFF, count);
             count = (count > 0) ? count : 0;
         }
-        s->bulk_pending = count;
-        s->bulk_offset = 0;
-        s->bulk_ep = 2;
-        printf("[%07lld] chihiro-usb [%s]: READ ic11 EEPROM addr=0x%02X count=%d data=", TS_MS, id, addr, count);
-        for (int i = 0; i < count && i < 16; i++) printf("%02X", s->bulk_buf[i]);
-        printf("\n");
+        s->ep_in[2].pending = count;
+        s->ep_in[2].offset = 0;
+        if(0) {
+            if(0) printf("[%07lld] chihiro-usb [%s]: READ ic11 EEPROM addr=0x%02X count=%d data=", TS_MS, id, addr, count);
+            for (int i = 0; i < count && i < 16; i++) printf("%02X", s->ep_in[2].buf[i]);
+            if(0) printf("\n");
+        }
         break;
     }
-    case 0x19: /* Get JVS responses — no JVS data pending */
+    case 0x19: { /* Get JVS responses (QC path) */
+        jvs_recv_count++;
         data[0] = 0x00;  /* not busy */
-        data[4] = 0;     /* 0 bytes of JVS response */
-        data[5] = 0;
+        /* Update sense in PINSB */
+        data[2] = (data[2] & 0xFC) | (s->jvs.sense & 0x03);
+        if (s->jvs.response_len > 0) {
+            jvs_recv_has_data++;
+            int rlen = s->jvs.response_len;
+            /* Wrap raw JVS frame in AN2131QC format for EP4 IN:
+             * [0]=0x00 [1]=pkt_count [2]=dest [3]=0x00
+             * [4..5]=frame_len(LE) [6..]=raw JVS frame */
+            uint8_t *ep = s->ep_in[4].buf;
+            int wrapped = 0;
+            uint8_t resp_dest = (s->jvs.last_target == JVS_BROADCAST) ? 0
+                                                                     : s->jvs.device_id;
+            ep[wrapped++] = 0x00;       /* status */
+            ep[wrapped++] = 0x01;       /* 1 packet */
+            ep[wrapped++] = resp_dest;  /* dest: 0 for broadcast, device_id for addressed */
+            ep[wrapped++] = 0x00;       /* dummy */
+            ep[wrapped++] = rlen & 0xFF;
+            ep[wrapped++] = (rlen >> 8) & 0xFF;
+            int copy = MIN(rlen, (int)sizeof(s->ep_in[4].buf) - wrapped);
+            memcpy(ep + wrapped, s->jvs.response, copy);
+            wrapped += copy;
+            data[4] = wrapped & 0xFF;
+            data[5] = (wrapped >> 8) & 0xFF;
+            s->ep_in[4].pending = wrapped;
+            s->ep_in[4].offset = 0;
+            s->jvs.response_len = 0;
+            if(0) printf("[%07lld] chihiro-usb [%s]: JVS RECV wrapped %d bytes (raw %d, dest=%d)\n",
+                   TS_MS, id, wrapped, rlen, resp_dest);
+        } else {
+            data[4] = 0;
+            data[5] = 0;
+        }
         break;
-    case 0x20: /* Send JVS packets — accept and discard */
-        printf("[%07lld] chihiro-usb [%s]: JVS SEND count=%d (stub)\n", TS_MS, id, index);
+    }
+    case 0x20: { /* Send JVS packets (QC path) */
+        jvs_send_count++;
+        if(0) { printf("[%07lld] chihiro-usb [%s]: JVS SEND %d bytes:", TS_MS, id, host_len);
+        for (int i = 0; i < host_len && i < 16; i++) printf(" %02X", host_data[i]);
+        printf("\n"); }
+        /* AN2131QC format: byte 0 = sequence counter, bytes 1+ = JVS frame */
+        uint8_t *jvs_data = host_data;
+        int jvs_len = host_len;
+        if (jvs_len >= 2 && host_data[0] != JVS_SYNC && host_data[1] == JVS_SYNC) {
+            jvs_data = host_data + 1;
+            jvs_len -= 1;
+        }
+        if (jvs_len > 0 && jvs_data[0] == JVS_SYNC) {
+            int rlen = chihiro_jvs_process(&s->jvs, jvs_data, jvs_len,
+                                            s->jvs.response, sizeof(s->jvs.response));
+            s->jvs.response_len = rlen;
+            if(0) printf("[%07lld] chihiro-usb [%s]: JVS RESP %d bytes\n", TS_MS, id, rlen);
+        }
         break;
+    }
     case 0x30: /* External interrupt control */
         data[4] = (value & 0xFF) > 0 ? 1 : 0;  /* enabled? */
         data[5] = 0;  /* IRQ counter */
-        printf("[%07lld] chihiro-usb [%s]: EXT IRQ control val=%d\n", TS_MS, id, value);
+        if(0) printf("[%07lld] chihiro-usb [%s]: EXT IRQ control val=%d\n", TS_MS, id, value);
         break;
     case 0x1C: /* Read RTC — queue BCD time for bulk IN EP4 (data[0]=0 success status) */
     {
@@ -446,38 +540,51 @@ static void handle_control(USBDevice *dev, USBPacket *p,
         struct tm *t = localtime(&now);
         #define TO_BCD(v) ((uint8_t)((v) + 6 * ((v) / 10)))
         int rtc_count = index;
-        if (rtc_count > 256) rtc_count = 256;
-        memset(s->bulk_buf, 0, rtc_count);
-        s->bulk_buf[0] = TO_BCD(t->tm_sec);
-        s->bulk_buf[1] = TO_BCD(t->tm_min);
-        s->bulk_buf[2] = TO_BCD(t->tm_hour);
-        s->bulk_buf[3] = 0;
-        s->bulk_buf[4] = TO_BCD(t->tm_mday);
-        s->bulk_buf[5] = TO_BCD(t->tm_mon + 1);
-        s->bulk_buf[6] = TO_BCD(t->tm_year - 100);
-        s->bulk_buf[7] = 0;
-        s->bulk_pending = rtc_count;
-        s->bulk_offset = 0;
-        s->bulk_ep = 5;
+        if (rtc_count > CHIHIRO_USB_EP_BUFSZ) rtc_count = CHIHIRO_USB_EP_BUFSZ;
+        memset(s->ep_in[5].buf, 0, rtc_count);
+        s->ep_in[5].buf[0] = TO_BCD(t->tm_sec);
+        s->ep_in[5].buf[1] = TO_BCD(t->tm_min);
+        s->ep_in[5].buf[2] = TO_BCD(t->tm_hour);
+        s->ep_in[5].buf[3] = 0;
+        s->ep_in[5].buf[4] = TO_BCD(t->tm_mday);
+        s->ep_in[5].buf[5] = TO_BCD(t->tm_mon + 1);
+        s->ep_in[5].buf[6] = TO_BCD(t->tm_year - 100);
+        s->ep_in[5].buf[7] = 0;
+        s->ep_in[5].pending = rtc_count;
+        s->ep_in[5].offset = 0;
         #undef TO_BCD
-        printf("[%07lld] chihiro-usb [%s]: RTC READ → %02X:%02X:%02X %02X/%02X/%02X (%d bytes queued EP5)\n",
-               TS_MS, id, s->bulk_buf[2], s->bulk_buf[1], s->bulk_buf[0],
-               s->bulk_buf[4], s->bulk_buf[5], s->bulk_buf[6], rtc_count);
+        if(0) printf("[%07lld] chihiro-usb [%s]: RTC READ → %02X:%02X:%02X %02X/%02X/%02X (%d bytes queued EP5)\n",
+               TS_MS, id, s->ep_in[5].buf[2], s->ep_in[5].buf[1], s->ep_in[5].buf[0],
+               s->ep_in[5].buf[4], s->ep_in[5].buf[5], s->ep_in[5].buf[6], rtc_count);
         break;
     }
     case 0x1D: /* Write ic10 EEPROM #1 — accept */
-    case 0x1E: /* Write ic10 EEPROM #2 — accept */
-    case 0x1F: /* Write external memory — accept */
+        break;
+    case 0x1E: /* Write ic11 EEPROM #2 via EP2 OUT */
+        s->write_1e_addr = value;
+        break;
+    case 0x1F: /* Write external memory via EP3 OUT */
+        s->write_1f_addr = value;
+        break;
     case 0x24: /* Write RTC — accept */
         break;
-    case 0x18: /* Read external memory — return zeros */
+    case 0x18: /* Read external memory / write-complete status poll */
     {
         int count = index;
-        if (count > 256) count = 256;
-        memset(s->bulk_buf, 0, count);
-        s->bulk_pending = count;
-        s->bulk_offset = 0;
-        s->bulk_ep = 3;
+        if (count == 0) {
+            /* Status poll — default fill already has data[0]=0 (not busy) */
+            break;
+        }
+        if (count > CHIHIRO_USB_EP_BUFSZ) count = CHIHIRO_USB_EP_BUFSZ;
+        int addr = value;
+        if (addr + count > 65536) count = 65536 - addr;
+        if (addr >= 0 && count > 0) {
+            memcpy(s->ep_in[3].buf, s->extmem + addr, count);
+        } else {
+            memset(s->ep_in[3].buf, 0, count > 0 ? count : 0);
+        }
+        s->ep_in[3].pending = count;
+        s->ep_in[3].offset = 0;
         break;
     }
     case 0xA0: /* ANCHOR_LOAD — EZ-USB firmware download (Cypress AN2131) */
@@ -487,17 +594,17 @@ static void handle_control(USBDevice *dev, USBPacket *p,
         if (ram_addr == 0x7F92) {
             /* CPUCS register: bit 0 = 1 → hold CPU in reset, 0 → run */
             bool hold = (count > 0 && data[0] & 0x01);
-            printf("[%07lld] chihiro-usb [%s]: ANCHOR_LOAD CPUCS=%s (total %u bytes downloaded)\n",
+            if(0) printf("[%07lld] chihiro-usb [%s]: ANCHOR_LOAD CPUCS=%s (total %u bytes downloaded)\n",
                    TS_MS, id, hold ? "HOLD" : "RUN", s->fw_bytes_written);
             if (s->fw_cpu_held && !hold) {
-                printf("[%07lld] chihiro-usb [%s]: ★ EZ-USB firmware loaded — CPU released\n",
+                if(0) printf("[%07lld] chihiro-usb [%s]: ★ EZ-USB firmware loaded — CPU released\n",
                        TS_MS, id);
             }
             s->fw_cpu_held = hold;
         } else {
             s->fw_bytes_written += count;
             if (s->fw_bytes_written <= count) {
-                printf("[%07lld] chihiro-usb [%s]: ANCHOR_LOAD start addr=0x%04X len=%d\n",
+                if(0) printf("[%07lld] chihiro-usb [%s]: ANCHOR_LOAD start addr=0x%04X len=%d\n",
                        TS_MS, id, ram_addr, count);
             }
         }
@@ -514,28 +621,37 @@ static void handle_control(USBDevice *dev, USBPacket *p,
         } else {
             p->actual_length = 0;
         }
-        printf("[%07lld] chihiro-usb [%s]: GET UART0 → %d bytes\n", TS_MS, id, avail);
+        if(0) printf("[%07lld] chihiro-usb [%s]: GET UART0 → %d bytes\n", TS_MS, id, avail);
         return;
     }
     case 0x1B: /* Get UART1 / JVS response (SC only) */
     {
-        int avail = s->uart1_rx_len;
+        int avail = s->jvs.response_len;
         if (avail > 0 && avail <= length) {
-            memcpy(data, s->uart1_rx, avail);
+            memcpy(data, s->jvs.response, avail);
             p->actual_length = avail;
+            s->jvs.response_len = 0;
+        } else if (s->uart1_rx_len > 0 && s->uart1_rx_len <= length) {
+            memcpy(data, s->uart1_rx, s->uart1_rx_len);
+            p->actual_length = s->uart1_rx_len;
             s->uart1_rx_len = 0;
         } else {
             p->actual_length = 0;
         }
-        printf("[%07lld] chihiro-usb [%s]: GET UART1/JVS → %d bytes\n", TS_MS, id, avail);
         return;
     }
     case 0x22: /* Send UART0 data (SC only) — accept and discard */
-        printf("[%07lld] chihiro-usb [%s]: SEND UART0 len=%d (stub)\n", TS_MS, id, length);
+        if(0) printf("[%07lld] chihiro-usb [%s]: SEND UART0 len=%d (stub)\n", TS_MS, id, length);
         break;
-    case 0x23: /* Send UART1 / JVS command (SC only) — accept and discard */
-        printf("[%07lld] chihiro-usb [%s]: SEND UART1/JVS len=%d (stub)\n", TS_MS, id, length);
+    case 0x23: { /* Send UART1 / JVS command (SC only) */
+        int jvs_len = host_len;
+        if (jvs_len > 0 && host_data[0] == JVS_SYNC) {
+            int rlen = chihiro_jvs_process(&s->jvs, host_data, jvs_len,
+                                            s->jvs.response, sizeof(s->jvs.response));
+            s->jvs.response_len = rlen;
+        }
         break;
+    }
     case 0x25: /* UART config (SC only) — accept */
     case 0x26:
     case 0x27:
@@ -547,21 +663,22 @@ static void handle_control(USBDevice *dev, USBPacket *p,
     case 0x2D:
     case 0x2E:
     case 0x2F:
-        printf("[%07lld] chihiro-usb [%s]: UART/GPIO config 0x%02X (stub)\n", TS_MS, id, bRequest);
+        if(0) printf("[%07lld] chihiro-usb [%s]: UART/GPIO config 0x%02X (stub)\n", TS_MS, id, bRequest);
         break;
     case 0x31: /* Set PORTB pins (SC only) — accept */
-        printf("[%07lld] chihiro-usb [%s]: SET PORTB val=0x%04X (stub)\n", TS_MS, id, value);
+        if(0) printf("[%07lld] chihiro-usb [%s]: SET PORTB val=0x%04X (stub)\n", TS_MS, id, value);
         break;
     default:
-        printf("[%07lld] chihiro-usb [%s]: UNHANDLED vendor req 0x%02X val=0x%04X idx=0x%04X len=%d → accepting\n",
+        if(0) printf("[%07lld] chihiro-usb [%s]: UNHANDLED vendor req 0x%02X val=0x%04X idx=0x%04X len=%d → accepting\n",
                TS_MS, id, bRequest, value, index, length);
         break;
     }
 
-    /* v202: Log vendor response data bytes */
-    if (length >= 4) {
-        printf("[%07lld] chihiro-usb [%s]: → vendor resp data[0..3]=%02X %02X %02X %02X (len=%d)\n",
-               TS_MS, id, data[0], data[1], data[2], data[3], length);
+    if (0) { /* Diagnostic: log vendor 0x15 (PINSB/sense check) */
+        if (bRequest == 0x15) {
+            printf("[%07lld] chihiro-usb [%s]: VENDOR 0x15 → data[0..3]=%02X %02X %02X %02X sense=%d\n",
+                   TS_MS, id, data[0], data[1], data[2], data[3], s->jvs.sense);
+        }
     }
 
     p->actual_length = length;
@@ -569,40 +686,91 @@ static void handle_control(USBDevice *dev, USBPacket *p,
 
 static void handle_data(USBDevice *dev, USBPacket *p)
 {
+    extern uint64_t perf_cnt_usb_handle;
+    perf_cnt_usb_handle++;
     ChihiroUSBState *s = (ChihiroUSBState *)dev;
     const char *id = ((ChihiroUSBState *)dev)->is_qc ? "QC" : "SC";
     int ep = p->ep->nr;
 
     if (p->pid == USB_TOKEN_IN) {
-        /* Bulk IN — return queued data */
-        if (ep == s->bulk_ep && s->bulk_pending > 0) {
-            int len = MIN(p->iov.size, s->bulk_pending);
-            usb_packet_copy(p, s->bulk_buf + s->bulk_offset, len);
-            s->bulk_offset += len;
-            s->bulk_pending -= len;
+        /* Bulk IN — return queued data from per-endpoint buffer */
+        if (ep >= 1 && ep < CHIHIRO_USB_MAX_EP && s->ep_in[ep].pending > 0) {
+            int len = MIN(p->iov.size, s->ep_in[ep].pending);
+            usb_packet_copy(p, s->ep_in[ep].buf + s->ep_in[ep].offset, len);
+            s->ep_in[ep].offset += len;
+            s->ep_in[ep].pending -= len;
             s->bulk_in_count++;
-            printf("[%07lld] chihiro-usb [%s]: bulk IN ep%d %d bytes (%d remaining)\n", TS_MS,
-                   id, ep, len, s->bulk_pending);
+            if(0) printf("[%07lld] chihiro-usb [%s]: BULK IN EP%d → %d bytes (remain=%d)\n",
+                   TS_MS, id, ep, len, s->ep_in[ep].pending);
         } else {
             s->nak_count++;
-            if (s->bulk_pending > 0) {
-                printf("[%07lld] chihiro-usb [%s]: NAK ep%d (data queued on ep%d, %d bytes)\n",
-                       TS_MS, id, ep, s->bulk_ep, s->bulk_pending);
-            }
-            p->status = USB_RET_NAK;
+            p->status = USB_RET_STALL;
+            if(0) printf("[%07lld] chihiro-usb [%s]: BULK IN EP%d → STALL (no data)\n",
+                   TS_MS, id, ep);
         }
     } else {
-        /* Bulk OUT — accept and discard for now */
+        /* Bulk OUT — capture data for JVS processing */
+        if(0) printf("[%07lld] chihiro-usb [%s]: BULK OUT EP%d %d bytes\n",
+               TS_MS, id, ep, (int)p->iov.size);
         int len = p->iov.size;
-        uint8_t discard[64];
+        uint8_t buf[256];
+        int total = 0;
         while (len > 0) {
-            int chunk = MIN(len, (int)sizeof(discard));
-            usb_packet_copy(p, discard, chunk);
+            int chunk = MIN(len, (int)sizeof(buf) - total);
+            if (chunk <= 0) {
+                uint8_t discard[64];
+                chunk = MIN(len, (int)sizeof(discard));
+                usb_packet_copy(p, discard, chunk);
+            } else {
+                usb_packet_copy(p, buf + total, chunk);
+                total += chunk;
+            }
             len -= chunk;
         }
+        if (total > 0) {
+            if(0) { printf("[%07lld] chihiro-usb [%s]: BULK OUT data:", TS_MS, id);
+            for (int i = 0; i < total && i < 32; i++) printf(" %02X", buf[i]);
+            printf("\n"); }
+
+            if (ep == 2) {
+                /* EP2 OUT: ic11 EEPROM write (from vendor 0x1E) */
+                uint16_t addr = s->write_1e_addr;
+                int copy = MIN(total, 512 - (int)addr);
+                if (copy > 0) {
+                    memcpy(s->ic11 + addr, buf, copy);
+                    s->write_1e_addr += copy;
+                }
+            } else if (ep == 3) {
+                /* EP3 OUT: external memory write (from vendor 0x1F) */
+                uint16_t addr = s->write_1f_addr;
+                int copy = MIN(total, 65536 - (int)addr);
+                if (copy > 0) {
+                    memcpy(s->extmem + addr, buf, copy);
+                    s->write_1f_addr += copy;
+                }
+            } else if (ep == 4) {
+                /* EP4 OUT: JVS data with 3-byte AN2131QC header */
+                uint8_t *jvs_p = NULL;
+                int jvs_n = 0;
+                if (total >= 4 && buf[3] == JVS_SYNC) {
+                    jvs_p = buf + 3;
+                    jvs_n = total - 3;
+                } else if (total >= 1 && buf[0] == JVS_SYNC) {
+                    jvs_p = buf;
+                    jvs_n = total;
+                }
+                if (jvs_p && jvs_n > 0) {
+                    if(0) { printf("[%07lld] chihiro-usb [%s]: JVS frame %d bytes:", TS_MS, id, jvs_n);
+                    for (int i = 0; i < jvs_n && i < 16; i++) printf(" %02X", jvs_p[i]);
+                    printf("\n"); }
+                    int rlen = chihiro_jvs_process(&s->jvs, jvs_p, jvs_n,
+                                                    s->jvs.response, sizeof(s->jvs.response));
+                    s->jvs.response_len = rlen;
+                    if(0) printf("[%07lld] chihiro-usb [%s]: JVS response %d bytes\n", TS_MS, id, rlen);
+                }
+            }
+        }
         s->bulk_out_count++;
-        printf("[%07lld] chihiro-usb [%s]: bulk OUT ep%d %zd bytes (discarded)\n", TS_MS,
-               id, ep, p->iov.size);
     }
 }
 
@@ -621,6 +789,24 @@ void chihiro_usb_reset_counters(USBDevice *dev)
     s->nak_count = 0;
     s->bulk_in_count = 0;
     s->bulk_out_count = 0;
+}
+
+void chihiro_usb_get_jvs_counters(uint64_t *send, uint64_t *recv, uint64_t *recv_data)
+{
+    if (send)      *send      = jvs_send_count;
+    if (recv)      *recv      = jvs_recv_count;
+    if (recv_data) *recv_data = jvs_recv_has_data;
+}
+
+void chihiro_usb_dump_vendor_histogram(void)
+{
+    printf("=== VENDOR REQUEST HISTOGRAM ===\n");
+    for (int i = 0; i < 256; i++) {
+        if (vendor_req_counts[i] > 0) {
+            printf("  req 0x%02X: %lu\n", i, (unsigned long)vendor_req_counts[i]);
+        }
+    }
+    printf("================================\n");
 }
 
 static void chihiro_an2131qc_realize(USBDevice *dev, Error **errp)
@@ -642,15 +828,17 @@ static void chihiro_an2131qc_realize(USBDevice *dev, Error **errp)
      * Original ic10 EEPROM has 0x01 (Japan) which would cause ERROR 31. */
     s->eeprom[0x1F00] = 0x02;  /* Region: 01=JPN, 02=USA, 03=EXP */
 
-    /* Initialize bulk transfer state */
-    s->bulk_pending = 0;
-    s->bulk_offset = 0;
-    s->bulk_ep = 0;
+    /* Initialize per-endpoint bulk transfer state */
+    memset(s->ep_in, 0, sizeof(s->ep_in));
 
-    /* Load ic11 baseboard EEPROM (128 bytes) — shared by QC and SC */
+    /* Load ic11 baseboard EEPROM (256 bytes, 24LC024) — first 128 from dump, rest zero */
     _Static_assert(sizeof(hotd3_ic11_24lc024) == 128,
-                   "ic11 EEPROM must be exactly 128 bytes");
-    memcpy(s->ic11, hotd3_ic11_24lc024, sizeof(s->ic11));
+                   "ic11 EEPROM dump must be exactly 128 bytes");
+    memset(s->ic11, 0, sizeof(s->ic11));
+    memcpy(s->ic11, hotd3_ic11_24lc024, sizeof(hotd3_ic11_24lc024));
+    memset(s->extmem, 0, sizeof(s->extmem));
+    s->write_1e_addr = 0;
+    s->write_1f_addr = 0;
 
     /* Initialize EZ-USB firmware state */
     s->fw_bytes_written = 0;
@@ -660,6 +848,8 @@ static void chihiro_an2131qc_realize(USBDevice *dev, Error **errp)
     s->ezusb_disconnect_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, ezusb_disconnect_cb, s);
     s->ezusb_reconnect_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, ezusb_reconnect_cb, s);
     s->ezusb_rebooted = true;  /* v307: reconnect disabled — Path B fix makes it unnecessary */
+
+    chihiro_jvs_init(&s->jvs);
 
     printf("[%07lld] Chihiro QC: loaded ic10 firmware (8192B) + ic11 (128B), "
            "region patched to USA (0x02), serial=%.16s\n",
@@ -710,13 +900,15 @@ static void chihiro_an2131sc_realize(USBDevice *dev, Error **errp)
                    "pc20 firmware must be exactly 8KB");
     memcpy(s->eeprom, hotd3_pc20_g24lc64, sizeof(s->eeprom));
 
-    /* Initialize bulk transfer state */
-    s->bulk_pending = 0;
-    s->bulk_offset = 0;
-    s->bulk_ep = 0;
+    /* Initialize per-endpoint bulk transfer state */
+    memset(s->ep_in, 0, sizeof(s->ep_in));
 
-    /* Load ic11 baseboard EEPROM (128 bytes) */
-    memcpy(s->ic11, hotd3_ic11_24lc024, sizeof(s->ic11));
+    /* Load ic11 baseboard EEPROM (256 bytes, 24LC024) */
+    memset(s->ic11, 0, sizeof(s->ic11));
+    memcpy(s->ic11, hotd3_ic11_24lc024, sizeof(hotd3_ic11_24lc024));
+    memset(s->extmem, 0, sizeof(s->extmem));
+    s->write_1e_addr = 0;
+    s->write_1f_addr = 0;
 
     /* Initialize EZ-USB firmware state */
     s->fw_bytes_written = 0;
@@ -730,6 +922,8 @@ static void chihiro_an2131sc_realize(USBDevice *dev, Error **errp)
     s->ezusb_disconnect_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, ezusb_disconnect_cb, s);
     s->ezusb_reconnect_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, ezusb_reconnect_cb, s);
     s->ezusb_rebooted = true;  /* v307: reconnect disabled — Path B fix makes it unnecessary */
+
+    chihiro_jvs_init(&s->jvs);
 
     printf("[%07lld] Chihiro SC: loaded pc20 firmware (8192B) + ic11 (128B)\n", TS_MS);
 }
