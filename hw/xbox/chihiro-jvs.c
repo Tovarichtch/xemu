@@ -13,6 +13,8 @@
 
 #define TS_MS ((long long)(qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL)))
 
+ChihiroJVSState *chihiro_jvs_global = NULL;
+
 static const char board_id[] =
     "SEGA ENTERPRISES,LTD.;I/O BD JVS;837-13551 ;Ver1.00;98/10";
 

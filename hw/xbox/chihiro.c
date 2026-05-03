@@ -36,6 +36,8 @@
 #include "hw/usb.h"
 #include "target/i386/cpu.h"
 #include "exec/watchpoint.h"
+#include "ui/input.h"
+#include "chihiro-jvs.h"
 
 /*
  * Chihiro Mediaboard LPC I/O
@@ -159,8 +161,7 @@ char chihiro_game_dir[1024];   /* Game directory path (from dvd_path) */
 static ChihiroLPCState *chihiro_lpc_global;
 uint32_t chihiro_usb_sm_pa;  /* PA of USB state machine globals at VA 0xC3F10 */
 
-/* v450: Performance counters — find the hot path causing lag */
-#include <time.h>
+/* Performance counters (incremented in various callbacks, cheap) */
 uint64_t perf_cnt_irq10_cb = 0;
 uint64_t perf_cnt_diag_cb = 0;
 uint64_t perf_cnt_dimm_cb = 0;
@@ -171,8 +172,6 @@ uint64_t perf_cnt_ohci_frame = 0;
 uint64_t perf_cnt_ohci_td = 0;
 uint64_t perf_cnt_usb_handle = 0;
 uint64_t perf_cnt_usb_control = 0;
-static time_t perf_start_time = 0;
-static bool perf_dumped = false;
 
 /* USB devices for delayed hotplug (simulates AN2131 I2C firmware boot) */
 static USBDevice *chihiro_usb_qc = NULL;
@@ -1835,6 +1834,10 @@ static void chihiro_usb_poll_patch_cb(void *opaque)
 {
     ChihiroLPCState *s = opaque;
     if (s->usb_poll_patched) return;
+    if (chihiro_game_running) {
+        fprintf(stderr, "[%07lld] USB patch scanner STOPPED (game running, applied<3)\n", TS_MS);
+        return;
+    }
 
     /* v274: UsbEnumPoll + RegisterClassDriver patches REMOVED.
      * These patches broke USB enumeration: NOPing the polling loop prevented
@@ -2884,248 +2887,16 @@ static void chihiro_irq10_timer_cb(void *opaque)
     ChihiroLPCState *s = opaque;
     perf_cnt_irq10_cb++;
 
-    /* EIP histogram: sample every tick to find spin loops */
-    #define EIP_HIST_SIZE 512
-    static struct { uint32_t eip; uint32_t count; } eip_hist[EIP_HIST_SIZE];
-    static int eip_hist_used = 0;
-    static uint32_t max_frame_func = 0;
-    static uint32_t caller_of_63410 = 0;
-    static uint32_t caller_esp = 0;
-    {
-        CPUState *cs = first_cpu;
-        if (cs) {
-            CPUX86State *env = &X86_CPU(cs)->env;
-            uint32_t eip = (uint32_t)env->eip;
-            uint32_t esp = (uint32_t)env->regs[R_ESP];
-            int found = -1;
-            for (int i = 0; i < eip_hist_used; i++) {
-                if (eip_hist[i].eip == eip) { found = i; break; }
-            }
-            if (found >= 0) {
-                eip_hist[found].count++;
-            } else if (eip_hist_used < EIP_HIST_SIZE) {
-                eip_hist[eip_hist_used].eip = eip;
-                eip_hist[eip_hist_used].count = 1;
-                eip_hist_used++;
-            }
-            /* Track max frame_func_ptr across all ticks */
-            uint32_t ffp_pa = chihiro_va_to_pa(0x00279f94);
-            if (ffp_pa != 0xFFFFFFFF) {
-                uint32_t ffp = 0;
-                cpu_physical_memory_read(ffp_pa, &ffp, 4);
-                if (ffp > max_frame_func) max_frame_func = ffp;
-            }
-            /* When EIP is in FUN_00063410, capture context */
-            if (eip >= 0x63410 && eip < 0x63500 && caller_of_63410 == 0) {
-                caller_esp = esp;
-                /* Try both ESP+4 and translating through 0x80000000 mask */
-                uint32_t try_esp = esp & 0x7FFFFFFF;
-                uint32_t esp_pa = chihiro_va_to_pa(try_esp + 4);
-                if (esp_pa == 0xFFFFFFFF) {
-                    esp_pa = chihiro_va_to_pa(esp + 4);
-                }
-                if (esp_pa != 0xFFFFFFFF) {
-                    cpu_physical_memory_read(esp_pa, &caller_of_63410, 4);
-                } else {
-                    /* Direct physical read: strip D0 prefix */
-                    uint32_t phys = (esp & 0x0FFFFFFF) + 4;
-                    if (phys < 0x08000000) {
-                        cpu_physical_memory_read(phys, &caller_of_63410, 4);
-                    }
-                }
-            }
-        }
-    }
-
-    if (!perf_dumped && chihiro_game_running) {
-        if (perf_start_time == 0) perf_start_time = time(NULL);
-        if (time(NULL) - perf_start_time >= 20) {
-            perf_dumped = true;
-            extern uint64_t perf_cnt_vblank;
-            extern uint32_t perf_pcrtc_enabled;
-            extern void chihiro_usb_get_jvs_counters(uint64_t *send, uint64_t *recv, uint64_t *recv_data);
-            uint64_t jvs_s = 0, jvs_r = 0, jvs_rd = 0;
-            chihiro_usb_get_jvs_counters(&jvs_s, &jvs_r, &jvs_rd);
-            printf("=== PERF COUNTERS (30s wall-clock, TS=%lld ms) ===\n"
-                   "irq10_cb:    %lu\n"
-                   "diag_cb:     %lu\n"
-                   "dimm_cb:     %lu\n"
-                   "lpc_read:    %lu\n"
-                   "lpc_write:   %lu\n"
-                   "ide_read:    %lu\n"
-                   "ohci_frame:  %lu\n"
-                   "ohci_td:     %lu\n"
-                   "usb_handle:  %lu\n"
-                   "usb_control: %lu\n"
-                   "vblank:      %lu  (pcrtc_en=0x%X)\n"
-                   "game_running: %d\n"
-                   "jvs_send:    %lu\n"
-                   "jvs_recv:    %lu  (with_data=%lu)\n",
-                   TS_MS,
-                   (unsigned long)perf_cnt_irq10_cb,
-                   (unsigned long)perf_cnt_diag_cb,
-                   (unsigned long)perf_cnt_dimm_cb,
-                   (unsigned long)perf_cnt_lpc_read,
-                   (unsigned long)perf_cnt_lpc_write,
-                   (unsigned long)perf_cnt_ide_read,
-                   (unsigned long)perf_cnt_ohci_frame,
-                   (unsigned long)perf_cnt_ohci_td,
-                   (unsigned long)perf_cnt_usb_handle,
-                   (unsigned long)perf_cnt_usb_control,
-                   (unsigned long)perf_cnt_vblank, perf_pcrtc_enabled,
-                   (int)chihiro_game_running,
-                   (unsigned long)jvs_s,
-                   (unsigned long)jvs_r, (unsigned long)jvs_rd);
-            { extern void chihiro_usb_dump_vendor_histogram(void);
-              chihiro_usb_dump_vendor_histogram(); }
-            printf("=== EIP HISTOGRAM (top 10) ===\n");
-            for (int rank = 0; rank < 10 && rank < eip_hist_used; rank++) {
-                int max_idx = -1;
-                uint32_t max_count = 0;
-                for (int i = 0; i < eip_hist_used; i++) {
-                    if (eip_hist[i].count > max_count) {
-                        max_count = eip_hist[i].count;
-                        max_idx = i;
-                    }
-                }
-                if (max_idx >= 0) {
-                    printf("  #%d: EIP=0x%08X  count=%u  (%.1f%%)\n",
-                           rank + 1, eip_hist[max_idx].eip, max_count,
-                           perf_cnt_irq10_cb > 0 ? 100.0 * max_count / perf_cnt_irq10_cb : 0.0);
-                    eip_hist[max_idx].count = 0;
-                }
-            }
-            printf("(%d unique EIPs sampled)\n"
-                   "================================\n", eip_hist_used);
-
-            /* One-shot game state dump: read key addresses from guest RAM */
-            static const struct { uint32_t va; const char *name; int size; } gstate[] = {
-                { 0x0027a410, "state_dispatch", 4 },
-                { 0x0027a188, "game_active",    4 },
-                { 0x0027a180, "pause_flag",     2 },
-                { 0x0027a730, "game_running",   4 },
-                { 0x00276b60, "tick_counter",   4 },
-                { 0x004d2a11, "mediaboard_st",  1 },
-                { 0x0027a124, "task_list_head", 4 },
-                { 0x00279f94, "frame_func_ptr", 4 },
-                { 0x004fc740, "sched_cur_ent",  4 },
-                { 0x002cb8e8, "config_ptr",     4 },
-                { 0x00276404, "error_code",     4 },
-                { 0x0027712c, "render_frames",  4 },
-                { 0x0027a10c, "sync_counter",   4 },
-                { 0x00276450, "sync_counter2",  4 },
-                { 0x002cb4d0, "speed_mode",     4 },
-                { 0x0027a1a0, "player_count",   4 },
-                { 0x00276c30, "post_d3dreset",  4 },
-                { 0x0030cf98, "d3d_device",     4 },
-                { 0x00217fc8, "aclib_ptr",      4 },
-                { 0x004bc540, "ac_thread",      4 },
-                { 0x004bc5dc, "jvs_state",      4 },
-                { 0x004bc5c8, "jvs_succ_cnt",   4 },
-                { 0x004bc5c4, "jvs_err_cnt",    4 },
-                { 0x004be160, "jvs_max_retry",  4 },
-                { 0x004bc5d8, "jvs_done_flag",  4 },
-                { 0x004cbd90, "jvs_usb_ready",  4 },
-            };
-            printf("=== GAME STATE DUMP ===\n");
-            for (int i = 0; i < (int)(sizeof(gstate)/sizeof(gstate[0])); i++) {
-                uint32_t pa = chihiro_va_to_pa(gstate[i].va);
-                uint32_t val = 0;
-                if (pa != 0xFFFFFFFF) {
-                    cpu_physical_memory_read(pa, &val, gstate[i].size);
-                    printf("  [VA=0x%08X PA=0x%08X] %-15s = 0x%X (%d)\n",
-                           gstate[i].va, pa, gstate[i].name, val, (int)val);
-                } else {
-                    printf("  [VA=0x%08X] %-15s = <UNMAPPED>\n",
-                           gstate[i].va, gstate[i].name);
-                }
-            }
-            /* Also dump 16 raw bytes at two key addresses for verification */
-            for (int k = 0; k < 2; k++) {
-                uint32_t check_va = (k == 0) ? 0x0027a410 : 0x004d2a11;
-                uint32_t check_pa = chihiro_va_to_pa(check_va);
-                printf("  RAW[0x%08X]: PA=0x%08X ", check_va, check_pa);
-                if (check_pa != 0xFFFFFFFF) {
-                    uint8_t raw[16];
-                    cpu_physical_memory_read(check_pa, raw, 16);
-                    for (int b = 0; b < 16; b++) printf("%02X ", raw[b]);
-                } else {
-                    printf("UNMAPPED");
-                }
-                printf("\n");
-            }
-            /* Verify runtime code at EIP 0x63430 vs Ghidra */
-            {
-                uint32_t code_pa = chihiro_va_to_pa(0x00063410);
-                printf("  CODE[VA=0x63410 PA=0x%08X]: ", code_pa);
-                if (code_pa != 0xFFFFFFFF) {
-                    uint8_t code[48];
-                    cpu_physical_memory_read(code_pa, code, 48);
-                    for (int b = 0; b < 48; b++) printf("%02X ", code[b]);
-                    /* Ghidra expects: 56 8B F1 E8 B8 F4 FF FF 0F BF 86 80 04 ... */
-                    printf("\n  MATCH: %s",
-                        (code[0]==0x56 && code[1]==0x8B && code[2]==0xF1) ?
-                        "YES (FUN_00063410)" : "NO — DIFFERENT CODE AT RUNTIME!");
-                } else {
-                    printf("UNMAPPED");
-                }
-                printf("\n");
-                /* Also check XBE entry point */
-                uint32_t ep_pa = chihiro_va_to_pa(0x10128);
-                uint32_t ep = 0;
-                if (ep_pa != 0xFFFFFFFF) {
-                    cpu_physical_memory_read(ep_pa, &ep, 4);
-                }
-                printf("  XBE_ENTRY = 0x%08X\n", ep);
-                /* Check game_main_loop (0xb1100) — read first 4 bytes */
-                uint32_t gml_pa = chihiro_va_to_pa(0x000b1100);
-                printf("  game_main_loop[VA=0xB1100 PA=0x%08X]: ", gml_pa);
-                if (gml_pa != 0xFFFFFFFF) {
-                    uint8_t gml[4];
-                    cpu_physical_memory_read(gml_pa, gml, 4);
-                    printf("%02X %02X %02X %02X", gml[0], gml[1], gml[2], gml[3]);
-                    /* Ghidra expects: 83 EC 40 (SUB ESP,0x40) */
-                    printf(" %s", (gml[0]==0x83 && gml[1]==0xEC && gml[2]==0x40) ?
-                        "MATCH" : "MISMATCH");
-                } else {
-                    printf("UNMAPPED");
-                }
-                printf("\n");
-            }
-            printf("  max_frame_func_ptr = 0x%08X\n", max_frame_func);
-            printf("  CALLER of FUN_63410: ret_addr=0x%08X (ESP was 0x%08X)\n",
-                   caller_of_63410, caller_esp);
-            /* Walk stack using physical address (strip 0xD0 prefix if needed) */
-            {
-                uint32_t base_phys = (caller_esp & 0x0FFFFFFF);
-                if (base_phys < 0x08000000) {
-                    printf("  STACK[phys=0x%06X]:", base_phys);
-                    for (int si = 0; si < 32; si++) {
-                        uint32_t slot = 0;
-                        cpu_physical_memory_read(base_phys + si * 4, &slot, 4);
-                        if (slot >= 0x10000 && slot < 0x200000) {
-                            printf(" [+%02X]=0x%08X", si*4, slot);
-                        }
-                    }
-                    printf("\n");
-                }
-            }
-            printf("=======================\n");
-        }
-    }
-
+    /* IRQ10 for SEGABOOT baseboard communication */
     if (s->eeprom_hack_applied && !chihiro_game_running) {
         qemu_irq_raise(s->irq10);
     }
 
-    /* Game XBE detection: compare XBE entry point at VA 0x10000+0x128.
-     * SEGABOOT is loaded multiple times (service menu → game boot).
-     * The game XBE has a DIFFERENT entry point than SEGABOOT.
-     * Only set game_running when the entry point changes. */
+    /* Game XBE detection: entry point change after QuickReboot */
     if (!chihiro_game_running && chihiro_active) {
         static uint32_t segaboot_entry = 0;
         static int xbe_check_tick = 0;
-        if (++xbe_check_tick % 31 == 0) { /* ~every 0.5s */
+        if (++xbe_check_tick % 31 == 0) {
             uint32_t entry_pa = chihiro_va_to_pa(0x10000 + 0x128);
             if (entry_pa != 0xFFFFFFFF) {
                 uint32_t cur_entry = 0;
@@ -3133,414 +2904,70 @@ static void chihiro_irq10_timer_cb(void *opaque)
                 if (cur_entry > 0x10000 && cur_entry < 0x08000000) {
                     if (segaboot_entry == 0) {
                         segaboot_entry = cur_entry;
-                        if(0) printf("[%07lld] Chihiro: SEGABOOT entry point: 0x%08X\n",
-                               TS_MS, segaboot_entry);
                     } else if (cur_entry != segaboot_entry) {
                         chihiro_game_running = true;
-                        if(0) printf("[%07lld] Chihiro: *** GAME XBE DETECTED *** "
-                               "entry=0x%08X (was SEGABOOT 0x%08X)\n",
-                               TS_MS, cur_entry, segaboot_entry);
                     }
                 }
             }
         }
     }
 
-    /* CRI state monitor: read game data structures directly.
-     * Addresses from Ghidra analysis of hod3xb.xbe (CRI ADX middleware). */
+    /* DMA META scan: provide mbcom slot responses to SEGABOOT */
+    if (chihiro_mbcom_enabled && !chihiro_game_running
+        && chihiro_lpc_global && chihiro_lpc_global->usb_poll_patched) {
+        static const struct { uint32_t slot_va; uint32_t meta_va; uint32_t stride; }
+            slot_layouts[] = {
+                { 0xAA7B0, 0xAA790, 0x60 },
+                { 0x89760, 0x89740, 0x40 },
+            };
+        for (int layout = 0; layout < 2; layout++) {
+            uint32_t slot_base_pa = chihiro_va_to_pa(slot_layouts[layout].slot_va);
+            if (slot_base_pa == 0xFFFFFFFF) continue;
+            uint32_t meta_base_pa = chihiro_va_to_pa(slot_layouts[layout].meta_va);
+            if (meta_base_pa == 0xFFFFFFFF) continue;
+            if (slot_base_pa >= 0x800000 || meta_base_pa >= 0x800000) continue;
+            uint32_t stride = slot_layouts[layout].stride;
+            for (int sl = 0; sl < 16; sl++) {
+                uint32_t data_pa = slot_base_pa + sl * stride;
+                uint32_t meta_pa = meta_base_pa + sl * stride;
+                if (data_pa + 4 >= 0x800000 || meta_pa + 12 >= 0x800000) continue;
+                uint8_t data_byte0;
+                uint16_t meta_marker;
+                cpu_physical_memory_read(data_pa, &data_byte0, 1);
+                cpu_physical_memory_read(meta_pa + 2, &meta_marker, 2);
+                if (data_byte0 == 0 || meta_marker != 0) continue;
+                uint16_t cmd_opcode = 0;
+                cpu_physical_memory_read(data_pa + 2, &cmd_opcode, 2);
+                uint32_t resp_data = 0, resp_data2 = 0;
+                switch (cmd_opcode) {
+                case 0x0001: resp_data = 0x20000000; break;
+                case 0x0100: resp_data = 5; resp_data2 = 100; break;
+                case 0x0101: resp_data = 0x0317; break;
+                case 0x0102: resp_data = 0x8002; break;
+                case 0x0103: resp_data = 0x6261632D; break;
+                default: resp_data = 0; break;
+                }
+                meta_marker = 0x0001;
+                cpu_physical_memory_write(meta_pa + 2, &meta_marker, 2);
+                cpu_physical_memory_write(meta_pa + 4, &resp_data, 4);
+                if (cmd_opcode == 0x0100)
+                    cpu_physical_memory_write(meta_pa + 8, &resp_data2, 4);
+                s->mbcom_e0_status |= 0x05;
+                qemu_irq_raise(s->irq10);
+            }
+            break;
+        }
+    }
+
+    /* Kill timer once game is running — no more irq10 needed */
     if (chihiro_game_running) {
-        static int cri_tick = 0;
-        if (++cri_tick % 62 == 0) { /* ~every 1s at 16ms ticks */
-            uint32_t pa;
-            /* 1. EIP: is the game stuck in the ADXF blocking loop? */
-            CPUState *cs = first_cpu;
-            uint32_t eip = 0;
-            if (cs) eip = (uint32_t)X86_CPU(cs)->env.eip;
-
-            /* 2. DAT_00279fd0: drive path (should be "D:\") */
-            char drive_path[8] = {0};
-            pa = chihiro_va_to_pa(0x00279fd0);
-            if (pa != 0xFFFFFFFF) cpu_physical_memory_read(pa, drive_path, 4);
-
-            /* 3. DAT_004ed7c0: CRI drive prefix (BSS, set by FUN_000c5070) */
-            char cri_prefix[8] = {0};
-            pa = chihiro_va_to_pa(0x004ed7c0);
-            if (pa != 0xFFFFFFFF) cpu_physical_memory_read(pa, cri_prefix, 4);
-
-            /* 4. DAT_004f6fe0: ADXF master handle (0 = not initialized) */
-            uint32_t adxf_handle = 0;
-            pa = chihiro_va_to_pa(0x004f6fe0);
-            if (pa != 0xFFFFFFFF) cpu_physical_memory_read(pa, &adxf_handle, 4);
-
-            /* 5. DAT_004f5f80: partition ID being loaded */
-            uint32_t pt_id = 0;
-            pa = chihiro_va_to_pa(0x004f5f80);
-            if (pa != 0xFFFFFFFF) cpu_physical_memory_read(pa, &pt_id, 4);
-
-            /* 6. DAT_004ea2a0: WX handle table (first 16 bytes) */
-            uint32_t wx_tbl[4] = {0};
-            pa = chihiro_va_to_pa(0x004ea2a0);
-            if (pa != 0xFFFFFFFF) cpu_physical_memory_read(pa, wx_tbl, 16);
-
-            /* 7. DAT_0030fdd8: CRI callback table group 5 (WX I/O server) */
-            uint32_t cb_grp5[4] = {0};
-            pa = chihiro_va_to_pa(0x0030fdd8 + 5 * 0x20);
-            if (pa != 0xFFFFFFFF) cpu_physical_memory_read(pa, cb_grp5, 16);
-
-            /* 8. Game thunk for NtCreateFile @ VA 0x11038 */
-            uint32_t ntcf_thunk = 0;
-            pa = chihiro_va_to_pa(0x00011038);
-            if (pa != 0xFFFFFFFF) cpu_physical_memory_read(pa, &ntcf_thunk, 4);
-
-            if(0) printf("[%07lld] CRI-MON: eip=0x%08X drv='%c%c%c%c' prefix='%c%c%c%c' "
-                   "adxf_h=0x%X ptid=%u wx=[%08X %08X %08X %08X] "
-                   "cb5=[%08X %08X] ntcf=0x%08X\n",
-                   TS_MS, eip,
-                   drive_path[0] ? drive_path[0] : '?',
-                   drive_path[1] ? drive_path[1] : '?',
-                   drive_path[2] ? drive_path[2] : '?',
-                   drive_path[3] ? drive_path[3] : '?',
-                   cri_prefix[0] ? cri_prefix[0] : '?',
-                   cri_prefix[1] ? cri_prefix[1] : '?',
-                   cri_prefix[2] ? cri_prefix[2] : '?',
-                   cri_prefix[3] ? cri_prefix[3] : '?',
-                   adxf_handle, pt_id,
-                   wx_tbl[0], wx_tbl[1], wx_tbl[2], wx_tbl[3],
-                   cb_grp5[0], cb_grp5[1], ntcf_thunk);
-
-            if (eip >= 0x80015551 && eip <= 0x80015554) {
-                uint32_t bc[5];
-                cpu_physical_memory_read(0x3ABE0, bc, 20);
-                if(0) printf("[%07lld] CRI-MON: *** BUGCHECK 0x%08X "
-                       "(p1=0x%08X p2=0x%08X p3=0x%08X p4=0x%08X) ***\n",
-                       TS_MS, bc[0], bc[1], bc[2], bc[3], bc[4]);
-            } else if (eip >= 0x000763b8 && eip <= 0x000763ca) {
-                if(0) printf("[%07lld] CRI-MON: *** EIP IN BLOCKING LOOP (ADXF_GetPtStat poll) ***\n",
-                       TS_MS);
-            }
+        timer_del(s->irq10_timer);
+        static bool logged_del = false;
+        if (!logged_del) {
+            fprintf(stderr, "[%07lld] irq10_timer DELETED (game running)\n", TS_MS);
+            logged_del = true;
         }
-    }
-
-    /* DMA META scan: marks mbcom slots as "ready" with responses.
-     * Required for boot=0 → boot=1 — SEGABOOT polls slot markers.
-     * fpr-23887: slot VA=0x89760, meta VA=0x89740, stride=0x40
-     * fpr-21042: slot VA=0xAA7B0, meta VA=0xAA790, stride=0x60 */
-    if (chihiro_mbcom_enabled && !chihiro_game_running) {
-        static int va_diag_count = 0;
-        if (va_diag_count++ % 62 == 0) { /* ~every 1 second at 16ms ticks */
-            CPUState *cpu = first_cpu;
-            if (cpu) {
-                X86CPU *x86 = X86_CPU(cpu);
-                uint32_t cr3 = x86->env.cr[3] & 0xFFFFF000;
-                uint32_t test_va = 0xAA7B0;
-                uint32_t pde_addr = cr3 + ((test_va >> 22) * 4);
-                uint32_t pde;
-                cpu_physical_memory_read(pde_addr, &pde, 4);
-                if (pde & 1) {
-                    uint32_t pa = 0;
-                    if (pde & 0x80) {
-                        pa = (pde & 0xFFC00000) | (test_va & 0x003FFFFF);
-                    } else {
-                        uint32_t pt_addr = (pde & 0xFFFFF000) + (((test_va >> 12) & 0x3FF) * 4);
-                        uint32_t pte;
-                        cpu_physical_memory_read(pt_addr, &pte, 4);
-                        if (pte & 1)
-                            pa = (pte & 0xFFFFF000) | (test_va & 0xFFF);
-                    }
-                    if (pa && (va_diag_count % 310 == 0)) {
-                        /* Dump first 3 slots raw hex every ~5s */
-                        uint32_t meta_pa = pa - 0x20; /* META = DATA - 0x20 */
-                        if(0) printf("[%07lld] SLOT-DUMP PA=0x%05X (META=0x%05X stride=0x60):\n",
-                               TS_MS, pa, meta_pa);
-                        for (int sl = 0; sl < 3; sl++) {
-                            uint8_t raw[96];
-                            cpu_physical_memory_read(meta_pa + sl * 0x60, raw, 96);
-                            if(0) printf("  slot[%d] META: ", sl);
-                            if(0) for (int b = 0; b < 32; b++) printf("%02X", raw[b]);
-                            if(0) printf("\n         DATA: ");
-                            if(0) for (int b = 32; b < 64; b++) printf("%02X", raw[b]);
-                            if(0) printf("\n         +40:  ");
-                            if(0) for (int b = 64; b < 96; b++) printf("%02X", raw[b]);
-                            if(0) printf("\n");
-                        }
-                    }
-                }
-            }
-        }
-
-        /* META scan: provide mbcom slot responses to SEGABOOT.
-         * Only active AFTER patches applied (usb_poll_patched=true)
-         * and ONLY when va_to_pa resolves correctly.
-         * v239 RAM dump confirmed: fpr-21042 slot PA=0xF57B0 stride=0x60
-         *
-         * Guard: validate cmd_opcode is known BEFORE writing anything.
-         * Previous corruption was from wrong stride or unmapped PAs. */
-        if (chihiro_lpc_global && chihiro_lpc_global->usb_poll_patched) {
-            static const struct { uint32_t slot_va; uint32_t meta_va; uint32_t stride; }
-                slot_layouts[] = {
-                    { 0xAA7B0, 0xAA790, 0x60 },  /* fpr-21042 */
-                    { 0x89760, 0x89740, 0x40 },  /* fpr-23887 */
-                };
-
-            for (int layout = 0; layout < 2; layout++) {
-                uint32_t slot_base_pa = chihiro_va_to_pa(slot_layouts[layout].slot_va);
-                if (slot_base_pa == 0xFFFFFFFF) continue;
-                uint32_t meta_base_pa = chihiro_va_to_pa(slot_layouts[layout].meta_va);
-                if (meta_base_pa == 0xFFFFFFFF) continue;
-
-                /* Sanity: PA must be in RAM range (< 8MB), not VRAM/MMIO */
-                if (slot_base_pa >= 0x800000 || meta_base_pa >= 0x800000) continue;
-
-                uint32_t stride = slot_layouts[layout].stride;
-
-                for (int sl = 0; sl < 16; sl++) {
-                    uint32_t data_pa = slot_base_pa + sl * stride;
-                    uint32_t meta_pa = meta_base_pa + sl * stride;
-
-                    /* Bounds check */
-                    if (data_pa + 4 >= 0x800000 || meta_pa + 12 >= 0x800000) continue;
-
-                    uint8_t data_byte0;
-                    uint16_t meta_marker;
-                    cpu_physical_memory_read(data_pa, &data_byte0, 1);
-                    cpu_physical_memory_read(meta_pa + 2, &meta_marker, 2);
-
-                    /* Only process if type is set and marker is clear */
-                    if (data_byte0 == 0 || meta_marker != 0) continue;
-
-                    uint16_t cmd_opcode = 0;
-                    cpu_physical_memory_read(data_pa + 2, &cmd_opcode, 2);
-
-                    uint32_t resp_data = 0, resp_data2 = 0;
-                    switch (cmd_opcode) {
-                    case 0x0001: resp_data = 0x20000000; break;
-                    case 0x0100: resp_data = 5; resp_data2 = 100; break;
-                    case 0x0101: resp_data = 0x0317; break;
-                    case 0x0102: resp_data = 0x8002; break;
-                    case 0x0103: resp_data = 0x6261632D; break;
-                    default:
-                        if(0) printf("[%07lld] Chihiro DMA: UNKNOWN cmd=0x%04X type=%u slot=%d "
-                               "PA=0x%05X meta=0x%05X — responding with 0\n",
-                               TS_MS, cmd_opcode, data_byte0, sl, data_pa, meta_pa);
-                        resp_data = 0;
-                        break;
-                    }
-
-                    meta_marker = 0x0001;
-                    cpu_physical_memory_write(meta_pa + 2, &meta_marker, 2);
-                    cpu_physical_memory_write(meta_pa + 4, &resp_data, 4);
-                    if (cmd_opcode == 0x0100)
-                        cpu_physical_memory_write(meta_pa + 8, &resp_data2, 4);
-                    s->mbcom_e0_status |= 0x05;
-                    qemu_irq_raise(s->irq10);
-
-                    if (cmd_opcode == 0x0100) {
-                        uint8_t meta_raw[16];
-                        cpu_physical_memory_read(meta_pa, meta_raw, 16);
-                        if(0) printf("[%07lld] META-STATUS-WRITE: meta_pa=0x%05X data_pa=0x%05X "
-                               "slot=%d raw=", TS_MS, meta_pa, data_pa, sl);
-                        if(0) for (int b = 0; b < 16; b++) printf("%02X", meta_raw[b]);
-                        if(0) printf(" [marker=%04X phase=%u pct=%u]\n",
-                               meta_marker, resp_data, resp_data2);
-                    }
-
-                    static uint16_t last_dma_cmd = 0xFFFF;
-                    static uint32_t dma_repeat_count = 0;
-                    if (cmd_opcode == last_dma_cmd) {
-                        dma_repeat_count++;
-                    } else {
-                        if (dma_repeat_count > 1)
-                            if(0) printf("[%07lld] Chihiro DMA: (prev cmd=0x%04X repeated %u)\n",
-                                   TS_MS, last_dma_cmd, dma_repeat_count);
-                        if(0) printf("[%07lld] Chihiro DMA: slot %d PA=0x%05X cmd=0x%04X resp=0x%08X\n",
-                               TS_MS, sl, data_pa, cmd_opcode, resp_data);
-                        last_dma_cmd = cmd_opcode;
-                        dma_repeat_count = 1;
-                    }
-                }
-                break; /* Use first working layout */
-            }
-        }
-    }
-
-    /* STATE MACHINE PROBE: scan for CheckErrors vtable (0x212B8) in
-     * SEGABOOT's contiguous memory region to find the state object.
-     * Rescans on every QuickReboot when the old PA becomes stale. */
-    {
-        static int sm_log = 0;
-        static uint32_t sm_obj_pa = 0x166150; /* initial from first boot vtable scan */
-        if (sm_log++ % 62 == 0) { /* ~every 1 second */
-            uint32_t sm_vtable = 0, sm_appobj = 0, sm_state = 0, sm_err = 0;
-            uint32_t sm_tick = 0, sm_flagc = 0, sm_done = 0, sm_errtick = 0;
-            cpu_physical_memory_read(sm_obj_pa, &sm_vtable, 4);
-
-            /* If vtable is garbage, rescan all RAM for 0x212B8 */
-            if (sm_vtable != 0x212B8 && sm_vtable != 0) {
-                static int scan_cooldown = 0;
-                if (scan_cooldown > 0) { scan_cooldown--; goto sm_done_label; }
-                bool found = false;
-                int hit_count = 0;
-                for (uint32_t pa = 0x1000; pa < 0x8000000; pa += 4) {
-                    uint32_t val;
-                    cpu_physical_memory_read(pa, &val, 4);
-                    if (val == 0x212B8) {
-                        uint32_t next;
-                        cpu_physical_memory_read(pa + 4, &next, 4);
-                        hit_count++;
-                        if (hit_count <= 5) {
-                            if(0) printf("[%07lld] SM-SCAN: 0x212B8 at PA 0x%07X next=0x%08X\n",
-                                   TS_MS, pa, next);
-                        }
-                        if (next >= 0xD0000000 || (next >= 0x80000000 && next < 0x88000000)) {
-                            sm_obj_pa = pa;
-                            cpu_physical_memory_read(sm_obj_pa, &sm_vtable, 4);
-                            if(0) printf("[%07lld] SM-REAL: RESCAN found at PA 0x%X (hit %d/%d)\n",
-                                   TS_MS, sm_obj_pa, hit_count, hit_count);
-                            found = true;
-                            break;
-                        }
-                    }
-                }
-                if (!found) {
-                    scan_cooldown = 5;
-                    if(0) printf("[%07lld] SM-REAL: vtable 0x212B8 — %d hits, none valid "
-                           "(old_pa=0x%X old_val=0x%X)\n",
-                           TS_MS, hit_count, sm_obj_pa, sm_vtable);
-                    /* Dump what's at the old PA for debugging */
-                    {
-                        uint8_t old[32];
-                        cpu_physical_memory_read(sm_obj_pa, old, 32);
-                        if(0) printf("[%07lld] SM-REAL: old PA dump: "
-                               "%02X%02X%02X%02X %02X%02X%02X%02X "
-                               "%02X%02X%02X%02X %02X%02X%02X%02X "
-                               "%02X%02X%02X%02X %02X%02X%02X%02X\n",
-                               TS_MS,
-                               old[0],old[1],old[2],old[3],old[4],old[5],old[6],old[7],
-                               old[8],old[9],old[10],old[11],old[12],old[13],old[14],old[15],
-                               old[16],old[17],old[18],old[19],old[20],old[21],old[22],old[23]);
-                        /* Also check XBE header to determine what's running */
-                        uint32_t xbe_pa = chihiro_va_to_pa(0x10000);
-                        uint32_t xbe_entry = 0;
-                        if (xbe_pa != 0xFFFFFFFF) {
-                            uint8_t m[4];
-                            cpu_physical_memory_read(xbe_pa, m, 4);
-                            cpu_physical_memory_read(xbe_pa + 0x128, &xbe_entry, 4);
-                            if(0) printf("[%07lld] SM-REAL: current XBE magic=%c%c%c%c entry=0x%08X\n",
-                                   TS_MS, m[0], m[1], m[2], m[3], xbe_entry);
-                        }
-                    }
-                    goto sm_done_label;
-                }
-            }
-
-            cpu_physical_memory_read(sm_obj_pa + 4, &sm_appobj, 4);
-            cpu_physical_memory_read(sm_obj_pa + 8, &sm_done, 4);
-            cpu_physical_memory_read(sm_obj_pa + 0xC, &sm_flagc, 4);
-            cpu_physical_memory_read(sm_obj_pa + 0x10, &sm_err, 4);
-            cpu_physical_memory_read(sm_obj_pa + 0x14, &sm_state, 4);
-            cpu_physical_memory_read(sm_obj_pa + 0x18, &sm_tick, 4);
-            cpu_physical_memory_read(sm_obj_pa + 0x1C, &sm_errtick, 4);
-            {
-                uint32_t ldp_mon = 0;
-                cpu_physical_memory_read(0x3B3D8, &ldp_mon, 4);
-                if(0) printf("[%07lld] SM-REAL: vt=0x%X app=0x%08X state=%u "
-                       "tick=%u err=%u flag_c=%u done=%u errtick=%u "
-                       "(PA=0x%X) LDP=0x%08X\n",
-                       TS_MS, sm_vtable, sm_appobj, sm_state,
-                       sm_tick, sm_err, sm_flagc, sm_done, sm_errtick,
-                       sm_obj_pa, ldp_mon);
-            }
-            if (sm_appobj >= 0xD0000000 || (sm_appobj >= 0x80000000 && sm_appobj < 0x88000000)) {
-                uint32_t aobj_pa = chihiro_va_to_pa(sm_appobj + 0x3BC);
-                uint32_t aobj_pa2 = chihiro_va_to_pa(sm_appobj + 0x3D4);
-                uint32_t v3bc = 0, v3d4 = 0;
-                if (aobj_pa != 0xFFFFFFFF)
-                    cpu_physical_memory_read(aobj_pa, &v3bc, 4);
-                if (aobj_pa2 != 0xFFFFFFFF)
-                    cpu_physical_memory_read(aobj_pa2, &v3d4, 4);
-                if(0) printf("[%07lld] SM-APP: [+3BC]=%u [+3D4]=0x%X\n",
-                       TS_MS, v3bc, v3d4);
-            }
-            sm_done_label: ;
-        }
-    }
-
-    /* Independent one-shot: dump SEGABOOT import thunks after boot */
-    {
-        static int thunks_dumped = 0;
-        if (!thunks_dumped && TS_MS > 8000) {
-            uint32_t thunk_pa = chihiro_va_to_pa(0x11038);
-            if (thunk_pa != 0xFFFFFFFF) {
-                uint32_t thunks[8];
-                cpu_physical_memory_read(thunk_pa - 8, thunks, 32);
-                if(0) printf("[%07lld] SEGABOOT-THUNKS @VA 0x11030: "
-                       "%08X %08X [NtCreateFile@11038]=%08X %08X "
-                       "%08X %08X %08X %08X\n",
-                       TS_MS, thunks[0], thunks[1], thunks[2],
-                       thunks[3], thunks[4], thunks[5],
-                       thunks[6], thunks[7]);
-                /* Also dump kernel partition state */
-                uint32_t dimm_sz = 0, fpga = 0, cqd = 0;
-                cpu_physical_memory_read(0x3B3CC, &dimm_sz, 4);
-                cpu_physical_memory_read(0x3B3C8, &fpga, 1);
-                cpu_physical_memory_read(0x3AF2C, &cqd, 1);
-                if(0) printf("[%07lld] KERNEL-MB: DIMM_sz=0x%08X FPGABoard=%u "
-                       "CreateQuickDone=%u\n", TS_MS, dimm_sz, fpga, cqd);
-                /* Check handle at this exact moment */
-                uint32_t h_pa = chihiro_va_to_pa(0xAA74C);
-                if (h_pa != 0xFFFFFFFF) {
-                    uint32_t h = 0;
-                    cpu_physical_memory_read(h_pa, &h, 4);
-                    if(0) printf("[%07lld] SEGABOOT-HANDLE: 0x%08X\n", TS_MS, h);
-                }
-                /* Init-progress probe: check how far mbcom_main_init got */
-                {
-                    uint32_t v;
-                    /* DAT_000aa670: set to 3 in FUN_0003a900 */
-                    uint32_t pa670 = chihiro_va_to_pa(0xAA670);
-                    /* DAT_0001eb9c: set to 1 in FUN_0003a900 */
-                    uint32_t pa1eb = chihiro_va_to_pa(0x1EB9C);
-                    /* DAT_000aa750: DMA mode set by FUN_0003e230 */
-                    uint32_t pa750 = chihiro_va_to_pa(0xAA750);
-                    /* DAT_000aad98: DMA thread A handle (FUN_00040140) */
-                    uint32_t pad98 = chihiro_va_to_pa(0xAAD98);
-                    /* DAT_000aae18: DMA thread B handle (FUN_00040140) */
-                    uint32_t pae18 = chihiro_va_to_pa(0xAAE18);
-                    uint32_t g670=0, g1eb=0, g750=0, gd98=0, ge18=0;
-                    if (pa670 != 0xFFFFFFFF) cpu_physical_memory_read(pa670, &g670, 4);
-                    if (pa1eb != 0xFFFFFFFF) cpu_physical_memory_read(pa1eb, &g1eb, 4);
-                    if (pa750 != 0xFFFFFFFF) cpu_physical_memory_read(pa750, &g750, 4);
-                    if (pad98 != 0xFFFFFFFF) cpu_physical_memory_read(pad98, &gd98, 4);
-                    if (pae18 != 0xFFFFFFFF) cpu_physical_memory_read(pae18, &ge18, 4);
-                    /* DAT_00011414/18/1c: JVS error state from FUN_0001a4b0 */
-                    uint32_t pa414 = chihiro_va_to_pa(0x11414);
-                    uint32_t pa418 = chihiro_va_to_pa(0x11418);
-                    uint32_t pa41c = chihiro_va_to_pa(0x1141C);
-                    uint32_t g414=0, g418=0, g41c=0;
-                    if (pa414 != 0xFFFFFFFF) cpu_physical_memory_read(pa414, &g414, 4);
-                    if (pa418 != 0xFFFFFFFF) cpu_physical_memory_read(pa418, &g418, 4);
-                    if (pa41c != 0xFFFFFFFF) cpu_physical_memory_read(pa41c, &g41c, 4);
-                    /* Device table flags: slot2(QC)=0xEA004, slot3(SC)=0xEA21C */
-                    uint32_t pa_qcf = chihiro_va_to_pa(0xEA004);
-                    uint32_t pa_scf = chihiro_va_to_pa(0xEA21C);
-                    uint8_t qcf=0, scf=0;
-                    if (pa_qcf != 0xFFFFFFFF) cpu_physical_memory_read(pa_qcf, &qcf, 1);
-                    if (pa_scf != 0xFFFFFFFF) cpu_physical_memory_read(pa_scf, &scf, 1);
-                    /* SC slot assignment at DAT_00011410 */
-                    uint32_t pa_scs = chihiro_va_to_pa(0x11410);
-                    uint32_t scs = 0;
-                    if (pa_scs != 0xFFFFFFFF) cpu_physical_memory_read(pa_scs, &scs, 4);
-                    if(0) printf("[%07lld] INIT-PROGRESS: aa670=%u 1eb9c=%u "
-                           "dma_mode(aa750)=%u threadA(aad98)=0x%X "
-                           "threadB(aae18)=0x%X | "
-                           "JVS_err=0x%08X JVS_str=0x%05X JVS_msg=0x%05X | "
-                           "QCflags=0x%02X SCflags=0x%02X SC_slot=%u\n",
-                           TS_MS, g670, g1eb, g750, gd98, ge18,
-                           g414, g418, g41c, qcf, scf, scs);
-                }
-                thunks_dumped = 1;
-            }
-        }
+        return;
     }
 
     /* Re-arm every 16ms (~60Hz) */
@@ -3684,6 +3111,21 @@ static void chihiro_eeprom_hack_cb(void *opaque)
     }
 }
 
+static void chihiro_kbd_event(DeviceState *dev, QemuConsole *src,
+                              InputEvent *evt)
+{
+    /* JVS input now handled by xemu_input_update_jvs_lightgun() in
+     * xemu-input.c — SDL keyboard polling, momentary (not toggle).
+     * Keys: 1=Start, 5=Coin, 9=Service, F2=Test, mouse=lightgun. */
+    (void)dev; (void)src; (void)evt;
+}
+
+static const QemuInputHandler chihiro_kbd_handler = {
+    .name  = "Chihiro JVS Keyboard",
+    .mask  = INPUT_EVENT_MASK_KEY,
+    .event = chihiro_kbd_event,
+};
+
 static void chihiro_lpc_realize(DeviceState *dev, Error **errp)
 {
     ChihiroLPCState *s = CHIHIRO_LPC_DEVICE(dev);
@@ -3748,6 +3190,8 @@ static void chihiro_lpc_realize(DeviceState *dev, Error **errp)
                                             chihiro_usb_poll_patch_cb, s);
     timer_mod(s->usb_poll_patch_timer,
               qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 10);
+
+    qemu_input_handler_register(dev, &chihiro_kbd_handler);
 
     if(0) printf("[%07lld] Chihiro: Mediaboard LPC I/O initialized at 0x4000-0x40FF\n", TS_MS);
 }
