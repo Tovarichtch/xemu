@@ -2909,14 +2909,30 @@ void qmp_x_exit_preconfig(Error **errp)
 static const char *get_eeprom_path(void)
 {
     const char *path = g_config.sys.files.eeprom_path;
+    bool is_chihiro = (int)g_config.sys.mem_limit >= 1;
+    XboxEEPROMVersion needed = is_chihiro ? XBOX_EEPROM_VERSION_D
+                                          : XBOX_EEPROM_VERSION_R1;
 
     if (strlen(path) == 0) {
         path = xemu_settings_get_default_eeprom_path();
         xemu_settings_set_string(&g_config.sys.files.eeprom_path, path);
     }
 
+    if (qemu_access(path, F_OK) == 0 && is_chihiro) {
+        FILE *f = qemu_fopen(path, "rb");
+        if (f) {
+            uint8_t data[256];
+            bool valid = fread(data, 1, 256, f) == 256;
+            fclose(f);
+            if (valid && xbox_eeprom_detect_version(data) != needed) {
+                printf("Chihiro: EEPROM has retail key, regenerating with debug key\n");
+                qemu_unlink(path);
+            }
+        }
+    }
+
     if (qemu_access(path, F_OK) == -1) {
-        if (!xbox_eeprom_generate(path, XBOX_EEPROM_VERSION_R1)) {
+        if (!xbox_eeprom_generate(path, needed)) {
             char *msg = g_strdup_printf("Failed to generate EEPROM file '%s'."
                                         "\n\nPlease check machine settings.",
                                         path);
@@ -3019,7 +3035,7 @@ void qemu_init(int argc, char **argv)
     fake_argv[fake_argc++] = g_strdup_printf("xbox%s%s%s,avpack=%s",
         (bootrom_arg != NULL) ? bootrom_arg : "",
         g_config.general.skip_boot_anim ? ",short-animation=on" : "",
-        ",kernel-irqchip=off",
+        "", /* kernel-irqchip=off REMOVED for perf test v487 */
         avpack_str
         );
 
