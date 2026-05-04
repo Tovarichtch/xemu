@@ -3,7 +3,7 @@
  *
  * Copyright (c) 2013 espes
  * Copyright (c) 2018-2021 Matt Borgerson
- * Copyright (c) 2025 Tovarichtch (Réda)
+ * Copyright (c) 2026 Réda Chérif-Touil
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public

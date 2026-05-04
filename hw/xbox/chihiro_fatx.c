@@ -10,7 +10,7 @@
  *   After superblock: FAT16 table
  *   After FAT: Data clusters (cluster_size = 32 sectors = 16KB)
  *
- * Copyright (c) 2025 Tovarichtch (Réda)
+ * Copyright (c) 2026 Réda Chérif-Touil
  * LGPL-2.0-or-later
  */
 
