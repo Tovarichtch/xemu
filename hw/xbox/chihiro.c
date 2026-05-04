@@ -1868,18 +1868,9 @@ static void chihiro_usb_poll_patch_cb(void *opaque)
      * Patch: replace first 3 bytes with 31 C0 C3 (xor eax,eax; ret)
      * -> always returns 0 -> caller takes CreateThread path
      */
-    static const uint8_t sig_qcbyte0[] = {
-        0xE8, 0x2B, 0x6E, 0x01, 0x00,  /* call GetQcStatus      */
-        0x0F, 0xB6, 0x00,              /* movzx eax, byte [eax]  */
-        0xC3                            /* ret                    */
-    };
-
-    /* fpr-21042 variant — different call offset */
-    static const uint8_t sig_qcbyte0_21042[] = {
-        0xE8, 0xEB, 0x96, 0x01, 0x00,  /* call 0x44460           */
-        0x0F, 0xB6, 0x00,              /* movzx eax, byte [eax]  */
-        0xC3                            /* ret                    */
-    };
+    /* LLE: GetQcStatusByte0 patch removed — status buffer stays 0 natively.
+     * sig_qcbyte0: E8 2B 6E 01 00 0F B6 00 C3 (call GetQcStatus; movzx eax,[eax]; ret)
+     * sig_qcbyte0_21042: E8 EB 96 01 00 0F B6 00 C3 (21042 variant) */
 
     /*
      * Patch 4: CreateThread return check (VA 0x425DE) — REMOVED in v201
@@ -2062,8 +2053,11 @@ static void chihiro_usb_poll_patch_cb(void *opaque)
         /* { sig_enumpoll_21042, ..., "UsbEnumPoll check (nop jne32) [21042]", false }, */
         /* { sig_classdrv, ..., "RegisterClassDriver check (je->jmp)", false }, */
         /* { sig_classdrv_21042, ..., "RegisterClassDriver check (je->jmp) [21042]", false }, */
-        { sig_qcbyte0,  sizeof(sig_qcbyte0),  0,  patch_xor_ret, 3, 0x3AD80, "GetQcStatusByte0 (xor eax,eax; ret)", false },
-        { sig_qcbyte0_21042, sizeof(sig_qcbyte0_21042), 0, patch_xor_ret, 3, 0x2AD70, "GetQcStatusByte0 (xor eax,eax; ret) [21042]", false },
+        /* LLE: GetQcStatusByte0 returns SEGABOOT's local status buffer (DAT_000c5d01).
+         * Initialized to 0 by FUN_00054690 before check. Our QC emulation handles
+         * the USB protocol correctly so the buffer should stay 0. */
+        /* { sig_qcbyte0,  sizeof(sig_qcbyte0),  0,  patch_xor_ret, 3, 0x3AD80, "GetQcStatusByte0 (xor eax,eax; ret)", false }, */
+        /* { sig_qcbyte0_21042, sizeof(sig_qcbyte0_21042), 0, patch_xor_ret, 3, 0x2AD70, "GetQcStatusByte0 (xor eax,eax; ret) [21042]", false }, */
         /* v201: CreateThread patch REMOVED — let USB poll thread be created */
         /* { sig_createthread, sizeof(sig_createthread), 8, patch_jmp, 1, 0x425D6, "CreateThread return (jne->jmp)", false }, */
         { sig_errval,   sizeof(sig_errval),   2,  patch_and0,    1, 0x2E3AB, "DIAG: error value 0x14->0x00",        false },
