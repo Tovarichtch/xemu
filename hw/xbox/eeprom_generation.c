@@ -90,6 +90,29 @@ static void xbox_sha1_compute(SHA1Context *ctx, XboxEEPROMVersion ver,
     sha1_result(ctx, hash);
 }
 
+XboxEEPROMVersion xbox_eeprom_detect_version(const uint8_t *data) {
+    for (int ver = XBOX_EEPROM_VERSION_D; ver <= XBOX_EEPROM_VERSION_R3; ver++) {
+        RC4Context rctx;
+        SHA1Context sctx;
+        uint8_t seed[20];
+        uint8_t decrypted[28];
+        uint8_t computed_hash[20];
+
+        memcpy(decrypted, data + 0x14, 0x1C);
+
+        xbox_sha1_compute(&sctx, ver, (uint8_t *)data, 20, seed);
+        rc4_init(&rctx, seed, sizeof(seed));
+        rc4_crypt(&rctx, decrypted, 0x1C);
+
+        xbox_sha1_compute(&sctx, ver, decrypted, 0x1C, computed_hash);
+
+        if (memcmp(computed_hash, data, 20) == 0) {
+            return (XboxEEPROMVersion)ver;
+        }
+    }
+    return (XboxEEPROMVersion)-1;
+}
+
 bool xbox_eeprom_generate(const char *file, XboxEEPROMVersion ver) {
     XboxEEPROM e;
     memset(&e, 0, sizeof(e));
