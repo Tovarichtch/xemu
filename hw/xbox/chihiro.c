@@ -1983,23 +1983,9 @@ static void chihiro_usb_poll_patch_cb(void *opaque)
      * Replace `mov eax, 3` with `xor eax, eax; nop*3` (same 5 bytes) so the function
      * returns 0 (no error) even on format mismatch.
      */
-    static const uint8_t sig_check_mainserial[] = {
-        0x85, 0xC0,                            /* test eax, eax      */
-        0x75, 0xD6,                            /* jne 0x2EC0B        */
-        0xB8, 0x03, 0x00, 0x00, 0x00,          /* mov eax, 3         */
-        0x5E,                                  /* pop esi            */
-        0xC3                                   /* ret                */
-    };
-
-    /* fpr-21042 variant — different jne offset + call prefix to avoid false positive */
-    static const uint8_t sig_check_mainserial_21042[] = {
-        0xE8, 0xB4, 0xF7, 0xFF, 0xFF,         /* call CheckSerial      */
-        0x85, 0xC0,                            /* test eax, eax      */
-        0x75, 0x07,                            /* jne +0x07          */
-        0xB8, 0x03, 0x00, 0x00, 0x00,          /* mov eax, 3         */
-        0x5E,                                  /* pop esi            */
-        0xC3                                   /* ret                */
-    };
+    /* LLE: serial check patches removed — valid serials provided natively.
+     * sig_check_mainserial: 85 C0 75 D6 B8 03 00 00 00 5E C3
+     * sig_check_mainserial_21042: E8 B4 F7 FF FF 85 C0 75 07 B8 03 00 00 00 5E C3 */
 
     /*
      * Patch 12: CheckMediaBoardSerial (VA 0x2EC88) — return 0 instead of 4
@@ -2017,14 +2003,8 @@ static void chihiro_usb_poll_patch_cb(void *opaque)
      * Without this patch, fixing error 3 would just reveal error 4 next (Bad serial
      * number on media board). Replace same way as patch 11.
      */
-    static const uint8_t sig_check_mediaserial[] = {
-        0x85, 0xC0,                            /* test eax, eax      */
-        0x75, 0x0A,                            /* jne 0x2EC91        */
-        0x5F,                                  /* pop edi            */
-        0xB8, 0x04, 0x00, 0x00, 0x00,          /* mov eax, 4         */
-        0x5E,                                  /* pop esi            */
-        0xC2, 0x04, 0x00                       /* ret 4              */
-    };
+    /* LLE: media serial check patch removed.
+     * sig_check_mediaserial: 85 C0 75 0A 5F B8 04 00 00 00 5E C2 04 00 */
 
     /* v176: REMOVED AV NOP patches (11+12). Proper fix: EEPROM video_standard
      * now includes AV_FLAGS_HDTV_480p (0x00080000) so the kernel configures
@@ -2040,7 +2020,7 @@ static void chihiro_usb_poll_patch_cb(void *opaque)
     static const uint8_t patch_xor_ret[] = { 0x31, 0xC0, 0xC3 };
     /* v200: patch_xor_ret4 removed — was only used by UsbPollQC/SC patches */
     /* static const uint8_t patch_xor_ret4[] = { 0x31, 0xC0, 0xC2, 0x04, 0x00 }; */
-    static const uint8_t patch_xor_nop3[]  = { 0x31, 0xC0, 0x90, 0x90, 0x90 }; /* xor eax, eax; nop*3 */
+    /* LLE: patch_xor_nop3 removed — serial check patches eliminated */
     /* v274: patch_nop6 removed — was only used by UsbEnumPoll 21042 patch */
     /* static const uint8_t patch_nop6[] = { 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 }; */
     /* v269: REMOVED patch_xor_ret8 + patch_mov1_ret — mbcom bypass patches reverted.
@@ -2067,9 +2047,11 @@ static void chihiro_usb_poll_patch_cb(void *opaque)
         { sig_enccheck,  sizeof(sig_enccheck),  2, patch_xor_ret, 2, 0x3A953, "EncryptionCheck (test->xor eax,eax)",  false },
         /* v153: REMOVED MbcomPollReady (was always return 1) — let clear-on-read deliver real responses */
         /* v153: REMOVED GetBootData (was always return 1) — let real boot data flow through */
-        { sig_check_mainserial,  sizeof(sig_check_mainserial),  4, patch_xor_nop3, 5, 0x2EC35, "CheckMainBoardSerial (err 3 -> 0)",  false },
-        { sig_check_mainserial_21042, sizeof(sig_check_mainserial_21042), 9, patch_xor_nop3, 5, 0x1EA9C, "CheckMainBoardSerial (err 3 -> 0) [21042]", false },
-        { sig_check_mediaserial, sizeof(sig_check_mediaserial), 5, patch_xor_nop3, 5, 0x2EC88, "CheckMediaBoardSerial (err 4 -> 0)", false },
+        /* LLE: serial checks pass natively. Main serial from ic10 EEPROM (0x1F10),
+         * media serial from mbcom CMD 0x0103 — both valid format %%%@-##@########. */
+        /* { sig_check_mainserial,  sizeof(sig_check_mainserial),  4, patch_xor_nop3, 5, 0x2EC35, "CheckMainBoardSerial (err 3 -> 0)",  false }, */
+        /* { sig_check_mainserial_21042, sizeof(sig_check_mainserial_21042), 9, patch_xor_nop3, 5, 0x1EA9C, "CheckMainBoardSerial (err 3 -> 0) [21042]", false }, */
+        /* { sig_check_mediaserial, sizeof(sig_check_mediaserial), 5, patch_xor_nop3, 5, 0x2EC88, "CheckMediaBoardSerial (err 4 -> 0)", false }, */
     };
     int num_patches = sizeof(patches) / sizeof(patches[0]);
     int applied = 0;
@@ -2105,7 +2087,7 @@ static void chihiro_usb_poll_patch_cb(void *opaque)
         }
     }
 
-    if (applied >= 3) {
+    if (applied >= num_patches) {
         s->usb_poll_patched = true;
         if(0) printf("[%07lld] Chihiro: %d/%d SEGABOOT patches applied. "
                "USB enumeration runs natively (no UsbEnumPoll bypass).\n",
@@ -2337,8 +2319,8 @@ static void chihiro_dimm_process_cmd(ChihiroLPCState *s)
     case 0x0102: /* SYSTEM_TYPE — low byte must be >=2 to pass board check */
         s->dimm_resp[2] = 0x8002;
         break;
-    case 0x0103: /* SERIAL */
-        memcpy(&s->dimm_resp[2], "-abc-abc12345678", 16);
+    case 0x0103: /* SERIAL — format: %%%@-##@######## (letters skip I/O) */
+        memcpy(&s->dimm_resp[2], "AAEE-01A00000001", 16);
         break;
     default:
         break;
