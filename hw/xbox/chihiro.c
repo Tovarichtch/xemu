@@ -1888,9 +1888,7 @@ static void chihiro_usb_poll_patch_cb(void *opaque)
      * Patch 5 (DIAGNOSTIC): Error value at VA 0x2E3AB
      *   C7 07 14 00 00 00    mov [edi], 0x14  (error code)
      */
-    static const uint8_t sig_errval[] = {
-        0xC7, 0x07, 0x14, 0x00, 0x00, 0x00   /* mov [edi], 0x14 */
-    };
+    /* LLE: sig_errval removed — C7 07 14 00 00 00 (mov [edi], 0x14) */
 
     /*
      * Patch 6: UsbPollQC_inner (VA 0x51140) — REMOVED in v200
@@ -1926,14 +1924,7 @@ static void chihiro_usb_poll_patch_cb(void *opaque)
      * EncryptionCheck calls USB transfer (0x51340→0x1A0B0) which fails because
      * the AN2131 class driver was never registered. This forces eax=0 (success).
      */
-    static const uint8_t sig_enccheck[] = {
-        0x33, 0xC9,                            /* xor ecx, ecx       */
-        0x85, 0xC0,                            /* test eax, eax      */
-        0x0F, 0x9D, 0xC1,                      /* setge cl           */
-        0x5F,                                  /* pop edi            */
-        0x49,                                  /* dec ecx            */
-        0x83, 0xE1, 0x02                       /* and ecx, 2         */
-    };
+    /* LLE: sig_enccheck removed — 33 C9 85 C0 0F 9D C1 5F 49 83 E1 02 */
 
     /*
      * Patch 9: MbcomPollReady (VA 0x3DBC0) — always return 1
@@ -2013,16 +2004,7 @@ static void chihiro_usb_poll_patch_cb(void *opaque)
     /* v207b: TDBuilder NOP patches REMOVED — diagnostic only, proven ineffective
      * in v206. Kept as documentation of the RE finding. */
 
-    /* Patch byte arrays */
-    /* v274: patch_jmp removed — was only used by UsbEnumPoll/RegisterClassDriver patches */
-    /* static const uint8_t patch_jmp[] = { 0xEB }; */
-    static const uint8_t patch_and0[]  = { 0x00 };
-    static const uint8_t patch_xor_ret[] = { 0x31, 0xC0, 0xC3 };
-    /* v200: patch_xor_ret4 removed — was only used by UsbPollQC/SC patches */
-    /* static const uint8_t patch_xor_ret4[] = { 0x31, 0xC0, 0xC2, 0x04, 0x00 }; */
-    /* LLE: patch_xor_nop3 removed — serial check patches eliminated */
-    /* v274: patch_nop6 removed — was only used by UsbEnumPoll 21042 patch */
-    /* static const uint8_t patch_nop6[] = { 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 }; */
+    /* All SEGABOOT patch byte arrays removed — zero patches remaining */
     /* v269: REMOVED patch_xor_ret8 + patch_mov1_ret — mbcom bypass patches reverted.
      * mbcom_main_init must run LLE. Baseboard emulation handles its IDE commands. */
 
@@ -2040,11 +2022,14 @@ static void chihiro_usb_poll_patch_cb(void *opaque)
         /* { sig_qcbyte0_21042, sizeof(sig_qcbyte0_21042), 0, patch_xor_ret, 3, 0x2AD70, "GetQcStatusByte0 (xor eax,eax; ret) [21042]", false }, */
         /* v201: CreateThread patch REMOVED — let USB poll thread be created */
         /* { sig_createthread, sizeof(sig_createthread), 8, patch_jmp, 1, 0x425D6, "CreateThread return (jne->jmp)", false }, */
-        { sig_errval,   sizeof(sig_errval),   2,  patch_and0,    1, 0x2E3AB, "DIAG: error value 0x14->0x00",        false },
+        /* LLE: errval diagnostic patch removed — error 0x14 path not reached with correct emulation */
+        /* { sig_errval,   sizeof(sig_errval),   2,  patch_and0,    1, 0x2E3AB, "DIAG: error value 0x14->0x00",        false }, */
         /* v200: UsbPollQC/SC patches REMOVED — let real USB poll functions execute */
         /* { sig_usbpollqc, sizeof(sig_usbpollqc), 0, patch_xor_ret4, 5, 0x51140, "UsbPollQC_inner (xor eax,eax; ret 4)", false }, */
         /* { sig_usbpollsc, sizeof(sig_usbpollsc), 0, patch_xor_ret4, 5, 0x51150, "UsbPollSC_inner (xor eax,eax; ret 4)", false }, */
-        { sig_enccheck,  sizeof(sig_enccheck),  2, patch_xor_ret, 2, 0x3A953, "EncryptionCheck (test->xor eax,eax)",  false },
+        /* LLE: EncryptionCheck — USB class driver registered natively since v274,
+         * transfer should succeed without forcing eax=0 */
+        /* { sig_enccheck,  sizeof(sig_enccheck),  2, patch_xor_ret, 2, 0x3A953, "EncryptionCheck (test->xor eax,eax)",  false }, */
         /* v153: REMOVED MbcomPollReady (was always return 1) — let clear-on-read deliver real responses */
         /* v153: REMOVED GetBootData (was always return 1) — let real boot data flow through */
         /* LLE: serial checks pass natively. Main serial from ic10 EEPROM (0x1F10),
