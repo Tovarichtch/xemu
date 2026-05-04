@@ -2189,44 +2189,6 @@ void chihiro_on_quickreboot_signal(void)
 
     chihiro_quickreboot_pending = true;
 
-    /* Log LDP and plant canary in STICKY section to test preservation */
-    {
-        uint32_t ldp_ptr = 0;
-        cpu_physical_memory_read(0x3B3D8, &ldp_ptr, 4);
-        if(0) printf("[%07lld] Chihiro: PRE-QUICKREBOOT LDP diag:\n", TS_MS);
-        if(0) printf("  LaunchDataPage @PA 0x3B3D8 = 0x%08X\n", ldp_ptr);
-        if (ldp_ptr && ldp_ptr != 0xFFFFFFFF) {
-            uint32_t ldp_pa = (ldp_ptr & 0x0FFFFFFF);
-            uint8_t d[64];
-            cpu_physical_memory_read(ldp_pa, d, 64);
-            if(0) printf("  LDP page @PA 0x%07X:\n", ldp_pa);
-            if(0) printf("    +00: %02X%02X%02X%02X %02X%02X%02X%02X"
-                   " %02X%02X%02X%02X %02X%02X%02X%02X\n",
-                   d[0],d[1],d[2],d[3],d[4],d[5],d[6],d[7],
-                   d[8],d[9],d[10],d[11],d[12],d[13],d[14],d[15]);
-            if(0) printf("    +10: %02X%02X%02X%02X %02X%02X%02X%02X"
-                   " %02X%02X%02X%02X %02X%02X%02X%02X\n",
-                   d[16],d[17],d[18],d[19],d[20],d[21],d[22],d[23],
-                   d[24],d[25],d[26],d[27],d[28],d[29],d[30],d[31]);
-            if(0) printf("    +20: %02X%02X%02X%02X %02X%02X%02X%02X"
-                   " %02X%02X%02X%02X %02X%02X%02X%02X\n",
-                   d[32],d[33],d[34],d[35],d[36],d[37],d[38],d[39],
-                   d[40],d[41],d[42],d[43],d[44],d[45],d[46],d[47]);
-            if(0) printf("    +30: %02X%02X%02X%02X %02X%02X%02X%02X"
-                   " %02X%02X%02X%02X %02X%02X%02X%02X\n",
-                   d[48],d[49],d[50],d[51],d[52],d[53],d[54],d[55],
-                   d[56],d[57],d[58],d[59],d[60],d[61],d[62],d[63]);
-            char path[56] = {0};
-            memcpy(path, d + 8, 52);
-            if(0) printf("    type=%u path='%.52s'\n",
-                   *(uint32_t*)d, path);
-        }
-        /* Canary at PA 0x3B400 (STICKY ends at 0x3B41F, well within range) */
-        uint32_t canary = 0xCAFEBABE;
-        cpu_physical_memory_write(0x3B400, &canary, 4);
-        if(0) printf("  CANARY written: 0xCAFEBABE @PA 0x3B400\n");
-    }
-
     /* Re-arm SEGABOOT patch scanner and reset port counters.
      * QuickReboot reloads SEGABOOT from flash ROM (patches lost).
      * Kernel code stays patched (QuickReboot keeps kernel in RAM). */
@@ -2241,9 +2203,7 @@ void chihiro_on_quickreboot_signal(void)
         s->dimm_cmd_count = 0;
         s->dimm_next_seq = 1;
 
-        if(0) printf("[%07lld] Chihiro: Re-armed SEGABOOT patch scanner\n", TS_MS);
-
-        chihiro_quickreboot_fast_diag = 0; /* disabled — diagnostics resolved */
+        chihiro_quickreboot_fast_diag = 0;
         timer_mod(s->diag_timer,
                   qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 50);
     }
@@ -2255,8 +2215,6 @@ void chihiro_on_quickreboot_signal(void)
     pte_mon_active = 0;
     data_wp_armed = 0;
     data_wp_hit_count = 0;
-    if(0) printf("[%07lld] PTE-MON: will track PTE for VA 0x135000 at DMA callbacks\n",
-           TS_MS);
 }
 
 /* Called from SMC handler when kernel writes SMC_REG_POWER (QuickReboot).
@@ -2492,150 +2450,9 @@ static uint64_t chihiro_lpc_io_read(void *opaque, hwaddr addr,
             r = 0x0000;  /* Handshake not yet done: upper byte=0 = init phase */
         }
         s->lpc_40f0_reads++;
-        /* Kernel patches on port 0x40F0 reads. */
-        {
-            /* Patch kernel to force MediaBoard driver init.
-             *
-             * The MediaBoard driver has two gate checks that SKIP device
-             * creation when gate=1 (assumes devices persisted via
-             * MmPersistContiguousMemory). We don't have persistence,
-             * so we NOP these JNE instructions to force device creation.
-             *
-             * This creates \Device\CdRom0, D:\, and partition symlinks
-             * which are needed to load game files.
-             *
-             * Patch 1: PA 0x30905 — JNE+37 → NOP (skips IoCreateSymbolicLink calls)
-             * Patch 2: PA 0x309AD — JNE+10 → NOP (skips FATX/partition init)
-             * Patch 3: PA 0x25B16 — JNE+23 → NOP (skips D:\ symlink when MB_FLAG=1)
-             * Patch 4: PA 0x25AB0 — JNE+24 → NOP (skips mbcom partition when MB_FLAG=1) */
-            {
-                uint8_t nop2[2] = {0x90, 0x90};
-                uint8_t check[2];
-                bool kernel_reloaded = false;
 
-                cpu_physical_memory_read(0x30905, check, 2);
-                if (check[0] == 0x75 && check[1] == 0x25) {
-                    cpu_physical_memory_write(0x30905, nop2, 2);
-                    kernel_reloaded = true;
-                    if(0) printf("[%07lld] Chihiro: Kernel patch 1: NOP JNE @ PA 0x30905 "
-                           "(force MediaBoard device creation)\n", TS_MS);
-                }
-
-                cpu_physical_memory_read(0x309AD, check, 2);
-                if (check[0] == 0x75 && check[1] == 0x0A) {
-                    cpu_physical_memory_write(0x309AD, nop2, 2);
-                    kernel_reloaded = true;
-                    if(0) printf("[%07lld] Chihiro: Kernel patch 2: NOP JNE @ PA 0x309AD "
-                           "(force partition init)\n", TS_MS);
-                }
-
-                cpu_physical_memory_read(0x25B1B, check, 2);
-                if (check[0] == 0x75 && check[1] == 0x17) {
-                    cpu_physical_memory_write(0x25B1B, nop2, 2);
-                    kernel_reloaded = true;
-                    if(0) printf("[%07lld] Chihiro: Kernel patch 3: NOP JNE @ PA 0x25B1B "
-                           "(force D:\\ symlink creation)\n", TS_MS);
-                }
-
-                cpu_physical_memory_read(0x25AAB, check, 2);
-                if (check[0] == 0x75 && check[1] == 0x18) {
-                    cpu_physical_memory_write(0x25AAB, nop2, 2);
-                    kernel_reloaded = true;
-                    if(0) printf("[%07lld] Chihiro: Kernel patch 4: NOP JNE @ PA 0x25AAB "
-                           "(force mbcom partition creation)\n", TS_MS);
-                }
-
-                if (kernel_reloaded && s->usb_poll_patched) {
-                    s->usb_poll_patched = false;
-                    timer_mod(s->usb_poll_patch_timer,
-                              qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 50);
-                    s->eeprom_hack_applied = false;
-                    timer_mod(s->eeprom_hack_timer,
-                              qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 1);
-                    if(0) printf("[%07lld] Chihiro: Kernel reloaded — "
-                           "re-arming patches\n", TS_MS);
-                }
-
-                if (chihiro_quickreboot_pending) {
-                    chihiro_quickreboot_pending = false;
-                    uint32_t ldp_ptr = 0;
-                    cpu_physical_memory_read(0x3B3D8, &ldp_ptr, 4);
-                    if(0) printf("[%07lld] Chihiro: POST-QUICKREBOOT LDP diag:\n",
-                           TS_MS);
-                    if(0) printf("  LaunchDataPage @PA 0x3B3D8 = 0x%08X\n",
-                           ldp_ptr);
-                    if (ldp_ptr && ldp_ptr != 0xFFFFFFFF) {
-                        uint32_t ldp_pa = (ldp_ptr & 0x0FFFFFFF);
-                        uint8_t ldp_data[0x410];
-                        cpu_physical_memory_read(ldp_pa, ldp_data, sizeof(ldp_data));
-                        char path[256]; memset(path, 0, sizeof(path));
-                        memcpy(path, ldp_data + 8, 255);
-                        uint32_t lt = *(uint32_t*)ldp_data;
-                        if(0) printf("  LDP@PA0x%07X: type=%u path='%s'\n",
-                               ldp_pa, lt, path);
-                        if (lt == 1) {
-                            uint32_t ec = *(uint32_t*)(ldp_data + 0x400);
-                            uint32_t et = *(uint32_t*)(ldp_data + 0x408);
-                            if(0) printf("  LDP ERROR: ctx=%u typ=%u\n", ec, et);
-                        }
-                    }
-                    uint8_t khqb = 0;
-                    cpu_physical_memory_read(0x3A93C, &khqb, 1);
-                    if(0) printf("  KeHasQuickBooted @PA 0x3A93C = %u\n", khqb);
-                    /* Check canary in STICKY section */
-                    uint32_t canary = 0;
-                    cpu_physical_memory_read(0x3B400, &canary, 4);
-                    if(0) printf("  CANARY @PA 0x3B400 = 0x%08X (%s)\n",
-                           canary,
-                           canary == 0xCAFEBABE ? "STICKY SURVIVED" :
-                           canary == 0 ? "ZEROED — STICKY NOT PRESERVED" :
-                           "CORRUPTED");
-                    /* Also check LDP page content even though pointer is NULL */
-                    uint8_t page_check[16];
-                    cpu_physical_memory_read(0x7FCD000, page_check, 16);
-                    if(0) printf("  LDP page @PA 0x7FCD000 (raw): "
-                           "%02X%02X%02X%02X %02X%02X%02X%02X "
-                           "%02X%02X%02X%02X %02X%02X%02X%02X\n",
-                           page_check[0], page_check[1],
-                           page_check[2], page_check[3],
-                           page_check[4], page_check[5],
-                           page_check[6], page_check[7],
-                           page_check[8], page_check[9],
-                           page_check[10], page_check[11],
-                           page_check[12], page_check[13],
-                           page_check[14], page_check[15]);
-                }
-            }
-
-            {
-                uint32_t ldp_snap = 0, canary_snap = 0;
-                cpu_physical_memory_read(0x3B3D8, &ldp_snap, 4);
-                cpu_physical_memory_read(0x3B400, &canary_snap, 4);
-                uint32_t region_snap = 0;
-                cpu_physical_memory_read(0x3B1D8, &region_snap, 4);
-                if(0) printf("[%07lld] Chihiro: port 0x40F0 read #%u — "
-                       "LDP=0x%08X canary=0x%08X XboxGameRegion=0x%08X\n",
-                       TS_MS, s->lpc_40f0_reads, ldp_snap, canary_snap,
-                       region_snap);
-                if (ldp_snap && ldp_snap != 0xFFFFFFFF) {
-                    uint32_t ldp_pa = ldp_snap & 0x0FFFFFFF;
-                    uint8_t ldp_full[0x410];
-                    cpu_physical_memory_read(ldp_pa, ldp_full, sizeof(ldp_full));
-                    uint32_t launch_type = *(uint32_t*)ldp_full;
-                    uint32_t launch_flags = *(uint32_t*)(ldp_full + 0x210);
-                    char path[256]; memset(path, 0, sizeof(path));
-                    memcpy(path, ldp_full + 8, 255);
-                    if(0) printf("  LDP@PA0x%07X: type=%u flags=0x%X path='%s'\n",
-                           ldp_pa, launch_type, launch_flags, path);
-                    if (launch_type == 1) {
-                        uint32_t err_ctx = *(uint32_t*)(ldp_full + 0x400);
-                        uint32_t err_typ = *(uint32_t*)(ldp_full + 0x408);
-                        if(0) printf("  LDP ERROR: context=%u type=%u "
-                               "(1=generic 3=region 5=media)\n",
-                               err_ctx, err_typ);
-                    }
-                }
-            }
+        if (chihiro_quickreboot_pending) {
+            chihiro_quickreboot_pending = false;
         }
         break;
     case SEGA_DIMM_SIZE:
@@ -2991,6 +2808,7 @@ static void chihiro_irq10_timer_cb(void *opaque)
  * The BIOS file is never modified — only RAM is patched after the
  * kernel has been decrypted and loaded by the 2BL.
  */
+
 static void chihiro_eeprom_hack_cb(void *opaque)
 {
     ChihiroLPCState *s = opaque;
@@ -3014,77 +2832,16 @@ static void chihiro_eeprom_hack_cb(void *opaque)
             if(0) printf("[%07lld] Chihiro: Applied EEPROM validation hack "
                    "(arcdkrnl @ 0x8003B744)\n", TS_MS);
 
-            /* Apply MediaBoard kernel patches NOW, before IdexChannelCreate
-             * calls IdexMediaBoardCreateQuick. These NOP gate checks that
-             * skip mbcom:/D:\ symlink creation when MB_FLAG=1.
-             * Without these, NtCreateFile("mbcom:") fails → handle=-1. */
+            /* Idle loop PAUSE: kernel spins at VA 0x8001B3F4 with NOP NOP CLI.
+             * Replace NOP NOP with PAUSE (F3 90) to yield host CPU. */
             {
-                uint8_t nop2k[2] = {0x90, 0x90};
                 uint8_t chk[2];
-
-                cpu_physical_memory_read(0x25AAB, chk, 2);
-                if (chk[0] == 0x75 && chk[1] == 0x18) {
-                    cpu_physical_memory_write(0x25AAB, nop2k, 2);
-                    if(0) printf("[%07lld] Chihiro: Kernel early patch: NOP JNE @ PA 0x25AAB "
-                           "(force mbcom partition)\n", TS_MS);
-                }
-
-                cpu_physical_memory_read(0x25B1B, chk, 2);
-                if (chk[0] == 0x75 && chk[1] == 0x17) {
-                    cpu_physical_memory_write(0x25B1B, nop2k, 2);
-                    if(0) printf("[%07lld] Chihiro: Kernel early patch: NOP JNE @ PA 0x25B1B "
-                           "(force D:\\ symlink)\n", TS_MS);
-                }
-
-                cpu_physical_memory_read(0x30905, chk, 2);
-                if (chk[0] == 0x75 && chk[1] == 0x25) {
-                    cpu_physical_memory_write(0x30905, nop2k, 2);
-                    if(0) printf("[%07lld] Chihiro: Kernel early patch: NOP JNE @ PA 0x30905 "
-                           "(force symlinks)\n", TS_MS);
-                }
-
-                cpu_physical_memory_read(0x309AD, chk, 2);
-                if (chk[0] == 0x75 && chk[1] == 0x0A) {
-                    cpu_physical_memory_write(0x309AD, nop2k, 2);
-                    if(0) printf("[%07lld] Chihiro: Kernel early patch: NOP JNE @ PA 0x309AD "
-                           "(force partition init)\n", TS_MS);
-                }
-
-                /* Idle loop PAUSE: kernel spins at VA 0x8001B3F4 with NOP NOP CLI.
-                 * Replace NOP NOP with PAUSE (F3 90) to yield host CPU. */
                 cpu_physical_memory_read(0x1B3F4, chk, 2);
                 if (chk[0] == 0x90 && chk[1] == 0x90) {
                     uint8_t pause_insn[2] = { 0xF3, 0x90 };
                     cpu_physical_memory_write(0x1B3F4, pause_insn, 2);
                     printf("[%07lld] Chihiro: Kernel idle loop PAUSE patch @ PA 0x1B3F4\n",
                            TS_MS);
-                }
-
-                /* Early LDP diagnostic — fires during kernel init,
-                 * BEFORE Phase1Initialization/FUN_8002e8b6 */
-                {
-                    uint32_t ldp_early = 0;
-                    cpu_physical_memory_read(0x3B3D8, &ldp_early, 4);
-                    uint32_t canary_early = 0;
-                    cpu_physical_memory_read(0x3B400, &canary_early, 4);
-                    uint8_t khqb_early = 0;
-                    cpu_physical_memory_read(0x3A93C, &khqb_early, 1);
-                    if(0) printf("[%07lld] Chihiro: EARLY-DIAG: LDP=0x%08X "
-                           "canary=0x%08X KHQB=%u\n",
-                           TS_MS, ldp_early, canary_early, khqb_early);
-                    if (ldp_early && ldp_early != 0xFFFFFFFF) {
-                        uint32_t epa = (ldp_early & 0x0FFFFFFF);
-                        uint8_t ed[16];
-                        cpu_physical_memory_read(epa, ed, 16);
-                        if(0) printf("[%07lld] Chihiro: EARLY-DIAG: LDP page @PA 0x%07X: "
-                               "%02X%02X%02X%02X %02X%02X%02X%02X "
-                               "%02X%02X%02X%02X %02X%02X%02X%02X\n",
-                               TS_MS, epa,
-                               ed[0],ed[1],ed[2],ed[3],
-                               ed[4],ed[5],ed[6],ed[7],
-                               ed[8],ed[9],ed[10],ed[11],
-                               ed[12],ed[13],ed[14],ed[15]);
-                    }
                 }
             }
 
