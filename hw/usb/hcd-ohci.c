@@ -1340,13 +1340,20 @@ static void ohci_frame_boundary(void *opaque)
     extern uint64_t perf_cnt_ohci_frame;
     perf_cnt_ohci_frame++;
 
-    /* Generate PCRTC vblank at ~60Hz (every 17 OHCI frames = 17ms) */
-    static int vblank_divider = 0;
-    if (++vblank_divider >= 17) {
-        vblank_divider = 0;
-        extern void nv2a_pcrtc_vblank_tick(void);
-        nv2a_pcrtc_vblank_tick();
+    /* Periodic timestamp: print emu time + wall clock every 2s of emu time */
+    {
+        static int64_t last_ts_print = 0;
+        int64_t emu_ms = qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL);
+        if (emu_ms - last_ts_print >= 2000) {
+            int64_t wall_ms = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+            fprintf(stderr, "[%07lld] OHCI heartbeat (wall=%lld.%03llds)\n",
+                    (long long)emu_ms,
+                    (long long)(wall_ms / 1000), (long long)(wall_ms % 1000));
+            last_ts_print = emu_ms;
+        }
     }
+
+    /* VBlank now driven by REALTIME timer in nv2a.c */
 
     OHCIState *ohci = opaque;
     struct ohci_hcca hcca;

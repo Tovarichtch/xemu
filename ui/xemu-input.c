@@ -513,7 +513,7 @@ void xemu_input_update_controller(ControllerState *state)
     state->last_input_updated_ts = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
 }
 
-static void xemu_input_update_jvs_lightgun(void)
+static void xemu_input_update_jvs(void)
 {
     if (!chihiro_jvs_global) return;
     ChihiroJVSState *jvs = chihiro_jvs_global;
@@ -541,18 +541,54 @@ static void xemu_input_update_jvs_lightgun(void)
     bool reload  = (mouseBtn & SDL_BUTTON_MASK(SDL_BUTTON_RIGHT)) != 0 ||
                    kbd[SDL_SCANCODE_R];
 
+    bool steer_left  = kbd[SDL_SCANCODE_LEFT];
+    bool steer_right = kbd[SDL_SCANCODE_RIGHT];
+    bool gas_key     = kbd[SDL_SCANCODE_UP];
+    bool brake_key   = kbd[SDL_SCANCODE_DOWN];
+
+    static bool driving_mode = false;
+    if (steer_left || steer_right || gas_key || brake_key)
+        driving_mode = true;
+    if (trigger || reload)
+        driving_mode = false;
+
+    static uint16_t steer_pos = 0x8000;
+    uint16_t steer_target = 0x8000;
+    if (steer_left && !steer_right) steer_target = 0x0000;
+    else if (steer_right && !steer_left) steer_target = 0xFFFF;
+    int steer_delta = (int)steer_target - (int)steer_pos;
+    int steer_step = 0x1000;
+    if (steer_delta > steer_step) steer_pos += steer_step;
+    else if (steer_delta < -steer_step) steer_pos -= steer_step;
+    else steer_pos = steer_target;
+
     uint8_t sw0 = 0;
+    uint8_t sw1 = 0;
 
-    if (offscreen) {
-        jvs->analog[0] = 0;
-        jvs->analog[1] = 0;
+    if (driving_mode) {
+        jvs->analog[0] = steer_pos;
+        jvs->analog[1] = gas_key ? 0xFFFF : 0x0000;
+        jvs->analog[2] = brake_key ? 0xFFFF : 0x0000;
+
+        if (kbd[SDL_SCANCODE_LSHIFT])
+            sw0 |= 0x10;
+        if (kbd[SDL_SCANCODE_SPACE])
+            sw0 |= 0x02;
     } else {
-        jvs->analog[0] = (uint16_t)(mx * 0xFFFF / winW);
-        jvs->analog[1] = (uint16_t)(my * 0xFFFF / winH);
-    }
+        if (offscreen) {
+            jvs->analog[0] = 0;
+            jvs->analog[1] = 0;
+        } else {
+            jvs->analog[0] = (uint16_t)(mx * 0xFFFF / winW);
+            jvs->analog[1] = (uint16_t)(my * 0xFFFF / winH);
+        }
 
-    if (trigger) sw0 |= 0x02;
-    if (reload)  sw0 |= 0x01;
+        if (trigger) sw0 |= 0x02;
+        if (reload)  sw0 |= 0x01;
+
+        if (!offscreen && !reload)
+            sw1 |= 0x80;
+    }
 
     if (kbd[g_config.input.keyboard_controller_scancode_map.start])
         sw0 |= 0x80;
@@ -560,11 +596,6 @@ static void xemu_input_update_jvs_lightgun(void)
         sw0 |= 0x40;
 
     jvs->player_switches[0][0] = sw0;
-
-    uint8_t sw1 = 0;
-    if (!offscreen && !reload) {
-        sw1 |= 0x80;  /* SCREEN-IN = IN (byte1 bit7): gun sensor detects screen */
-    }
     jvs->player_switches[0][1] = sw1;
 
     jvs->system_switches = kbd[SDL_SCANCODE_F2] ? 0x80 : 0x00;
@@ -585,7 +616,7 @@ void xemu_input_update_controllers(void)
     QTAILQ_FOREACH (iter, &available_controllers, entry) {
         xemu_input_update_rumble(iter);
     }
-    xemu_input_update_jvs_lightgun();
+    xemu_input_update_jvs();
 }
 
 void xemu_input_update_sdl_kbd_controller_state(ControllerState *state)

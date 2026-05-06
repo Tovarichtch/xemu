@@ -881,6 +881,11 @@ DEF_METHOD(NV097, SET_FLIP_MODULO)
 
 DEF_METHOD(NV097, FLIP_INCREMENT_WRITE)
 {
+    static int flip_inc_logged = 0;
+    if (!flip_inc_logged) {
+        fprintf(stderr, "PGRAPH: FLIP_INCREMENT_WRITE triggered\n");
+        flip_inc_logged = 1;
+    }
     uint32_t old =
         PG_GET_MASK(NV_PGRAPH_SURFACE, NV_PGRAPH_SURFACE_WRITE_3D);
 
@@ -900,6 +905,11 @@ DEF_METHOD(NV097, FLIP_INCREMENT_WRITE)
 
 DEF_METHOD(NV097, FLIP_STALL)
 {
+    static int flip_logged = 0;
+    if (!flip_logged) {
+        fprintf(stderr, "PGRAPH: FLIP_STALL triggered\n");
+        flip_logged = 1;
+    }
     trace_nv2a_pgraph_flip_stall();
     d->pgraph.renderer->ops.surface_update(d, false, true, true);
     d->pgraph.renderer->ops.flip_stall(d);

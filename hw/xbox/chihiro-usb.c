@@ -28,6 +28,7 @@
 #include "chihiro-firmware.h"
 #include "chihiro-jvs.h"
 #define TS_MS ((long long)(qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL)))
+extern bool chihiro_game_running;
 #define DEBUG_CUSB
 #ifdef DEBUG_CUSB
 #define DPRINTF(s, ...) do { } while(0)
@@ -46,7 +47,7 @@ typedef struct ChihiroUSBState {
 
     /* Per-endpoint bulk IN buffers (EP1–EP5, index 0 unused) */
     #define CHIHIRO_USB_MAX_EP 6
-    #define CHIHIRO_USB_EP_BUFSZ 1024
+    #define CHIHIRO_USB_EP_BUFSZ 8192
     struct {
         uint8_t buf[CHIHIRO_USB_EP_BUFSZ];
         int pending;
@@ -56,6 +57,7 @@ typedef struct ChihiroUSBState {
     /* EZ-USB firmware download state (ANCHOR_LOAD / bRequest 0xA0) */
     uint32_t fw_bytes_written;  /* total bytes received via 0xA0 */
     bool fw_cpu_held;           /* true if CPUCS register set to hold CPU */
+    bool fw_loaded;             /* true after game firmware uploaded and CPU released */
 
     /* ic11 EEPROM (512 bytes) — baseboard config, "ACBU0001" + game ID */
     uint8_t ic11[512];
@@ -72,6 +74,7 @@ typedef struct ChihiroUSBState {
     int uart0_rx_len;
     uint8_t uart1_rx[256];  /* UART1 / JVS receive buffer */
     int uart1_rx_len;
+    bool sc_jvs_polling;    /* SC: firmware JVS poll loop active (set by VENDOR 0x23) */
 
     /* v202: instrumentation counters (read/reset by DIAG timer) */
     uint32_t nak_count;    /* bulk IN NAK count since last report */
@@ -337,20 +340,22 @@ static void handle_control(USBDevice *dev, USBPacket *p,
     ChihiroUSBState *s = (ChihiroUSBState *)dev;
     const char *id = ((ChihiroUSBState *)dev)->is_qc ? "QC" : "SC";
 
-    if(0) printf("[%07lld] chihiro-usb [%s]: control req=0x%04X val=0x%04X idx=0x%04X len=%d [%s]\n", TS_MS,
-           id, request, value, index, length,
-           (request == 0x8006 && (value >> 8) == 1) ? "GET_DESCRIPTOR(DEVICE)" :
-           (request == 0x8006 && (value >> 8) == 2) ? "GET_DESCRIPTOR(CONFIG)" :
-           (request == 0x8006 && (value >> 8) == 3) ? "GET_DESCRIPTOR(STRING)" :
-           (request == 0x0005) ? "SET_ADDRESS" :
-           (request == 0x0009) ? "SET_CONFIG" :
-           (request == 0x010B) ? "SET_INTERFACE" :
-           (request == 0x0001) ? "CLEAR_FEATURE" :
-           (request == 0x0003) ? "SET_FEATURE" :
-           (request == 0x8000) ? "GET_STATUS" :
-           ((request >> 8) == 0x40 || (request >> 8) == 0xC0) ? "VENDOR" :
-           "OTHER");
-    fflush(stdout);
+    {
+        static int ctrl_log = 0;
+        if (ctrl_log < 10000) {
+            ctrl_log++;
+            fprintf(stderr, "[%07lld] chihiro-usb [%s]: CTRL req=0x%04X val=0x%04X idx=0x%04X len=%d [%s]\n", TS_MS,
+                   id, request, value, index, length,
+                   (request == 0x8006 && (value >> 8) == 1) ? "GET_DESC(DEV)" :
+                   (request == 0x8006 && (value >> 8) == 2) ? "GET_DESC(CFG)" :
+                   (request == 0x8006 && (value >> 8) == 3) ? "GET_DESC(STR)" :
+                   (request == 0x0005) ? "SET_ADDRESS" :
+                   (request == 0x0009) ? "SET_CONFIG" :
+                   (request == 0x010B) ? "SET_IFACE" :
+                   ((request >> 8) == 0x40 || (request >> 8) == 0xC0) ? "VENDOR" :
+                   "OTHER");
+        }
+    }
 
     int ret = usb_desc_handle_control(dev, p, request, value, index,
                                       length, data);
@@ -395,15 +400,17 @@ static void handle_control(USBDevice *dev, USBPacket *p,
     int bRequest = request & 0xFF;
     vendor_req_counts[(uint8_t)bRequest]++;
 
-    if (0) { /* JVS vendor request logging — enable for debugging */
-        if (bRequest >= 0x15 && bRequest <= 0x20) {
-            printf("[%07lld] chihiro-usb [%s]: VENDOR 0x%02X val=0x%04X idx=0x%04X len=%d",
+    if (chihiro_game_running) {
+        static int game_vendor_log = 0;
+        if (game_vendor_log < 10000) {
+            game_vendor_log++;
+            fprintf(stderr, "[%07lld] chihiro-usb [%s]: VENDOR 0x%02X val=0x%04X idx=0x%04X len=%d",
                    TS_MS, id, bRequest, value, index, length);
             if (!((request >> 8) & 0x80) && length > 0) {
-                printf(" OUT_DATA=");
-                for (int i = 0; i < length && i < 32; i++) printf("%02X", data[i]);
+                fprintf(stderr, " OUT=");
+                for (int i = 0; i < length && i < 16; i++) fprintf(stderr, "%02X", data[i]);
             }
-            printf("\n");
+            fprintf(stderr, "\n");
         }
     }
 
@@ -412,7 +419,7 @@ static void handle_control(USBDevice *dev, USBPacket *p,
      * requests like 0x20/0x23 that carry JVS payload. */
     uint8_t host_data[256];
     int host_len = MIN(length, (int)sizeof(host_data));
-    if (!((request >> 8) & 0x80)) {
+    if (!((request >> 8) & 0x80) && host_len > 0) {
         memcpy(host_data, data, host_len);
     }
 
@@ -480,17 +487,14 @@ static void handle_control(USBDevice *dev, USBPacket *p,
         if (s->jvs.response_len > 0) {
             jvs_recv_has_data++;
             int rlen = s->jvs.response_len;
-            /* Wrap raw JVS frame in AN2131QC format for EP4 IN:
-             * [0]=0x00 [1]=pkt_count [2]=dest [3]=0x00
-             * [4..5]=frame_len(LE) [6..]=raw JVS frame */
             uint8_t *ep = s->ep_in[4].buf;
             int wrapped = 0;
             uint8_t resp_dest = (s->jvs.last_target == JVS_BROADCAST) ? 0
                                                                      : s->jvs.device_id;
-            ep[wrapped++] = 0x00;       /* status */
-            ep[wrapped++] = 0x01;       /* 1 packet */
-            ep[wrapped++] = resp_dest;  /* dest: 0 for broadcast, device_id for addressed */
-            ep[wrapped++] = 0x00;       /* dummy */
+            ep[wrapped++] = 0x00;
+            ep[wrapped++] = 0x01;
+            ep[wrapped++] = resp_dest;
+            ep[wrapped++] = 0x00;
             ep[wrapped++] = rlen & 0xFF;
             ep[wrapped++] = (rlen >> 8) & 0xFF;
             int copy = MIN(rlen, (int)sizeof(s->ep_in[4].buf) - wrapped);
@@ -501,8 +505,10 @@ static void handle_control(USBDevice *dev, USBPacket *p,
             s->ep_in[4].pending = wrapped;
             s->ep_in[4].offset = 0;
             s->jvs.response_len = 0;
-            if(0) printf("[%07lld] chihiro-usb [%s]: JVS RECV wrapped %d bytes (raw %d, dest=%d)\n",
-                   TS_MS, id, wrapped, rlen, resp_dest);
+        } else if (s->ep_in[4].pending > 0) {
+            /* Data already queued by EP4 OUT auto-queue — report it */
+            data[4] = s->ep_in[4].pending & 0xFF;
+            data[5] = (s->ep_in[4].pending >> 8) & 0xFF;
         } else {
             data[4] = 0;
             data[5] = 0;
@@ -592,21 +598,17 @@ static void handle_control(USBDevice *dev, USBPacket *p,
         uint16_t ram_addr = value;  /* wValue = target address in 8051 RAM */
         int count = length;
         if (ram_addr == 0x7F92) {
-            /* CPUCS register: bit 0 = 1 → hold CPU in reset, 0 → run */
             bool hold = (count > 0 && data[0] & 0x01);
-            if(0) printf("[%07lld] chihiro-usb [%s]: ANCHOR_LOAD CPUCS=%s (total %u bytes downloaded)\n",
+            fprintf(stderr, "[%07lld] chihiro-usb [%s]: ANCHOR_LOAD CPUCS=%s (total %u bytes)\n",
                    TS_MS, id, hold ? "HOLD" : "RUN", s->fw_bytes_written);
             if (s->fw_cpu_held && !hold) {
-                if(0) printf("[%07lld] chihiro-usb [%s]: ★ EZ-USB firmware loaded — CPU released\n",
+                s->fw_loaded = true;
+                fprintf(stderr, "[%07lld] chihiro-usb [%s]: FW LOADED — CPU released\n",
                        TS_MS, id);
             }
             s->fw_cpu_held = hold;
         } else {
             s->fw_bytes_written += count;
-            if (s->fw_bytes_written <= count) {
-                if(0) printf("[%07lld] chihiro-usb [%s]: ANCHOR_LOAD start addr=0x%04X len=%d\n",
-                       TS_MS, id, ram_addr, count);
-            }
         }
         break;
     }
@@ -621,34 +623,62 @@ static void handle_control(USBDevice *dev, USBPacket *p,
         } else {
             p->actual_length = 0;
         }
-        if(0) printf("[%07lld] chihiro-usb [%s]: GET UART0 → %d bytes\n", TS_MS, id, avail);
         return;
     }
     case 0x1B: /* Get UART1 / JVS response (SC only) */
     {
-        int avail = s->jvs.response_len;
-        if (avail > 0 && avail <= length) {
-            memcpy(data, s->jvs.response, avail);
-            p->actual_length = avail;
-            s->jvs.response_len = 0;
-        } else if (s->uart1_rx_len > 0 && s->uart1_rx_len <= length) {
-            memcpy(data, s->uart1_rx, s->uart1_rx_len);
-            p->actual_length = s->uart1_rx_len;
-            s->uart1_rx_len = 0;
+        if (s->sc_jvs_polling && s->ep_in[3].pending == 0) {
+            /* SC firmware auto-polls gun controller — generate JVS response.
+             * Queue on EP3 IN (same pattern as QC's 0x19 → EP4). */
+            uint8_t resp[64];
+            int rp = 0;
+            resp[rp++] = JVS_SYNC;
+            resp[rp++] = 0x00;  /* dest = host */
+            int count_pos = rp++;  /* placeholder for count */
+            resp[rp++] = JVS_STATUS_OK;
+            /* ReadSW response: report + system + 2x2 player bytes */
+            resp[rp++] = JVS_REPORT_OK;
+            resp[rp++] = 0x00;  /* system (test/tilt off) */
+            resp[rp++] = 0x00;  /* P1 sw1 (no buttons) */
+            resp[rp++] = 0x00;  /* P1 sw2 */
+            resp[rp++] = 0x00;  /* P2 sw1 */
+            resp[rp++] = 0x00;  /* P2 sw2 */
+            /* ReadAnalog response: report + 4 channels (center=0x8000) */
+            resp[rp++] = JVS_REPORT_OK;
+            resp[rp++] = 0x80; resp[rp++] = 0x00;  /* P1 X */
+            resp[rp++] = 0x80; resp[rp++] = 0x00;  /* P1 Y */
+            resp[rp++] = 0x80; resp[rp++] = 0x00;  /* P2 X */
+            resp[rp++] = 0x80; resp[rp++] = 0x00;  /* P2 Y */
+            /* Count and checksum */
+            int payload_len = rp - 3;
+            resp[count_pos] = payload_len + 1;
+            uint8_t csum = 0;
+            for (int i = 1; i < rp; i++) csum += resp[i];
+            resp[rp++] = csum;
+            memcpy(s->ep_in[3].buf, resp, rp);
+            s->ep_in[3].pending = rp;
+            s->ep_in[3].offset = 0;
+            data[4] = rp & 0xFF;
+            data[5] = (rp >> 8) & 0xFF;
+        } else if (s->ep_in[3].pending > 0) {
+            data[4] = s->ep_in[3].pending & 0xFF;
+            data[5] = (s->ep_in[3].pending >> 8) & 0xFF;
         } else {
             p->actual_length = 0;
+            return;
         }
-        return;
+        break;
     }
     case 0x22: /* Send UART0 data (SC only) — accept and discard */
         if(0) printf("[%07lld] chihiro-usb [%s]: SEND UART0 len=%d (stub)\n", TS_MS, id, length);
         break;
-    case 0x23: { /* Send UART1 / JVS command (SC only) */
-        int jvs_len = host_len;
-        if (jvs_len > 0 && host_data[0] == JVS_SYNC) {
-            int rlen = chihiro_jvs_process(&s->jvs, host_data, jvs_len,
-                                            s->jvs.response, sizeof(s->jvs.response));
-            s->jvs.response_len = rlen;
+    case 0x23: { /* Trigger UART1 / JVS poll (SC only, IN request) */
+        if (!s->is_qc && !s->sc_jvs_polling) {
+            s->jvs.device_id = 1;
+            s->jvs.sense = 0;
+            s->sc_jvs_polling = true;
+            fprintf(stderr, "[%07lld] chihiro-usb [%s]: SC JVS polling started (id=1, idx=%d)\n",
+                   TS_MS, id, index);
         }
         break;
     }
@@ -692,6 +722,16 @@ static void handle_data(USBDevice *dev, USBPacket *p)
     const char *id = ((ChihiroUSBState *)dev)->is_qc ? "QC" : "SC";
     int ep = p->ep->nr;
 
+    if (chihiro_game_running && !s->is_qc) {
+        static int sc_data_log = 0;
+        if (sc_data_log < 10000) {
+            sc_data_log++;
+            fprintf(stderr, "[%07lld] chihiro-usb [SC]: GAME BULK %s EP%d size=%d pending=%d\n",
+                   TS_MS, p->pid == USB_TOKEN_IN ? "IN" : "OUT", ep,
+                   (int)p->iov.size, s->ep_in[ep].pending);
+        }
+    }
+
     if (p->pid == USB_TOKEN_IN) {
         /* Bulk IN — return queued data from per-endpoint buffer */
         if (ep >= 1 && ep < CHIHIRO_USB_MAX_EP && s->ep_in[ep].pending > 0) {
@@ -700,18 +740,39 @@ static void handle_data(USBDevice *dev, USBPacket *p)
             s->ep_in[ep].offset += len;
             s->ep_in[ep].pending -= len;
             s->bulk_in_count++;
-            if(0) printf("[%07lld] chihiro-usb [%s]: BULK IN EP%d → %d bytes (remain=%d)\n",
-                   TS_MS, id, ep, len, s->ep_in[ep].pending);
+            if (chihiro_game_running) {
+                static int game_bulk_in_log = 0;
+                if (game_bulk_in_log < 10000) {
+                    game_bulk_in_log++;
+                    fprintf(stderr, "[%07lld] chihiro-usb [%s]: BULK IN EP%d → %d bytes:",
+                           TS_MS, id, ep, len);
+                    for (int i = 0; i < len && i < 16; i++)
+                        fprintf(stderr, " %02X", s->ep_in[ep].buf[s->ep_in[ep].offset - len + i]);
+                    fprintf(stderr, "\n");
+                }
+            }
         } else {
             s->nak_count++;
-            p->status = USB_RET_STALL;
-            if(0) printf("[%07lld] chihiro-usb [%s]: BULK IN EP%d → STALL (no data)\n",
-                   TS_MS, id, ep);
+            static int nak_log = 0;
+            if (nak_log < 50) {
+                nak_log++;
+                fprintf(stderr, "[%07lld] chihiro-usb [%s]: NAK EP%d IN\n",
+                       TS_MS, id, ep);
+            }
+            p->status = USB_RET_NAK;
         }
     } else {
         /* Bulk OUT — capture data for JVS processing */
         if(0) printf("[%07lld] chihiro-usb [%s]: BULK OUT EP%d %d bytes\n",
                TS_MS, id, ep, (int)p->iov.size);
+        if (chihiro_game_running && s->is_qc) {
+            static int qc_out_log = 0;
+            if (qc_out_log < 10000) {
+                qc_out_log++;
+                fprintf(stderr, "[%07lld] chihiro-usb [QC]: GAME OUT EP%d %d bytes\n",
+                       TS_MS, ep, (int)p->iov.size);
+            }
+        }
         int len = p->iov.size;
         uint8_t buf[256];
         int total = 0;
@@ -748,8 +809,35 @@ static void handle_data(USBDevice *dev, USBPacket *p)
                     memcpy(s->extmem + addr, buf, copy);
                     s->write_1f_addr += copy;
                 }
+                if (chihiro_game_running) {
+                    static int ep3_out_log = 0;
+                    if (ep3_out_log < 30) {
+                        ep3_out_log++;
+                        fprintf(stderr, "[%07lld] chihiro-usb [%s]: EP3 OUT %d bytes → extmem[0x%04X]:",
+                               TS_MS, id, total, addr);
+                        for (int i = 0; i < total && i < 32; i++) fprintf(stderr, " %02X", buf[i]);
+                        fprintf(stderr, "\n");
+                    }
+                    s->ep_in[3].buf[0] = 0x00;
+                    s->ep_in[3].buf[1] = 0x00;
+                    s->ep_in[3].buf[2] = 0x00;
+                    s->ep_in[3].buf[3] = 0x00;
+                    s->ep_in[3].pending = 4;
+                    s->ep_in[3].offset = 0;
+                }
+
             } else if (ep == 4) {
-                /* EP4 OUT: JVS data with 3-byte AN2131QC header */
+                /* EP4 OUT: JVS data with 3-byte AN2131QC header.
+                 * Process and auto-queue response on EP4 IN (simulates
+                 * AN2131QC firmware's automatic JVS bus relay). */
+                static int ep4_out_log = 0;
+                if (ep4_out_log < 30) {
+                    ep4_out_log++;
+                    fprintf(stderr, "[%07lld] GAME EP4 OUT %d bytes:",
+                           TS_MS, total);
+                    for (int i = 0; i < total && i < 32; i++) fprintf(stderr, " %02X", buf[i]);
+                    fprintf(stderr, "\n");
+                }
                 uint8_t *jvs_p = NULL;
                 int jvs_n = 0;
                 if (total >= 4 && buf[3] == JVS_SYNC) {
@@ -760,13 +848,42 @@ static void handle_data(USBDevice *dev, USBPacket *p)
                     jvs_n = total;
                 }
                 if (jvs_p && jvs_n > 0) {
-                    if(0) { printf("[%07lld] chihiro-usb [%s]: JVS frame %d bytes:", TS_MS, id, jvs_n);
-                    for (int i = 0; i < jvs_n && i < 16; i++) printf(" %02X", jvs_p[i]);
-                    printf("\n"); }
                     int rlen = chihiro_jvs_process(&s->jvs, jvs_p, jvs_n,
                                                     s->jvs.response, sizeof(s->jvs.response));
                     s->jvs.response_len = rlen;
-                    if(0) printf("[%07lld] chihiro-usb [%s]: JVS response %d bytes\n", TS_MS, id, rlen);
+                    if (rlen > 0 && chihiro_game_running) {
+                        uint8_t *ep4 = s->ep_in[4].buf;
+                        int wrapped = 0;
+                        uint8_t resp_dest = (s->jvs.last_target == JVS_BROADCAST) ? 0
+                                                                                  : s->jvs.device_id;
+                        ep4[wrapped++] = 0x00;
+                        ep4[wrapped++] = 0x01;
+                        ep4[wrapped++] = resp_dest;
+                        ep4[wrapped++] = 0x00;
+                        ep4[wrapped++] = rlen & 0xFF;
+                        ep4[wrapped++] = (rlen >> 8) & 0xFF;
+                        int copy = MIN(rlen, (int)sizeof(s->ep_in[4].buf) - wrapped);
+                        memcpy(ep4 + wrapped, s->jvs.response, copy);
+                        wrapped += copy;
+                        s->ep_in[4].pending = wrapped;
+                        s->ep_in[4].offset = 0;
+                        s->jvs.response_len = 0;
+                        static int ep4_in_log = 0;
+                        if (ep4_in_log < 30) {
+                            ep4_in_log++;
+                            fprintf(stderr, "[%07lld] GAME EP4 IN queued %d bytes:",
+                                   TS_MS, wrapped);
+                            for (int i = 0; i < wrapped && i < 32; i++) fprintf(stderr, " %02X", ep4[i]);
+                            fprintf(stderr, "\n");
+                        }
+                    }
+                } else if (total > 0) {
+                    static int ep4_nojvs_log = 0;
+                    if (ep4_nojvs_log < 30) {
+                        ep4_nojvs_log++;
+                        fprintf(stderr, "[%07lld] GAME EP4 OUT NOT-JVS (no sync)\n",
+                               TS_MS);
+                    }
                 }
             }
         }

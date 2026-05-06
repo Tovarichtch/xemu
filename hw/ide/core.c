@@ -971,15 +971,13 @@ static void ide_dma_cb(void *opaque, int ret)
 
     trace_ide_dma_cb(s, sector_num, n, IDE_DMA_CMD_str(s->dma_cmd));
 
-    if (s->unit == 1) {
-        static int64_t last_dma_ts = 0;
-        int64_t now = qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL);
-        if (now != last_dma_ts || sector_num > 0x88) {
-            if(0) printf("[%07lld] IDE-DMA-CB: unit=%d cmd=%s LBA=%lu n=%d\n",
-                   now, s->unit, IDE_DMA_CMD_str(s->dma_cmd),
-                   (unsigned long)sector_num, n);
-            last_dma_ts = now;
-        }
+    if (s->unit == 1 && sector_num >= 0xFC800 && sector_num <= 0xFC801) {
+        static int ide_mbcom_log = 0;
+        if (ide_mbcom_log < 50) { ide_mbcom_log++;
+            int64_t now = qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL);
+            fprintf(stderr, "[%07lld] IDE mbcom %s LBA=0x%lX n=%d\n",
+                    now, IDE_DMA_CMD_str(s->dma_cmd),
+                    (unsigned long)sector_num, n); }
     }
 
     /* Chihiro: intercept IDE reads on baseboard (unit 1) for mbcom/mbrom sectors.

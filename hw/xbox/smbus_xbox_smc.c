@@ -136,7 +136,8 @@ static int smc_write_data(SMBusDevice *dev, uint8_t *buf, uint8_t len)
         break;
 
     case SMC_REG_POWER:
-        if(0) printf("[SMC] POWER write: 0x%02X (%s%s%s)\n", buf[0],
+        fprintf(stderr, "[SMC] POWER write: 0x%02X scratch=0x%02X (%s%s%s)\n", buf[0],
+               smc->scratch_reg,
                (buf[0] & SMC_REG_POWER_RESET) ? "RESET " : "",
                (buf[0] & SMC_REG_POWER_CYCLE) ? "CYCLE " : "",
                (buf[0] & SMC_REG_POWER_SHUTDOWN) ? "SHUTDOWN " : "");
@@ -155,10 +156,7 @@ static int smc_write_data(SMBusDevice *dev, uint8_t *buf, uint8_t len)
         break;
 
     case SMC_REG_SCRATCH:
-        if(0) printf("[SMC] SCRATCH write: 0x%02X (was 0x%02X)\n", buf[0], smc->scratch_reg);
-        /* Detect QuickReboot: HalReturnToFirmware(QuickReboot) writes 0x04.
-         * Called on EVERY 0x04 write — chihiro_on_quickreboot_signal uses
-         * usb_poll_patched guard to ignore the kernel's first-boot write. */
+        fprintf(stderr, "[SMC] SCRATCH write: 0x%02X (was 0x%02X)\n", buf[0], smc->scratch_reg);
         if (buf[0] == 0x04) {
             chihiro_on_quickreboot_signal();
         }
@@ -196,14 +194,14 @@ static uint8_t smc_receive_byte(SMBusDevice *dev)
         return smc->traystate_reg;
 
     case SMC_REG_SCRATCH:
-        if(0) printf("[SMC] SCRATCH read: 0x%02X\n", smc->scratch_reg);
+        fprintf(stderr, "[SMC] SCRATCH read: 0x%02X\n", smc->scratch_reg);
         return smc->scratch_reg;
 
     case SMC_REG_AVPACK: {
         static int avpack_log_once = 0;
         if (!avpack_log_once) {
             avpack_log_once = 1;
-            if(0) printf("Chihiro SMC: avpack_reg=0x%02X (0=SCART 1=HDTV 2=VGA 4=SVIDEO 6=COMPOSITE)\n",
+            printf("SMC: avpack_reg=0x%02X (0=SCART 1=HDTV 2=VGA 4=SVIDEO 6=COMPOSITE)\n",
                    smc->avpack_reg);
         }
         return smc->avpack_reg;
@@ -283,7 +281,7 @@ static void smbus_smc_realize(DeviceState *dev, Error **errp)
     smc->version_string = NULL;
     smc->version_string_index = 0;
     smc->traystate_reg = 0;
-    smc->avpack_reg = SMC_REG_AVPACK_SCART; /* Chihiro: kernel maps 0x00→VGA (DIP 6,7,8 ground AV pins) */
+    smc->avpack_reg = SMC_REG_AVPACK_SCART;
     smc->intstatus_reg = 0;
     /* NOTE: scratch_reg is NOT cleared here.
      * On real Xbox hardware, the SMC (PIC16LC) has its own power domain
@@ -311,14 +309,14 @@ static void smbus_smc_realize(DeviceState *dev, Error **errp)
         g_free(avpack);
     }
 
-    /* Chihiro: force SMC avpack to 0x00 regardless of command line.
+    /* Chihiro: force SMC avpack to SCART regardless of command line.
      * On real hardware, DIP 6,7,8 ground the AV sense pins → SMC reads 0x00.
-     * The Chihiro kernel maps 0x00 → AV_PACK_VGA (unlike retail → SCART).
-     * This is the ONLY value that makes the kernel program NV2A for VGA. */
+     * Chihiro games expect SCART mode; SEGABOOT reads boot.id for video
+     * timing details. */
     {
         MachineState *ms = MACHINE(qdev_get_machine());
         if (ms->ram_size > 64 * 1024 * 1024) {
-            smc->avpack_reg = SMC_REG_AVPACK_SCART; /* 0x00 = VGA on Chihiro */
+            smc->avpack_reg = SMC_REG_AVPACK_SCART;
         }
     }
 

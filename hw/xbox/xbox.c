@@ -415,8 +415,19 @@ void xbox_init_common(MachineState *machine,
                     /* Store game dir for boot.id reading at QuickReboot */
                     {
                         extern char chihiro_game_dir[1024];
+                        extern bool chihiro_board_type3;
                         strncpy(chihiro_game_dir, game_dir, 1023);
                         chihiro_game_dir[1023] = 0;
+                        /* Auto-detect Type-3 (ASIC) board:
+                         * Type-3 game dirs contain "firmware.asic" */
+                        char det_path[1088];
+                        struct stat det_st;
+                        snprintf(det_path, sizeof(det_path),
+                                 "%s/firmware.asic", game_dir);
+                        chihiro_board_type3 = (stat(det_path, &det_st) == 0);
+                        if (chihiro_board_type3) {
+                            printf("Chihiro: Type-3 (ASIC) board detected\n");
+                        }
                     }
                 }
             }

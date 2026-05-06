@@ -28,7 +28,7 @@
 #define FATX_DIRENTS_PER_CLUSTER (FATX_CLUSTER_SIZE / FATX_DIRENT_SIZE)
 #define FATX_FAT_END        0xFFFF
 #define FATX_FAT_FREE       0x0000
-#define FATX_MAX_FILES      512
+#define FATX_MAX_FILES      2048
 #define FATX_MAX_NAME       42
 
 /* File entry for building */
@@ -115,15 +115,20 @@ static void fatx_write_dirent(uint32_t offset, const char *name,
     e[62] = 0x81; e[63] = 0x2D;
 }
 
-/* Scan host directory recursively, add files to fatx_files[] */
+/* Scan host directory: add all entries at this level first, then recurse.
+ * This ensures parent directory entries (especially root XBEs) are always
+ * present even when subdirectories contain hundreds of files. */
 static int fatx_scan_dir(const char *host_dir, int parent_idx)
 {
     DIR *d = opendir(host_dir);
     if (!d) return -1;
 
+    int first_idx = fatx_file_count;
+
+    /* Pass 1: add all entries at this level (files + dirs) */
     struct dirent *ent;
     while ((ent = readdir(d)) != NULL) {
-        if (ent->d_name[0] == '.') continue;  /* skip . .. .hidden */
+        if (ent->d_name[0] == '.') continue;
         if (fatx_file_count >= FATX_MAX_FILES) break;
 
         FATXFileEntry *fe = &fatx_files[fatx_file_count];
@@ -139,15 +144,23 @@ static int fatx_scan_dir(const char *host_dir, int parent_idx)
         if (S_ISDIR(st.st_mode)) {
             fe->is_dir = 1;
             fe->size = 0;
-            int my_idx = fatx_file_count++;
-            fatx_scan_dir(fe->host_path, my_idx);
         } else if (S_ISREG(st.st_mode)) {
             fe->is_dir = 0;
             fe->size = (uint32_t)st.st_size;
-            fatx_file_count++;
+        } else {
+            continue;
         }
+        fatx_file_count++;
     }
     closedir(d);
+
+    /* Pass 2: recurse into subdirectories */
+    int end_idx = fatx_file_count;
+    for (int i = first_idx; i < end_idx; i++) {
+        if (fatx_files[i].is_dir) {
+            fatx_scan_dir(fatx_files[i].host_path, i);
+        }
+    }
     return 0;
 }
 

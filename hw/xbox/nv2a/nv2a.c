@@ -196,16 +196,37 @@ int nv2a_get_screen_off(void)
 uint64_t perf_cnt_vblank = 0;
 uint32_t perf_pcrtc_enabled = 0;
 
-/* Called from OHCI frame boundary every 17ms virtual (see hcd-ohci.c) */
-void nv2a_pcrtc_vblank_tick(void)
+#include <time.h>
+
+/* PCRTC VBlank driven by REALTIME wall clock at ~60Hz.
+ * Decoupled from guest CPU speed — fires regardless of TCG load. */
+static void nv2a_realtime_vblank_cb(void *opaque)
 {
-    NV2AState *d = g_nv2a;
-    if (!d) return;
+    NV2AState *d = opaque;
     d->pcrtc.pending_interrupts |= NV_PCRTC_INTR_0_VBLANK;
     d->pcrtc.raster = 0;
     perf_cnt_vblank++;
     perf_pcrtc_enabled = d->pcrtc.enabled_interrupts;
+
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
     nv2a_update_irq(d);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    static uint64_t total_ns = 0, count = 0;
+    total_ns += (uint64_t)(t1.tv_sec - t0.tv_sec) * 1000000000ULL +
+                (uint64_t)(t1.tv_nsec - t0.tv_nsec);
+    count++;
+    if (count % 600 == 0)
+        fprintf(stderr, "IRQ avg: %luns (%lu calls)\n",
+                (unsigned long)(total_ns / count), (unsigned long)count);
+
+    timer_mod(d->vblank_timer,
+              qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 16);
+}
+
+/* Legacy entry point — no longer called from OHCI */
+void nv2a_pcrtc_vblank_tick(void)
+{
 }
 
 static void nv2a_vga_gfx_update(void *opaque)
@@ -261,6 +282,12 @@ static void nv2a_init_vga(NV2AState *d)
     d->hw_ops = *vga->hw_ops;
     d->hw_ops.gfx_update = nv2a_vga_gfx_update;
     vga->con = graphic_console_init(DEVICE(d), 0, &d->hw_ops, vga);
+
+    /* PCRTC VBlank: REALTIME wall-clock timer at ~60Hz */
+    d->vblank_timer = timer_new_ms(QEMU_CLOCK_REALTIME,
+                                    nv2a_realtime_vblank_cb, d);
+    timer_mod(d->vblank_timer,
+              qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 16);
 
     /* PCRTC vblank: generated from OHCI frame boundary at ~60Hz.
      * See nv2a_pcrtc_vblank_tick() called from hcd-ohci.c. */
