@@ -441,6 +441,27 @@ bool chihiro_fatx_read_sector(uint32_t lba, void *buffer)
     uint32_t offset = lba * FATX_SECTOR_SIZE;
     if (offset + FATX_SECTOR_SIZE <= fatx_image_size) {
         memcpy(buffer, fatx_image + offset, FATX_SECTOR_SIZE);
+        {
+            static uint32_t fatx_read_count = 0;
+            static uint32_t fatx_last_milestone = 0;
+            fatx_read_count++;
+            if (fatx_read_count == 1 ||
+                fatx_read_count / 10000 > fatx_last_milestone) {
+                fatx_last_milestone = fatx_read_count / 10000;
+                fprintf(stderr, "[FATX] READS=%u lba=%u\n",
+                       fatx_read_count, lba);
+            }
+            uint32_t *w = (uint32_t *)buffer;
+            if (w[0] == 0 && w[1] > 0 && w[1] < 0x1000 &&
+                (w[2] == 0x20 || w[2] == 0x10)) {
+                static int tex_sec_count = 0;
+                if (tex_sec_count < 10) {
+                    fprintf(stderr, "[FATX] HDR-SEC lba=%u: %08X %08X %08X %08X\n",
+                           lba, w[0], w[1], w[2], w[3]);
+                    tex_sec_count++;
+                }
+            }
+        }
         if (fatx_diag_lba && lba == fatx_diag_lba) {
             uint8_t *b = (uint8_t *)buffer;
             printf("[FATX] READ-DIAG lba=%u: [0x29]=%02X [0x7E]=%02X\n",
