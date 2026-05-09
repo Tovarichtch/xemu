@@ -153,6 +153,15 @@ typedef struct ChihiroLPCState {
     QEMUTimer *t3_heartbeat_timer; /* ')' mode: periodic IRQ10 to wake worker thread */
     bool       t3_worker_alive;    /* set when game sends first E1=0xF in ')' mode */
 
+    /* Type-3 unsolicited handshake state machine:
+     * 0 = idle (waiting for game detection)
+     * 1 = sent cmd 0x0002 unsolicited, waiting for game's 0x0001 ACK
+     * 2 = sent 0x8001+DIMM_SIZE ACK for cmd 0x0002, waiting for game to consume
+     * 3 = sent cmd 0x0003 unsolicited, waiting for game's 0x0001 ACK
+     * 4 = sent 0x8001+DIMM_SIZE ACK for cmd 0x0003, waiting for game to consume
+     * 5 = handshakes complete, reactive mode (respond to EXEC only) */
+    int        t3_handshake_state;
+
     int64_t    last_lpc_activity_ms; /* timestamp of last LPC read/write */
 
 } ChihiroLPCState;
@@ -3180,19 +3189,28 @@ static void chihiro_lpc_io_write(void *opaque, hwaddr addr, uint64_t val,
             }
         } else {
             if (chihiro_game_running && chihiro_board_type3 && e1_armed) {
-                /* ')' mode (Type-3 game): SADDR burst handler already
-                 * processed the command. E1=0 is the game's confirmation.
-                 * Clear E0 bit 0 so the worker doesn't re-process stale data
-                 * on the next heartbeat wake-up. */
+                /* ')' mode (Type-3 game): E1=0 is the game's confirmation.
+                 * Advance the handshake state machine based on what the game
+                 * just ACKed. During handshake (states 1-4), each E1=0 means
+                 * the game consumed our unsolicited message or ACK. */
                 if (!s->t3_worker_alive) {
                     s->t3_worker_alive = true;
                     fprintf(stderr, "[%07lld] T3 WORKER ALIVE\n", TS_MS);
                 }
                 s->mbcom_e0_status &= ~0x01;
                 qemu_irq_lower(s->irq10);
+
+                /* Handshake state 1→2: worker consumed the 0x8001 DIMM_SIZE,
+                 * handshake bit is now set. Switch to reactive mode — no more
+                 * heartbeat needed, EXEC responses deliver E0+IRQ10. */
+                if (s->t3_handshake_state == 1) {
+                    s->t3_handshake_state = 2;
+                    fprintf(stderr, "[%07lld] T3 HANDSHAKE DONE → reactive mode\n", TS_MS);
+                }
+
                 if (e1_log < 2000) { e1_log++;
-                    fprintf(stderr, "[%07lld] E1=0 T3_ACK e0=0x%02X→0x%02X irq10↓\n",
-                            TS_MS, s->mbcom_e0_status | 0x01, s->mbcom_e0_status); }
+                    fprintf(stderr, "[%07lld] E1=0 T3_ACK state=%d e0=0x%02X irq10↓\n",
+                            TS_MS, s->t3_handshake_state, s->mbcom_e0_status); }
             } else if (e1_armed && s->mbcom_resp_ready) {
                 /* RESP_DELIVER ('!' mode / SEGABOOT) */
                 s->mbcom_resp_ready = false;
@@ -3338,21 +3356,36 @@ static void chihiro_t3_heartbeat_cb(void *opaque)
     ChihiroLPCState *s = opaque;
     if (!chihiro_game_running || !chihiro_board_type3) return;
 
-    if (!s->t3_worker_alive) {
+    /* State 0: send 0x8001 DIMM_SIZE handshake — the game's worker
+     * (FUN_0014cb60) requires the FIRST response to have bytes[2:3]=0x8001
+     * to set its handshake bit. Without this, ALL subsequent responses
+     * are rejected. After handshake, switch to reactive mode. */
+    if (s->t3_handshake_state == 0) {
+        s->dimm_cmd[0] = 1 | (0x0001 << 16); /* seq=1, cmd=DIMM_SIZE */
+        chihiro_dimm_process_cmd(s);
+        s->dimm_resp_ready = true;
         s->mbcom_e0_status |= 0x01;
+        qemu_irq_lower(s->irq10);
+        qemu_irq_raise(s->irq10);
+        s->t3_handshake_state = 1;
+        fprintf(stderr, "[%07lld] T3 BOOTSTRAP: 0x8001 DIMM_SIZE loaded, IRQ10 fired\n", TS_MS);
+    } else if (s->t3_handshake_state == 1) {
+        /* Re-fire IRQ10 with E0 until worker picks up the handshake */
+        s->mbcom_e0_status |= 0x01;
+        qemu_irq_lower(s->irq10);
+        qemu_irq_raise(s->irq10);
+    } else {
+        return; /* state >= 2: reactive mode, no heartbeat */
     }
-    qemu_irq_lower(s->irq10);
-    qemu_irq_raise(s->irq10);
 
     static int hb_log = 0;
-    if (hb_log < 30) { hb_log++;
-        fprintf(stderr, "[%07lld] T3 HEARTBEAT: E0=0x%02X, worker_alive=%d\n",
-                TS_MS, s->mbcom_e0_status, s->t3_worker_alive);
+    if (hb_log < 50) { hb_log++;
+        fprintf(stderr, "[%07lld] T3 HEARTBEAT: state=%d E0=0x%02X worker=%d\n",
+                TS_MS, s->t3_handshake_state, s->mbcom_e0_status, s->t3_worker_alive);
     }
 
     timer_mod(s->t3_heartbeat_timer,
-              qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) +
-              (s->t3_worker_alive ? 16 : 50));
+              qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 50);
 }
 
 static void chihiro_irq10_timer_cb(void *opaque)
@@ -3398,38 +3431,37 @@ static void chihiro_irq10_timer_cb(void *opaque)
         }
     }
 
-    /* Game-mode mbcom bootstrap: pre-load GetDIMMSize response (0x8001)
-     * and fire IRQ10 to wake the worker thread. On real hardware, the V850
-     * media board firmware sends this unsolicited after game boot.
-     * The worker validates 0x8001 as handshake, then starts sending commands.
+    /* Game-mode mbcom bootstrap.
      *
-     * TIMING CRITICAL: Must fire IMMEDIATELY at game detection so that
-     * resp_ready=true BEFORE FUN_0014c4e0 reads F0 to determine mode.
-     * Pre-load DIMM_SIZE response into dimm_resp[] (SADDR buffer) so the
-     * worker thread gets it on first wake-up. Then start the heartbeat timer
-     * to periodically fire E0+IRQ10 until the worker is alive.
+     * Type-1 ('!' mode): Pre-load DIMM_SIZE (0x8001) and fire IRQ10
+     * immediately. Worker uses IDE DMA polling, no handshake needed.
      *
-     * F0 now always returns 0x0100 for Type-3 (mode is constant, not
-     * tied to resp_ready). Response availability is via E0 bit 0 only. */
+     * Type-3 (')' mode): Start the V850 unsolicited handshake sequence.
+     * Real firmware sends cmd 0x0002 (DMA state 4) then cmd 0x0003 (DMA
+     * state 5). Each is a handshake: V850 sends unsolicited → game responds
+     * 0x0001 → V850 ACKs with 0x8001+DIMM_SIZE. The heartbeat timer drives
+     * this state machine. After both handshakes, switch to reactive mode
+     * where each EXEC gets an immediate response+E0+IRQ10. */
     if (chihiro_game_running && chihiro_mbcom_enabled) {
         static bool bootstrap_done = false;
         if (!bootstrap_done) {
-            s->dimm_cmd[0] = 1 | (0x0001 << 16); /* seq=1, cmd=DIMM_SIZE */
-            chihiro_dimm_process_cmd(s);
-            s->dimm_resp_ready = true;
-            s->mbcom_e0_status |= 0x01;
             memset(chihiro_mbcom_command, 0, 32);
 
             if (chihiro_board_type3) {
-                /* ')' mode: start heartbeat timer. Don't fire IRQ10 now —
-                 * the game's ISR/semaphore don't exist yet. The timer will
-                 * fire E0+IRQ10 every 50ms until the worker responds. */
+                /* ')' mode: start unsolicited handshake state machine.
+                 * Don't fire IRQ10 now — game ISR/semaphore don't exist yet.
+                 * The heartbeat timer will deliver the first unsolicited msg. */
                 s->t3_worker_alive = false;
+                s->t3_handshake_state = 0;
                 timer_mod(s->t3_heartbeat_timer,
                           qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 100);
-                fprintf(stderr, "[%07lld] *** GAME MBCOM BOOTSTRAP T3: DIMM_SIZE loaded, heartbeat started ***\n", TS_MS);
+                fprintf(stderr, "[%07lld] *** GAME MBCOM BOOTSTRAP T3: handshake sequence started ***\n", TS_MS);
             } else {
-                /* '!' mode: fire IRQ10 immediately */
+                /* '!' mode: fire DIMM_SIZE + IRQ10 immediately */
+                s->dimm_cmd[0] = 1 | (0x0001 << 16);
+                chihiro_dimm_process_cmd(s);
+                s->dimm_resp_ready = true;
+                s->mbcom_e0_status |= 0x01;
                 s->mbcom_resp_ready = true;
                 s->lpc_scratch_4026 &= ~0x0100;
                 qemu_irq_lower(s->irq10);
@@ -3590,6 +3622,7 @@ static void chihiro_lpc_realize(DeviceState *dev, Error **errp)
     s->t3_heartbeat_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL,
                                           chihiro_t3_heartbeat_cb, s);
     s->t3_worker_alive = false;
+    s->t3_handshake_state = 0;
     s->dimm_cmd_count = 0;
     s->dimm_next_seq = 1;
 
