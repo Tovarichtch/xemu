@@ -189,6 +189,8 @@ uint64_t perf_cnt_ohci_td = 0;
 uint64_t perf_cnt_usb_handle = 0;
 uint64_t perf_cnt_usb_control = 0;
 
+static bool lpc_log_verbose = false;
+
 /* === Freeze diagnostic ring buffers === */
 #define FREEZE_RING_SIZE 5
 typedef struct {
@@ -937,8 +939,8 @@ static void chihiro_diag_timer_cb(void *opaque)
         static int game_diag_count = 0;
         game_diag_count++;
 
-        /* Track XPR fault address mapping and D3D contiguous pool */
-        {
+        /* XPR/XBE debug probes — disabled by default */
+        if (lpc_log_verbose) {
             uint32_t xpr_pa = chihiro_va_to_pa(0x2F427593);
             static uint32_t prev_xpr_pa = 0xDEADBEEF;
             if (xpr_pa != prev_xpr_pa) {
@@ -946,26 +948,6 @@ static void chihiro_diag_timer_cb(void *opaque)
                         TS_MS, xpr_pa,
                         xpr_pa == 0xFFFFFFFF ? "UNMAPPED" : "MAPPED");
                 prev_xpr_pa = xpr_pa;
-            }
-            /* Check what the game's XBE base actually is */
-            if (game_diag_count == 1) {
-                uint32_t xbe_pa = chihiro_va_to_pa(0x10000);
-                uint32_t alt_pa = chihiro_va_to_pa(0xE0000);
-                uint32_t entry_pa = chihiro_va_to_pa(0xE80E8);
-                uint32_t crash_pa = chihiro_va_to_pa(0xE050A);
-                fprintf(stderr, "[%07lld] XBE-MAP: VA 0x10000→PA 0x%08X "
-                        "VA 0xE0000→PA 0x%08X VA 0xE80E8→PA 0x%08X "
-                        "VA 0xE050A→PA 0x%08X\n",
-                        TS_MS, xbe_pa, alt_pa, entry_pa, crash_pa);
-                /* Check MmAllocateContiguous pool boundaries */
-                for (uint32_t probe = 0x2F400000; probe <= 0x2F430000;
-                     probe += 0x10000) {
-                    uint32_t pa = chihiro_va_to_pa(probe);
-                    if (pa != 0xFFFFFFFF) {
-                        fprintf(stderr, "  VA 0x%08X → PA 0x%08X (MAPPED)\n",
-                                probe, pa);
-                    }
-                }
             }
         }
 
@@ -1882,7 +1864,7 @@ static void chihiro_diag_timer_cb(void *opaque)
      * Watch resource entry 32 (chr_guerrilla) at VA 0x00498A60. */
     {
         static int tex_probe_state = 0;
-        if (tex_probe_state < 3) {
+        if (lpc_log_verbose && tex_probe_state < 3) {
             uint32_t re_pa = chihiro_va_to_pa(0x00498A60);
             if (re_pa != 0xFFFFFFFF) {
                 uint32_t hdr_va = 0;
@@ -2756,7 +2738,7 @@ static void chihiro_dimm_process_cmd(ChihiroLPCState *s)
             break;
         }
 
-        fprintf(stderr, "[%07lld] DIMM T3: cmd=0x%04X seq=%u resp: %08X %08X %08X %08X\n",
+        if (lpc_log_verbose) fprintf(stderr, "[%07lld] DIMM T3: cmd=0x%04X seq=%u resp: %08X %08X %08X %08X\n",
                 TS_MS, cmd, seq, s->dimm_resp[0], s->dimm_resp[1],
                 s->dimm_resp[2], s->dimm_resp[3]);
     } else {
@@ -2808,7 +2790,7 @@ static uint64_t chihiro_lpc_io_read(void *opaque, hwaddr addr,
 
     if (chihiro_game_running) {
         static int game_lpc_read_log = 0;
-        if (game_lpc_read_log < 500) {
+        if (lpc_log_verbose && game_lpc_read_log < 500) {
             game_lpc_read_log++;
             fprintf(stderr, "[%07lld] GAME LPC READ port=0x%04X (reg=0x%08X)\n",
                    TS_MS, (int)(0x4000 + addr), s->lpc_reg_addr);
@@ -2822,7 +2804,7 @@ static uint64_t chihiro_lpc_io_read(void *opaque, hwaddr addr,
             r = s->asic_cpu_ctrl;
             if (chihiro_game_running) {
                 static int cpu_rdy_log = 0;
-                if (cpu_rdy_log < 30) { cpu_rdy_log++;
+                if (lpc_log_verbose && cpu_rdy_log < 30) { cpu_rdy_log++;
                     fprintf(stderr, "[%07lld] GAME READ 0x80000140 → 0x%08X (cpu_ctrl)\n",
                             TS_MS, (unsigned)r); }
             }
@@ -2841,7 +2823,7 @@ static uint64_t chihiro_lpc_io_read(void *opaque, hwaddr addr,
                 r = 0x00; /* bit0=0 → Ethernet present */
                 if (chihiro_game_running) {
                     static int pcistat_log = 0;
-                    if (pcistat_log < 50) { pcistat_log++;
+                    if (lpc_log_verbose && pcistat_log < 50) { pcistat_log++;
                         fprintf(stderr, "[%07lld] GAME SADDR READ 0x80000160 → 0x00 (Ether present)\n", TS_MS); }
                 }
             } else if (target == 0x80000164) {
@@ -2849,7 +2831,7 @@ static uint64_t chihiro_lpc_io_read(void *opaque, hwaddr addr,
             } else if (target >= 0x84000000 && target <= 0x8400001C) {
                 static int saddr_resp_read_count = 0;
                 saddr_resp_read_count++;
-                if (saddr_resp_read_count <= 500) {
+                if (lpc_log_verbose && saddr_resp_read_count <= 500) {
                     fprintf(stderr, "[%07lld] SADDR READ 0x%08X (resp buf) → 0x%08X\n",
                             TS_MS, target, s->dimm_resp[(target - 0x84000000) / 4]);
                 }
@@ -2858,11 +2840,11 @@ static uint64_t chihiro_lpc_io_read(void *opaque, hwaddr addr,
             } else if (target == 0xA0001E60) {
                 r = 0x00000002; /* V850 firmware state: 2 = CRC OK / ready */
                 static int a1e60_log = 0;
-                if (a1e60_log < 20) { a1e60_log++;
+                if (lpc_log_verbose && a1e60_log < 20) { a1e60_log++;
                     fprintf(stderr, "[%07lld] SADDR READ 0xA0001E60 → 0x%08X (fw state)\n", TS_MS, r); }
             } else {
                 static int unknown_saddr_log = 0;
-                if (unknown_saddr_log < 200) {
+                if (lpc_log_verbose && unknown_saddr_log < 200) {
                     fprintf(stderr, "[%07lld] SADDR READ UNKNOWN: bb_reg=0x%08X → 0\n",
                             TS_MS, target);
                     unknown_saddr_log++;
@@ -2877,7 +2859,7 @@ static uint64_t chihiro_lpc_io_read(void *opaque, hwaddr addr,
         case 0x90000000: r = 0x01; break; /* shared memory status = ready */
         default: r = 0; break;
         }
-        if (CHIHIRO_LOG) {
+        if (CHIHIRO_LOG && lpc_log_verbose) {
             static int lpc_read_log = 0;
             if (lpc_read_log < 500) {
                 fprintf(stderr, "[%07lld] LPC REG READ [0x%08X] -> 0x%08X\n", TS_MS,
@@ -2921,7 +2903,7 @@ static uint64_t chihiro_lpc_io_read(void *opaque, hwaddr addr,
         } else {
             r = 0x0000; /* Type-1: always '!' mode */
         }
-        { static int f0_log = 0; if (f0_log < 500) { f0_log++;
+        { static int f0_log = 0; if (lpc_log_verbose && f0_log < 500) { f0_log++;
             fprintf(stderr, "[%07lld] F0 READ → 0x%04X (type3=%d)\n",
                     TS_MS, (unsigned)r, chihiro_board_type3); } }
         s->lpc_40f0_reads++;
@@ -2941,7 +2923,7 @@ static uint64_t chihiro_lpc_io_read(void *opaque, hwaddr addr,
         break;
     case 0xE0: {
         r = s->mbcom_e0_status;
-        static int e0_log = 0; if (e0_log < 2000) { e0_log++;
+        static int e0_log = 0; if (lpc_log_verbose && e0_log < 2000) { e0_log++;
             fprintf(stderr, "[%07lld] E0 READ → 0x%02X (bit0=%d bit2=%d)\n",
                     TS_MS, (unsigned)r, (r & 1), (r >> 2) & 1); }
         break;
@@ -2952,7 +2934,7 @@ static uint64_t chihiro_lpc_io_read(void *opaque, hwaddr addr,
         break;
     default: {
         static int unknown_port_log = 0;
-        if (unknown_port_log < 30) {
+        if (lpc_log_verbose && unknown_port_log < 30) {
             fprintf(stderr, "[%07lld] LPC READ UNKNOWN port 0x%04X → 0\n",
                     TS_MS, (unsigned)(addr + 0x4000));
             unknown_port_log++;
@@ -2985,7 +2967,7 @@ static void chihiro_lpc_io_write(void *opaque, hwaddr addr, uint64_t val,
 
     if (chihiro_game_running) {
         static int game_lpc_write_log = 0;
-        if (game_lpc_write_log < 300) {
+        if (lpc_log_verbose && game_lpc_write_log < 300) {
             game_lpc_write_log++;
             fprintf(stderr, "[%07lld] GAME LPC WRITE port=0x%04X val=0x%08X\n",
                    TS_MS, (int)(0x4000 + addr), (unsigned)val);
@@ -3019,10 +3001,10 @@ static void chihiro_lpc_io_write(void *opaque, hwaddr addr, uint64_t val,
                 static int addr_log = 0;
                 if (chihiro_game_running) {
                     static int gaddr_log = 0;
-                    if (gaddr_log < 500) { gaddr_log++;
+                    if (lpc_log_verbose && gaddr_log < 500) { gaddr_log++;
                         fprintf(stderr, "[%07lld] GAME SADDR ADDR: bb_reg_addr=0x%08X\n",
                                 TS_MS, (unsigned)val); }
-                } else if (addr_log < 200) {
+                } else if (lpc_log_verbose && addr_log < 200) {
                     fprintf(stderr, "[%07lld] SADDR ADDR: bb_reg_addr=0x%08X\n",
                             TS_MS, (unsigned)val);
                     addr_log++;
@@ -3035,7 +3017,7 @@ static void chihiro_lpc_io_write(void *opaque, hwaddr addr, uint64_t val,
                 s->bb_dma_active = true;
                 s->bb_dma_count = 0;
                 static int burst_on_log = 0;
-                if (burst_on_log < 10) {
+                if (lpc_log_verbose && burst_on_log < 10) {
                     fprintf(stderr, "[%07lld] SADDR BURST ON: target=0x%08X\n",
                             TS_MS, s->bb_reg_addr);
                     burst_on_log++;
@@ -3043,7 +3025,7 @@ static void chihiro_lpc_io_write(void *opaque, hwaddr addr, uint64_t val,
             } else {
                 if (s->bb_dma_active) {
                     static int burst_off_log = 0;
-                    if (burst_off_log < 10) {
+                    if (lpc_log_verbose && burst_off_log < 10) {
                         fprintf(stderr, "[%07lld] SADDR BURST OFF: wrote %u dwords\n",
                                 TS_MS, s->bb_dma_count);
                         burst_off_log++;
@@ -3057,7 +3039,7 @@ static void chihiro_lpc_io_write(void *opaque, hwaddr addr, uint64_t val,
                 uint32_t wa = s->bb_reg_addr;
                 {
                     static int burst_data_log = 0;
-                    if (burst_data_log < 40) {
+                    if (lpc_log_verbose && burst_data_log < 40) {
                         fprintf(stderr, "[%07lld] SADDR BURST DATA: [0x%08X] <- 0x%08X (dma#%u)\n",
                                 TS_MS, wa, (unsigned)val, s->bb_dma_count);
                         burst_data_log++;
@@ -3086,7 +3068,7 @@ static void chihiro_lpc_io_write(void *opaque, hwaddr addr, uint64_t val,
                 /* Register-mode: single-word write to target address */
                 uint32_t wa = s->bb_reg_addr;
                 static int regmode_log_count = 0;
-                if (regmode_log_count < 200) {
+                if (lpc_log_verbose && regmode_log_count < 200) {
                     fprintf(stderr, "[%07lld] SADDR REG-WRITE: target=0x%08X val=0x%08X\n",
                             TS_MS, wa, (unsigned)val);
                     regmode_log_count++;
@@ -3108,15 +3090,15 @@ static void chihiro_lpc_io_write(void *opaque, hwaddr addr, uint64_t val,
                 } else if (wa == 0x80000140) {
                     s->asic_cpu_ctrl = (uint32_t)val;
                 } else if (wa == 0xA0001E60) {
-                    fprintf(stderr, "[%07lld] SADDR WRITE 0xA0001E60 <- 0x%08X (fw state)\n",
+                    if (lpc_log_verbose) fprintf(stderr, "[%07lld] SADDR WRITE 0xA0001E60 <- 0x%08X (fw state)\n",
                             TS_MS, (unsigned)val);
                 } else if (wa == 0x84000040) {
                     /* ASIC execute trigger */
-                    fprintf(stderr, "[%07lld] SADDR REG-MODE: 0x84000040 <- 0x%08X\n",
+                    if (lpc_log_verbose) fprintf(stderr, "[%07lld] SADDR REG-MODE: 0x84000040 <- 0x%08X\n",
                             TS_MS, (unsigned)val);
                     if (val & 1) {
                         static int exec_dump = 0;
-                        if (exec_dump < 30) {
+                        if (lpc_log_verbose && exec_dump < 30) {
                             fprintf(stderr, "[%07lld] EXEC dimm_cmd: %08X %08X %08X %08X %08X %08X %08X %08X\n",
                                     TS_MS,
                                     s->dimm_cmd[0], s->dimm_cmd[1], s->dimm_cmd[2], s->dimm_cmd[3],
@@ -3168,7 +3150,7 @@ static void chihiro_lpc_io_write(void *opaque, hwaddr addr, uint64_t val,
         if (s->mbcom_e0_status == 0)
             qemu_irq_lower(s->irq10);
         static int e0w_log = 0;
-        if (e0w_log < 100) { e0w_log++;
+        if (lpc_log_verbose && e0w_log < 100) { e0w_log++;
             fprintf(stderr, "[%07lld] E0 WRITE val=0x%02X e0=0x%02X→0x%02X%s\n",
                     TS_MS, (unsigned)(uint8_t)val, old_e0, s->mbcom_e0_status,
                     s->mbcom_e0_status == 0 ? " irq10↓" : ""); }
@@ -3193,7 +3175,7 @@ static void chihiro_lpc_io_write(void *opaque, hwaddr addr, uint64_t val,
                 uint8_t dma0 = chihiro_mbcom_command[0];
                 uint8_t dma1 = chihiro_mbcom_command[1];
                 chihiro_mbcom_process();
-                if (e1_log < 2000) { e1_log++;
+                if (lpc_log_verbose && e1_log < 2000) { e1_log++;
                     fprintf(stderr, "[%07lld] E1=0x%X SEGABOOT_DMA dma=%02X%02X\n",
                             TS_MS, (unsigned)val, dma0, dma1); }
                 s->mbcom_e0_status |= 0x01;
@@ -3203,7 +3185,7 @@ static void chihiro_lpc_io_write(void *opaque, hwaddr addr, uint64_t val,
             } else {
                 /* ARM for E1=0 trigger (game mode or SEGABOOT ack) */
                 e1_armed = true;
-                if (e1_log < 2000) { e1_log++;
+                if (lpc_log_verbose && e1_log < 2000) { e1_log++;
                     fprintf(stderr, "[%07lld] E1=0x%X ARM scratch=0x%04X dma=%02X%02X\n",
                             TS_MS, (unsigned)val, s->lpc_scratch_4026,
                             chihiro_mbcom_command[0], chihiro_mbcom_command[1]); }
@@ -3215,12 +3197,12 @@ static void chihiro_lpc_io_write(void *opaque, hwaddr addr, uint64_t val,
                  * so the worker can proceed to read SADDR. */
                 if (!s->t3_worker_alive) {
                     s->t3_worker_alive = true;
-                    fprintf(stderr, "[%07lld] T3 WORKER ALIVE\n", TS_MS);
+                    if (lpc_log_verbose) fprintf(stderr, "[%07lld] T3 WORKER ALIVE\n", TS_MS);
                 }
                 s->mbcom_e0_status &= ~0x01;
                 qemu_irq_lower(s->irq10);
 
-                if (e1_log < 2000) { e1_log++;
+                if (lpc_log_verbose && e1_log < 2000) { e1_log++;
                     fprintf(stderr, "[%07lld] E1=0 T3_ACK e0=0x%02X irq10↓\n",
                             TS_MS, s->mbcom_e0_status); }
             } else if (e1_armed && s->mbcom_resp_ready) {
@@ -3228,7 +3210,7 @@ static void chihiro_lpc_io_write(void *opaque, hwaddr addr, uint64_t val,
                 s->mbcom_resp_ready = false;
                 qemu_irq_lower(s->irq10);
                 qemu_irq_raise(s->irq10);
-                if (e1_log < 2000) { e1_log++;
+                if (lpc_log_verbose && e1_log < 2000) { e1_log++;
                     fprintf(stderr, "[%07lld] E1=0 RESP_DELIVER scratch=0x%04X resp: %02X%02X %02X%02X\n",
                             TS_MS, s->lpc_scratch_4026,
                             chihiro_mbcom_response[0], chihiro_mbcom_response[1],
@@ -3249,7 +3231,7 @@ static void chihiro_lpc_io_write(void *opaque, hwaddr addr, uint64_t val,
                 s->lpc_scratch_4026 &= ~0x0100;
                 qemu_irq_lower(s->irq10);
                 qemu_irq_raise(s->irq10);
-                if (e1_log < 2000) { e1_log++;
+                if (lpc_log_verbose && e1_log < 2000) { e1_log++;
                     fprintf(stderr, "[%07lld] E1=0 DMA_PROCESS scratch=0x%04X resp: %02X%02X %02X%02X %02X%02X%02X%02X\n",
                             TS_MS, s->lpc_scratch_4026,
                             chihiro_mbcom_response[0], chihiro_mbcom_response[1],
@@ -3259,7 +3241,7 @@ static void chihiro_lpc_io_write(void *opaque, hwaddr addr, uint64_t val,
             } else {
                 s->lpc_scratch_4026 &= ~0x0100;
                 qemu_irq_lower(s->irq10);
-                if (e1_log < 2000) { e1_log++;
+                if (lpc_log_verbose && e1_log < 2000) { e1_log++;
                     fprintf(stderr, "[%07lld] E1=0 LOWER armed=%d scratch=0x%04X\n",
                             TS_MS, e1_armed, s->lpc_scratch_4026); }
             }
@@ -3739,8 +3721,9 @@ static void chihiro_mbcom_process(void)
     /* zero out rest of 32-byte response area */
     memset(r + 4, 0, 28);
 
-    fprintf(stderr, "[%07lld] MBCOM cmd=0x%04X data: %02X %02X %02X %02X %02X %02X\n",
-            TS_MS, cmd_code, w[0], w[1], w[2], w[3], w[4], w[5]);
+    if (lpc_log_verbose)
+        fprintf(stderr, "[%07lld] MBCOM cmd=0x%04X data: %02X %02X %02X %02X %02X %02X\n",
+                TS_MS, cmd_code, w[0], w[1], w[2], w[3], w[4], w[5]);
 
     switch (cmd_code) {
     case 0x0001: /* DIMM_SIZE — 512MB = 0x20000000 (matches port 0x40F4 factor=2) */
@@ -3799,7 +3782,7 @@ static void chihiro_mbcom_process(void)
         r[4] = 1; r[5] = 0; r[6] = 0; r[7] = 10;
         break;
     default:
-        fprintf(stderr, "[%07lld] MBCOM UNHANDLED cmd=0x%04X\n", TS_MS, cmd_code);
+        if (lpc_log_verbose) fprintf(stderr, "[%07lld] MBCOM UNHANDLED cmd=0x%04X\n", TS_MS, cmd_code);
         break;
     }
 
@@ -3882,7 +3865,7 @@ bool chihiro_ide_read_sector(uint32_t lba, void *buffer)
     }
     {
         static uint32_t ide_total = 0;
-        if (++ide_total % 500 == 0)
+        if (lpc_log_verbose && ++ide_total % 500 == 0)
             fprintf(stderr, "[%07lld] IDE-STATS: total=%u meta=%u fatx=%u mbcom=%u "
                    "(post-QR: flash=%u fatx=%u game_xbe=%u)\n",
                    TS_MS, ide_total, ide_meta_cnt, ide_fatx_cnt, ide_mbcom_cnt,
@@ -3900,7 +3883,7 @@ bool chihiro_ide_read_sector(uint32_t lba, void *buffer)
         const uint8_t *d = (const uint8_t *)buffer;
         static int fc800_read_count = 0;
         fc800_read_count++;
-        if (fc800_read_count <= 20) {
+        if (lpc_log_verbose && fc800_read_count <= 20) {
             fprintf(stderr, "[%07lld] MBCOM READ FC800 #%d: %02X%02X %02X%02X "
                     "%02X%02X%02X%02X %02X%02X%02X%02X\n",
                     TS_MS, fc800_read_count,

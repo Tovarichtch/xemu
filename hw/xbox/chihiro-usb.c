@@ -30,6 +30,7 @@
 #define TS_MS ((long long)(qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL)))
 extern bool chihiro_game_running;
 extern int64_t freeze_last_usb_activity_ms;
+static bool usb_log_verbose = false;
 #define DEBUG_CUSB
 #ifdef DEBUG_CUSB
 #define DPRINTF(s, ...) do { } while(0)
@@ -344,7 +345,7 @@ static void handle_control(USBDevice *dev, USBPacket *p,
 
     {
         static int ctrl_log = 0;
-        if (ctrl_log < 10000) {
+        if (usb_log_verbose && ctrl_log < 10000) {
             ctrl_log++;
             fprintf(stderr, "[%07lld] chihiro-usb [%s]: CTRL req=0x%04X val=0x%04X idx=0x%04X len=%d [%s]\n", TS_MS,
                    id, request, value, index, length,
@@ -404,7 +405,7 @@ static void handle_control(USBDevice *dev, USBPacket *p,
 
     if (chihiro_game_running) {
         static int game_vendor_log = 0;
-        if (game_vendor_log < 10000) {
+        if (usb_log_verbose && game_vendor_log < 10000) {
             game_vendor_log++;
             fprintf(stderr, "[%07lld] chihiro-usb [%s]: VENDOR 0x%02X val=0x%04X idx=0x%04X len=%d",
                    TS_MS, id, bRequest, value, index, length);
@@ -518,7 +519,7 @@ static void handle_control(USBDevice *dev, USBPacket *p,
         {
             static int v19_log = 0;
             int pending = data[4] | (data[5] << 8);
-            if (v19_log < 50 || (pending == 0 && v19_log < 200)) {
+            if (usb_log_verbose && (v19_log < 50 || (pending == 0 && v19_log < 200))) {
                 v19_log++;
                 fprintf(stderr, "[%07lld] JVS-0x19: sense=%d pending=%d data:",
                         TS_MS, s->jvs.sense, pending);
@@ -543,7 +544,7 @@ static void handle_control(USBDevice *dev, USBPacket *p,
             s->jvs.response_len = rlen;
             {
                 static int v20_log = 0;
-                if (v20_log < 50) {
+                if (usb_log_verbose && v20_log < 50) {
                     v20_log++;
                     fprintf(stderr, "[%07lld] JVS-0x20: sent %d → resp %d bytes:",
                             TS_MS, jvs_len, rlen);
@@ -744,7 +745,7 @@ static void handle_data(USBDevice *dev, USBPacket *p)
 
     if (chihiro_game_running && !s->is_qc) {
         static int sc_data_log = 0;
-        if (sc_data_log < 10000) {
+        if (usb_log_verbose && sc_data_log < 10000) {
             sc_data_log++;
             fprintf(stderr, "[%07lld] chihiro-usb [SC]: GAME BULK %s EP%d size=%d pending=%d\n",
                    TS_MS, p->pid == USB_TOKEN_IN ? "IN" : "OUT", ep,
@@ -763,7 +764,7 @@ static void handle_data(USBDevice *dev, USBPacket *p)
             freeze_last_usb_activity_ms = TS_MS;
             if (chihiro_game_running) {
                 static int game_bulk_in_log = 0;
-                if (game_bulk_in_log < 10000) {
+                if (usb_log_verbose && game_bulk_in_log < 10000) {
                     game_bulk_in_log++;
                     fprintf(stderr, "[%07lld] chihiro-usb [%s]: BULK IN EP%d → %d bytes:",
                            TS_MS, id, ep, len);
@@ -775,7 +776,7 @@ static void handle_data(USBDevice *dev, USBPacket *p)
         } else {
             s->nak_count++;
             static int nak_log = 0;
-            if (nak_log < 50) {
+            if (usb_log_verbose && nak_log < 50) {
                 nak_log++;
                 fprintf(stderr, "[%07lld] chihiro-usb [%s]: NAK EP%d IN\n",
                        TS_MS, id, ep);
@@ -788,7 +789,7 @@ static void handle_data(USBDevice *dev, USBPacket *p)
                TS_MS, id, ep, (int)p->iov.size);
         if (chihiro_game_running && s->is_qc) {
             static int qc_out_log = 0;
-            if (qc_out_log < 10000) {
+            if (usb_log_verbose && qc_out_log < 10000) {
                 qc_out_log++;
                 fprintf(stderr, "[%07lld] chihiro-usb [QC]: GAME OUT EP%d %d bytes\n",
                        TS_MS, ep, (int)p->iov.size);
@@ -832,7 +833,7 @@ static void handle_data(USBDevice *dev, USBPacket *p)
                 }
                 if (chihiro_game_running) {
                     static int ep3_out_log = 0;
-                    if (ep3_out_log < 30) {
+                    if (usb_log_verbose && ep3_out_log < 30) {
                         ep3_out_log++;
                         fprintf(stderr, "[%07lld] chihiro-usb [%s]: EP3 OUT %d bytes → extmem[0x%04X]:",
                                TS_MS, id, total, addr);
@@ -852,7 +853,7 @@ static void handle_data(USBDevice *dev, USBPacket *p)
                  * Process and auto-queue response on EP4 IN (simulates
                  * AN2131QC firmware's automatic JVS bus relay). */
                 static int ep4_out_log = 0;
-                if (ep4_out_log < 30) {
+                if (usb_log_verbose && ep4_out_log < 30) {
                     ep4_out_log++;
                     fprintf(stderr, "[%07lld] GAME EP4 OUT %d bytes:",
                            TS_MS, total);
@@ -890,7 +891,7 @@ static void handle_data(USBDevice *dev, USBPacket *p)
                         s->ep_in[4].offset = 0;
                         s->jvs.response_len = 0;
                         static int ep4_in_log = 0;
-                        if (ep4_in_log < 30) {
+                        if (usb_log_verbose && ep4_in_log < 30) {
                             ep4_in_log++;
                             fprintf(stderr, "[%07lld] GAME EP4 IN queued %d bytes:",
                                    TS_MS, wrapped);
@@ -900,7 +901,7 @@ static void handle_data(USBDevice *dev, USBPacket *p)
                     }
                 } else if (total > 0) {
                     static int ep4_nojvs_log = 0;
-                    if (ep4_nojvs_log < 30) {
+                    if (usb_log_verbose && ep4_nojvs_log < 30) {
                         ep4_nojvs_log++;
                         fprintf(stderr, "[%07lld] GAME EP4 OUT NOT-JVS (no sync)\n",
                                TS_MS);

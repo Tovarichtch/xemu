@@ -44,6 +44,7 @@ typedef struct {
 /* Builder state */
 uint32_t fatx_diag_lba = 0; /* LBA of XBE section 11 critical sector (extern) */
 uint32_t fatx_diag_lba_sec0 = 0; /* LBA of XBE section 0 critical sector (VA 0x135000) */
+static bool fatx_log_verbose = false;
 static uint8_t *fatx_image = NULL;
 static uint32_t fatx_image_size = 0;
 static FATXFileEntry fatx_files[FATX_MAX_FILES];
@@ -474,14 +475,14 @@ bool chihiro_fatx_read_sector(uint32_t lba, void *buffer)
             static uint32_t fatx_read_count = 0;
             static uint32_t fatx_last_milestone = 0;
             fatx_read_count++;
-            if (fatx_read_count == 1 ||
-                fatx_read_count / 10000 > fatx_last_milestone) {
+            if (fatx_log_verbose && (fatx_read_count == 1 ||
+                fatx_read_count / 10000 > fatx_last_milestone)) {
                 fatx_last_milestone = fatx_read_count / 10000;
                 fprintf(stderr, "[FATX] READS=%u lba=%u\n",
                        fatx_read_count, lba);
             }
             uint32_t *w = (uint32_t *)buffer;
-            if (w[0] == 0 && w[1] > 0 && w[1] < 0x1000 &&
+            if (fatx_log_verbose && w[0] == 0 && w[1] > 0 && w[1] < 0x1000 &&
                 (w[2] == 0x20 || w[2] == 0x10)) {
                 static int tex_sec_count = 0;
                 if (tex_sec_count < 10) {
@@ -491,12 +492,12 @@ bool chihiro_fatx_read_sector(uint32_t lba, void *buffer)
                 }
             }
         }
-        if (fatx_diag_lba && lba == fatx_diag_lba) {
+        if (fatx_log_verbose && fatx_diag_lba && lba == fatx_diag_lba) {
             uint8_t *b = (uint8_t *)buffer;
             printf("[FATX] READ-DIAG lba=%u: [0x29]=%02X [0x7E]=%02X\n",
                    lba, b[0x29], b[0x7E]);
         }
-        if (fatx_diag_lba_sec0 && lba == fatx_diag_lba_sec0) {
+        if (fatx_log_verbose && fatx_diag_lba_sec0 && lba == fatx_diag_lba_sec0) {
             uint8_t *b = (uint8_t *)buffer;
             printf("[FATX] READ-SEC0 lba=%u: %02X %02X %02X %02X %02X\n",
                    lba, b[0], b[1], b[2], b[3], b[4]);

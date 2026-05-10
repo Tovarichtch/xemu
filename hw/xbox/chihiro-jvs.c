@@ -304,7 +304,7 @@ int chihiro_jvs_process(ChihiroJVSState *s,
     if (data_len >= 10 && raw[0] == 0x20 && raw[7] == 0x32) {
         jvs_game_phase = 1;  /* transition detected */
     }
-    if (jvs_game_phase && jvs_dump_count < 100) {
+    if (0 && jvs_game_phase && jvs_dump_count < 100) {
         jvs_dump_count++;
         fprintf(stderr, "[%07lld] JVS RAW: target=0x%02X count=%d data(%d):",
                TS_MS, target, escaped_count, data_len);
