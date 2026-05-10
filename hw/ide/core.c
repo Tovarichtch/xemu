@@ -973,7 +973,13 @@ static void ide_dma_cb(void *opaque, int ret)
 
     if (s->unit == 1 && sector_num >= 0xFC800 && sector_num <= 0xFC801) {
         static int ide_mbcom_log = 0;
-        if (ide_mbcom_log < 50) { ide_mbcom_log++;
+        extern bool chihiro_game_running;
+        static bool ide_mbcom_game_reset = false;
+        if (chihiro_game_running && !ide_mbcom_game_reset) {
+            ide_mbcom_game_reset = true;
+            ide_mbcom_log = 0;
+        }
+        if (ide_mbcom_log < 100) { ide_mbcom_log++;
             int64_t now = qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL);
             fprintf(stderr, "[%07lld] IDE mbcom %s LBA=0x%lX n=%d\n",
                     now, IDE_DMA_CMD_str(s->dma_cmd),

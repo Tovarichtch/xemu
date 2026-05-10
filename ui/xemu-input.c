@@ -598,7 +598,7 @@ static void xemu_input_update_jvs(void)
     jvs->player_switches[0][0] = sw0;
     jvs->player_switches[0][1] = sw1;
 
-    jvs->system_switches = kbd[SDL_SCANCODE_F2] ? 0x80 : 0x00;
+    jvs->system_switches = kbd[SDL_SCANCODE_0] ? 0x80 : 0x00;
 
     static bool coin_prev;
     bool coin_key = kbd[SDL_SCANCODE_5];

@@ -411,6 +411,26 @@ void xbox_init_common(MachineState *machine,
                     if (fatx) {
                         printf("Chihiro: FATX built from '%s' (%u MB)\n",
                                game_dir, fatx_size / (1024*1024));
+
+                        /* If dvd_path points to a specific .xbe, patch boot.id
+                         * in the FATX image so SEGABOOT launches that XBE. */
+                        if (!S_ISDIR(st.st_mode)) {
+                            const char *xbe_name = strrchr(dvd, '/');
+                            if (!xbe_name) xbe_name = strrchr(dvd, '\\');
+                            if (xbe_name) xbe_name++; else xbe_name = dvd;
+                            for (uint32_t off = 0; off + 480 <= fatx_size; off++) {
+                                if (memcmp(fatx + off, "BTID", 4) == 0 &&
+                                    memcmp(fatx + off + 0x20, "XBAM", 4) == 0) {
+                                    char patched[32];
+                                    memset(patched, 0, 32);
+                                    snprintf(patched, 32, "\\%s", xbe_name);
+                                    memcpy(fatx + off + 0xA0, patched, 32);
+                                    printf("Chihiro: boot.id patched → '%s'\n",
+                                           patched);
+                                    break;
+                                }
+                            }
+                        }
                     }
                     /* Store game dir for boot.id reading at QuickReboot */
                     {

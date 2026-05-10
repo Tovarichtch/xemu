@@ -90,6 +90,11 @@ typedef struct ChihiroUSBState {
     QEMUTimer *ezusb_reconnect_timer;
     bool ezusb_rebooted;
 
+    /* ACBU protocol HLE state (multi-round cmd/response exchange) */
+    bool acbu_response_ready;   /* ic11 response is available for reading */
+    bool acbu_sbhq_pending;     /* SBHQ data write in progress, response not yet generated */
+    int64_t acbu_last_ep3_out_ms; /* timestamp of last EP3 OUT write (for SBHQ completion detect) */
+
     /* JVS I/O board emulation state (shared between QC and SC paths) */
     ChihiroJVSState jvs;
 } ChihiroUSBState;
@@ -403,17 +408,12 @@ static void handle_control(USBDevice *dev, USBPacket *p,
     int bRequest = request & 0xFF;
     vendor_req_counts[(uint8_t)bRequest]++;
 
-    if (chihiro_game_running) {
+    if (chihiro_game_running && s->is_qc && bRequest != 0x20 && bRequest != 0x19) {
         static int game_vendor_log = 0;
-        if (usb_log_verbose && game_vendor_log < 10000) {
+        if (game_vendor_log < 500) {
             game_vendor_log++;
-            fprintf(stderr, "[%07lld] chihiro-usb [%s]: VENDOR 0x%02X val=0x%04X idx=0x%04X len=%d",
+            fprintf(stderr, "[%07lld] chihiro-usb [%s]: VENDOR 0x%02X val=0x%04X idx=0x%04X len=%d\n",
                    TS_MS, id, bRequest, value, index, length);
-            if (!((request >> 8) & 0x80) && length > 0) {
-                fprintf(stderr, " OUT=");
-                for (int i = 0; i < length && i < 16; i++) fprintf(stderr, "%02X", data[i]);
-            }
-            fprintf(stderr, "\n");
         }
     }
 
@@ -599,7 +599,21 @@ static void handle_control(USBDevice *dev, USBPacket *p,
     {
         int count = index;
         if (count == 0) {
-            /* Status poll — default fill already has data[0]=0 (not busy) */
+            if (s->acbu_sbhq_pending) {
+                memcpy(s->extmem + 0x8000, s->ic11, 128);
+                s->acbu_sbhq_pending = false;
+                s->acbu_response_ready = true;
+                fprintf(stderr, "[%07lld] chihiro-usb [%s]: SBHQ HLE — "
+                       "copied ic11 (128B) to extmem[0x8000]\n", TS_MS, id);
+            }
+            if (s->acbu_response_ready) {
+                data[0] = 0x01;
+                p->actual_length = 1;
+            }
+            if (chihiro_game_running) {
+                fprintf(stderr, "[%07lld] chihiro-usb [%s]: STATUS POLL → %s\n",
+                       TS_MS, id, s->acbu_response_ready ? "READY" : "IDLE");
+            }
             break;
         }
         if (count > CHIHIRO_USB_EP_BUFSZ) count = CHIHIRO_USB_EP_BUFSZ;
@@ -612,22 +626,39 @@ static void handle_control(USBDevice *dev, USBPacket *p,
         }
         s->ep_in[3].pending = count;
         s->ep_in[3].offset = 0;
+        s->acbu_response_ready = false;
+        if (chihiro_game_running) {
+            fprintf(stderr, "[%07lld] chihiro-usb [%s]: EXTMEM READ addr=0x%04X count=%d data=",
+                   TS_MS, id, addr, count);
+            for (int i = 0; i < count && i < 16; i++)
+                fprintf(stderr, "%02X", s->ep_in[3].buf[i]);
+            fprintf(stderr, "\n");
+        }
         break;
     }
     case 0xA0: /* ANCHOR_LOAD — EZ-USB firmware download (Cypress AN2131) */
     {
         uint16_t ram_addr = value;  /* wValue = target address in 8051 RAM */
         int count = length;
+        bool is_read = (request >> 8) & 0x80;
         if (ram_addr == 0x7F92) {
-            bool hold = (count > 0 && data[0] & 0x01);
-            fprintf(stderr, "[%07lld] chihiro-usb [%s]: ANCHOR_LOAD CPUCS=%s (total %u bytes)\n",
-                   TS_MS, id, hold ? "HOLD" : "RUN", s->fw_bytes_written);
-            if (s->fw_cpu_held && !hold) {
-                s->fw_loaded = true;
-                fprintf(stderr, "[%07lld] chihiro-usb [%s]: FW LOADED — CPU released\n",
-                       TS_MS, id);
+            if (!is_read) {
+                bool hold = (count > 0 && data[0] & 0x01);
+                fprintf(stderr, "[%07lld] chihiro-usb [%s]: ANCHOR_LOAD CPUCS=%s (total %u bytes)\n",
+                       TS_MS, id, hold ? "HOLD" : "RUN", s->fw_bytes_written);
+                if (s->fw_cpu_held && !hold) {
+                    s->fw_loaded = true;
+                    fprintf(stderr, "[%07lld] chihiro-usb [%s]: FW LOADED — CPU released\n",
+                           TS_MS, id);
+                }
+                s->fw_cpu_held = hold;
             }
-            s->fw_cpu_held = hold;
+        } else if (is_read) {
+            fprintf(stderr, "[%07lld] chihiro-usb [%s]: ANCHOR_LOAD READ addr=0x%04X len=%d → data=",
+                   TS_MS, id, ram_addr, count);
+            for (int i = 0; i < count && i < 16; i++)
+                fprintf(stderr, "%02X", data[i]);
+            fprintf(stderr, "\n");
         } else {
             s->fw_bytes_written += count;
         }
@@ -762,36 +793,65 @@ static void handle_data(USBDevice *dev, USBPacket *p)
             s->ep_in[ep].pending -= len;
             s->bulk_in_count++;
             freeze_last_usb_activity_ms = TS_MS;
-            if (chihiro_game_running) {
-                static int game_bulk_in_log = 0;
-                if (usb_log_verbose && game_bulk_in_log < 10000) {
-                    game_bulk_in_log++;
-                    fprintf(stderr, "[%07lld] chihiro-usb [%s]: BULK IN EP%d → %d bytes:",
-                           TS_MS, id, ep, len);
-                    for (int i = 0; i < len && i < 16; i++)
-                        fprintf(stderr, " %02X", s->ep_in[ep].buf[s->ep_in[ep].offset - len + i]);
-                    fprintf(stderr, "\n");
+            if (chihiro_game_running && s->is_qc) {
+                static int in_by_ep[8] = {0};
+                if (ep < 8 && in_by_ep[ep] < 5) {
+                    in_by_ep[ep]++;
+                    fprintf(stderr, "[%07lld] chihiro-usb [QC]: BULK IN EP%d → %d bytes (sbhq=%d)\n",
+                           TS_MS, ep, len, (int)s->acbu_sbhq_pending);
                 }
             }
         } else {
-            s->nak_count++;
-            static int nak_log = 0;
-            if (usb_log_verbose && nak_log < 50) {
-                nak_log++;
-                fprintf(stderr, "[%07lld] chihiro-usb [%s]: NAK EP%d IN\n",
-                       TS_MS, id, ep);
+            if (s->acbu_sbhq_pending && s->is_qc && ep == 3 &&
+                s->acbu_last_ep3_out_ms > 0 &&
+                (TS_MS - s->acbu_last_ep3_out_ms) > 500) {
+                memcpy(s->ep_in[3].buf, s->ic11, 128);
+                s->ep_in[3].pending = 128;
+                s->ep_in[3].offset = 0;
+                s->acbu_sbhq_pending = false;
+                s->acbu_response_ready = true;
+                fprintf(stderr, "[%07lld] chihiro-usb [QC]: SBHQ HLE — "
+                       "ic11 (128B) queued on EP3 IN (waited %lldms after upload)\n",
+                       TS_MS, (long long)(TS_MS - s->acbu_last_ep3_out_ms));
+                int len = MIN(p->iov.size, s->ep_in[3].pending);
+                usb_packet_copy(p, s->ep_in[3].buf, len);
+                s->ep_in[3].offset += len;
+                s->ep_in[3].pending -= len;
+                s->bulk_in_count++;
+            } else {
+                s->nak_count++;
+                if (chihiro_game_running && s->is_qc) {
+                    static int nak_by_ep[8] = {0};
+                    if (ep < 8 && nak_by_ep[ep] < 5) {
+                        nak_by_ep[ep]++;
+                        fprintf(stderr, "[%07lld] chihiro-usb [QC]: NAK EP%d IN (sbhq=%d last_out=%lld gap=%lld)\n",
+                               TS_MS, ep, (int)s->acbu_sbhq_pending,
+                               (long long)s->acbu_last_ep3_out_ms,
+                               s->acbu_last_ep3_out_ms > 0 ? (long long)(TS_MS - s->acbu_last_ep3_out_ms) : -1LL);
+                    }
+                    if (s->acbu_sbhq_pending && ep == 3) {
+                        static int sbhq_ep3_diag = 0;
+                        if (sbhq_ep3_diag < 3) {
+                            sbhq_ep3_diag++;
+                            fprintf(stderr, "[%07lld] chihiro-usb [QC]: SBHQ EP3 NAK check: "
+                                   "last_out=%lld gap=%lld (need>500)\n",
+                                   TS_MS, (long long)s->acbu_last_ep3_out_ms,
+                                   (long long)(TS_MS - s->acbu_last_ep3_out_ms));
+                        }
+                    }
+                }
+                p->status = USB_RET_NAK;
             }
-            p->status = USB_RET_NAK;
         }
     } else {
         /* Bulk OUT — capture data for JVS processing */
         if(0) printf("[%07lld] chihiro-usb [%s]: BULK OUT EP%d %d bytes\n",
                TS_MS, id, ep, (int)p->iov.size);
         if (chihiro_game_running && s->is_qc) {
-            static int qc_out_log = 0;
-            if (usb_log_verbose && qc_out_log < 10000) {
-                qc_out_log++;
-                fprintf(stderr, "[%07lld] chihiro-usb [QC]: GAME OUT EP%d %d bytes\n",
+            static int out_by_ep[8] = {0};
+            if (ep < 8 && out_by_ep[ep] < 5) {
+                out_by_ep[ep]++;
+                fprintf(stderr, "[%07lld] chihiro-usb [QC]: BULK OUT EP%d %d bytes\n",
                        TS_MS, ep, (int)p->iov.size);
             }
         }
@@ -831,21 +891,37 @@ static void handle_data(USBDevice *dev, USBPacket *p)
                     memcpy(s->extmem + addr, buf, copy);
                     s->write_1f_addr += copy;
                 }
+                s->acbu_last_ep3_out_ms = TS_MS;
                 if (chihiro_game_running) {
-                    static int ep3_out_log = 0;
-                    if (usb_log_verbose && ep3_out_log < 30) {
-                        ep3_out_log++;
+                    if (usb_log_verbose) {
                         fprintf(stderr, "[%07lld] chihiro-usb [%s]: EP3 OUT %d bytes → extmem[0x%04X]:",
                                TS_MS, id, total, addr);
                         for (int i = 0; i < total && i < 32; i++) fprintf(stderr, " %02X", buf[i]);
                         fprintf(stderr, "\n");
                     }
-                    s->ep_in[3].buf[0] = 0x00;
-                    s->ep_in[3].buf[1] = 0x00;
-                    s->ep_in[3].buf[2] = 0x00;
-                    s->ep_in[3].buf[3] = 0x00;
-                    s->ep_in[3].pending = 4;
-                    s->ep_in[3].offset = 0;
+
+                    /* ACBU protocol HLE: when game writes "ACBU" command to
+                     * extmem[0x8000], the AN2131 firmware reads ic11 EEPROM
+                     * and returns it at extmem[0x8400] as the response.
+                     * We skip firmware execution and copy ic11 directly. */
+                    if (addr == 0x8000 && total >= 4 &&
+                        buf[0] == 'A' && buf[1] == 'C' &&
+                        buf[2] == 'B' && buf[3] == 'U') {
+                        memcpy(s->extmem + 0x8400, s->ic11, 128);
+                        s->acbu_response_ready = true;
+                        fprintf(stderr, "[%07lld] chihiro-usb [%s]: ACBU HLE — "
+                               "copied ic11 (128B) to extmem[0x8400]\n",
+                               TS_MS, id);
+                    }
+
+                    if (addr == 0x8400 && total >= 4 &&
+                        buf[0] == 'S' && buf[1] == 'B' &&
+                        buf[2] == 'H' && buf[3] == 'Q') {
+                        s->acbu_sbhq_pending = true;
+                        fprintf(stderr, "[%07lld] chihiro-usb [%s]: SBHQ detected — "
+                               "response will be queued on EP3 IN after upload\n",
+                               TS_MS, id);
+                    }
                 }
 
             } else if (ep == 4) {
@@ -963,10 +1039,11 @@ static void chihiro_an2131qc_realize(USBDevice *dev, Error **errp)
                    "ic10 firmware must be exactly 8KB");
     memcpy(s->eeprom, hotd3_ic10_g24lc64, sizeof(s->eeprom));
 
-    /* Override region to USA (0x02) to match game's bootid regionFlags.
-     * HOD3 bootid has regionFlags=0xFFFFFF0E (US+EXP, no JP).
-     * Original ic10 EEPROM has 0x01 (Japan) which would cause ERROR 31. */
-    s->eeprom[0x1F00] = 0x02;  /* Region: 01=JPN, 02=USA, 03=EXP */
+    /* Region byte at eeprom[0x1F00]: SEGABOOT checks boot.id[0x38] bitmask
+     * against (1 << region). JPN-only games (e.g. Golf SBLF, bitmask=0x02)
+     * fail with ERROR 05 if region=2. Region=1 (JPN) works for all known
+     * games since all bitmasks include bit 1. */
+    s->eeprom[0x1F00] = 0x01;  /* Region: 01=JPN, 02=USA, 03=EXP */
 
     /* Initialize per-endpoint bulk transfer state */
     memset(s->ep_in, 0, sizeof(s->ep_in));
@@ -993,7 +1070,7 @@ static void chihiro_an2131qc_realize(USBDevice *dev, Error **errp)
     chihiro_jvs_global = &s->jvs;
 
     printf("[%07lld] Chihiro QC: loaded ic10 firmware (8192B) + ic11 (128B), "
-           "region patched to USA (0x02), serial=%.16s\n",
+           "region=JPN (0x01), serial=%.16s\n",
            TS_MS, (const char *)&s->eeprom[0x1F10]);
 }
 

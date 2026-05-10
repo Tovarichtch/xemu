@@ -15,6 +15,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/timer.h"
 #include <dirent.h>
 #include <sys/stat.h>
 
@@ -471,27 +472,29 @@ bool chihiro_fatx_read_sector(uint32_t lba, void *buffer)
     uint32_t offset = lba * FATX_SECTOR_SIZE;
     if (offset + FATX_SECTOR_SIZE <= fatx_image_size) {
         memcpy(buffer, fatx_image + offset, FATX_SECTOR_SIZE);
+
+        /* Per-second I/O stats — always active, one fprintf/sec */
         {
-            static uint32_t fatx_read_count = 0;
-            static uint32_t fatx_last_milestone = 0;
-            fatx_read_count++;
-            if (fatx_log_verbose && (fatx_read_count == 1 ||
-                fatx_read_count / 10000 > fatx_last_milestone)) {
-                fatx_last_milestone = fatx_read_count / 10000;
-                fprintf(stderr, "[FATX] READS=%u lba=%u\n",
-                       fatx_read_count, lba);
-            }
-            uint32_t *w = (uint32_t *)buffer;
-            if (fatx_log_verbose && w[0] == 0 && w[1] > 0 && w[1] < 0x1000 &&
-                (w[2] == 0x20 || w[2] == 0x10)) {
-                static int tex_sec_count = 0;
-                if (tex_sec_count < 10) {
-                    fprintf(stderr, "[FATX] HDR-SEC lba=%u: %08X %08X %08X %08X\n",
-                           lba, w[0], w[1], w[2], w[3]);
-                    tex_sec_count++;
-                }
+            static uint32_t reads_interval = 0;
+            static uint32_t reads_total = 0;
+            static uint64_t bytes_interval = 0;
+            static int64_t last_report_ms = -1;
+            reads_interval++;
+            reads_total++;
+            bytes_interval += FATX_SECTOR_SIZE;
+            int64_t now = qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL);
+            if (last_report_ms < 0) last_report_ms = now;
+            if (now - last_report_ms >= 1000) {
+                fprintf(stderr, "[%07lld] FATX-IO: %u reads (%u KB) this sec | total=%u reads\n",
+                       (long long)now, reads_interval,
+                       (uint32_t)(bytes_interval / 1024),
+                       reads_total);
+                reads_interval = 0;
+                bytes_interval = 0;
+                last_report_ms = now;
             }
         }
+
         if (fatx_log_verbose && fatx_diag_lba && lba == fatx_diag_lba) {
             uint8_t *b = (uint8_t *)buffer;
             printf("[FATX] READ-DIAG lba=%u: [0x29]=%02X [0x7E]=%02X\n",

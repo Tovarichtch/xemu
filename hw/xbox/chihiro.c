@@ -939,6 +939,41 @@ static void chihiro_diag_timer_cb(void *opaque)
         static int game_diag_count = 0;
         game_diag_count++;
 
+        /* EIP profiler — sample CPU state every tick during loading phase */
+        {
+            static int eip_profile_count = 0;
+            if (eip_profile_count < 30) {
+                CPUState *cpu = first_cpu;
+                X86CPU *x86 = cpu ? X86_CPU(cpu) : NULL;
+                CPUX86State *env = x86 ? &x86->env : NULL;
+                if (env) {
+                    uint32_t eip = (uint32_t)env->eip;
+                    uint32_t esp = (uint32_t)env->regs[R_ESP];
+                    uint32_t eax = (uint32_t)env->regs[R_EAX];
+                    uint32_t ebp = (uint32_t)env->regs[R_EBP];
+                    /* Walk EBP chain for call stack (up to 5 frames) */
+                    fprintf(stderr, "[%07lld] EIP-PROF #%02d: EIP=0x%08X ESP=0x%08X EBP=0x%08X EAX=0x%08X",
+                           TS_MS, eip_profile_count, eip, esp, ebp, eax);
+                    uint32_t frame = ebp;
+                    for (int depth = 0; depth < 5 && frame >= 0x80010000
+                             && frame < 0x88000000; depth++) {
+                        uint32_t frame_pa = frame & 0x07FFFFFF;
+                        uint32_t ret_addr = 0;
+                        cpu_physical_memory_read(frame_pa + 4, &ret_addr, 4);
+                        if (ret_addr > 0x10000 && ret_addr < 0x08000000) {
+                            fprintf(stderr, " →0x%08X", ret_addr);
+                        }
+                        uint32_t next_frame = 0;
+                        cpu_physical_memory_read(frame_pa, &next_frame, 4);
+                        if (next_frame <= frame) break;
+                        frame = next_frame;
+                    }
+                    fprintf(stderr, "\n");
+                }
+                eip_profile_count++;
+            }
+        }
+
         /* XPR/XBE debug probes — disabled by default */
         if (lpc_log_verbose) {
             uint32_t xpr_pa = chihiro_va_to_pa(0x2F427593);
@@ -3107,6 +3142,16 @@ static void chihiro_lpc_io_write(void *opaque, hwaddr addr, uint64_t val,
                         }
                         freeze_record_exec((s->dimm_cmd[0] >> 16) & 0xFFFF);
                         chihiro_dimm_process_cmd(s);
+                        {
+                            static int game_exec_log = 0;
+                            if (chihiro_game_running && game_exec_log < 50) {
+                                fprintf(stderr, "[%07lld] GAME-EXEC #%d: cmd=%08X → resp: %08X %08X %08X %08X\n",
+                                        TS_MS, game_exec_log,
+                                        s->dimm_cmd[0], s->dimm_resp[0], s->dimm_resp[1],
+                                        s->dimm_resp[2], s->dimm_resp[3]);
+                                game_exec_log++;
+                            }
+                        }
 
                         /* V850 unsolicited 0x0002/0x0003 are RESET REQUESTS
                          * (acLibUpdateMedia → XLaunchNewImageA). Do NOT send. */
@@ -3721,9 +3766,14 @@ static void chihiro_mbcom_process(void)
     /* zero out rest of 32-byte response area */
     memset(r + 4, 0, 28);
 
-    if (lpc_log_verbose)
-        fprintf(stderr, "[%07lld] MBCOM cmd=0x%04X data: %02X %02X %02X %02X %02X %02X\n",
-                TS_MS, cmd_code, w[0], w[1], w[2], w[3], w[4], w[5]);
+    {
+        static int mbcom_cmd_log = 0;
+        if (mbcom_cmd_log < 100) {
+            mbcom_cmd_log++;
+            fprintf(stderr, "[%07lld] MBCOM cmd=0x%04X seq=%02X%02X data: %02X %02X %02X %02X %02X %02X\n",
+                    TS_MS, cmd_code, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
+        }
+    }
 
     switch (cmd_code) {
     case 0x0001: /* DIMM_SIZE — 512MB = 0x20000000 (matches port 0x40F4 factor=2) */
