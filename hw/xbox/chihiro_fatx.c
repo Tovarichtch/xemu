@@ -115,6 +115,41 @@ static void fatx_write_dirent(uint32_t offset, const char *name,
     e[62] = 0x81; e[63] = 0x2D;
 }
 
+/* Clear and write directory entries into a FAT cluster chain */
+static void fatx_write_dir_entries(uint32_t first_cluster,
+                                    const int *child_indices, int child_count)
+{
+    uint32_t cluster = first_cluster;
+    int entry = 0;
+
+    /* Clear all clusters in chain first */
+    uint32_t c = first_cluster;
+    while (c != 0 && c != FATX_FAT_END && c < fatx_total_clusters) {
+        uint32_t off = fatx_cluster_offset(c);
+        if (off + FATX_CLUSTER_SIZE <= fatx_image_size) {
+            memset(fatx_image + off, 0xFF, FATX_CLUSTER_SIZE);
+        }
+        uint16_t next = fatx_fat[c];
+        if (next == FATX_FAT_END || next == 0) break;
+        c = next;
+    }
+
+    /* Write entries following FAT chain */
+    for (int i = 0; i < child_count; i++) {
+        if (entry >= FATX_DIRENTS_PER_CLUSTER) {
+            uint16_t next = fatx_fat[cluster];
+            if (next == FATX_FAT_END || next == 0 || next >= fatx_total_clusters) break;
+            cluster = next;
+            entry = 0;
+        }
+        uint32_t off = fatx_cluster_offset(cluster) + entry * FATX_DIRENT_SIZE;
+        int idx = child_indices[i];
+        fatx_write_dirent(off, fatx_files[idx].name, fatx_files[idx].first_cluster,
+                          fatx_files[idx].size, fatx_files[idx].is_dir);
+        entry++;
+    }
+}
+
 /* Scan host directory: add all entries at this level first, then recurse.
  * This ensures parent directory entries (especially root XBEs) are always
  * present even when subdirectories contain hundreds of files. */
@@ -201,10 +236,20 @@ uint8_t *chihiro_fatx_build(const char *game_dir, uint32_t *out_size,
     /* Image only needs space for actual file data, not the whole partition */
     uint64_t file_data = 0;
     for (int i = 0; i < fatx_file_count; i++) {
-        if (!fatx_files[i].is_dir) {
+        if (fatx_files[i].is_dir) {
+            /* Count children to estimate directory cluster needs */
+            int children = 0;
+            for (int j = 0; j < fatx_file_count; j++) {
+                if (fatx_files[j].parent_idx == i) children++;
+            }
+            uint32_t dir_clusters = (children * FATX_DIRENT_SIZE +
+                                     FATX_CLUSTER_SIZE - 1) / FATX_CLUSTER_SIZE;
+            if (dir_clusters == 0) dir_clusters = 1;
+            file_data += (uint64_t)dir_clusters * FATX_CLUSTER_SIZE;
+        } else {
             file_data += fatx_files[i].size;
+            file_data += FATX_CLUSTER_SIZE;
         }
-        file_data += FATX_CLUSTER_SIZE;
     }
     file_data += FATX_CLUSTER_SIZE * 16;
     uint32_t needed_clusters =
@@ -234,8 +279,14 @@ uint8_t *chihiro_fatx_build(const char *game_dir, uint32_t *out_size,
     for (int i = 0; i < fatx_file_count; i++) {
         FATXFileEntry *fe = &fatx_files[i];
         if (fe->is_dir) {
-            /* Directory: allocate 1 cluster for entries (will fill later) */
-            fe->first_cluster = fatx_alloc_chain(FATX_CLUSTER_SIZE);
+            /* Count children to determine how many clusters this dir needs */
+            int children = 0;
+            for (int j = 0; j < fatx_file_count; j++) {
+                if (fatx_files[j].parent_idx == i) children++;
+            }
+            if (children == 0) children = 1;
+            uint32_t dir_bytes = (uint32_t)children * FATX_DIRENT_SIZE;
+            fe->first_cluster = fatx_alloc_chain(dir_bytes);
         } else {
             /* File: allocate chain, read data */
             fe->first_cluster = fatx_alloc_chain(fe->size > 0 ? fe->size : 1);
@@ -319,42 +370,32 @@ uint8_t *chihiro_fatx_build(const char *game_dir, uint32_t *out_size,
     }
 
     /* Phase 5: Build directory entries */
-    /* Root directory: all files with parent_idx == -1 */
-    uint32_t root_cluster = fatx_alloc_chain(FATX_CLUSTER_SIZE);
-    uint32_t root_off = fatx_cluster_offset(root_cluster);
-    memset(fatx_image + root_off, 0xFF, FATX_CLUSTER_SIZE);
-    int root_entry = 0;
+    /* Temp array for collecting child indices */
+    int *child_buf = (int *)g_malloc(fatx_file_count * sizeof(int));
 
+    /* Root directory: count children and allocate */
+    int root_children = 0;
     for (int i = 0; i < fatx_file_count; i++) {
-        if (fatx_files[i].parent_idx != -1) continue;
-        fatx_write_dirent(root_off + root_entry * FATX_DIRENT_SIZE,
-                          fatx_files[i].name, fatx_files[i].first_cluster,
-                          fatx_files[i].size, fatx_files[i].is_dir);
-        root_entry++;
+        if (fatx_files[i].parent_idx == -1) child_buf[root_children++] = i;
     }
+    uint32_t root_dir_bytes = (uint32_t)root_children * FATX_DIRENT_SIZE;
+    if (root_dir_bytes < FATX_CLUSTER_SIZE) root_dir_bytes = FATX_CLUSTER_SIZE;
+    uint32_t root_cluster = fatx_alloc_chain(root_dir_bytes);
+    fatx_write_dir_entries(root_cluster, child_buf, root_children);
 
     /* Subdirectory entries */
     for (int i = 0; i < fatx_file_count; i++) {
         if (!fatx_files[i].is_dir) continue;
-        uint32_t dir_off = fatx_cluster_offset(fatx_files[i].first_cluster);
-        memset(fatx_image + dir_off, 0xFF, FATX_CLUSTER_SIZE);
-        int entry = 0;
-
+        int children = 0;
         for (int j = 0; j < fatx_file_count; j++) {
-            if (fatx_files[j].parent_idx != i) continue;
-            fatx_write_dirent(dir_off + entry * FATX_DIRENT_SIZE,
-                              fatx_files[j].name, fatx_files[j].first_cluster,
-                              fatx_files[j].size, fatx_files[j].is_dir);
-            entry++;
+            if (fatx_files[j].parent_idx == i) child_buf[children++] = j;
         }
+        fatx_write_dir_entries(fatx_files[i].first_cluster, child_buf, children);
     }
 
-    /* Update superblock: root cluster pointer is cluster 1 in FATX
-     * Actually, Xbox FATX root directory starts at cluster 1 (first data cluster).
-     * We allocated root at root_cluster. Need to make it cluster 1.
-     * Swap root cluster data to cluster 1 position. */
+    /* Root directory must be at cluster 1 in FATX.
+     * Swap cluster 1 data with root_cluster data. */
     if (root_cluster != 1) {
-        /* Swap cluster 1 and root_cluster data */
         uint32_t off1 = fatx_cluster_offset(1);
         uint32_t offR = fatx_cluster_offset(root_cluster);
         uint8_t tmp[FATX_CLUSTER_SIZE];
@@ -362,12 +403,10 @@ uint8_t *chihiro_fatx_build(const char *game_dir, uint32_t *out_size,
         memcpy(fatx_image + off1, fatx_image + offR, FATX_CLUSTER_SIZE);
         memcpy(fatx_image + offR, tmp, FATX_CLUSTER_SIZE);
 
-        /* Update FAT: swap entries */
         uint16_t fat1 = fatx_fat[1];
         fatx_fat[1] = fatx_fat[root_cluster];
         fatx_fat[root_cluster] = fat1;
 
-        /* Update file entries that pointed to cluster 1 */
         for (int i = 0; i < fatx_file_count; i++) {
             if (fatx_files[i].first_cluster == 1)
                 fatx_files[i].first_cluster = root_cluster;
@@ -375,34 +414,24 @@ uint8_t *chihiro_fatx_build(const char *game_dir, uint32_t *out_size,
                 fatx_files[i].first_cluster = 1;
         }
 
-        /* Update directory entries that reference swapped clusters */
-        /* Re-write root directory at cluster 1 */
-        uint32_t new_root_off = fatx_cluster_offset(1);
-        memset(fatx_image + new_root_off, 0xFF, FATX_CLUSTER_SIZE);
-        root_entry = 0;
+        /* Re-write all directory entries with updated cluster numbers */
+        root_children = 0;
         for (int i = 0; i < fatx_file_count; i++) {
-            if (fatx_files[i].parent_idx != -1) continue;
-            fatx_write_dirent(new_root_off + root_entry * FATX_DIRENT_SIZE,
-                              fatx_files[i].name, fatx_files[i].first_cluster,
-                              fatx_files[i].size, fatx_files[i].is_dir);
-            root_entry++;
+            if (fatx_files[i].parent_idx == -1) child_buf[root_children++] = i;
         }
+        fatx_write_dir_entries(1, child_buf, root_children);
 
-        /* Re-write subdirectory entries */
         for (int i = 0; i < fatx_file_count; i++) {
             if (!fatx_files[i].is_dir) continue;
-            uint32_t dir_off = fatx_cluster_offset(fatx_files[i].first_cluster);
-            memset(fatx_image + dir_off, 0xFF, FATX_CLUSTER_SIZE);
-            int entry = 0;
+            int children = 0;
             for (int j = 0; j < fatx_file_count; j++) {
-                if (fatx_files[j].parent_idx != i) continue;
-                fatx_write_dirent(dir_off + entry * FATX_DIRENT_SIZE,
-                                  fatx_files[j].name, fatx_files[j].first_cluster,
-                                  fatx_files[j].size, fatx_files[j].is_dir);
-                entry++;
+                if (fatx_files[j].parent_idx == i) child_buf[children++] = j;
             }
+            fatx_write_dir_entries(fatx_files[i].first_cluster, child_buf, children);
         }
     }
+
+    g_free(child_buf);
 
     printf("[FATX] Built: %d files, root at cluster 1, image %u bytes\n",
            fatx_file_count, fatx_image_size);

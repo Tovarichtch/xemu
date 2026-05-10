@@ -29,6 +29,7 @@
 #include "chihiro-jvs.h"
 #define TS_MS ((long long)(qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL)))
 extern bool chihiro_game_running;
+extern int64_t freeze_last_usb_activity_ms;
 #define DEBUG_CUSB
 #ifdef DEBUG_CUSB
 #define DPRINTF(s, ...) do { } while(0)
@@ -337,6 +338,7 @@ static void handle_control(USBDevice *dev, USBPacket *p,
 {
     extern uint64_t perf_cnt_usb_control;
     perf_cnt_usb_control++;
+    freeze_last_usb_activity_ms = TS_MS;
     ChihiroUSBState *s = (ChihiroUSBState *)dev;
     const char *id = ((ChihiroUSBState *)dev)->is_qc ? "QC" : "SC";
 
@@ -513,13 +515,21 @@ static void handle_control(USBDevice *dev, USBPacket *p,
             data[4] = 0;
             data[5] = 0;
         }
+        {
+            static int v19_log = 0;
+            int pending = data[4] | (data[5] << 8);
+            if (v19_log < 50 || (pending == 0 && v19_log < 200)) {
+                v19_log++;
+                fprintf(stderr, "[%07lld] JVS-0x19: sense=%d pending=%d data:",
+                        TS_MS, s->jvs.sense, pending);
+                for (int i = 0; i < 8; i++) fprintf(stderr, " %02X", data[i]);
+                fprintf(stderr, "\n");
+            }
+        }
         break;
     }
     case 0x20: { /* Send JVS packets (QC path) */
         jvs_send_count++;
-        if(0) { printf("[%07lld] chihiro-usb [%s]: JVS SEND %d bytes:", TS_MS, id, host_len);
-        for (int i = 0; i < host_len && i < 16; i++) printf(" %02X", host_data[i]);
-        printf("\n"); }
         /* AN2131QC format: byte 0 = sequence counter, bytes 1+ = JVS frame */
         uint8_t *jvs_data = host_data;
         int jvs_len = host_len;
@@ -531,7 +541,17 @@ static void handle_control(USBDevice *dev, USBPacket *p,
             int rlen = chihiro_jvs_process(&s->jvs, jvs_data, jvs_len,
                                             s->jvs.response, sizeof(s->jvs.response));
             s->jvs.response_len = rlen;
-            if(0) printf("[%07lld] chihiro-usb [%s]: JVS RESP %d bytes\n", TS_MS, id, rlen);
+            {
+                static int v20_log = 0;
+                if (v20_log < 50) {
+                    v20_log++;
+                    fprintf(stderr, "[%07lld] JVS-0x20: sent %d → resp %d bytes:",
+                            TS_MS, jvs_len, rlen);
+                    for (int i = 0; i < rlen && i < 40; i++)
+                        fprintf(stderr, " %02X", s->jvs.response[i]);
+                    fprintf(stderr, "\n");
+                }
+            }
         }
         break;
     }
@@ -740,6 +760,7 @@ static void handle_data(USBDevice *dev, USBPacket *p)
             s->ep_in[ep].offset += len;
             s->ep_in[ep].pending -= len;
             s->bulk_in_count++;
+            freeze_last_usb_activity_ms = TS_MS;
             if (chihiro_game_running) {
                 static int game_bulk_in_log = 0;
                 if (game_bulk_in_log < 10000) {
@@ -888,6 +909,7 @@ static void handle_data(USBDevice *dev, USBPacket *p)
             }
         }
         s->bulk_out_count++;
+        freeze_last_usb_activity_ms = TS_MS;
     }
 }
 
