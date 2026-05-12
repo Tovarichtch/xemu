@@ -18,6 +18,15 @@ void chihiro_usb_set_devices(USBDevice *qc, USBDevice *sc);
 /* Load baseboard flash ROM (SEGABOOT) from file */
 void chihiro_load_flash_rom(const char *bios_path);
 
+/* Load baseboard EEPROMs (ic10, ic11, pc20) from BIOS directory */
+void chihiro_load_eeproms(const char *bios_path);
+extern uint8_t *chihiro_ic10_data;
+extern uint32_t chihiro_ic10_size;
+extern uint8_t *chihiro_ic11_data;
+extern uint32_t chihiro_ic11_size;
+extern uint8_t *chihiro_pc20_data;
+extern uint32_t chihiro_pc20_size;
+
 /* Called from SMC when SCRATCH=0x04 (QuickReboot signal) */
 void chihiro_on_quickreboot_signal(void);
 

@@ -204,6 +204,7 @@ typedef struct AN2131State {
         uint8_t  slave_addr;        /* 7-bit I2C address */
         uint16_t mem_addr;          /* Current EEPROM byte address */
         bool     reading;           /* true = read from slave */
+        bool     first_read;        /* EZ-USB dummy read after RESTART */
         int      addr_bytes_sent;   /* Address bytes received so far */
         int      addr_bytes_needed; /* 1 for 24LC024, 2 for 24LC64 */
         uint8_t *eeprom;            /* Pointer to selected EEPROM buffer */

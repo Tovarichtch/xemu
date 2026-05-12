@@ -26,6 +26,7 @@
 
 #include "qemu/timer.h"
 #include "chihiro-firmware.h"
+#include "chihiro.h"
 #include "chihiro-jvs.h"
 #include "chihiro-an2131.h"
 #define TS_MS ((long long)(qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL)))
@@ -1307,12 +1308,14 @@ static void chihiro_an2131qc_realize(USBDevice *dev, Error **errp)
     usb_desc_init(dev);
     dev->auto_attach = 0;  /* Attach later via hotplug timer */
 
-    /* Load real ic10 QC EEPROM firmware (8192 bytes from MAME hotd3.zip).
+    /* Load ic10 QC EEPROM firmware (8192 bytes).
      * Contains AN2131 8051 firmware code + region/serial/game data.
      * SEGABOOT reads this via vendor request 0x16 + bulk IN EP1. */
-    _Static_assert(sizeof(hotd3_ic10_g24lc64) == 8192,
-                   "ic10 firmware must be exactly 8KB");
-    memcpy(s->eeprom, hotd3_ic10_g24lc64, sizeof(s->eeprom));
+    if (chihiro_ic10_data && chihiro_ic10_size == sizeof(s->eeprom)) {
+        memcpy(s->eeprom, chihiro_ic10_data, sizeof(s->eeprom));
+    } else {
+        memcpy(s->eeprom, hotd3_ic10_g24lc64, sizeof(s->eeprom));
+    }
 
     /* Region byte at eeprom[0x1F00]: SEGABOOT checks boot.id[0x38] bitmask
      * against (1 << region). JPN-only games (e.g. Golf SBLF, bitmask=0x02)
@@ -1323,11 +1326,13 @@ static void chihiro_an2131qc_realize(USBDevice *dev, Error **errp)
     /* Initialize per-endpoint bulk transfer state */
     memset(s->ep_in, 0, sizeof(s->ep_in));
 
-    /* Load ic11 baseboard EEPROM (256 bytes, 24LC024) — first 128 from dump, rest zero */
-    _Static_assert(sizeof(hotd3_ic11_24lc024) == 128,
-                   "ic11 EEPROM dump must be exactly 128 bytes");
+    /* Load ic11 baseboard EEPROM (256 bytes, 24LC024) */
     memset(s->ic11, 0, sizeof(s->ic11));
-    memcpy(s->ic11, hotd3_ic11_24lc024, sizeof(hotd3_ic11_24lc024));
+    if (chihiro_ic11_data && chihiro_ic11_size <= sizeof(s->ic11)) {
+        memcpy(s->ic11, chihiro_ic11_data, chihiro_ic11_size);
+    } else {
+        memcpy(s->ic11, hotd3_ic11_24lc024, sizeof(hotd3_ic11_24lc024));
+    }
     memset(s->extmem, 0, sizeof(s->extmem));
     s->write_1e_addr = 0;
     s->write_1f_addr = 0;
@@ -1349,7 +1354,7 @@ static void chihiro_an2131qc_realize(USBDevice *dev, Error **errp)
     s->an2131.ic10_eeprom = s->eeprom;
     s->an2131.ic10_size = sizeof(s->eeprom);
     s->an2131.ic11_eeprom = s->ic11;
-    s->an2131.ic11_size = sizeof(hotd3_ic11_24lc024);
+    s->an2131.ic11_size = chihiro_ic11_data ? chihiro_ic11_size : 128;
     s->an2131.extmem = s->extmem;
     s->an2131.extmem_size = sizeof(s->extmem);
     s->an2131.usb_dev = s;
@@ -1364,9 +1369,13 @@ static void chihiro_an2131qc_realize(USBDevice *dev, Error **errp)
                   qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 1);
     }
 
-    printf("[%07lld] Chihiro QC: loaded ic10 (8192B) + ic11 (128B), "
-           "region=JPN (0x01), serial=%.16s, LLE=%s\n",
-           TS_MS, (const char *)&s->eeprom[0x1F10],
+    printf("[%07lld] Chihiro QC: ic10=%s ic11=%s, "
+           "region=0x%02X, serial=%.16s, LLE=%s\n",
+           TS_MS,
+           chihiro_ic10_data ? "disk" : "builtin",
+           chihiro_ic11_data ? "disk" : "builtin",
+           s->eeprom[0x1F00],
+           (const char *)&s->eeprom[0x1F10],
            s->use_lle ? "ACTIVE" : "OFF");
 }
 
@@ -1410,17 +1419,23 @@ static void chihiro_an2131sc_realize(USBDevice *dev, Error **errp)
     usb_desc_init(dev);
     dev->auto_attach = 0;  /* Attach later via hotplug timer */
 
-    /* Load real pc20 SC EEPROM firmware (8192 bytes from MAME hotd3.zip). */
-    _Static_assert(sizeof(hotd3_pc20_g24lc64) == 8192,
-                   "pc20 firmware must be exactly 8KB");
-    memcpy(s->eeprom, hotd3_pc20_g24lc64, sizeof(s->eeprom));
+    /* Load pc20 SC EEPROM firmware (8192 bytes). */
+    if (chihiro_pc20_data && chihiro_pc20_size == sizeof(s->eeprom)) {
+        memcpy(s->eeprom, chihiro_pc20_data, sizeof(s->eeprom));
+    } else {
+        memcpy(s->eeprom, hotd3_pc20_g24lc64, sizeof(s->eeprom));
+    }
 
     /* Initialize per-endpoint bulk transfer state */
     memset(s->ep_in, 0, sizeof(s->ep_in));
 
     /* Load ic11 baseboard EEPROM (256 bytes, 24LC024) */
     memset(s->ic11, 0, sizeof(s->ic11));
-    memcpy(s->ic11, hotd3_ic11_24lc024, sizeof(hotd3_ic11_24lc024));
+    if (chihiro_ic11_data && chihiro_ic11_size <= sizeof(s->ic11)) {
+        memcpy(s->ic11, chihiro_ic11_data, chihiro_ic11_size);
+    } else {
+        memcpy(s->ic11, hotd3_ic11_24lc024, sizeof(hotd3_ic11_24lc024));
+    }
     memset(s->extmem, 0, sizeof(s->extmem));
     s->write_1e_addr = 0;
     s->write_1f_addr = 0;
@@ -1445,7 +1460,7 @@ static void chihiro_an2131sc_realize(USBDevice *dev, Error **errp)
     s->an2131.ic10_eeprom = s->eeprom;
     s->an2131.ic10_size = sizeof(s->eeprom);
     s->an2131.ic11_eeprom = s->ic11;
-    s->an2131.ic11_size = sizeof(hotd3_ic11_24lc024);
+    s->an2131.ic11_size = chihiro_ic11_data ? chihiro_ic11_size : 128;
     s->an2131.extmem = s->extmem;
     s->an2131.extmem_size = sizeof(s->extmem);
     s->an2131.usb_dev = s;

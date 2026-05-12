@@ -43,10 +43,10 @@ static void i2c_select_device(AN2131State *s, uint8_t addr7)
         s->i2c.eeprom = s->ic10_eeprom;
         s->i2c.eeprom_size = s->ic10_size;
         s->i2c.addr_bytes_needed = 2;   /* 24LC64: 2-byte address */
-    } else if (addr7 == 0x51 && s->ic11_eeprom) {
-        s->i2c.eeprom = s->ic11_eeprom;
-        s->i2c.eeprom_size = s->ic11_size;
-        s->i2c.addr_bytes_needed = 1;   /* 24LC024: 1-byte address */
+    } else if (addr7 == 0x51 && s->ic10_eeprom) {
+        s->i2c.eeprom = s->ic10_eeprom;
+        s->i2c.eeprom_size = s->ic10_size;
+        s->i2c.addr_bytes_needed = 2;   /* ic10 24LC64: A0=1 on baseboard → addr 0x51 */
     } else if (addr7 == 0x55 && s->ic11_eeprom) {
         s->i2c.eeprom = s->ic11_eeprom;
         s->i2c.eeprom_size = s->ic11_size;
@@ -87,6 +87,7 @@ static void i2c_dat_write(AN2131State *s, uint8_t val)
             return;
         }
         s->i2c.phase = s->i2c.reading ? I2C_DATA : I2C_MEM_ADDR;
+        s->i2c.first_read = s->i2c.reading;
         i2c_fire_done(s, true);
         break;
     }
@@ -121,6 +122,11 @@ static void i2c_dat_write(AN2131State *s, uint8_t val)
 static uint8_t i2c_dat_read(AN2131State *s)
 {
     uint8_t val = 0xFF;
+    if (s->i2c.first_read) {
+        s->i2c.first_read = false;
+        i2c_fire_done(s, true);
+        return val;
+    }
     if (s->i2c.reading && s->i2c.eeprom &&
         s->i2c.mem_addr < (uint16_t)s->i2c.eeprom_size) {
         val = s->i2c.eeprom[s->i2c.mem_addr];

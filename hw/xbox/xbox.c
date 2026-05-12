@@ -385,6 +385,7 @@ void xbox_init_common(MachineState *machine,
         /* Load baseboard flash ROM (SEGABOOT) from file.
          * Searches for fpr-23887/fpr21042 next to the BIOS file. */
         chihiro_load_flash_rom(g_config.sys.files.flashrom_path);
+        chihiro_load_eeproms(g_config.sys.files.flashrom_path);
 
         /* Build FATX from game directory if dvd_path is a directory.
          * If dvd_path points to an XBE, use its parent directory. */

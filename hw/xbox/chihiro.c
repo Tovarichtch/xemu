@@ -3327,6 +3327,13 @@ static bool chihiro_mbcom_enabled = false;
 static uint8_t *chihiro_flash_rom = NULL;
 static uint32_t chihiro_flash_rom_size = 0;
 
+uint8_t *chihiro_ic10_data = NULL;
+uint32_t chihiro_ic10_size = 0;
+uint8_t *chihiro_ic11_data = NULL;
+uint32_t chihiro_ic11_size = 0;
+uint8_t *chihiro_pc20_data = NULL;
+uint32_t chihiro_pc20_size = 0;
+
 /* Load flash ROM from a file path. Called during LPC device init.
  * Searches for fpr-23887 or fpr21042 in the same directory as the BIOS. */
 void chihiro_load_flash_rom(const char *bios_path)
@@ -3381,6 +3388,57 @@ void chihiro_load_flash_rom(const char *bios_path)
     }
     if(0) printf("[%07lld] Chihiro: No flash ROM found (fpr-23887/fpr21042). "
            "Will fall through to baseboard.img for mbrom reads.\n", TS_MS);
+}
+
+static uint8_t *load_eeprom_file(const char *dir, const char *name,
+                                 uint32_t expected_size, uint32_t *out_size)
+{
+    char path[2048];
+    snprintf(path, sizeof(path), "%s%s", dir, name);
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (sz <= 0 || (expected_size && (uint32_t)sz != expected_size)) {
+        fclose(f);
+        return NULL;
+    }
+    uint8_t *buf = (uint8_t *)g_malloc0(sz);
+    if (fread(buf, 1, sz, f) != (size_t)sz) {
+        g_free(buf);
+        fclose(f);
+        return NULL;
+    }
+    fclose(f);
+    *out_size = (uint32_t)sz;
+    return buf;
+}
+
+void chihiro_load_eeproms(const char *bios_path)
+{
+    if (chihiro_ic10_data) return;
+
+    char dir[1024] = {0};
+    const char *last_sep = strrchr(bios_path, '/');
+    if (!last_sep) last_sep = strrchr(bios_path, '\\');
+    if (last_sep) {
+        int dir_len = last_sep - bios_path + 1;
+        if (dir_len < (int)sizeof(dir))
+            memcpy(dir, bios_path, dir_len);
+    }
+
+    chihiro_ic10_data = load_eeprom_file(dir, "ic10_g24lc64.bin",
+                                         8192, &chihiro_ic10_size);
+    chihiro_ic11_data = load_eeprom_file(dir, "ic11_24lc024.bin",
+                                         128, &chihiro_ic11_size);
+    chihiro_pc20_data = load_eeprom_file(dir, "pc20_g24lc64.bin",
+                                         8192, &chihiro_pc20_size);
+
+    printf("Chihiro: EEPROMs from disk: ic10=%s (%uB), ic11=%s (%uB), pc20=%s (%uB)\n",
+           chihiro_ic10_data ? "OK" : "MISSING", chihiro_ic10_size,
+           chihiro_ic11_data ? "OK" : "MISSING", chihiro_ic11_size,
+           chihiro_pc20_data ? "OK" : "MISSING", chihiro_pc20_size);
 }
 
 static void chihiro_dimm_resp_timer_cb(void *opaque)
