@@ -2927,16 +2927,14 @@ static uint64_t chihiro_lpc_io_read(void *opaque, hwaddr addr,
     case SEGA_XBAM_STRING_2:
         r = 0x4D41;     /* "MA" → full string reads as "XBAM" */
         break;
-    case 0xF0: /* Board mode indicator (FUN_0014b590 reads this EVERY wake-up).
-               * High byte selects communication protocol:
-               *   0 = '!' mode (Type-1: IDE DMA via mbcom: device)
-               *   1 = ')' mode (Type-3: SADDR at 0x84000000/0x84000020)
-               * Must be CONSTANT — game re-evaluates mode each IRQ10 cycle.
-               * Response readiness is signaled via E0 bit 0, not F0. */
+    case 0xF0: /* Board mode / device count.
+               * acLib v0.22 (HotD3): checks full 16-bit == 1 → derives device 0x21.
+               * Later acLib: high byte = device ID (0x21=FPGA, 0x29=ASIC).
+               * Type-3: 0x0100 → ')' mode (SADDR). Type-1: 0x0001 → '!' mode (DMA). */
         if (chihiro_board_type3) {
-            r = 0x0100; /* Type-3: always ')' mode */
+            r = 0x0100;
         } else {
-            r = 0x0000; /* Type-1: always '!' mode */
+            r = 0x0001;
         }
         { static int f0_log = 0; if (lpc_log_verbose && f0_log < 500) { f0_log++;
             fprintf(stderr, "[%07lld] F0 READ → 0x%04X (type3=%d)\n",
@@ -4113,9 +4111,15 @@ bool chihiro_ide_write_sector(uint32_t lba, const void *buffer)
         }
         if (chihiro_game_running &&
             (chihiro_mbcom_command[0] != 0 || chihiro_mbcom_command[1] != 0)) {
-            /* Game mode: store command, fire IRQ10 to wake worker thread.
-             * Worker does E1 cycle with handler[1] (out 0x4026,0x0102)
-             * which triggers DMA_PROCESS on E1=0. */
+            /* Game mode: process immediately — the acLib poll loop blocks
+             * the update thread waiting for the response. Clear the command
+             * buffer after processing to prevent the E1 handler from
+             * double-processing the same command. */
+            chihiro_mbcom_process();
+            memset(chihiro_mbcom_command, 0, 32);
+            if (chihiro_lpc_global) {
+                chihiro_lpc_global->mbcom_e0_status |= 0x01;
+            }
             if (chihiro_irq10_global) {
                 qemu_irq_lower(chihiro_irq10_global);
                 qemu_irq_raise(chihiro_irq10_global);
