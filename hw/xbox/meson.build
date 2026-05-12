@@ -1,6 +1,8 @@
 specific_ss.add(files(
 	'acpi_xbox.c',
 	'amd_smbus.c',
+	'chihiro-8051.c',
+	'chihiro-an2131.c',
 	'chihiro-jvs.c',
 	'chihiro-usb.c',
 	'chihiro.c',

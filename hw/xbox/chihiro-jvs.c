@@ -82,16 +82,27 @@ static int jvs_handle_command(ChihiroJVSState *s,
     case 0xF0: /* Reset */
         if (cmd_len < 2) return 1;
         s->reset_count++;
+        fprintf(stderr, "[%07lld] JVS RESET: reset_count=%d sense=%d id=%d\n",
+               TS_MS, s->reset_count, s->sense, s->device_id);
         if (s->reset_count >= 2) {
             s->device_id = 0;
             s->sense = 3;
             s->reset_count = 0;
+            fprintf(stderr, "[%07lld] JVS RESET: applied → sense=3 id=0\n", TS_MS);
         }
         *rpos = rp;
         return 2;
 
     case 0xF1: /* Set Device ID */
         if (cmd_len < 2) return 1;
+        if (s->sense == 0) {
+            fprintf(stderr, "[%07lld] JVS SET_ID: BLOCKED sense=0 id=%d (already assigned)\n",
+                   TS_MS, s->device_id);
+            *rpos = rp;
+            return 2;
+        }
+        fprintf(stderr, "[%07lld] JVS SET_ID: sense=%d → assigning id=%d\n",
+               TS_MS, s->sense, cmd[1]);
         s->device_id = cmd[1];
         s->sense = 0;
         s->reset_count = 0;
@@ -302,7 +313,7 @@ int chihiro_jvs_process(ChihiroJVSState *s,
     static int jvs_game_phase = 0;
     static int jvs_dump_count = 0;
     if (data_len >= 10 && raw[0] == 0x20 && raw[7] == 0x32) {
-        jvs_game_phase = 1;  /* transition detected */
+        jvs_game_phase = 1;
     }
     if (0 && jvs_game_phase && jvs_dump_count < 100) {
         jvs_dump_count++;
