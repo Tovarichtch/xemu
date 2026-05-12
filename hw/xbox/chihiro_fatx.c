@@ -29,7 +29,7 @@
 #define FATX_DIRENTS_PER_CLUSTER (FATX_CLUSTER_SIZE / FATX_DIRENT_SIZE)
 #define FATX_FAT_END        0xFFFF
 #define FATX_FAT_FREE       0x0000
-#define FATX_MAX_FILES      2048
+#define FATX_MAX_FILES      8192
 #define FATX_MAX_NAME       42
 
 /* File entry for building */
@@ -213,12 +213,12 @@ uint8_t *chihiro_fatx_build(const char *game_dir, uint32_t *out_size,
     fatx_next_cluster = 1;
 
     /* Phase 1: Scan directory */
-    printf("[FATX] Scanning: %s\n", game_dir);
+    fprintf(stderr, "[FATX] Scanning: %s\n", game_dir);
     if (fatx_scan_dir(game_dir, -1) < 0) {
-        printf("[FATX] ERROR: cannot open directory '%s'\n", game_dir);
+        fprintf(stderr, "[FATX] ERROR: cannot open directory '%s'\n", game_dir);
         return NULL;
     }
-    printf("[FATX] Found %d files/dirs\n", fatx_file_count);
+    fprintf(stderr, "[FATX] Found %d files/dirs\n", fatx_file_count);
 
     /* Phase 2: Calculate layout to match kernel expectations.
      * The kernel calculates FAT size from the FULL partition, not file data.
@@ -258,7 +258,7 @@ uint8_t *chihiro_fatx_build(const char *game_dir, uint32_t *out_size,
         (uint32_t)(file_data / FATX_CLUSTER_SIZE) + 256;
     fatx_image_size = fatx_data_offset + needed_clusters * FATX_CLUSTER_SIZE;
 
-    printf("[FATX] Clusters: %u, FAT: %u bytes, Image: %u bytes (%.1f MB)\n",
+    fprintf(stderr, "[FATX] Clusters: %u, FAT: %u bytes, Image: %u bytes (%.1f MB)\n",
            fatx_total_clusters, fat_bytes, fatx_image_size,
            fatx_image_size / (1024.0 * 1024.0));
 
