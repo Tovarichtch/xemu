@@ -403,6 +403,17 @@ void xbox_init_common(MachineState *machine,
                         char *slash = strrchr(game_dir, '/');
                         if (!slash) slash = strrchr(game_dir, '\\');
                         if (slash) *slash = '\0';
+                        /* TODO: delete — FATX hack for subdirectory games (WMMT1).
+                         * Will be removed when FATX is replaced by real DIMM board. */
+                        char bootid_check[2112];
+                        snprintf(bootid_check, sizeof(bootid_check),
+                                 "%s/boot.id", game_dir);
+                        struct stat bid_st;
+                        if (stat(bootid_check, &bid_st) != 0) {
+                            slash = strrchr(game_dir, '/');
+                            if (!slash) slash = strrchr(game_dir, '\\');
+                            if (slash) *slash = '\0';
+                        }
                     }
                     uint32_t fatx_size = 0;
                     /* mbfs: partition = DIMM_sectors - 0x8000 (512MB → 0xF8000) */
@@ -413,18 +424,20 @@ void xbox_init_common(MachineState *machine,
                         printf("Chihiro: FATX built from '%s' (%u MB)\n",
                                game_dir, fatx_size / (1024*1024));
 
-                        /* If dvd_path points to a specific .xbe, patch boot.id
-                         * in the FATX image so SEGABOOT launches that XBE. */
+                        /* TODO: delete — FATX boot.id patching hack.
+                         * Will be removed with FATX when real DIMM board is emulated. */
                         if (!S_ISDIR(st.st_mode)) {
-                            const char *xbe_name = strrchr(dvd, '/');
-                            if (!xbe_name) xbe_name = strrchr(dvd, '\\');
-                            if (xbe_name) xbe_name++; else xbe_name = dvd;
+                            size_t gd_len = strlen(game_dir);
+                            const char *rel = dvd + gd_len;
+                            if (*rel == '/' || *rel == '\\') rel++;
                             for (uint32_t off = 0; off + 480 <= fatx_size; off++) {
                                 if (memcmp(fatx + off, "BTID", 4) == 0 &&
                                     memcmp(fatx + off + 0x20, "XBAM", 4) == 0) {
                                     char patched[32];
                                     memset(patched, 0, 32);
-                                    snprintf(patched, 32, "\\%s", xbe_name);
+                                    snprintf(patched, 32, "\\%s", rel);
+                                    for (int i = 0; i < 32; i++)
+                                        if (patched[i] == '/') patched[i] = '\\';
                                     memcpy(fatx + off + 0xA0, patched, 32);
                                     printf("Chihiro: boot.id patched → '%s'\n",
                                            patched);
