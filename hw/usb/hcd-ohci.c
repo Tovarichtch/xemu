@@ -899,8 +899,6 @@ static void ohci_td_pkt(const char *msg, const uint8_t *buf, size_t len)
  */
 static int ohci_service_td(OHCIState *ohci, struct ohci_ed *ed)
 {
-    extern uint64_t perf_cnt_ohci_td;
-    perf_cnt_ohci_td++;
     int dir;
     size_t len = 0, pktlen = 0;
     const char *str = NULL;
@@ -1337,9 +1335,6 @@ static void ohci_process_lists(OHCIState *ohci)
 /* Do frame processing on frame boundary */
 static void ohci_frame_boundary(void *opaque)
 {
-    extern uint64_t perf_cnt_ohci_frame;
-    perf_cnt_ohci_frame++;
-
     /* Periodic timestamp: print emu time + wall clock every 2s of emu time */
     {
         static int64_t last_ts_print = 0;

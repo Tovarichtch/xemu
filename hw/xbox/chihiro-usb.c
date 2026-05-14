@@ -32,14 +32,6 @@
 #define TS_MS ((long long)(qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL)))
 extern bool chihiro_game_running;
 extern bool lpc_log_verbose;
-extern int64_t freeze_last_usb_activity_ms;
-static bool usb_log_verbose = false;
-#define DEBUG_CUSB
-#ifdef DEBUG_CUSB
-#define DPRINTF(s, ...) do { } while(0)
-#else
-#define DPRINTF(...)
-#endif
 
 typedef struct ChihiroUSBState {
     USBDevice dev;
@@ -87,11 +79,6 @@ typedef struct ChihiroUSBState {
     int uart0_empty_polls;
     int64_t uart0_first_poll_ms;
     int64_t uart0_last_log_ms;
-
-    /* v202: instrumentation counters (read/reset by DIAG timer) */
-    uint32_t nak_count;    /* bulk IN NAK count since last report */
-    uint32_t bulk_in_count;  /* successful bulk IN count */
-    uint32_t bulk_out_count; /* bulk OUT count */
 
     /* v302: EZ-USB firmware reboot simulation timers.
      * Real AN2131 loads firmware from EEPROM after initial enumeration,
@@ -359,35 +346,12 @@ static void handle_reset(USBDevice *dev)
     }
 }
 
-static uint64_t jvs_send_count = 0;
-static uint64_t jvs_recv_count = 0;
-static uint64_t jvs_recv_has_data = 0;
 
 static void handle_control(USBDevice *dev, USBPacket *p,
                int request, int value, int index, int length, uint8_t *data)
 {
-    extern uint64_t perf_cnt_usb_control;
-    perf_cnt_usb_control++;
-    freeze_last_usb_activity_ms = TS_MS;
     ChihiroUSBState *s = (ChihiroUSBState *)dev;
-    const char *id = ((ChihiroUSBState *)dev)->is_qc ? "QC" : "SC";
-
-    {
-        static int ctrl_log = 0;
-        if (usb_log_verbose && ctrl_log < 10000) {
-            ctrl_log++;
-            fprintf(stderr, "[%07lld] chihiro-usb [%s]: CTRL req=0x%04X val=0x%04X idx=0x%04X len=%d [%s]\n", TS_MS,
-                   id, request, value, index, length,
-                   (request == 0x8006 && (value >> 8) == 1) ? "GET_DESC(DEV)" :
-                   (request == 0x8006 && (value >> 8) == 2) ? "GET_DESC(CFG)" :
-                   (request == 0x8006 && (value >> 8) == 3) ? "GET_DESC(STR)" :
-                   (request == 0x0005) ? "SET_ADDRESS" :
-                   (request == 0x0009) ? "SET_CONFIG" :
-                   (request == 0x010B) ? "SET_IFACE" :
-                   ((request >> 8) == 0x40 || (request >> 8) == 0xC0) ? "VENDOR" :
-                   "OTHER");
-        }
-    }
+    const char *id = s->is_qc ? "QC" : "SC";
 
     int ret = usb_desc_handle_control(dev, p, request, value, index,
                                       length, data);
@@ -602,12 +566,10 @@ static void handle_control(USBDevice *dev, USBPacket *p,
         break;
     }
     case 0x19: { /* Get JVS responses (QC path) */
-        jvs_recv_count++;
         data[0] = 0x00;  /* not busy */
         /* Update sense in PINSB */
         data[2] = (data[2] & 0xFC) | (s->jvs.sense & 0x03);
         if (s->jvs.response_len > 0) {
-            jvs_recv_has_data++;
             int rlen = s->jvs.response_len;
             uint8_t *ep = s->ep_in[4].buf;
             int wrapped = 0;
@@ -638,7 +600,6 @@ static void handle_control(USBDevice *dev, USBPacket *p,
         break;
     }
     case 0x20: { /* Send JVS packets (QC path) */
-        jvs_send_count++;
         /* AN2131QC format: byte 0 = sequence counter, bytes 1+ = JVS frame */
         uint8_t *jvs_data = host_data;
         int jvs_len = host_len;
@@ -871,10 +832,8 @@ static void handle_control(USBDevice *dev, USBPacket *p,
 
 static void handle_data(USBDevice *dev, USBPacket *p)
 {
-    extern uint64_t perf_cnt_usb_handle;
-    perf_cnt_usb_handle++;
     ChihiroUSBState *s = (ChihiroUSBState *)dev;
-    const char *id = ((ChihiroUSBState *)dev)->is_qc ? "QC" : "SC";
+    const char *id = s->is_qc ? "QC" : "SC";
     int ep = p->ep->nr;
 
     /* LLE path: route bulk transfers through AN2131 firmware */
@@ -895,8 +854,6 @@ static void handle_data(USBDevice *dev, USBPacket *p)
                     s->an2131.ep[4].cs_in &= ~0x02;
                     s->an2131.in07irq |= (1 << 4);
                 }
-                s->bulk_in_count++;
-                freeze_last_usb_activity_ms = TS_MS;
             } else {
                 int avail = an2131_ep_in_poll(&s->an2131, ep);
                 if (lpc_log_verbose && !s->is_qc && (ep == 1 || ep == 2)) {
@@ -918,13 +875,10 @@ static void handle_data(USBDevice *dev, USBPacket *p)
                             fprintf(stderr, "\n");
                         }
                         usb_packet_copy(p, buf, got);
-                        s->bulk_in_count++;
-                        freeze_last_usb_activity_ms = TS_MS;
                     } else {
                         p->status = USB_RET_NAK;
                     }
                 } else {
-                    s->nak_count++;
                     p->status = USB_RET_NAK;
                 }
             }
@@ -934,8 +888,6 @@ static void handle_data(USBDevice *dev, USBPacket *p)
             int chunk = MIN(len, (int)sizeof(buf));
             usb_packet_copy(p, buf, chunk);
             an2131_ep_out_write(&s->an2131, ep, buf, chunk);
-            s->bulk_out_count++;
-            freeze_last_usb_activity_ms = TS_MS;
 
             /* Backup write HLE: track EP3 OUT writes and signal completion
              * for the 0x18 count=0 status poll. */
@@ -969,8 +921,6 @@ static void handle_data(USBDevice *dev, USBPacket *p)
             usb_packet_copy(p, s->ep_in[ep].buf + s->ep_in[ep].offset, len);
             s->ep_in[ep].offset += len;
             s->ep_in[ep].pending -= len;
-            s->bulk_in_count++;
-            freeze_last_usb_activity_ms = TS_MS;
         } else {
             if (s->acbu_sbhq_pending && s->is_qc && ep == 3 &&
                 s->acbu_last_ep3_out_ms > 0 &&
@@ -984,9 +934,7 @@ static void handle_data(USBDevice *dev, USBPacket *p)
                 usb_packet_copy(p, s->ep_in[3].buf, len);
                 s->ep_in[3].offset += len;
                 s->ep_in[3].pending -= len;
-                s->bulk_in_count++;
             } else {
-                s->nak_count++;
                 p->status = USB_RET_NAK;
             }
         }
@@ -1076,35 +1024,8 @@ static void handle_data(USBDevice *dev, USBPacket *p)
                 }
             }
         }
-        s->bulk_out_count++;
-        freeze_last_usb_activity_ms = TS_MS;
     }
 }
-
-/* v202: Counter accessors for DIAG timer in chihiro.c */
-void chihiro_usb_get_counters(USBDevice *dev, uint32_t *nak, uint32_t *bulk_in, uint32_t *bulk_out)
-{
-    ChihiroUSBState *s = (ChihiroUSBState *)dev;
-    if (nak)      *nak      = s->nak_count;
-    if (bulk_in)  *bulk_in  = s->bulk_in_count;
-    if (bulk_out) *bulk_out = s->bulk_out_count;
-}
-
-void chihiro_usb_reset_counters(USBDevice *dev)
-{
-    ChihiroUSBState *s = (ChihiroUSBState *)dev;
-    s->nak_count = 0;
-    s->bulk_in_count = 0;
-    s->bulk_out_count = 0;
-}
-
-void chihiro_usb_get_jvs_counters(uint64_t *send, uint64_t *recv, uint64_t *recv_data)
-{
-    if (send)      *send      = jvs_send_count;
-    if (recv)      *recv      = jvs_recv_count;
-    if (recv_data) *recv_data = jvs_recv_has_data;
-}
-
 
 static void chihiro_an2131qc_realize(USBDevice *dev, Error **errp)
 {
