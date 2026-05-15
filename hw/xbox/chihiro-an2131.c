@@ -9,6 +9,8 @@
  * Register addresses from Cypress EZ-USB TRM v1.9/1.10.
  */
 
+#include "qemu/osdep.h"
+#include "qemu/timer.h"
 #include "chihiro-an2131.h"
 #include "chihiro-jvs.h"
 #include <string.h>
@@ -166,7 +168,7 @@ static uint8_t an2131_xdata_read(Cpu8051State *cpu, uint16_t addr)
         case AN_OUTC:     return s->outc;
         case AN_PINSA:    return s->pinsa;
         case AN_PINSB: {
-            extern ChihiroJVSState *chihiro_jvs_global;
+
             uint8_t sense = chihiro_jvs_global ? (chihiro_jvs_global->sense & 0x03) : 0x03;
             return (s->pinsb & ~0x03) | sense;
         }
@@ -352,6 +354,14 @@ static void an2131_xdata_write(Cpu8051State *cpu, uint16_t addr, uint8_t val)
                 s->ep[n].bc_in = val;
                 s->ep[n].in_armed = true;
                 s->ep[n].cs_in |= EPCS_BSY;
+                if (n == 4) s->diag_ep4_arms++;
+                if (n == 3) {
+                    static int ep3arm_diag = 0;
+                    if (ep3arm_diag < 30)
+                        fprintf(stderr, "[EP3-ARM] bc=%d PC=0x%04X\n",
+                                val, s->cpu.pc);
+                    ep3arm_diag++;
+                }
             } else {
                 s->ep[n].cs_in = val;
             }
@@ -372,8 +382,29 @@ static void an2131_xdata_write(Cpu8051State *cpu, uint16_t addr, uint8_t val)
     }
 
     /* External SRAM: 0x2000-0x7B3F and 0x8000-0xFFFF */
-    if (s->extmem)
+    if (s->extmem) {
+        if (addr == 0xB003 && val != s->extmem[addr]) {
+            static int b3diag = 0;
+            if (b3diag < 20) {
+                b3diag++;
+                fprintf(stderr, "[B003-WRITE] old=%02X new=%02X PC=0x%04X SP=0x%02X "
+                        "state=%02X B000: %02X %02X %02X %02X %02X %02X\n",
+                        s->extmem[addr], val, s->cpu.pc, s->cpu.sfr[0x81-0x80],
+                        s->cpu.iram[0x08],
+                        s->extmem[0xB000], s->extmem[0xB001], s->extmem[0xB002],
+                        val, s->extmem[0xB004], s->extmem[0xB005]);
+            }
+        }
+        if (addr == 0xE485 || addr == 0xE486) {
+            static int ediag = 0;
+            if (ediag < 10) { ediag++;
+                fprintf(stderr, "[E485-WRITE] addr=%04X val=%02X PC=0x%04X "
+                        "E485=%02X E486=%02X\n",
+                        addr, val, s->cpu.pc, s->extmem[0xE485], s->extmem[0xE486]);
+            }
+        }
         s->extmem[addr] = val;
+    }
 }
 
 /* ── SFR callbacks (AN2131-specific registers) ────────────────────── */
@@ -432,6 +463,15 @@ static void an2131_sfr_write(Cpu8051State *cpu, uint8_t addr, uint8_t val)
     }
     case 0xC1: /* SBUF1 — serial TX (channel 1, JVS) */
     {
+        s->diag_sbuf1_writes++;
+        { static int sbd = 0; if (sbd < 30) { sbd++;
+            uint8_t sp = cpu->sp;
+            fprintf(stderr, "[SBUF1-WR] byte=0x%02X PC=0x%04X state=%02X "
+                    "txlen=%d SP=%02X ret=%04X ret2=%04X\n",
+                    val, cpu->pc, cpu->iram[0x08], s->jvs_tx_len, sp,
+                    (cpu->iram[sp] << 8) | cpu->iram[sp > 0 ? sp-1 : 0],
+                    sp > 1 ? ((cpu->iram[sp-2] << 8) | cpu->iram[sp-3]) : 0);
+        }}
         cpu->sfr[0xC0 - 0x80] |= 0x02;  /* set TI1 — byte "sent" */
 
         if (val == 0xE0 && s->jvs_tx_len > 0) {
@@ -446,7 +486,8 @@ static void an2131_sfr_write(Cpu8051State *cpu, uint8_t addr, uint8_t val)
         }
 
         if (s->jvs_tx_expected > 0 && s->jvs_tx_len >= s->jvs_tx_expected) {
-            extern ChihiroJVSState *chihiro_jvs_global;
+            s->diag_jvs_tx++;
+
             if (chihiro_jvs_global) {
                 int rlen = chihiro_jvs_process(chihiro_jvs_global,
                                                s->jvs_tx_buf, s->jvs_tx_expected,
@@ -461,7 +502,9 @@ static void an2131_sfr_write(Cpu8051State *cpu, uint8_t addr, uint8_t val)
                            s->jvs_tx_expected > 3 ? s->jvs_tx_buf[3] : 0);
                 }
                 if (rlen > 0) {
+                    s->diag_jvs_rx++;
                     s->jvs_response_ready = true;
+                    s->jvs_response_set_cycles = s->total_cycles;
                 }
             }
             s->jvs_tx_len = 0;
@@ -521,6 +564,7 @@ static void check_interrupts(AN2131State *s)
     if ((cpu->sfr[SFR_IE - 0x80] & 0x02) &&
         (cpu->sfr[SFR_TCON - 0x80] & 0x20)) {
         cpu->sfr[SFR_TCON - 0x80] &= ~0x20;  /* clear TF0 */
+        s->diag_t0_overflows++;
         cpu8051_interrupt(cpu, 0x000B);
         return;
     }
@@ -529,6 +573,7 @@ static void check_interrupts(AN2131State *s)
     if ((cpu->sfr[SFR_IE - 0x80] & 0x08) &&
         (cpu->sfr[SFR_TCON - 0x80] & 0x80)) {
         cpu->sfr[SFR_TCON - 0x80] &= ~0x80;  /* clear TF1 */
+        s->diag_t1_overflows++;
         cpu8051_interrupt(cpu, 0x001B);
         return;
     }
@@ -536,6 +581,7 @@ static void check_interrupts(AN2131State *s)
     /* Serial interrupt (RI|TI in SCON), enabled by IE.4 (ES) */
     if ((cpu->sfr[SFR_IE - 0x80] & 0x10) &&
         (cpu->sfr[SFR_SCON - 0x80] & 0x03)) {
+        s->diag_serial0_irqs++;
         cpu8051_interrupt(cpu, 0x0023);
         return;
     }
@@ -543,6 +589,7 @@ static void check_interrupts(AN2131State *s)
     /* Second serial channel (SFR 0xC0 bits 0-1), enabled by IE.6 */
     if ((cpu->sfr[SFR_IE - 0x80] & 0x40) &&
         (cpu->sfr[0xC0 - 0x80] & 0x03)) {
+        s->diag_serial1_irqs++;
         cpu8051_interrupt(cpu, 0x003B);
         return;
     }
@@ -556,7 +603,18 @@ static void check_interrupts(AN2131State *s)
             if (s->usbbav & USBBAV_AVEN) {
                 s->ram[0x0045] = avec;
             }
+            if (avec == 0x3C) {
+                static int ep4out_isr_diag = 0;
+                if (ep4out_isr_diag < 20) {
+                    fprintf(stderr, "[ISR-DISPATCH] EP4OUT avec=0x3C usbbav=0x%02X "
+                            "code[43:46]=%02X%02X%02X in_int=%d PC=0x%04X\n",
+                            s->usbbav, s->ram[0x0043], s->ram[0x0044], s->ram[0x0045],
+                            cpu->in_interrupt, cpu->pc);
+                    ep4out_isr_diag++;
+                }
+            }
             s->exif |= 0x10;
+            s->diag_usb_irqs++;
             cpu8051_interrupt(cpu, INT2_VECTOR);
             return;
         }
@@ -566,6 +624,7 @@ static void check_interrupts(AN2131State *s)
     if ((s->eie & 0x02) && s->i2c_irq_pending) {
         s->i2c_irq_pending = false;
         s->exif |= 0x20;
+        s->diag_i2c_irqs++;
         cpu8051_interrupt(cpu, INT3_VECTOR);
     }
 }
@@ -727,14 +786,19 @@ int an2131_setup_packet(AN2131State *s, const uint8_t setup[8],
 {
     if (!s->cpu_running) return -1;
 
+    s->diag_setup_calls++;
     static int sp_log = 0;
-    bool do_log = (sp_log < 30);
+    int64_t sp_now = qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL);
+    bool post_segaboot = (sp_now > 6000);
 
-    if (do_log) {
-        fprintf(stderr, "[AN2131] setup_packet ENTER: bReq=0x%02X in_int=%d halted=%d "
-                "PC=0x%04X usbirq=0x%02X ep0cs=0x%02X\n",
-                setup[1], s->cpu.in_interrupt, s->cpu.halted,
-                s->cpu.pc, s->usbirq, s->ep0cs);
+    if (post_segaboot) {
+        fprintf(stderr, "[SP %07lld] bReq=0x%02X wVal=0x%04X wIdx=0x%04X wLen=%d "
+                "PC=0x%04X ep4arm=%d\n",
+                (long long)sp_now, setup[1],
+                (uint16_t)(setup[2] | (setup[3] << 8)),
+                (uint16_t)(setup[4] | (setup[5] << 8)),
+                (uint16_t)(setup[6] | (setup[7] << 8)),
+                s->cpu.pc, s->ep[4].in_armed);
     }
 
     /* Force-clear stale interrupt state */
@@ -756,15 +820,32 @@ int an2131_setup_packet(AN2131State *s, const uint8_t setup[8],
 
     bool is_in = setup[0] & 0x80;
     bool need_ep4 = (setup[1] == 0x19 && is_in);
+
+    /* SESSION24 DIAG: dump extmem[0xB000] state on v0x19 */
+    if (post_segaboot && setup[1] == 0x19) {
+        static int v19d = 0;
+        if (v19d < 30) {
+            v19d++;
+            fprintf(stderr, "[v19-PRE] state=%02X iram17=%02X ep4arm=%d B000:",
+                    s->cpu.iram[0x08], s->cpu.iram[0x17], s->ep[4].in_armed);
+            if (s->extmem) {
+                for (int i = 0; i < 10; i++)
+                    fprintf(stderr, " %02X", s->extmem[0xB000 + i]);
+            }
+            fprintf(stderr, "\n");
+        }
+    }
     int cycles = 0;
     int limit = 500000;
     int drain = 0;
+    bool mainloop_hit = false;
 
     while (cycles < limit) {
         jvs_rx_deliver(s);
         check_interrupts(s);
         int c = cpu8051_step(&s->cpu);
         if (c <= 0) {
+            s->total_cycles++;
             if (usb_irq_pending(s) || s->i2c_irq_pending ||
                 s->jvs_response_ready || s->jvs_rx_pending) {
                 s->cpu.halted = false;
@@ -773,6 +854,12 @@ int an2131_setup_packet(AN2131State *s, const uint8_t setup[8],
             break;
         }
         cycles += c;
+        s->total_cycles += c;
+
+        if (drain && s->cpu.pc == 0x0696) mainloop_hit = true;
+
+        if (is_in && s->ep[0].in_armed)
+            s->ep0cs &= ~EP0CS_INBSY;
 
         if (!drain) {
             if (is_in && s->ep[0].in_armed) {
@@ -781,21 +868,53 @@ int an2131_setup_packet(AN2131State *s, const uint8_t setup[8],
             }
             if (!is_in && !(s->usbirq & USBIRQ_SUDAV)) drain = cycles;
         }
-        if (drain && (cycles - drain) > 2000) break;
+        if (drain && mainloop_hit && (cycles - drain) > 2000) break;
+        if (drain && (cycles - drain) > 20000) break;
     }
 
-    if (do_log) {
-        sp_log++;
-        fprintf(stderr, "[AN2131] setup_packet EXIT: cycles=%d in_armed=%d in_int=%d "
-                "halted=%d PC=0x%04X usbirq=0x%02X\n",
-                cycles, s->ep[0].in_armed, s->cpu.in_interrupt,
-                s->cpu.halted, s->cpu.pc, s->usbirq);
+    if (post_segaboot) {
+        fprintf(stderr, "[SP-DRAIN %07lld] bReq=0x%02X cyc=%d drain_at=%d "
+                "drain_run=%d mainloop=%d slot3=%02X%02X%02X PC=0x%04X\n",
+                (long long)sp_now, setup[1], cycles, drain,
+                drain ? cycles - drain : 0, mainloop_hit,
+                s->cpu.iram[0x30], s->cpu.iram[0x31], s->cpu.iram[0x32],
+                s->cpu.pc);
     }
+
+    /* SESSION24 DIAG: post-run state for v0x19 */
+    if (post_segaboot && setup[1] == 0x19) {
+        static int v19p = 0;
+        if (v19p < 30) {
+            v19p++;
+            fprintf(stderr, "[v19-POST] state=%02X iram17=%02X ep4arm=%d bc4=%d "
+                    "B000:",
+                    s->cpu.iram[0x08], s->cpu.iram[0x17],
+                    s->ep[4].in_armed, s->ep[4].bc_in);
+            if (s->extmem) {
+                for (int i = 0; i < 10; i++)
+                    fprintf(stderr, " %02X", s->extmem[0xB000 + i]);
+            }
+            fprintf(stderr, " IN0:");
+            for (int i = 0; i < 8; i++)
+                fprintf(stderr, " %02X", s->ram[AN_IN0BUF - 0x6000 + i]);
+            fprintf(stderr, " IN4:");
+            for (int i = 0; i < 8; i++)
+                fprintf(stderr, " %02X", s->ram[0x1700 + i]);
+            fprintf(stderr, "\n");
+        }
+    }
+
+    sp_log++;
 
     if (is_in && s->ep[0].in_armed) {
         int bc = s->ep[0].bc_in;
         int copy = min_int(bc, resp_max);
         memcpy(resp_buf, &s->ram[AN_IN0BUF - 0x6000], copy);
+
+        /* v0x19 pending_len override — REMOVED for testing (session 26).
+         * Was needed when JVS RX delivery was broken (virtual-time delay).
+         * With cycle-based delay, firmware handles B000 correctly. */
+
         s->ep[0].in_armed = false;
         s->ep0cs &= ~EP0CS_INBSY;
         return copy;
@@ -810,7 +929,7 @@ int an2131_ep_in_poll(AN2131State *s, int ep_nr)
 
     an2131_run(s, 5000);
 
-    return s->ep[ep_nr].in_armed ? s->ep[ep_nr].bc_in : 0;
+    return s->ep[ep_nr].in_armed ? s->ep[ep_nr].bc_in : -1;
 }
 
 int an2131_ep_in_read(AN2131State *s, int ep_nr,
@@ -837,6 +956,10 @@ int an2131_ep_in_read(AN2131State *s, int ep_nr,
     /* Notify firmware: IN data was sent to host */
     s->in07irq |= (1 << ep_nr);
 
+    if (ep_nr == 4) {
+        s->jvs_ep4_consumed = true;
+    }
+
     return copy;
 }
 
@@ -860,8 +983,46 @@ void an2131_ep_out_write(AN2131State *s, int ep_nr,
         s->ep[ep_nr].cs_out |= EPCS_BSY;
 
     s->out07irq |= (1 << ep_nr);
+    if (ep_nr == 3) {
+        static int ep3set_diag = 0;
+        if (ep3set_diag < 5)
+            fprintf(stderr, "[EP3-IRQ-SET] out07irq=%02X ep=%d\n",
+                    s->out07irq, ep_nr);
+        ep3set_diag++;
+    }
+
+    if (ep_nr == 4) {
+        s->jvs_ep4_consumed = false;
+        static int ep4out_diag = 0;
+        if (ep4out_diag < 20) {
+            fprintf(stderr, "[EP4OUT-PRE] len=%d iram[0A:0B]=%02X%02X "
+                    "iram[12:13]=%02X%02X slot3=%02X%02X%02X data:",
+                    copy, s->cpu.iram[0x0A], s->cpu.iram[0x0B],
+                    s->cpu.iram[0x12], s->cpu.iram[0x13],
+                    s->cpu.iram[0x30], s->cpu.iram[0x31], s->cpu.iram[0x32]);
+            for (int i = 0; i < copy && i < 9; i++)
+                fprintf(stderr, " %02X", data[i]);
+            fprintf(stderr, "\n");
+        }
+    }
 
     an2131_run(s, 50000);
+
+    if (ep_nr == 4) {
+        static int ep4out_post = 0;
+        if (ep4out_post < 20) {
+            fprintf(stderr, "[EP4OUT-POST] iram[0A:0B]=%02X%02X "
+                    "iram[12:13]=%02X%02X slot3=%02X%02X%02X PC=0x%04X "
+                    "jvs_tx=%d jvs_rx=%d ep4_armed=%d sbuf1_wr=%"PRIu64"\n",
+                    s->cpu.iram[0x0A], s->cpu.iram[0x0B],
+                    s->cpu.iram[0x12], s->cpu.iram[0x13],
+                    s->cpu.iram[0x30], s->cpu.iram[0x31], s->cpu.iram[0x32],
+                    s->cpu.pc,
+                    s->jvs_tx_len, s->jvs_rx_len, s->ep[4].in_armed,
+                    s->diag_sbuf1_writes);
+            ep4out_post++;
+        }
+    }
 }
 
 static void jvs_rx_deliver(AN2131State *s)
@@ -869,22 +1030,53 @@ static void jvs_rx_deliver(AN2131State *s)
     Cpu8051State *cpu = &s->cpu;
     if (cpu->in_interrupt) return;
 
-    /* First byte: wait until TX state machine drains (TI1 cleared) */
+    /* First byte: simulate RS-485 serial latency (~2ms at 115200 baud).
+     * Use CPU cycles (not virtual time) so delay works during an2131_run bursts. */
     if (s->jvs_response_ready) {
+        uint64_t elapsed = s->total_cycles - s->jvs_response_set_cycles;
+        if (elapsed < 2000) return;
         if (cpu->sfr[0xC0 - 0x80] & 0x02) return;  /* TI1 still set */
         cpu->sfr[0xC1 - 0x80] = s->jvs_rx_buf[0];
         s->jvs_rx_pos = 1;
         cpu->sfr[0xC0 - 0x80] |= 0x01;  /* set RI1 */
         s->jvs_response_ready = false;
         s->jvs_rx_pending = false;
+        { static int rxd = 0; if (rxd < 10) { rxd++;
+            fprintf(stderr, "[JVS-RX] FIRST byte=0x%02X delay=%llu cyc len=%d state=%02X\n",
+                    s->jvs_rx_buf[0], (unsigned long long)elapsed,
+                    s->jvs_rx_len, s->cpu.iram[0x08]);
+        }}
         return;
     }
 
     /* Subsequent bytes: deliver after ISR returns */
     if (s->jvs_rx_pending) {
         if (s->jvs_rx_pos < s->jvs_rx_len) {
-            cpu->sfr[0xC1 - 0x80] = s->jvs_rx_buf[s->jvs_rx_pos++];
+            uint8_t rxbyte = s->jvs_rx_buf[s->jvs_rx_pos];
+            cpu->sfr[0xC1 - 0x80] = rxbyte;
+            s->jvs_rx_pos++;
             cpu->sfr[0xC0 - 0x80] |= 0x01;  /* set RI1 */
+            { static int rxe = 0; if (rxe < 40) { rxe++;
+                fprintf(stderr, "[JVS-RX] byte[%d]=0x%02X state=%02X "
+                        "B440: %02X %02X %02X %02X %02X %02X\n",
+                        s->jvs_rx_pos - 1, rxbyte, s->cpu.iram[0x08],
+                        s->extmem[0xB440], s->extmem[0xB441],
+                        s->extmem[0xB442], s->extmem[0xB443],
+                        s->extmem[0xB444], s->extmem[0xB445]);
+            }}
+            if (s->jvs_rx_pos >= s->jvs_rx_len) {
+                static int rxl = 0; if (rxl < 10) { rxl++;
+                    fprintf(stderr, "[JVS-RX] COMPLETE: B000:");
+                    if (s->extmem)
+                        for (int i = 0; i < 12; i++)
+                            fprintf(stderr, " %02X", s->extmem[0xB000 + i]);
+                    fprintf(stderr, " | B440:");
+                    if (s->extmem)
+                        for (int i = 0; i < 12; i++)
+                            fprintf(stderr, " %02X", s->extmem[0xB440 + i]);
+                    fprintf(stderr, "\n");
+                }
+            }
         }
         s->jvs_rx_pending = false;
     }
@@ -893,13 +1085,27 @@ static void jvs_rx_deliver(AN2131State *s)
 int an2131_run(AN2131State *s, int max_cycles)
 {
     if (!s->cpu_running) return 0;
+    static uint8_t last_jvs_state = 0xFF;
+    static int sdiag = 0;
 
     int total = 0;
     while (total < max_cycles) {
+        uint8_t cur_state = s->cpu.iram[0x08];
+        if (cur_state != last_jvs_state && sdiag < 40) {
+            sdiag++;
+            fprintf(stderr, "[STATE] %02X→%02X PC=0x%04X E8000=%02X "
+                    "SCON1=%02X slot3=%02X%02X%02X\n",
+                    last_jvs_state, cur_state, s->cpu.pc,
+                    s->extmem ? s->extmem[0x8000] : 0,
+                    s->cpu.sfr[0xC0-0x80],
+                    s->cpu.iram[0x30], s->cpu.iram[0x31], s->cpu.iram[0x32]);
+            last_jvs_state = cur_state;
+        }
         jvs_rx_deliver(s);
         check_interrupts(s);
         int c = cpu8051_step(&s->cpu);
         if (c <= 0) {
+            s->total_cycles++;
             if (usb_irq_pending(s) || s->i2c_irq_pending ||
                 s->jvs_response_ready || s->jvs_rx_pending) {
                 s->cpu.halted = false;
@@ -908,6 +1114,7 @@ int an2131_run(AN2131State *s, int max_cycles)
             break;
         }
         total += c;
+        s->total_cycles += c;
     }
     return total;
 }

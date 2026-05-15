@@ -99,6 +99,22 @@ typedef struct ChihiroUSBState {
     AN2131State an2131;
     bool use_lle;  /* true after firmware loaded and AN2131 CPU running */
     QEMUTimer *lle_tick_timer;
+
+    /* JVS watchdog diagnostic */
+    int64_t last_jvs_send_ms;
+    int64_t last_jvs_recv_ms;
+    bool jvs_watchdog_fired;
+
+    /* ── DIAG: event-driven listeners (no behavior change) ──── */
+    int64_t diag_last_report_ms;
+    uint64_t diag_tick_count;
+    uint64_t diag_cycles_total;
+    /* state snapshot for transition detection */
+    bool diag_prev_tr0;
+    bool diag_prev_ep4_armed;
+    bool diag_prev_halted;
+    bool diag_prev_cpu_running;
+    int  diag_zero_cycle_streak;
 } ChihiroUSBState;
 
 enum chihiro_usb_strings {
@@ -298,7 +314,6 @@ static void ezusb_disconnect_cb(void *opaque)
 {
     ChihiroUSBState *s = (ChihiroUSBState *)opaque;
     USBDevice *dev = &s->dev;
-    const char *id = s->is_qc ? "QC" : "SC";
 
     if (!dev->attached) {
         return;
@@ -316,7 +331,6 @@ static void ezusb_reconnect_cb(void *opaque)
 {
     ChihiroUSBState *s = (ChihiroUSBState *)opaque;
     USBDevice *dev = &s->dev;
-    const char *id = s->is_qc ? "QC" : "SC";
 
     if (dev->attached) {
         return;
@@ -325,11 +339,142 @@ static void ezusb_reconnect_cb(void *opaque)
     usb_device_attach(dev, &error_abort);
 }
 
+static void diag_dump_state(ChihiroUSBState *s, const char *reason, int64_t now)
+{
+    AN2131State *a = &s->an2131;
+    Cpu8051State *cpu = &a->cpu;
+    uint8_t tcon = cpu->sfr[SFR_TCON - 0x80];
+    uint8_t tmod = cpu->sfr[SFR_TMOD - 0x80];
+    uint8_t ie   = cpu->sfr[SFR_IE - 0x80];
+    uint8_t scon1 = cpu->sfr[0xC0 - 0x80];
+    uint16_t t0 = cpu->sfr[SFR_TL0 - 0x80] |
+                  ((uint16_t)cpu->sfr[SFR_TH0 - 0x80] << 8);
+    fprintf(stderr,
+        "[DIAG %07lld] %s | "
+        "PC=0x%04X SP=0x%02X halted=%d in_int=%d "
+        "IE=0x%02X TCON=0x%02X TMOD=0x%02X T0=%04X "
+        "SCON1=0x%02X TR0=%d TR1=%d "
+        "ep4arm=%d jvs_rdy=%d cpu_run=%d "
+        "tx_len=%d rx_pos=%d/%d\n",
+        (long long)now, reason,
+        cpu->pc, cpu->sp, cpu->halted, cpu->in_interrupt,
+        ie, tcon, tmod, t0,
+        scon1, (tcon >> 4) & 1, (tcon >> 6) & 1,
+        a->ep[4].in_armed, a->jvs_response_ready, a->cpu_running,
+        a->jvs_tx_len, a->jvs_rx_pos, a->jvs_rx_len);
+}
+
 static void lle_tick_cb(void *opaque)
 {
     ChihiroUSBState *s = (ChihiroUSBState *)opaque;
     if (s->use_lle && s->an2131.cpu_running) {
-        an2131_run(&s->an2131, 6000);
+        int ran = an2131_run(&s->an2131, 6000);
+        int64_t now = qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL);
+
+        s->diag_tick_count++;
+        s->diag_cycles_total += ran;
+
+        if (s->is_qc && now > 6000) {
+            AN2131State *a = &s->an2131;
+            Cpu8051State *cpu = &a->cpu;
+            uint8_t tcon = cpu->sfr[SFR_TCON - 0x80];
+            bool tr0 = (tcon >> 4) & 1;
+            bool ep4_armed = a->ep[4].in_armed;
+            bool halted = cpu->halted;
+            bool cpu_running = a->cpu_running;
+
+            /* Listener: TR0 transition */
+            if (tr0 != s->diag_prev_tr0) {
+                char buf[64];
+                snprintf(buf, sizeof(buf), "TR0: %d->%d", s->diag_prev_tr0, tr0);
+                diag_dump_state(s, buf, now);
+                s->diag_prev_tr0 = tr0;
+            }
+
+            /* Listener: EP4 armed transition */
+            if (ep4_armed != s->diag_prev_ep4_armed) {
+                char buf[64];
+                snprintf(buf, sizeof(buf), "EP4arm: %d->%d", s->diag_prev_ep4_armed, ep4_armed);
+                diag_dump_state(s, buf, now);
+                s->diag_prev_ep4_armed = ep4_armed;
+            }
+
+            /* Listener: CPU halted transition */
+            if (halted != s->diag_prev_halted) {
+                char buf[64];
+                snprintf(buf, sizeof(buf), "HALT: %d->%d", s->diag_prev_halted, halted);
+                diag_dump_state(s, buf, now);
+                s->diag_prev_halted = halted;
+            }
+
+            /* Listener: cpu_running transition */
+            if (cpu_running != s->diag_prev_cpu_running) {
+                char buf[64];
+                snprintf(buf, sizeof(buf), "CPU_RUN: %d->%d", s->diag_prev_cpu_running, cpu_running);
+                diag_dump_state(s, buf, now);
+                s->diag_prev_cpu_running = cpu_running;
+            }
+
+            /* Listener: zero-cycle streak (CPU stuck) */
+            if (ran == 0) {
+                s->diag_zero_cycle_streak++;
+                if (s->diag_zero_cycle_streak == 1 ||
+                    s->diag_zero_cycle_streak == 10 ||
+                    s->diag_zero_cycle_streak == 100) {
+                    char buf[64];
+                    snprintf(buf, sizeof(buf), "ZERO_CYC streak=%d", s->diag_zero_cycle_streak);
+                    diag_dump_state(s, buf, now);
+                }
+            } else {
+                if (s->diag_zero_cycle_streak > 0) {
+                    char buf[64];
+                    snprintf(buf, sizeof(buf), "ZERO_CYC ended after %d", s->diag_zero_cycle_streak);
+                    diag_dump_state(s, buf, now);
+                }
+                s->diag_zero_cycle_streak = 0;
+            }
+
+            /* Periodic summary every 2s for background context */
+            if ((now - s->diag_last_report_ms) >= 2000) {
+                fprintf(stderr,
+                    "[DIAG %07lld] SUMMARY ticks=%llu cyc=%llu "
+                    "T0=%llu T1=%llu S0=%llu S1=%llu USB=%llu I2C=%llu "
+                    "jvsTX=%llu jvsRX=%llu sbuf1w=%llu ep4arm=%llu setup=%llu "
+                    "PC=0x%04X SP=0x%02X TH0=0x%02X\n",
+                    (long long)now,
+                    (unsigned long long)s->diag_tick_count,
+                    (unsigned long long)s->diag_cycles_total,
+                    (unsigned long long)a->diag_t0_overflows,
+                    (unsigned long long)a->diag_t1_overflows,
+                    (unsigned long long)a->diag_serial0_irqs,
+                    (unsigned long long)a->diag_serial1_irqs,
+                    (unsigned long long)a->diag_usb_irqs,
+                    (unsigned long long)a->diag_i2c_irqs,
+                    (unsigned long long)a->diag_jvs_tx,
+                    (unsigned long long)a->diag_jvs_rx,
+                    (unsigned long long)a->diag_sbuf1_writes,
+                    (unsigned long long)a->diag_ep4_arms,
+                    (unsigned long long)a->diag_setup_calls,
+                    cpu->pc, cpu->sp,
+                    cpu->sfr[SFR_TH0 - 0x80]);
+
+                s->diag_last_report_ms = now;
+                s->diag_tick_count = 0;
+                s->diag_cycles_total = 0;
+                a->diag_t0_overflows = 0;
+                a->diag_t1_overflows = 0;
+                a->diag_serial0_irqs = 0;
+                a->diag_serial1_irqs = 0;
+                a->diag_usb_irqs = 0;
+                a->diag_i2c_irqs = 0;
+                a->diag_jvs_tx = 0;
+                a->diag_jvs_rx = 0;
+                a->diag_sbuf1_writes = 0;
+                a->diag_ep4_arms = 0;
+                a->diag_setup_calls = 0;
+            }
+        }
+
         timer_mod(s->lle_tick_timer,
                   qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 1);
     }
@@ -409,6 +554,35 @@ static void handle_control(USBDevice *dev, USBPacket *p,
             p->actual_length = length;
         }
 
+        if (s->is_qc && bRequest == 0x20) {
+            s->last_jvs_send_ms = TS_MS;
+            static int v20_detail = 0;
+            if (v20_detail < 50) {
+                fprintf(stderr, "[%07lld] v20 DETAIL: bmReqType=0x%02X dir=%s val=0x%04X idx=0x%04X wLen=%d resp=%d out_len=%d\n",
+                        TS_MS, setup[0], (setup[0] & 0x80) ? "IN" : "OUT",
+                        value, index, length, resp_len, out_len);
+                if (resp_len > 0) {
+                    fprintf(stderr, "  resp:");
+                    for (int i = 0; i < resp_len && i < 8; i++)
+                        fprintf(stderr, " %02X", data[i]);
+                    fprintf(stderr, "\n");
+                }
+                v20_detail++;
+            }
+        }
+
+        if (s->is_qc && bRequest == 0x19) {
+            static int v19_detail = 0;
+            if (v19_detail < 50) {
+                fprintf(stderr, "[%07lld] v19 DETAIL: resp=%d ep4arm=%d ep4bc=%d data:",
+                        TS_MS, resp_len, s->an2131.ep[4].in_armed, s->an2131.ep[4].bc_in);
+                for (int i = 0; i < resp_len && i < 8; i++)
+                    fprintf(stderr, " %02X", data[i]);
+                fprintf(stderr, "\n");
+                v19_detail++;
+            }
+        }
+
         if (lpc_log_verbose && (bRequest == 0x1C || bRequest == 0x24 || bRequest == 0x15
                                 || bRequest == 0x17 || bRequest == 0x18 || bRequest == 0x16)) {
             fprintf(stderr, "[%07lld] LLE [%s] v0x%02X val=0x%04X idx=0x%04X resp_len=%d ctrl={",
@@ -466,41 +640,9 @@ static void handle_control(USBDevice *dev, USBPacket *p,
             }
             int64_t now = TS_MS;
             if (now - sc_uart_last_summary >= 5000) {
-                fprintf(stderr, "[%lld] SC UART summary: 0x1A=%d 0x1B=%d polls\n",
-                        now, sc_uart_1a_count, sc_uart_1b_count);
+                fprintf(stderr, "[%ld] SC UART summary: 0x1A=%d 0x1B=%d polls\n",
+                        (long)now, sc_uart_1a_count, sc_uart_1b_count);
                 sc_uart_last_summary = now;
-            }
-        }
-
-        /* ACBU/SBHQ HLE: firmware callback 3 overwrites extmem[0x8000],
-         * destroying ACBU data. Until JVS serial is connected to firmware,
-         * handle ACBU status polls and write_1f_addr tracking here. */
-        if (bRequest == 0x1F) {
-            s->write_1f_addr = value;
-            s->write_1f_remaining = index;
-            s->acbu_response_ready = false;
-        }
-        if (bRequest == 0x18) {
-            int count = index;
-            if (count == 0) {
-                if (s->acbu_sbhq_pending) {
-                    memcpy(s->extmem + 0x8000, s->ic11, 128);
-                    s->acbu_sbhq_pending = false;
-                    s->acbu_response_ready = true;
-                }
-                if (s->acbu_response_ready) {
-                    data[0] = 0x01;
-                }
-            } else {
-                if (count > CHIHIRO_USB_EP_BUFSZ) count = CHIHIRO_USB_EP_BUFSZ;
-                int addr = value;
-                if (addr + count > 65536) count = 65536 - addr;
-                if (addr >= 0 && count > 0) {
-                    memcpy(s->ep_in[3].buf, s->extmem + addr, count);
-                }
-                s->ep_in[3].pending = count;
-                s->ep_in[3].offset = 0;
-                s->acbu_response_ready = false;
             }
         }
 
@@ -565,53 +707,23 @@ static void handle_control(USBDevice *dev, USBPacket *p,
         s->ep_in[2].offset = 0;
         break;
     }
-    case 0x19: { /* Get JVS responses (QC path) */
-        data[0] = 0x00;  /* not busy */
-        /* Update sense in PINSB */
-        data[2] = (data[2] & 0xFC) | (s->jvs.sense & 0x03);
-        if (s->jvs.response_len > 0) {
-            int rlen = s->jvs.response_len;
-            uint8_t *ep = s->ep_in[4].buf;
-            int wrapped = 0;
-            uint8_t resp_dest = (s->jvs.last_target == JVS_BROADCAST) ? 0
-                                                                     : s->jvs.device_id;
-            ep[wrapped++] = 0x00;
-            ep[wrapped++] = 0x01;
-            ep[wrapped++] = resp_dest;
-            ep[wrapped++] = 0x00;
-            ep[wrapped++] = rlen & 0xFF;
-            ep[wrapped++] = (rlen >> 8) & 0xFF;
-            int copy = MIN(rlen, (int)sizeof(s->ep_in[4].buf) - wrapped);
-            memcpy(ep + wrapped, s->jvs.response, copy);
-            wrapped += copy;
-            data[4] = wrapped & 0xFF;
-            data[5] = (wrapped >> 8) & 0xFF;
-            s->ep_in[4].pending = wrapped;
-            s->ep_in[4].offset = 0;
-            s->jvs.response_len = 0;
-        } else if (s->ep_in[4].pending > 0) {
-            /* Data already queued by EP4 OUT auto-queue — report it */
-            data[4] = s->ep_in[4].pending & 0xFF;
-            data[5] = (s->ep_in[4].pending >> 8) & 0xFF;
-        } else {
-            data[4] = 0;
-            data[5] = 0;
+    case 0x19: { /* JVS poll — fully handled by firmware via an2131_setup_packet() */
+        static int v19_log = 0;
+        if (v19_log < 200 || (v19_log % 5000 == 0)) {
+            fprintf(stderr, "[%07lld] v19 LLE: data[0:5]=%02X %02X %02X %02X %02X %02X ep4_armed=%d ep4_bc=%d\n",
+                    TS_MS, data[0], data[1], data[2], data[3], data[4], data[5],
+                    s->an2131.ep[4].in_armed, s->an2131.ep[4].bc_in);
         }
+        v19_log++;
         break;
     }
-    case 0x20: { /* Send JVS packets (QC path) */
-        /* AN2131QC format: byte 0 = sequence counter, bytes 1+ = JVS frame */
-        uint8_t *jvs_data = host_data;
-        int jvs_len = host_len;
-        if (jvs_len >= 2 && host_data[0] != JVS_SYNC && host_data[1] == JVS_SYNC) {
-            jvs_data = host_data + 1;
-            jvs_len -= 1;
+    case 0x20: { /* JVS send — firmware sends via SBUF1, serial path handles response */
+        static int v20_log = 0;
+        if (v20_log < 50 || (v20_log % 5000 == 0)) {
+            fprintf(stderr, "[%07lld] v20 LLE: host_len=%d jvs_response_ready=%d rx_len=%d\n",
+                    TS_MS, host_len, s->an2131.jvs_response_ready, s->an2131.jvs_rx_len);
         }
-        if (jvs_len > 0 && jvs_data[0] == JVS_SYNC) {
-            int rlen = chihiro_jvs_process(&s->jvs, jvs_data, jvs_len,
-                                            s->jvs.response, sizeof(s->jvs.response));
-            s->jvs.response_len = rlen;
-        }
+        v20_log++;
         break;
     }
     case 0x30: /* External interrupt control */
@@ -738,8 +850,8 @@ static void handle_control(USBDevice *dev, USBPacket *p,
                 s->uart0_empty_polls++;
                 int64_t now = TS_MS;
                 if (now - s->uart0_last_log_ms >= 5000) {
-                    fprintf(stderr, "[%lld] SC UART0 READ: %d empty polls since t=%lld\n",
-                            now, s->uart0_empty_polls, s->uart0_first_poll_ms);
+                    fprintf(stderr, "[%ld] SC UART0 READ: %d empty polls since t=%ld\n",
+                            (long)now, s->uart0_empty_polls, (long)s->uart0_first_poll_ms);
                     s->uart0_last_log_ms = now;
                 }
             }
@@ -833,12 +945,30 @@ static void handle_control(USBDevice *dev, USBPacket *p,
 static void handle_data(USBDevice *dev, USBPacket *p)
 {
     ChihiroUSBState *s = (ChihiroUSBState *)dev;
-    const char *id = s->is_qc ? "QC" : "SC";
     int ep = p->ep->nr;
+
+    if (s->is_qc && ep == 4) {
+        static int ep4_data_log = 0;
+        if (ep4_data_log < 50) {
+            fprintf(stderr, "[%07lld] handle_data EP4 pid=%s armed=%d bc=%d\n",
+                    TS_MS, p->pid == USB_TOKEN_IN ? "IN" : "OUT",
+                    s->an2131.ep[4].in_armed, s->an2131.ep[4].bc_in);
+            ep4_data_log++;
+        }
+    }
 
     /* LLE path: route bulk transfers through AN2131 firmware */
     if (s->use_lle) {
         if (p->pid == USB_TOKEN_IN) {
+            if (ep == 3 && s->is_qc) {
+                static int ep3in_poll_diag = 0;
+                if (ep3in_poll_diag < 50) {
+                    fprintf(stderr, "[EP3-IN-POLL] t=%lld pending=%d fw_arm=%d fw_bc=%d\n",
+                            TS_MS, s->ep_in[3].pending, s->an2131.ep[3].in_armed,
+                            s->an2131.ep[3].bc_in);
+                    ep3in_poll_diag++;
+                }
+            }
             /* HLE-excluded vendor requests (0x16/0x17 etc.) queue data on
              * s->ep_in[] buffers.  Serve those first so the host sees them
              * even though the bulk IN path is otherwise LLE-driven. */
@@ -847,12 +977,14 @@ static void handle_data(USBDevice *dev, USBPacket *p)
                 usb_packet_copy(p, s->ep_in[ep].buf + s->ep_in[ep].offset, len);
                 s->ep_in[ep].offset += len;
                 s->ep_in[ep].pending -= len;
-                if (ep == 4 && s->ep_in[ep].pending == 0 &&
-                    s->an2131.ep[4].in_armed) {
-                    s->an2131.ep[4].in_armed = false;
-                    s->an2131.ep[4].bc_in = 0;
-                    s->an2131.ep[4].cs_in &= ~0x02;
-                    s->an2131.in07irq |= (1 << 4);
+                if (ep == 4 && s->is_qc) {
+                    s->last_jvs_recv_ms = TS_MS;
+                    if (s->ep_in[ep].pending == 0 && s->an2131.ep[4].in_armed) {
+                        s->an2131.ep[4].in_armed = false;
+                        s->an2131.ep[4].bc_in = 0;
+                        s->an2131.ep[4].cs_in &= ~0x02;
+                        s->an2131.in07irq |= (1 << 4);
+                    }
                 }
             } else {
                 int avail = an2131_ep_in_poll(&s->an2131, ep);
@@ -864,7 +996,7 @@ static void handle_data(USBDevice *dev, USBPacket *p)
                                 TS_MS, ep, avail);
                     }
                 }
-                if (avail > 0) {
+                if (avail >= 0) {
                     uint8_t buf[64];
                     int got = an2131_ep_in_read(&s->an2131, ep, buf, MIN((int)p->iov.size, (int)sizeof(buf)));
                     if (got > 0) {
@@ -874,9 +1006,20 @@ static void handle_data(USBDevice *dev, USBPacket *p)
                                 fprintf(stderr, " %02X", buf[i]);
                             fprintf(stderr, "\n");
                         }
-                        usb_packet_copy(p, buf, got);
-                    } else {
-                        p->status = USB_RET_NAK;
+                        if (ep == 4 && s->is_qc) {
+                            static int ep4in_data_log = 0;
+                            if (ep4in_data_log < 50) {
+                                fprintf(stderr, "[%07lld] EP4_IN_DATA: %d bytes:", TS_MS, got);
+                                for (int i = 0; i < got && i < 16; i++)
+                                    fprintf(stderr, " %02X", buf[i]);
+                                fprintf(stderr, "\n");
+                                ep4in_data_log++;
+                            }
+                        }
+                        if (got > 0)
+                            usb_packet_copy(p, buf, got);
+                        if (ep == 4 && s->is_qc)
+                            s->last_jvs_recv_ms = TS_MS;
                     }
                 } else {
                     p->status = USB_RET_NAK;
@@ -887,7 +1030,33 @@ static void handle_data(USBDevice *dev, USBPacket *p)
             uint8_t buf[64];
             int chunk = MIN(len, (int)sizeof(buf));
             usb_packet_copy(p, buf, chunk);
+            {
+                static int bulk_out_log = 0;
+                if (bulk_out_log < 200) {
+                    fprintf(stderr, "[%07lld] BULK_OUT ep=%d len=%d", TS_MS, ep, chunk);
+                    for (int i = 0; i < 8 && i < chunk; i++)
+                        fprintf(stderr, " %02X", buf[i]);
+                    fprintf(stderr, "\n");
+                    bulk_out_log++;
+                }
+            }
             an2131_ep_out_write(&s->an2131, ep, buf, chunk);
+            if (ep == 3) {
+                static int ep3out_run_diag = 0;
+                if (ep3out_run_diag < 10)
+                    fprintf(stderr, "[EP3OUT-RUN] pre: out07irq=%02X cpu_run=%d in_int=%d\n",
+                            s->an2131.out07irq, s->an2131.cpu_running,
+                            s->an2131.cpu.in_interrupt);
+                an2131_run(&s->an2131, 5000);
+                if (ep3out_run_diag < 10) {
+                    fprintf(stderr, "[EP3OUT-RUN] post: out07irq=%02X in_int=%d PC=0x%04X\n",
+                            s->an2131.out07irq, s->an2131.cpu.in_interrupt,
+                            s->an2131.cpu.pc);
+                    ep3out_run_diag++;
+                }
+            } else {
+                an2131_run(&s->an2131, 2000);
+            }
 
             /* Backup write HLE: track EP3 OUT writes and signal completion
              * for the 0x18 count=0 status poll. */
@@ -986,42 +1155,6 @@ static void handle_data(USBDevice *dev, USBPacket *p)
                     s->acbu_response_ready = true;
                 }
 
-            } else if (ep == 4) {
-                /* EP4 OUT: JVS data with 3-byte AN2131QC header.
-                 * Process and auto-queue response on EP4 IN (simulates
-                 * AN2131QC firmware's automatic JVS bus relay). */
-                uint8_t *jvs_p = NULL;
-                int jvs_n = 0;
-                if (total >= 4 && buf[3] == JVS_SYNC) {
-                    jvs_p = buf + 3;
-                    jvs_n = total - 3;
-                } else if (total >= 1 && buf[0] == JVS_SYNC) {
-                    jvs_p = buf;
-                    jvs_n = total;
-                }
-                if (jvs_p && jvs_n > 0) {
-                    int rlen = chihiro_jvs_process(&s->jvs, jvs_p, jvs_n,
-                                                    s->jvs.response, sizeof(s->jvs.response));
-                    s->jvs.response_len = rlen;
-                    if (rlen > 0 && chihiro_game_running) {
-                        uint8_t *ep4 = s->ep_in[4].buf;
-                        int wrapped = 0;
-                        uint8_t resp_dest = (s->jvs.last_target == JVS_BROADCAST) ? 0
-                                                                                  : s->jvs.device_id;
-                        ep4[wrapped++] = 0x00;
-                        ep4[wrapped++] = 0x01;
-                        ep4[wrapped++] = resp_dest;
-                        ep4[wrapped++] = 0x00;
-                        ep4[wrapped++] = rlen & 0xFF;
-                        ep4[wrapped++] = (rlen >> 8) & 0xFF;
-                        int copy = MIN(rlen, (int)sizeof(s->ep_in[4].buf) - wrapped);
-                        memcpy(ep4 + wrapped, s->jvs.response, copy);
-                        wrapped += copy;
-                        s->ep_in[4].pending = wrapped;
-                        s->ep_in[4].offset = 0;
-                        s->jvs.response_len = 0;
-                    }
-                }
             }
         }
     }

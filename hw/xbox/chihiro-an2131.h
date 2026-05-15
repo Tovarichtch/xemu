@@ -263,6 +263,22 @@ typedef struct AN2131State {
     void *usb_dev;          /* Back-pointer to ChihiroUSBState */
     bool jvs_response_ready;  /* JVS response generated, waiting for TX drain before RX */
     bool jvs_rx_pending;      /* RI1 cleared, next byte deferred until after RETI */
+    uint64_t total_cycles;             /* cumulative CPU cycles (advances during bursts) */
+    uint64_t jvs_response_set_cycles;  /* total_cycles when JVS response was generated */
+    bool jvs_ep4_consumed;    /* EP4 IN data read by host, pending_len should return to base */
+
+    /* ── DIAG event counters (incremented in an2131, read in chihiro-usb) ── */
+    uint64_t diag_t0_overflows;
+    uint64_t diag_t1_overflows;
+    uint64_t diag_serial0_irqs;
+    uint64_t diag_serial1_irqs;
+    uint64_t diag_usb_irqs;
+    uint64_t diag_i2c_irqs;
+    uint64_t diag_jvs_tx;
+    uint64_t diag_jvs_rx;
+    uint64_t diag_sbuf1_writes;
+    uint64_t diag_ep4_arms;
+    uint64_t diag_setup_calls;
 } AN2131State;
 
 /* ── Public API ──────────────────────────────────────────────────────── */
