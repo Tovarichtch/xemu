@@ -868,6 +868,7 @@ int an2131_setup_packet(AN2131State *s, const uint8_t setup[8],
             }
             if (!is_in && !(s->usbirq & USBIRQ_SUDAV)) drain = cycles;
         }
+        if (drain && mainloop_hit && setup[1] == 0x20) break;
         if (drain && mainloop_hit && (cycles - drain) > 2000) break;
         if (drain && (cycles - drain) > 20000) break;
     }
@@ -881,26 +882,17 @@ int an2131_setup_packet(AN2131State *s, const uint8_t setup[8],
                 s->cpu.pc);
     }
 
-    /* SESSION24 DIAG: post-run state for v0x19 */
     if (post_segaboot && setup[1] == 0x19) {
-        static int v19p = 0;
-        if (v19p < 30) {
-            v19p++;
-            fprintf(stderr, "[v19-POST] state=%02X iram17=%02X ep4arm=%d bc4=%d "
-                    "B000:",
-                    s->cpu.iram[0x08], s->cpu.iram[0x17],
-                    s->ep[4].in_armed, s->ep[4].bc_in);
-            if (s->extmem) {
-                for (int i = 0; i < 10; i++)
-                    fprintf(stderr, " %02X", s->extmem[0xB000 + i]);
-            }
-            fprintf(stderr, " IN0:");
-            for (int i = 0; i < 8; i++)
-                fprintf(stderr, " %02X", s->ram[AN_IN0BUF - 0x6000 + i]);
-            fprintf(stderr, " IN4:");
-            for (int i = 0; i < 8; i++)
-                fprintf(stderr, " %02X", s->ram[0x1700 + i]);
-            fprintf(stderr, "\n");
+        static uint64_t v19_armed = 0, v19_empty = 0;
+        static int64_t v19_last_report = 0;
+        if (s->ep[4].in_armed) v19_armed++; else v19_empty++;
+        int64_t now_ms = qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL);
+        if (now_ms - v19_last_report >= 2000) {
+            fprintf(stderr, "[v19-STREAK] armed=%llu empty=%llu ratio=%.1f%%\n",
+                    (unsigned long long)v19_armed, (unsigned long long)v19_empty,
+                    (v19_armed + v19_empty) > 0 ?
+                    100.0 * v19_empty / (v19_armed + v19_empty) : 0.0);
+            v19_last_report = now_ms;
         }
     }
 
