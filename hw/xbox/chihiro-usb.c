@@ -339,142 +339,11 @@ static void ezusb_reconnect_cb(void *opaque)
     usb_device_attach(dev, &error_abort);
 }
 
-static void diag_dump_state(ChihiroUSBState *s, const char *reason, int64_t now)
-{
-    AN2131State *a = &s->an2131;
-    Cpu8051State *cpu = &a->cpu;
-    uint8_t tcon = cpu->sfr[SFR_TCON - 0x80];
-    uint8_t tmod = cpu->sfr[SFR_TMOD - 0x80];
-    uint8_t ie   = cpu->sfr[SFR_IE - 0x80];
-    uint8_t scon1 = cpu->sfr[0xC0 - 0x80];
-    uint16_t t0 = cpu->sfr[SFR_TL0 - 0x80] |
-                  ((uint16_t)cpu->sfr[SFR_TH0 - 0x80] << 8);
-    fprintf(stderr,
-        "[DIAG %07lld] %s | "
-        "PC=0x%04X SP=0x%02X halted=%d in_int=%d "
-        "IE=0x%02X TCON=0x%02X TMOD=0x%02X T0=%04X "
-        "SCON1=0x%02X TR0=%d TR1=%d "
-        "ep4arm=%d jvs_rdy=%d cpu_run=%d "
-        "tx_len=%d rx_pos=%d/%d\n",
-        (long long)now, reason,
-        cpu->pc, cpu->sp, cpu->halted, cpu->in_interrupt,
-        ie, tcon, tmod, t0,
-        scon1, (tcon >> 4) & 1, (tcon >> 6) & 1,
-        a->ep[4].in_armed, a->jvs_response_ready, a->cpu_running,
-        a->jvs_tx_len, a->jvs_rx_pos, a->jvs_rx_len);
-}
-
 static void lle_tick_cb(void *opaque)
 {
     ChihiroUSBState *s = (ChihiroUSBState *)opaque;
     if (s->use_lle && s->an2131.cpu_running) {
-        int ran = an2131_run(&s->an2131, 6000);
-        int64_t now = qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL);
-
-        s->diag_tick_count++;
-        s->diag_cycles_total += ran;
-
-        if (s->is_qc && now > 6000) {
-            AN2131State *a = &s->an2131;
-            Cpu8051State *cpu = &a->cpu;
-            uint8_t tcon = cpu->sfr[SFR_TCON - 0x80];
-            bool tr0 = (tcon >> 4) & 1;
-            bool ep4_armed = a->ep[4].in_armed;
-            bool halted = cpu->halted;
-            bool cpu_running = a->cpu_running;
-
-            /* Listener: TR0 transition */
-            if (tr0 != s->diag_prev_tr0) {
-                char buf[64];
-                snprintf(buf, sizeof(buf), "TR0: %d->%d", s->diag_prev_tr0, tr0);
-                diag_dump_state(s, buf, now);
-                s->diag_prev_tr0 = tr0;
-            }
-
-            /* Listener: EP4 armed transition */
-            if (ep4_armed != s->diag_prev_ep4_armed) {
-                char buf[64];
-                snprintf(buf, sizeof(buf), "EP4arm: %d->%d", s->diag_prev_ep4_armed, ep4_armed);
-                diag_dump_state(s, buf, now);
-                s->diag_prev_ep4_armed = ep4_armed;
-            }
-
-            /* Listener: CPU halted transition */
-            if (halted != s->diag_prev_halted) {
-                char buf[64];
-                snprintf(buf, sizeof(buf), "HALT: %d->%d", s->diag_prev_halted, halted);
-                diag_dump_state(s, buf, now);
-                s->diag_prev_halted = halted;
-            }
-
-            /* Listener: cpu_running transition */
-            if (cpu_running != s->diag_prev_cpu_running) {
-                char buf[64];
-                snprintf(buf, sizeof(buf), "CPU_RUN: %d->%d", s->diag_prev_cpu_running, cpu_running);
-                diag_dump_state(s, buf, now);
-                s->diag_prev_cpu_running = cpu_running;
-            }
-
-            /* Listener: zero-cycle streak (CPU stuck) */
-            if (ran == 0) {
-                s->diag_zero_cycle_streak++;
-                if (s->diag_zero_cycle_streak == 1 ||
-                    s->diag_zero_cycle_streak == 10 ||
-                    s->diag_zero_cycle_streak == 100) {
-                    char buf[64];
-                    snprintf(buf, sizeof(buf), "ZERO_CYC streak=%d", s->diag_zero_cycle_streak);
-                    diag_dump_state(s, buf, now);
-                }
-            } else {
-                if (s->diag_zero_cycle_streak > 0) {
-                    char buf[64];
-                    snprintf(buf, sizeof(buf), "ZERO_CYC ended after %d", s->diag_zero_cycle_streak);
-                    diag_dump_state(s, buf, now);
-                }
-                s->diag_zero_cycle_streak = 0;
-            }
-
-            /* Periodic summary every 2s for background context */
-            if ((now - s->diag_last_report_ms) >= 2000) {
-                fprintf(stderr,
-                    "[DIAG %07lld] SUMMARY ticks=%llu cyc=%llu "
-                    "T0=%llu T1=%llu S0=%llu S1=%llu USB=%llu I2C=%llu "
-                    "jvsTX=%llu jvsRX=%llu sbuf1w=%llu ep4arm=%llu setup=%llu "
-                    "PC=0x%04X SP=0x%02X TH0=0x%02X\n",
-                    (long long)now,
-                    (unsigned long long)s->diag_tick_count,
-                    (unsigned long long)s->diag_cycles_total,
-                    (unsigned long long)a->diag_t0_overflows,
-                    (unsigned long long)a->diag_t1_overflows,
-                    (unsigned long long)a->diag_serial0_irqs,
-                    (unsigned long long)a->diag_serial1_irqs,
-                    (unsigned long long)a->diag_usb_irqs,
-                    (unsigned long long)a->diag_i2c_irqs,
-                    (unsigned long long)a->diag_jvs_tx,
-                    (unsigned long long)a->diag_jvs_rx,
-                    (unsigned long long)a->diag_sbuf1_writes,
-                    (unsigned long long)a->diag_ep4_arms,
-                    (unsigned long long)a->diag_setup_calls,
-                    cpu->pc, cpu->sp,
-                    cpu->sfr[SFR_TH0 - 0x80]);
-
-                s->diag_last_report_ms = now;
-                s->diag_tick_count = 0;
-                s->diag_cycles_total = 0;
-                a->diag_t0_overflows = 0;
-                a->diag_t1_overflows = 0;
-                a->diag_serial0_irqs = 0;
-                a->diag_serial1_irqs = 0;
-                a->diag_usb_irqs = 0;
-                a->diag_i2c_irqs = 0;
-                a->diag_jvs_tx = 0;
-                a->diag_jvs_rx = 0;
-                a->diag_sbuf1_writes = 0;
-                a->diag_ep4_arms = 0;
-                a->diag_setup_calls = 0;
-            }
-        }
-
+        an2131_run(&s->an2131, 6000);
         timer_mod(s->lle_tick_timer,
                   qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 1);
     }
@@ -556,31 +425,6 @@ static void handle_control(USBDevice *dev, USBPacket *p,
 
         if (s->is_qc && bRequest == 0x20) {
             s->last_jvs_send_ms = TS_MS;
-            static int v20_detail = 0;
-            if (v20_detail < 50) {
-                fprintf(stderr, "[%07lld] v20 DETAIL: bmReqType=0x%02X dir=%s val=0x%04X idx=0x%04X wLen=%d resp=%d out_len=%d\n",
-                        TS_MS, setup[0], (setup[0] & 0x80) ? "IN" : "OUT",
-                        value, index, length, resp_len, out_len);
-                if (resp_len > 0) {
-                    fprintf(stderr, "  resp:");
-                    for (int i = 0; i < resp_len && i < 8; i++)
-                        fprintf(stderr, " %02X", data[i]);
-                    fprintf(stderr, "\n");
-                }
-                v20_detail++;
-            }
-        }
-
-        if (s->is_qc && bRequest == 0x19) {
-            static int v19_detail = 0;
-            if (v19_detail < 50) {
-                fprintf(stderr, "[%07lld] v19 DETAIL: resp=%d ep4arm=%d ep4bc=%d data:",
-                        TS_MS, resp_len, s->an2131.ep[4].in_armed, s->an2131.ep[4].bc_in);
-                for (int i = 0; i < resp_len && i < 8; i++)
-                    fprintf(stderr, " %02X", data[i]);
-                fprintf(stderr, "\n");
-                v19_detail++;
-            }
         }
 
         if (lpc_log_verbose && (bRequest == 0x1C || bRequest == 0x24 || bRequest == 0x15

@@ -86,6 +86,9 @@ struct Cpu8051State {
     bool     in_interrupt;  /* Set by cpu8051_interrupt, cleared by RETI */
     uint64_t cycles;
 
+    /* Timer 0 CLK/12 prescaler (ticks once per 3 machine cycles when CKCON.3=0) */
+    uint8_t timer0_prescale;
+
     /* Opaque pointer for AN2131 layer */
     void *opaque;
 };

@@ -152,30 +152,40 @@ static void timer_tick(Cpu8051State *s)
 
     /* Timer 0 — only if TR0 is set (TCON.4) */
     if (tcon & 0x10) {
-        uint8_t mode0 = tmod & 0x03;
-        if (mode0 == 1) {
-            /* Mode 1: 16-bit timer */
-            uint16_t t0 = s->sfr[SFR_TL0 - 0x80] | ((uint16_t)s->sfr[SFR_TH0 - 0x80] << 8);
-            t0++;
-            if (t0 == 0) {
-                tcon |= 0x20;  /* TF0 — overflow flag */
+        /* AN2131 CKCON.3: 0=CLK/12 (tick every 3 machine cycles), 1=CLK/4 */
+        bool t0_fast = s->sfr[0x8E - 0x80] & 0x08;
+        bool t0_tick = true;
+        if (!t0_fast) {
+            s->timer0_prescale++;
+            if (s->timer0_prescale < 3) t0_tick = false;
+            else s->timer0_prescale = 0;
+        }
+        if (t0_tick) {
+            uint8_t mode0 = tmod & 0x03;
+            if (mode0 == 1) {
+                /* Mode 1: 16-bit timer */
+                uint16_t t0 = s->sfr[SFR_TL0 - 0x80] | ((uint16_t)s->sfr[SFR_TH0 - 0x80] << 8);
+                t0++;
+                if (t0 == 0) {
+                    tcon |= 0x20;  /* TF0 — overflow flag */
+                }
+                s->sfr[SFR_TL0 - 0x80] = (uint8_t)t0;
+                s->sfr[SFR_TH0 - 0x80] = (uint8_t)(t0 >> 8);
+            } else if (mode0 == 2) {
+                /* Mode 2: 8-bit auto-reload */
+                uint8_t tl = s->sfr[SFR_TL0 - 0x80];
+                tl++;
+                if (tl == 0) {
+                    tl = s->sfr[SFR_TH0 - 0x80];
+                    tcon |= 0x20;
+                }
+                s->sfr[SFR_TL0 - 0x80] = tl;
             }
-            s->sfr[SFR_TL0 - 0x80] = (uint8_t)t0;
-            s->sfr[SFR_TH0 - 0x80] = (uint8_t)(t0 >> 8);
-        } else if (mode0 == 2) {
-            /* Mode 2: 8-bit auto-reload */
-            uint8_t tl = s->sfr[SFR_TL0 - 0x80];
-            tl++;
-            if (tl == 0) {
-                tl = s->sfr[SFR_TH0 - 0x80];
-                tcon |= 0x20;
-            }
-            s->sfr[SFR_TL0 - 0x80] = tl;
         }
     }
 
-    /* Timer 1 — only if TR1 is set (TCON.6) */
-    if (tcon & 0x40) {
+    /* Timer 1 — only if TR1 is set (TCON.6) and C/T#=0 (internal clock) */
+    if ((tcon & 0x40) && !(tmod & 0x40)) {
         uint8_t mode1 = (tmod >> 4) & 0x03;
         if (mode1 == 1) {
             uint16_t t1 = s->sfr[SFR_TL1 - 0x80] | ((uint16_t)s->sfr[SFR_TH1 - 0x80] << 8);

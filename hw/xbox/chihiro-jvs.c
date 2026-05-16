@@ -35,35 +35,6 @@ void chihiro_jvs_init(ChihiroJVSState *s)
     }
 }
 
-static int jvs_unescape(const uint8_t *src, int src_len,
-                         uint8_t *dst, int dst_max)
-{
-    int di = 0;
-    for (int si = 0; si < src_len && di < dst_max; si++) {
-        if (src[si] == JVS_ESCAPE && si + 1 < src_len) {
-            dst[di++] = src[++si] + 1;
-        } else {
-            dst[di++] = src[si];
-        }
-    }
-    return di;
-}
-
-static int jvs_escape(const uint8_t *src, int src_len,
-                       uint8_t *dst, int dst_max)
-{
-    int di = 0;
-    for (int si = 0; si < src_len && di < dst_max - 1; si++) {
-        if (src[si] == JVS_SYNC || src[si] == JVS_ESCAPE) {
-            dst[di++] = JVS_ESCAPE;
-            dst[di++] = src[si] - 1;
-        } else {
-            if (di < dst_max) dst[di++] = src[si];
-        }
-    }
-    return di;
-}
-
 /*
  * Handle a single JVS command from the unescaped data stream.
  * Returns the number of input bytes consumed (command + params).
@@ -309,21 +280,6 @@ int chihiro_jvs_process(ChihiroJVSState *s,
     int data_len = (raw_len >= escaped_count) ? escaped_count - 1 : raw_len - 1;
     if (data_len < 0) data_len = 0;
 
-    /* Dump ALL JVS requests during game phase */
-    static int jvs_game_phase = 0;
-    static int jvs_dump_count = 0;
-    if (data_len >= 10 && raw[0] == 0x20 && raw[7] == 0x32) {
-        jvs_game_phase = 1;
-    }
-    if (0 && jvs_game_phase && jvs_dump_count < 100) {
-        jvs_dump_count++;
-        fprintf(stderr, "[%07lld] JVS RAW: target=0x%02X count=%d data(%d):",
-               TS_MS, target, escaped_count, data_len);
-        for (int i = 0; i < data_len && i < 32; i++)
-            fprintf(stderr, " %02X", raw[i]);
-        fprintf(stderr, "\n");
-    }
-
     uint8_t csum = target + escaped_count;
     for (int i = 0; i < data_len; i++) csum += raw[i];
     if (raw_len >= escaped_count && raw[escaped_count - 1] != (csum & 0xFF)) {
@@ -392,20 +348,6 @@ int chihiro_jvs_process(ChihiroJVSState *s,
 
     int out_len = (fpos < out_max) ? fpos : out_max;
     memcpy(out, frame, out_len);
-
-    static int last_resp_len = 0;
-    if (out_len != last_resp_len) {
-        fprintf(stderr, "[%07lld] JVS: resp size changed %d → %d, request (%d data bytes):",
-               TS_MS, last_resp_len, out_len, data_len);
-        for (int i = 0; i < data_len && i < 32; i++)
-            fprintf(stderr, " %02X", raw[i]);
-        fprintf(stderr, "\n");
-        last_resp_len = out_len;
-    }
-
-    { static int jvs_cmd_log = 0; if (jvs_cmd_log < 30) { jvs_cmd_log++;
-        fprintf(stderr, "[%07lld] JVS: cmd=%02X → resp %d bytes (sense=%d id=%d)\n",
-               TS_MS, (data_len > 0) ? raw[0] : 0, out_len, s->sense, s->device_id); } }
 
     return out_len;
 }

@@ -254,7 +254,8 @@ typedef struct AN2131State {
     uint8_t jvs_tx_buf[256];
     int     jvs_tx_len;
     int     jvs_tx_expected;   /* total bytes expected in current frame */
-    uint8_t jvs_rx_buf[256];
+    bool    jvs_tx_escape;     /* next TX byte is escaped (follows 0xD0) */
+    uint8_t jvs_rx_buf[512];
     int     jvs_rx_len;
     int     jvs_rx_pos;        /* next byte to feed back via SBUF1 RX */
 
