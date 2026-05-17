@@ -33,6 +33,11 @@
 #include "chihiro.h"
 #include "chihiro_fatx.h"
 #include "system/blockdev.h"
+#include "system/system.h"
+#include "block/blkmemory.h"
+#include "block/block-global-state.h"
+#include "block/block_int-global-state.h"
+#include "qemu/main-loop.h"
 #include "hw/usb.h"
 #include "target/i386/cpu.h"
 #include "exec/watchpoint.h"
@@ -127,7 +132,6 @@ typedef struct ChihiroLPCState {
     uint32_t lpc_4084_reads;   /* MbcomCommand (state 2) — port 0x4084 (session) */
     uint32_t last_bootstate;   /* previous bootstate to detect changes */
     uint16_t lpc_scratch_4026;    /* Port 0x4026 read-write scratch register */
-    bool     mbcom_handshake_done; /* True after SEGABOOT writes 0x0102 to port 0x4026 */
     uint8_t  mbcom_e0_status;     /* Port 0x40E0 status bits: bit0=data, bit2=cmd_complete */
     bool     mbcom_resp_ready;    /* Game-mode: response pending → port 0x40F0 returns 0x0100 */
 
@@ -168,15 +172,22 @@ typedef struct ChihiroLPCState {
 
 static bool chihiro_active;
 bool chihiro_game_running;  /* Set after QuickReboot — disables SEGABOOT DMA scan */
+static int game_mode_bus_starts;  /* BUS START count since game_running became true */
 static bool chihiro_boot3_reached; /* Set when SEGABOOT reaches boot=3 (checks complete) */
 static bool chihiro_quickreboot_pending; /* Set at QuickReboot, consumed by port 0x40F0 handler */
 static char chihiro_game_filename[64]; /* Game XBE filename saved at boot=3 */
 char chihiro_game_dir[1024];   /* Game directory path (from dvd_path) */
+
+static char chihiro_save_path[2048];
+static bool chihiro_resolve_save_path(void);
 bool chihiro_board_type3;      /* true = ASIC (Type-3), false = FPGA (Type-1) */
 static ChihiroLPCState *chihiro_lpc_global;
 uint32_t chihiro_usb_sm_pa;  /* PA of USB state machine globals at VA 0xC3F10 */
 
 bool lpc_log_verbose = false;
+
+static uint8_t chihiro_mbcom_command[512];
+static uint8_t chihiro_mbcom_response[512];
 
 /* USB devices for delayed hotplug (simulates AN2131 I2C firmware boot) */
 static USBDevice *chihiro_usb_qc = NULL;
@@ -210,6 +221,51 @@ void chihiro_on_ohci_bus_start(void)
 
     ohci_bus_start_count++;
     fprintf(stderr, "[%07lld] Chihiro USB: BUS START #%d\n", TS_MS, ohci_bus_start_count);
+
+    /* Detect QuickReboot back to SEGABOOT: when in game mode, the game's own
+     * BUS START is the first one (game_mode_bus_starts goes 0→1). The second
+     * BUS START means SEGABOOT reloaded after a soft reinit (QuickReboot). */
+    if (chihiro_game_running) {
+        game_mode_bus_starts++;
+        if (game_mode_bus_starts >= 2) {
+            fprintf(stderr, "[%07lld] QUICKREBOOT (BUS START #%d in game mode)\n",
+                    TS_MS, game_mode_bus_starts);
+            chihiro_game_running = false;
+            chihiro_boot3_reached = false;
+            chihiro_quickreboot_pending = true;
+            memset(chihiro_mbcom_command, 0, 32);
+            memset(chihiro_mbcom_response, 0, 32);
+            if (s) {
+                s->usb_poll_patched = false;
+                timer_mod(s->usb_poll_patch_timer,
+                          qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 50);
+                s->lpc_401e_reads = 0;
+                s->lpc_40f0_reads = 0;
+                s->lpc_4084_reads = 0;
+                s->lpc_scratch_4026 = 0;
+                s->mbcom_e0_status = 0;
+                s->mbcom_resp_ready = false;
+                s->bb_dma_active = false;
+                s->bb_dma_count = 0;
+                s->bb_reg_addr = 0;
+                s->bb_reg_status = 0;
+                s->bb_event_pending = false;
+                s->dimm_cmd_count = 0;
+                s->dimm_next_seq = 1;
+                s->dimm_cmd_idx = 0;
+                s->dimm_resp_ready = false;
+                memset(s->dimm_cmd, 0, sizeof(s->dimm_cmd));
+                memset(s->dimm_resp, 0, sizeof(s->dimm_resp));
+                timer_del(s->dimm_event_timer);
+                timer_del(s->dimm_resp_timer);
+                s->t3_worker_alive = false;
+                s->t3_handshake_state = 0;
+                timer_del(s->t3_heartbeat_timer);
+                timer_mod(s->diag_timer,
+                          qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 50);
+            }
+        }
+    }
 
     /* First BUS START: schedule initial hotplug (devices not yet attached) */
     /* Subsequent BUS STARTs (game kernel): detach + re-attach for fresh CSC */
@@ -457,6 +513,19 @@ static void chihiro_diag_timer_cb(void *opaque)
             /* LLE: SEGABOOT calls XLaunchNewImageA which allocates LDP,
              * marks it persistent, and fills launch data. Kernel's STICKY
              * section preserves LaunchDataPage pointer across QuickReboot. */
+
+            /* Load per-game save (ic11 calibration + extmem) now that
+             * game filename is known — must happen before game XBE reads ic11 */
+            if (chihiro_game_filename[0] && !chihiro_save_path[0]) {
+                if (chihiro_resolve_save_path()) {
+                    if (!chihiro_usb_save_load(chihiro_save_path)) {
+                        fprintf(stderr, "Chihiro: no save found at %s\n", chihiro_save_path);
+                    }
+                } else {
+                    fprintf(stderr, "Chihiro: save path resolve failed (dir='%s' file='%s')\n",
+                            chihiro_game_dir, chihiro_game_filename);
+                }
+            }
         }
         s->last_bootstate = bootstate;
     }
@@ -641,6 +710,9 @@ void chihiro_on_quickreboot_signal(void)
 {
     if (!chihiro_active) return;
 
+    fprintf(stderr, "[%07lld] === QUICKREBOOT === game_running=%d boot3=%d\n",
+            TS_MS, chihiro_game_running, chihiro_boot3_reached);
+
     /* Ignore SCRATCH=0x04 during first kernel init — the kernel writes
      * SCRATCH as part of normal boot before SEGABOOT even loads.
      * Only react after SEGABOOT has been patched at least once. */
@@ -672,8 +744,12 @@ void chihiro_on_quickreboot_signal(void)
     }
 
     chihiro_quickreboot_pending = true;
+    chihiro_game_running = false;
+    chihiro_boot3_reached = false;
+    memset(chihiro_mbcom_command, 0, 32);
+    memset(chihiro_mbcom_response, 0, 32);
 
-    /* Re-arm SEGABOOT patch scanner and reset port counters.
+    /* Re-arm SEGABOOT patch scanner and reset ALL mbcom/DMA state.
      * QuickReboot reloads SEGABOOT from flash ROM (patches lost).
      * Kernel code stays patched (QuickReboot keeps kernel in RAM). */
     if (chihiro_lpc_global) {
@@ -682,10 +758,33 @@ void chihiro_on_quickreboot_signal(void)
         timer_mod(s->usb_poll_patch_timer,
                   qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 50);
         s->lpc_401e_reads = 0;
-        s->mbcom_handshake_done = false;
         s->lpc_40f0_reads = 0;
+        s->lpc_4084_reads = 0;
+        s->lpc_scratch_4026 = 0;
+        s->mbcom_e0_status = 0;
+        s->mbcom_resp_ready = false;
+
+        /* Reset DMA burst state */
+        s->bb_dma_active = false;
+        s->bb_dma_count = 0;
+        s->bb_reg_addr = 0;
+        s->bb_reg_status = 0;
+        s->bb_event_pending = false;
+
+        /* Reset DIMM mailbox state */
         s->dimm_cmd_count = 0;
         s->dimm_next_seq = 1;
+        s->dimm_cmd_idx = 0;
+        s->dimm_resp_ready = false;
+        memset(s->dimm_cmd, 0, sizeof(s->dimm_cmd));
+        memset(s->dimm_resp, 0, sizeof(s->dimm_resp));
+        timer_del(s->dimm_event_timer);
+        timer_del(s->dimm_resp_timer);
+
+        /* Reset Type-3 state */
+        s->t3_worker_alive = false;
+        s->t3_handshake_state = 0;
+        timer_del(s->t3_heartbeat_timer);
 
         timer_mod(s->diag_timer,
                   qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 50);
@@ -708,89 +807,9 @@ bool chihiro_intercept_reset(void)
  * STICKY section (LaunchDataPage) and MmPersistContiguousMemory.
  * See project_quickreboot_mechanism.md for details. */
 
-/* TEMPORARY: Simulates PIC baseboard (sp5001.bin) periodic STATUS
- * notifications. On real hardware, the PIC continuously reports
- * game-ready status via shared memory at 0x84000000. SEGABOOT
- * polls for these events in writes_3bc_3d4 (FUN_0002ddd0) to
- * set the [app_obj+0x3BC] gate that unblocks game loading.
- *
- * TODO: Replace with proper PIC16 emulation running
- * sp5001.bin firmware for upstream LLE integration. */
 static void chihiro_dimm_event_timer_cb(void *opaque)
 {
-    ChihiroLPCState *s = CHIHIRO_LPC_DEVICE(opaque);
-
-    if (chihiro_game_running) return;
-
-    /* Periodic DMA slot scan — same logic as the port 0x40F0 handler.
-     * SEGABOOT's writes_3bc_3d4 sends STATUS commands via DMA slots,
-     * but stops reading port 0x40F0 after initial boot. Without this
-     * timer, those commands go unprocessed and app_obj+0x3BC is never
-     * set, blocking game launch when SERVICE button is released. */
-
-    static const struct { uint32_t slot_va; uint32_t meta_va; uint32_t stride; const char *name; }
-        layouts[] = {
-            { 0xAA7B0, 0xAA790, 0x60, "2.00-fpr21042" },
-            { 0x89760, 0x89740, 0x40, "2.00-fpr23887" },
-        };
-
-    static int scan_fail_count = 0;
-
-    int processed = 0;
-    for (int layout = 0; layout < 2; layout++) {
-        uint32_t slot_base_pa = chihiro_va_to_pa(layouts[layout].slot_va);
-        if (slot_base_pa == 0xFFFFFFFF) {
-            scan_fail_count++;
-            if (scan_fail_count <= 5)
-                fprintf(stderr, "[%07lld] DIMM-SCAN: layout '%s' VA=0x%05X → PA FAIL\n",
-                        TS_MS, layouts[layout].name, layouts[layout].slot_va);
-            continue;
-        }
-        uint32_t meta_base_pa = chihiro_va_to_pa(layouts[layout].meta_va);
-        if (meta_base_pa == 0xFFFFFFFF) continue;
-        if (slot_base_pa >= 0x800000 || meta_base_pa >= 0x800000) continue;
-
-        uint32_t stride = layouts[layout].stride;
-        for (int sl = 0; sl < 16; sl++) {
-            uint32_t data_pa = slot_base_pa + sl * stride;
-            uint32_t meta_pa = meta_base_pa + sl * stride;
-            if (data_pa + 4 >= 0x800000 || meta_pa + 12 >= 0x800000) continue;
-
-            uint8_t data_byte0;
-            uint16_t meta_marker;
-            cpu_physical_memory_read(data_pa, &data_byte0, 1);
-            cpu_physical_memory_read(meta_pa + 2, &meta_marker, 2);
-
-            if (data_byte0 == 0 || meta_marker != 0) continue;
-
-            uint16_t cmd_opcode = 0;
-            cpu_physical_memory_read(data_pa + 2, &cmd_opcode, 2);
-
-            uint32_t resp_data = 0, resp_data2 = 0;
-            switch (cmd_opcode) {
-            case 0x0001: resp_data = 0x20000000; break;
-            case 0x0100: resp_data = 5; resp_data2 = 100; break;
-            case 0x0101: resp_data = 0x0317; break;
-            case 0x0102: resp_data = 0x8002; break;
-            case 0x0103: resp_data = 0x6261632D; break;
-            default: break;
-            }
-
-            meta_marker = 0x0001;
-            cpu_physical_memory_write(meta_pa + 2, &meta_marker, 2);
-            cpu_physical_memory_write(meta_pa + 4, &resp_data, 4);
-            if (cmd_opcode == 0x0100)
-                cpu_physical_memory_write(meta_pa + 8, &resp_data2, 4);
-            s->mbcom_e0_status |= 0x05;
-            qemu_irq_raise(s->irq10);
-
-            processed++;
-        }
-        break;
-    }
-
-    timer_mod(s->dimm_event_timer,
-              qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 50);
+    (void)opaque;
 }
 
 static void chihiro_dimm_process_cmd(ChihiroLPCState *s)
@@ -868,12 +887,8 @@ static void chihiro_dimm_process_cmd(ChihiroLPCState *s)
     s->dimm_resp_ready = true;
     s->dimm_next_seq = seq + 1;
     s->dimm_cmd_count++;
-
-    if (s->dimm_cmd_count == 5 && s->dimm_event_timer) {
-        timer_mod(s->dimm_event_timer,
-                  qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 100);
-    }
 }
+
 
 static uint64_t chihiro_lpc_io_read(void *opaque, hwaddr addr,
                                     unsigned size)
@@ -1037,8 +1052,6 @@ static uint64_t chihiro_lpc_io_read(void *opaque, hwaddr addr,
     return r;
 }
 
-static uint8_t chihiro_mbcom_command[512];
-static uint8_t chihiro_mbcom_response[512];
 static void chihiro_mbcom_process(void);
 
 static void chihiro_lpc_io_write(void *opaque, hwaddr addr, uint64_t val,
@@ -1209,9 +1222,6 @@ static void chihiro_lpc_io_write(void *opaque, hwaddr addr, uint64_t val,
         return;
     case 0x26:  /* Port 0x4026: scratch register */
         s->lpc_scratch_4026 = (uint16_t)val;
-        if (val == 0x0102) {
-            s->mbcom_handshake_done = true;
-        }
         break;
     case SEGA_IRQ10_ACK: { /* 0xE0 — ack: clear specific bits */
         uint8_t old_e0 = s->mbcom_e0_status;
@@ -1232,6 +1242,8 @@ static void chihiro_lpc_io_write(void *opaque, hwaddr addr, uint64_t val,
                            * Protocol (from vsg.xbe FUN_0014c120 + DPC at 0x14c0e0):
                            *   DPC writes E1=0xF (ARM)
                            *   Worker checks scratch bit 8: set=busy, clear=ready
+                           */
+        /*
                            *   Worker writes cmd to DMA (FC801), then E1=0xF, E1=0
                            *   E1=0 = "process the DMA command" (not scratch!)
                            * scratch 0x0102 = status register (bit8=busy), NOT a command */
@@ -1240,15 +1252,9 @@ static void chihiro_lpc_io_write(void *opaque, hwaddr addr, uint64_t val,
         if (val != 0) {
             if (!chihiro_game_running &&
                 (chihiro_mbcom_command[0] != 0 || chihiro_mbcom_command[1] != 0)) {
-                /* SEGABOOT DMA: E1=non-zero with command in buffer → process */
-                uint8_t dma0 = chihiro_mbcom_command[0];
-                uint8_t dma1 = chihiro_mbcom_command[1];
                 chihiro_mbcom_process();
-                if (lpc_log_verbose && e1_log < 2000) { e1_log++;
-                    fprintf(stderr, "[%07lld] E1=0x%X SEGABOOT_DMA dma=%02X%02X\n",
-                            TS_MS, (unsigned)val, dma0, dma1); }
                 s->mbcom_e0_status |= 0x01;
-                s->mbcom_resp_ready = true;
+                s->dimm_cmd_count++;
                 qemu_irq_lower(s->irq10);
                 qemu_irq_raise(s->irq10);
             } else {
@@ -1516,12 +1522,12 @@ static void chihiro_irq10_timer_cb(void *opaque)
                     }
                 } else if (armed) {
                     chihiro_game_running = true;
-                    s->lpc_scratch_4026 = 0;  /* clear stale SEGABOOT handshake value */
-                    memset(chihiro_mbcom_command, 0, 32); /* clear stale SEGABOOT commands */
+                    game_mode_bus_starts = 0;
+                    memset(chihiro_mbcom_command, 0, 32);
                     s->mbcom_resp_ready = false;
                     s->mbcom_e0_status = 0;
                     timer_del(s->dimm_event_timer);
-                    fprintf(stderr, "[%07lld] *** GAME XBE DETECTED (entry 0x%08X → 0x%08X) ***\n",
+                    fprintf(stderr, "[%07lld] GAME XBE DETECTED (entry 0x%08X → 0x%08X)\n",
                             TS_MS, segaboot_entry, cur_entry);
                 } else {
                     segaboot_entry = cur_entry;
@@ -1780,6 +1786,87 @@ static void chihiro_register_types(void)
 
 type_init(chihiro_register_types)
 
+/* ═══════════════════════════════════════════════════════════════════════
+ * Save file persistence (Phase 2)
+ *
+ * Persists QC ic11 (512B) + extmem backup region (32KB) per game.
+ * File: ~/.local/share/xemu/xemu/saves/<game>.sav
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+static char chihiro_save_path[2048];
+
+static bool chihiro_resolve_save_path(void)
+{
+    if (!chihiro_game_dir[0]) return false;
+
+    /* Resolve game filename from boot.id if not already known */
+    if (!chihiro_game_filename[0]) {
+        char bootid_path[1100];
+        snprintf(bootid_path, sizeof(bootid_path), "%s/boot.id", chihiro_game_dir);
+        FILE *f = fopen(bootid_path, "rb");
+        if (f) {
+            uint8_t bid[480];
+            if (fread(bid, 1, 480, f) >= 0xC0) {
+                char *exec = (char *)&bid[0xA0];
+                exec[31] = 0;
+                char *name = exec;
+                while (*name == '\\' || *name == '/') name++;
+                if (*name) {
+                    strncpy(chihiro_game_filename, name, 63);
+                    chihiro_game_filename[63] = 0;
+                }
+            }
+            fclose(f);
+        }
+    }
+
+    if (!chihiro_game_filename[0]) return false;
+
+    /* Strip .xbe extension for save filename */
+    char base[64];
+    strncpy(base, chihiro_game_filename, 63);
+    base[63] = 0;
+    char *dot = strrchr(base, '.');
+    if (dot) *dot = 0;
+
+    /* Build saves directory path */
+    const char *home = getenv("HOME");
+    if (!home) home = "/tmp";
+    char saves_dir[1024];
+    snprintf(saves_dir, sizeof(saves_dir),
+             "%s/.local/share/xemu/xemu/saves", home);
+
+    /* Create directory if needed */
+    g_mkdir_with_parents(saves_dir, 0755);
+
+    snprintf(chihiro_save_path, sizeof(chihiro_save_path),
+             "%s/%s.sav", saves_dir, base);
+    return true;
+}
+
+static void chihiro_exit_notify(Notifier *notifier, void *data)
+{
+    (void)notifier;
+    (void)data;
+    if (!chihiro_active) return;
+    if (!chihiro_save_path[0] && !chihiro_resolve_save_path()) return;
+    chihiro_usb_save_flush(chihiro_save_path);
+}
+
+static Notifier chihiro_exit_notifier = { .notify = chihiro_exit_notify };
+static bool chihiro_exit_notifier_registered = false;
+
+void chihiro_save_init(void)
+{
+    if (chihiro_exit_notifier_registered) return;
+    qemu_add_exit_notifier(&chihiro_exit_notifier);
+    chihiro_exit_notifier_registered = true;
+
+    if (chihiro_resolve_save_path()) {
+        chihiro_usb_save_load(chihiro_save_path);
+    }
+}
+
 /*
  * Chihiro MediaBoard IDE mbcom protocol handler
  *
@@ -1799,6 +1886,143 @@ type_init(chihiro_register_types)
 #define CHIHIRO_MBCOM_COMMAND   (CHIHIRO_MBCOM_BASE + 0x4801)  /* 0xFC801 */
 #define CHIHIRO_MBROM0          0x8000000
 #define CHIHIRO_MBROM1          0x8000800
+
+/* MemoryRegion-backed IDE interface.
+ * Only FATX goes through the block device. Flash ROM and mbcom are
+ * served via synchronous hooks in core.c (chihiro_rom_io/chihiro_mbcom_io). */
+#define CHIHIRO_FS_SIZE         ((uint64_t)CHIHIRO_MBCOM_BASE * 512)  /* 496 MB */
+#define CHIHIRO_ROM_SIZE        (2 * 1024 * 1024)  /* 2MB */
+
+static MemoryRegion chihiro_interface_container;
+static MemoryRegion chihiro_interface_fs;
+static AddressSpace chihiro_interface_as;
+static bool chihiro_interface_ready = false;
+
+void chihiro_ide_interface_init(void)
+{
+    printf("Chihiro: IDE interface init START (fs=%llu)\n",
+           (unsigned long long)CHIHIRO_FS_SIZE);
+    fflush(stdout);
+
+    memory_region_init(&chihiro_interface_container, NULL,
+                       "chihiro.interface", CHIHIRO_FS_SIZE);
+
+    memory_region_init_ram(&chihiro_interface_fs, NULL,
+                           "chihiro.interface.filesystem",
+                           CHIHIRO_FS_SIZE, &error_fatal);
+
+    memory_region_add_subregion(&chihiro_interface_container,
+                                0, &chihiro_interface_fs);
+
+    address_space_init(&chihiro_interface_as, &chihiro_interface_container,
+                       "chihiro.interface");
+
+    printf("Chihiro: IDE interface — MemoryRegions + AddressSpace OK\n");
+    fflush(stdout);
+
+    BlockDriverState *bs = bdrv_new();
+    bdrv_memory_open(bs, &chihiro_interface_as, CHIHIRO_FS_SIZE);
+    bdrv_set_monitor_owned(bs);
+    printf("Chihiro: IDE interface — BDS created\n");
+    fflush(stdout);
+
+    BlockBackend *blk = blk_new(qemu_get_aio_context(),
+                                BLK_PERM_CONSISTENT_READ | BLK_PERM_WRITE,
+                                BLK_PERM_ALL);
+    blk_insert_bs(blk, bs, &error_fatal);
+    monitor_add_blk(blk, "chihiro-interface", &error_fatal);
+    printf("Chihiro: IDE interface — BlockBackend created\n");
+    fflush(stdout);
+
+    DriveInfo *dinfo = g_malloc0(sizeof(*dinfo));
+    dinfo->type = IF_IDE;
+    dinfo->bus = 0;
+    dinfo->unit = 1;
+    dinfo->media_cd = false;
+    blk_set_legacy_dinfo(blk, dinfo);
+
+    chihiro_interface_ready = true;
+    printf("Chihiro: IDE interface initialized (%u MB fs, ROM via hook)\n",
+           (uint32_t)(CHIHIRO_FS_SIZE / (1024 * 1024)));
+    fflush(stdout);
+}
+
+void chihiro_ide_load_rom(void)
+{
+    if (!chihiro_flash_rom) return;
+    printf("Chihiro: flash ROM (%u bytes) ready for IDE hook\n",
+           chihiro_flash_rom_size);
+}
+
+void chihiro_fatx_populate(const uint8_t *fatx_data, uint32_t fatx_size)
+{
+    if (!chihiro_interface_ready) {
+        fprintf(stderr, "Chihiro: ERROR — fatx_populate called before interface_init\n");
+        return;
+    }
+    void *fs_ptr = memory_region_get_ram_ptr(&chihiro_interface_fs);
+    uint32_t copy_len = MIN(fatx_size, (uint32_t)CHIHIRO_FS_SIZE);
+    memcpy(fs_ptr, fatx_data, copy_len);
+    printf("Chihiro: FATX populated (%u MB into filesystem region)\n",
+           copy_len / (1024 * 1024));
+}
+
+bool chihiro_rom_io(uint32_t lba, void *buf, bool is_write)
+{
+    if (!chihiro_flash_rom || !chihiro_flash_rom_size) return false;
+    if (lba < CHIHIRO_MBROM0) return false;
+
+    uint32_t rom_sector = lba - CHIHIRO_MBROM0;
+    uint32_t rom_offset = rom_sector * 512;
+    if (rom_offset + 512 > chihiro_flash_rom_size) return false;
+
+    if (!is_write) {
+        memcpy(buf, chihiro_flash_rom + rom_offset, 512);
+    }
+    return true;
+}
+
+bool chihiro_mbcom_io(uint32_t lba, void *buf, bool is_write)
+{
+    if (!chihiro_mbcom_enabled) return false;
+
+    if (!is_write) {
+        if (lba == CHIHIRO_MBCOM_RESPONSE) {
+            memset(buf, 0, 512);
+            memcpy(buf, chihiro_mbcom_response, 32);
+            return true;
+        }
+        if (lba == CHIHIRO_MBCOM_COMMAND) {
+            memset(buf, 0, 512);
+            memcpy(buf, chihiro_mbcom_command, 32);
+            return true;
+        }
+    } else {
+        if (lba == CHIHIRO_MBCOM_RESPONSE) {
+            if (!chihiro_game_running) {
+                memcpy(chihiro_mbcom_response, buf, 32);
+            }
+            return true;
+        }
+        if (lba == CHIHIRO_MBCOM_COMMAND) {
+            memcpy(chihiro_mbcom_command, buf, 32);
+            if (chihiro_game_running &&
+                (chihiro_mbcom_command[0] != 0 || chihiro_mbcom_command[1] != 0)) {
+                chihiro_mbcom_process();
+                memset(chihiro_mbcom_command, 0, 32);
+                if (chihiro_lpc_global) {
+                    chihiro_lpc_global->mbcom_e0_status |= 0x01;
+                }
+                if (chihiro_irq10_global) {
+                    qemu_irq_lower(chihiro_irq10_global);
+                    qemu_irq_raise(chihiro_irq10_global);
+                }
+            }
+            return true;
+        }
+    }
+    return false;
+}
 
 void chihiro_mbcom_init(void)
 {
@@ -1899,220 +2123,9 @@ static void chihiro_mbcom_process(void)
         break;
     }
 
-    /* MAME: clear command header bytes 0-3 after processing (ack to baseboard) */
     chihiro_mbcom_command[0] = 0;
     chihiro_mbcom_command[1] = 0;
     chihiro_mbcom_command[2] = 0;
     chihiro_mbcom_command[3] = 0;
-
-    /* Start periodic DMA slot scan after initial handshake commands.
-     * SEGABOOT stops reading port 0x40F0 after boot, so the DMA scan
-     * in the 0x40F0 handler stops running. This timer ensures that
-     * STATUS commands from writes_3bc_3d4 (which sets app_obj+0x3BC
-     * gate for game launch) are processed independently.
-     * Counter resets on QuickReboot (modulo 5 check). */
-    {
-        static int mbcom_ide_cmd_count = 0;
-        mbcom_ide_cmd_count++;
-        if ((mbcom_ide_cmd_count % 5) == 0 && chihiro_lpc_global
-            && chihiro_lpc_global->dimm_event_timer) {
-            timer_mod(chihiro_lpc_global->dimm_event_timer,
-                      qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 200);
-        }
-    }
 }
 
-/*
- * IDE DMA read. Aligned with MAME chihiro.cpp::read_sector():
- *   LBA 0xFC800 (BASE+0x4800) → returns chihiro_mbcom_response (read_buffer)
- *   LBA 0xFC801 (BASE+0x4801) → returns chihiro_mbcom_command (write_buffer)
- *   Only first 32 bytes are meaningful; rest is zero.
- */
-bool chihiro_ide_read_sector(uint32_t lba, void *buffer)
-{
-    if (!chihiro_mbcom_enabled) return false;
-
-    static uint32_t ide_meta_cnt = 0, ide_fatx_cnt = 0, ide_mbcom_cnt = 0;
-    static uint32_t ide_game_xbe_cnt = 0;
-    static bool ide_after_quickreboot = false;
-    static uint32_t ide_post_qr_flash_cnt = 0, ide_post_qr_fatx_cnt = 0;
-
-    if (!ide_after_quickreboot) {
-        uint8_t khqb = 0;
-        cpu_physical_memory_read(0x3A93C, &khqb, 1);
-        if (khqb) {
-            ide_after_quickreboot = true;
-            ide_post_qr_flash_cnt = 0;
-            ide_post_qr_fatx_cnt = 0;
-            ide_game_xbe_cnt = 0;
-        }
-    }
-
-    if (lba >= 0x89 && lba < CHIHIRO_MBCOM_BASE) {
-        ide_fatx_cnt++;
-        if (ide_after_quickreboot) ide_post_qr_fatx_cnt++;
-        /* Game XBE range: cluster 22674 → LBA 725672, ~4280 sectors */
-        if (lba >= 725672 && lba < 730000) {
-            ide_game_xbe_cnt++;
-        }
-    } else if (lba < 0x89) {
-        ide_meta_cnt++;
-    } else {
-        ide_mbcom_cnt++;
-    }
-    {
-        static uint32_t ide_total = 0;
-        if (lpc_log_verbose && ++ide_total % 500 == 0)
-            fprintf(stderr, "[%07lld] IDE-STATS: total=%u meta=%u fatx=%u mbcom=%u "
-                   "(post-QR: flash=%u fatx=%u game_xbe=%u)\n",
-                   TS_MS, ide_total, ide_meta_cnt, ide_fatx_cnt, ide_mbcom_cnt,
-                   ide_post_qr_flash_cnt, ide_post_qr_fatx_cnt, ide_game_xbe_cnt);
-    }
-
-    /* FATX partition: serve from in-memory image (LBA 0 to ~700K) */
-    if (lba < CHIHIRO_MBCOM_BASE && chihiro_fatx_read_sector(lba, buffer)) {
-        return true;
-    }
-
-    if (lba == CHIHIRO_MBCOM_RESPONSE) {
-        memset(buffer, 0, 512);
-        memcpy(buffer, chihiro_mbcom_response, 32);
-        const uint8_t *d = (const uint8_t *)buffer;
-        static int fc800_read_count = 0;
-        fc800_read_count++;
-        if (lpc_log_verbose && fc800_read_count <= 20) {
-            fprintf(stderr, "[%07lld] MBCOM READ FC800 #%d: %02X%02X %02X%02X "
-                    "%02X%02X%02X%02X %02X%02X%02X%02X\n",
-                    TS_MS, fc800_read_count,
-                    d[0],d[1],d[2],d[3],d[4],d[5],d[6],d[7],d[8],d[9],d[10],d[11]);
-        }
-        return true;
-    }
-    if (lba == CHIHIRO_MBCOM_COMMAND) {
-        memset(buffer, 0, 512);
-        memcpy(buffer, chihiro_mbcom_command, 32);
-        return true;
-    }
-
-    /* mbrom0/mbrom1: serve from loaded flash ROM file.
-     * baseboard.img layout: LBA 0x8000800 → byte 0 of fpr-23887 (full 2MB).
-     * mbrom0 (LBA 0x8000000-0x80007FF): returns zeros (not needed for boot).
-     * mbrom1 (LBA 0x8000800+): flash ROM from byte 0. */
-    if (lba >= CHIHIRO_MBROM0 && chihiro_flash_rom) {
-        ide_post_qr_flash_cnt++;
-        memset(buffer, 0, 512);
-        uint32_t bank_offset = (lba >= CHIHIRO_MBROM1) ? 0x100000 : 0;
-        static bool mbrom1_logged = false;
-        if (bank_offset && !mbrom1_logged) {
-            printf("[%07lld] Chihiro: mbrom1 read (SEGABOOT 2.13)\n", TS_MS);
-            mbrom1_logged = true;
-        }
-        uint32_t offset = bank_offset + (lba & 0x7FF) * 512;
-        if (offset < chihiro_flash_rom_size) {
-            uint32_t copy_len = 512;
-            if (offset + copy_len > chihiro_flash_rom_size)
-                copy_len = chihiro_flash_rom_size - offset;
-            memcpy(buffer, chihiro_flash_rom + offset, copy_len);
-        }
-        return true;
-    }
-    memset(buffer, 0, 512);
-    return true;
-}
-
-/*
- * IDE DMA write. Aligned with MAME chihiro.cpp::write_sector():
- *   LBA 0xFC800 → write into chihiro_mbcom_response (read_buffer)
- *   LBA 0xFC801 → write into chihiro_mbcom_command (write_buffer) THEN process + IRQ10
- */
-bool chihiro_ide_write_sector(uint32_t lba, const void *buffer)
-{
-    if (!chihiro_mbcom_enabled) return false;
-
-    if (lba == CHIHIRO_MBCOM_RESPONSE) {
-        if (chihiro_game_running) {
-            /* Game mode: FC800 writes are the game clearing its local copy of the
-             * response buffer before sending a command. On real hardware, the V850
-             * response lives in separate memory (0x0C000000) — don't let the game's
-             * buffer clear overwrite our pending response. Just ignore. */
-        } else {
-            memcpy(chihiro_mbcom_response, buffer, 32);
-        }
-        return true;
-    }
-    if (lba == CHIHIRO_MBCOM_COMMAND) {
-        memcpy(chihiro_mbcom_command, buffer, 32);
-        if (!chihiro_game_running &&
-            (chihiro_mbcom_command[0] != 0 || chihiro_mbcom_command[1] != 0)) {
-            /* SEGABOOT: process immediately on DMA write (no E1 trigger needed) */
-            chihiro_mbcom_process();
-            if (chihiro_lpc_global) {
-                chihiro_lpc_global->mbcom_e0_status |= 0x01;
-            }
-            if (chihiro_irq10_global) {
-                qemu_irq_lower(chihiro_irq10_global);
-                qemu_irq_raise(chihiro_irq10_global);
-            }
-        }
-        if (chihiro_game_running &&
-            (chihiro_mbcom_command[0] != 0 || chihiro_mbcom_command[1] != 0)) {
-            /* Game mode: process immediately — the acLib poll loop blocks
-             * the update thread waiting for the response. Clear the command
-             * buffer after processing to prevent the E1 handler from
-             * double-processing the same command. */
-            chihiro_mbcom_process();
-            memset(chihiro_mbcom_command, 0, 32);
-            if (chihiro_lpc_global) {
-                chihiro_lpc_global->mbcom_e0_status |= 0x01;
-            }
-            if (chihiro_irq10_global) {
-                qemu_irq_lower(chihiro_irq10_global);
-                qemu_irq_raise(chihiro_irq10_global);
-            }
-        }
-        return true;
-    }
-    return false;
-}
-
-/*
- * Called from ide_dma_cb() when a DMA WRITE completes on IDE unit 1.
- * Checks if the write was to the mbcom command sector (LBA 0xFC801).
- * If so, reads back the command, processes it, and writes the response.
- * v146: aligned with MAME convention (FC800=response, FC801=cmd).
- */
-void chihiro_ide_dma_write_done(BlockBackend *blk, int64_t sector_num)
-{
-    if (!chihiro_mbcom_enabled) return;
-
-    int64_t cmd_lba = CHIHIRO_MBCOM_COMMAND;
-    int64_t resp_lba = CHIHIRO_MBCOM_RESPONSE;
-
-    if (sector_num <= cmd_lba) return;
-    if (sector_num > cmd_lba + 256) return;
-
-    /* Read back the command sector */
-    uint8_t cmd_data[512];
-    int ret = blk_pread(blk, cmd_lba * 512, 512, cmd_data, 0);
-    if (ret < 0) return;
-
-    if (cmd_data[0] == 0 && cmd_data[1] == 0) return;
-
-    /* Copy into command buffer then process (MAME style) */
-    memcpy(chihiro_mbcom_command, cmd_data, 32);
-    chihiro_mbcom_process();
-
-    /* Write response back to disk (for persistence through any DMA rereads) */
-    uint8_t resp_sector[512];
-    memset(resp_sector, 0, 512);
-    memcpy(resp_sector, chihiro_mbcom_response, 32);
-    blk_pwrite(blk, resp_lba * 512, 512, resp_sector, 0);
-
-    /* Clear command sector on disk (MAME clears header bytes; we clear whole sector) */
-    memset(cmd_data, 0, 512);
-    blk_pwrite(blk, cmd_lba * 512, 512, cmd_data, 0);
-
-    if (chihiro_irq10_global) {
-        qemu_irq_raise(chihiro_irq10_global);
-    }
-}

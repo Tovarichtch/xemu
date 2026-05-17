@@ -30,7 +30,6 @@
 #include "qemu/error-report.h"
 #include "qemu/main-loop.h"
 #include "qemu/timer.h"
-#define TS_MS ((long long)(qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL)))
 #include "qemu/hw-version.h"
 #include "qemu/memalign.h"
 #include "system/system.h"
@@ -896,6 +895,8 @@ static void ide_dma_cb(void *opaque, int ret)
     bool stay_active = false;
     int32_t prep_size = 0;
 
+
+
     if (ret == -EINVAL) {
         ide_dma_error(s);
         return;
@@ -934,15 +935,6 @@ static void ide_dma_cb(void *opaque, int ret)
         s->status = READY_STAT | SEEK_STAT;
         ide_bus_set_irq(s->bus);
 
-        /* Chihiro mbcom hook: after a DMA write completes on unit 1,
-         * check if the sector is in the mbcom command range.
-         * If so, process the command and write the response. */
-        if (s->dma_cmd == IDE_DMA_WRITE && s->unit == 1) {
-            extern void chihiro_ide_dma_write_done(BlockBackend *blk,
-                                                    int64_t sector_num);
-            chihiro_ide_dma_write_done(s->blk, sector_num);
-        }
-
         goto eot;
     }
 
@@ -954,16 +946,7 @@ static void ide_dma_cb(void *opaque, int ret)
     /* prepare_buf() must succeed and respect the limit */
     assert(prep_size >= 0 && prep_size <= n * 512);
 
-    /*
-     * Now prep_size stores the number of bytes in the sglist, and
-     * s->io_buffer_size stores the number of bytes described by the PRDs.
-     */
-
     if (prep_size < n * 512) {
-        /*
-         * The PRDs are too short for this request. Error condition!
-         * Reset the Active bit and don't raise the interrupt.
-         */
         s->status = READY_STAT | SEEK_STAT;
         ide_dma_buf_commit(s, 0);
         goto eot;
@@ -986,61 +969,73 @@ static void ide_dma_cb(void *opaque, int ret)
                     (unsigned long)sector_num, n); }
     }
 
-    /* Chihiro: intercept IDE reads on baseboard (unit 1) for mbcom/mbrom sectors.
-     * Must be BEFORE ide_sect_range_ok — mbcom/mbrom LBAs are beyond
-     * the baseboard.img size and would be rejected as out-of-range.
-     * Must handle ALL sectors in multi-sector DMA requests. */
-    if (s->dma_cmd == IDE_DMA_READ && s->unit == 1 && n > 0) {
-        extern bool chihiro_ide_read_sector(uint32_t lba, void *buffer);
+    /* Chihiro IDE slave intercepts: mbcom mailbox + flash ROM.
+     * mbcom (FC800/FC801): HLE mailbox, temporary until V850 LLE.
+     * ROM (0x8000000+): flash ROM served synchronously from loaded buffer.
+     * FATX (0-0xF7FFF): goes through MemoryRegion-backed block device. */
+    if (s->unit == 1 && n > 0) {
+        extern bool chihiro_mbcom_io(uint32_t lba, void *buf, bool is_write);
+        extern bool chihiro_rom_io(uint32_t lba, void *buf, bool is_write);
         uint8_t sector_buf[512];
-        if (chihiro_ide_read_sector((uint32_t)sector_num, sector_buf)) {
-            int total = n;
-            int sg_idx = 0;
-            dma_addr_t sg_off = 0;
-            for (int i = 0; i < total; i++) {
-                if (i > 0) {
-                    chihiro_ide_read_sector((uint32_t)(sector_num + i), sector_buf);
-                }
-                int remaining = 512;
-                int buf_pos = 0;
-                while (remaining > 0) {
-                    while (sg_idx < s->sg.nsg && sg_off >= s->sg.sg[sg_idx].len) {
-                        sg_off -= s->sg.sg[sg_idx].len;
-                        sg_idx++;
-                    }
-                    if (sg_idx >= s->sg.nsg) break;
-                    dma_addr_t dest = s->sg.sg[sg_idx].base + sg_off;
-                    dma_addr_t avail = s->sg.sg[sg_idx].len - sg_off;
-                    int chunk = (remaining < (int)avail) ? remaining : (int)avail;
-                    dma_memory_write(&address_space_memory, dest,
-                                     sector_buf + buf_pos, chunk,
-                                     MEMTXATTRS_UNSPECIFIED);
-                    sg_off += chunk;
-                    buf_pos += chunk;
-                    remaining -= chunk;
-                }
+        if (s->dma_cmd == IDE_DMA_READ &&
+            (sector_num == 0xFC800 || sector_num == 0xFC801)) {
+            if (chihiro_mbcom_io((uint32_t)sector_num, sector_buf, false)) {
+                dma_memory_write(&address_space_memory,
+                                 s->sg.sg[0].base, sector_buf, 512,
+                                 MEMTXATTRS_UNSPECIFIED);
+                sector_num += 1;
+                ide_set_sector(s, sector_num);
+                s->nsector -= 1;
+                s->status = READY_STAT | SEEK_STAT;
+                ide_bus_set_irq(s->bus);
+                goto eot;
             }
-            sector_num += total;
-            ide_set_sector(s, sector_num);
-            s->nsector -= total;
-            s->status = READY_STAT | SEEK_STAT;
-            ide_bus_set_irq(s->bus);
-            goto eot;
         }
-    }
-
-    /* Chihiro: intercept IDE writes on baseboard (unit 1) for mbcom sectors */
-    if (s->dma_cmd == IDE_DMA_WRITE && s->unit == 1 && n > 0) {
-        extern bool chihiro_ide_write_sector(uint32_t lba, const void *buffer);
-        uint8_t sector_buf[512];
-        dma_memory_read(&address_space_memory,
-                        s->sg.sg[0].base, sector_buf, 512,
-                        MEMTXATTRS_UNSPECIFIED);
-        if (chihiro_ide_write_sector((uint32_t)sector_num, sector_buf)) {
-            sector_num += 1;
-            ide_set_sector(s, sector_num);
-            s->nsector -= 1;
-            if (s->nsector == 0) {
+        if (s->dma_cmd == IDE_DMA_READ && sector_num >= 0x8000000) {
+            if (chihiro_rom_io((uint32_t)sector_num, sector_buf, false)) {
+                int total = n;
+                int sg_idx = 0;
+                dma_addr_t sg_off = 0;
+                for (int i = 0; i < total; i++) {
+                    if (i > 0) {
+                        chihiro_rom_io((uint32_t)(sector_num + i), sector_buf, false);
+                    }
+                    int remaining = 512;
+                    int buf_pos = 0;
+                    while (remaining > 0) {
+                        while (sg_idx < s->sg.nsg && sg_off >= s->sg.sg[sg_idx].len) {
+                            sg_off -= s->sg.sg[sg_idx].len;
+                            sg_idx++;
+                        }
+                        if (sg_idx >= s->sg.nsg) break;
+                        dma_addr_t dest = s->sg.sg[sg_idx].base + sg_off;
+                        dma_addr_t avail = s->sg.sg[sg_idx].len - sg_off;
+                        int chunk = (remaining < (int)avail) ? remaining : (int)avail;
+                        dma_memory_write(&address_space_memory, dest,
+                                         sector_buf + buf_pos, chunk,
+                                         MEMTXATTRS_UNSPECIFIED);
+                        sg_off += chunk;
+                        buf_pos += chunk;
+                        remaining -= chunk;
+                    }
+                }
+                sector_num += total;
+                ide_set_sector(s, sector_num);
+                s->nsector -= total;
+                s->status = READY_STAT | SEEK_STAT;
+                ide_bus_set_irq(s->bus);
+                goto eot;
+            }
+        }
+        if (s->dma_cmd == IDE_DMA_WRITE &&
+            (sector_num == 0xFC800 || sector_num == 0xFC801)) {
+            dma_memory_read(&address_space_memory,
+                            s->sg.sg[0].base, sector_buf, 512,
+                            MEMTXATTRS_UNSPECIFIED);
+            if (chihiro_mbcom_io((uint32_t)sector_num, sector_buf, true)) {
+                sector_num += 1;
+                ide_set_sector(s, sector_num);
+                s->nsector -= 1;
                 s->status = READY_STAT | SEEK_STAT;
                 ide_bus_set_irq(s->bus);
                 goto eot;
@@ -1056,8 +1051,6 @@ static void ide_dma_cb(void *opaque, int ret)
     }
 
     offset = sector_num << BDRV_SECTOR_BITS;
-    if (s->unit == 1 && s->dma_cmd == IDE_DMA_READ) {
-    }
     switch (s->dma_cmd) {
     case IDE_DMA_READ:
         s->bus->dma->aiocb = dma_blk_read(s->blk, &s->sg, offset,
@@ -1440,26 +1433,6 @@ void ide_ioport_write(void *opaque, uint32_t addr, uint32_t val)
     case ATA_IOPORT_WR_COMMAND:
         ide_clear_hob(bus);
         qemu_irq_lower(bus->irq);
-        /* Chihiro debug: log IDE commands (suppress FC801 polling spam) */
-        {
-            IDEState *active = ide_bus_active_if(bus);
-            int unit = active->unit;
-            int64_t sector = ide_get_sector(active);
-            int nsector = active->nsector ? active->nsector : 256;
-            static uint32_t fc801_count = 0;
-            if (unit == 1 && sector == 0xFC801) {
-                fc801_count++;
-                if (fc801_count <= 15) {
-                    if(0) printf("[%07lld] IDE cmd=0x%02X unit=%d LBA=0x%llX nsect=%d\n",
-                           TS_MS, val, unit, (long long)sector, nsector);
-                } else if (fc801_count == 16) {
-                    if(0) printf("[%07lld] IDE FC801 polling — suppressing further logs\n", TS_MS);
-                }
-            } else {
-                if(0) printf("[%07lld] IDE cmd=0x%02X unit=%d LBA=0x%llX nsect=%d\n",
-                       TS_MS, val, unit, (long long)sector, nsector);
-            }
-        }
         ide_bus_exec_cmd(bus, val);
         break;
     }

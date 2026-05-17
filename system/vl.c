@@ -3116,36 +3116,23 @@ void qemu_init(int argc, char **argv)
             format_suffix = ",format=raw";
         }
 
-        /* Chihiro: if dvd_path is a directory or XBE, create a stub file.
-         * The in-memory FATX + IDE hooks serve real data; the stub just
-         * makes QEMU create the IDE device on index=1. */
+        /* Chihiro: if dvd_path is a directory or XBE, skip the -drive for
+         * index=1 entirely. The IDE slave is registered programmatically
+         * by chihiro_ide_interface_init() with a MemoryRegion-backed device. */
         struct stat dvd_st;
         if (stat(dvd_path, &dvd_st) == 0 &&
             (S_ISDIR(dvd_st.st_mode) ||
              g_ascii_strcasecmp(ext, ".xbe") == 0)) {
-            static char stub_path[512];
-            snprintf(stub_path, sizeof(stub_path), "%s%s",
-                     xemu_settings_get_base_path(), "chihiro_stub.img");
-            /* Create 1MB stub if it doesn't exist */
-            if (access(stub_path, F_OK) != 0) {
-                FILE *sf = fopen(stub_path, "wb");
-                if (sf) {
-                    uint8_t zero[512];
-                    memset(zero, 0, 512);
-                    for (int i = 0; i < 2048; i++) fwrite(zero, 1, 512, sf);
-                    fclose(sf);
-                }
-            }
             free(escaped_dvd_path);
-            escaped_dvd_path = strdup_double_commas(stub_path);
-            dvd_media = "disk";
-            format_suffix = ",format=raw";
+            escaped_dvd_path = NULL;
         }
     }
-    fake_argv[fake_argc++] = strdup("-drive");
-    fake_argv[fake_argc++] = g_strdup_printf("index=1,media=%s,file=%s%s",
-        dvd_media, escaped_dvd_path, format_suffix);
-    free(escaped_dvd_path);
+    if (escaped_dvd_path) {
+        fake_argv[fake_argc++] = strdup("-drive");
+        fake_argv[fake_argc++] = g_strdup_printf("index=1,media=%s,file=%s%s",
+            dvd_media, escaped_dvd_path, format_suffix);
+        free(escaped_dvd_path);
+    }
 
     fake_argv[fake_argc++] = strdup("-display");
     fake_argv[fake_argc++] = strdup("xemu");

@@ -305,8 +305,20 @@ void xbox_init_common(MachineState *machine,
                              OBJECT(pit), &error_fatal);
     isa_realize_and_unref(pcms->pcspk, isa_bus, &error_fatal);
 
+    if (machine->ram_size > 64 * 1024 * 1024) {
+        chihiro_ide_interface_init();
+    }
+
+    printf("Chihiro: TRACE — before piix3-ide create\n"); fflush(stdout);
     PCIDevice *dev = pci_create_simple(pci_bus, PCI_DEVFN(9, 0), "piix3-ide");
+    printf("Chihiro: TRACE — before pci_ide_create_devs\n"); fflush(stdout);
+    {
+        DriveInfo *di = drive_get_by_index(IF_IDE, 1);
+        printf("Chihiro: TRACE — drive_get_by_index(IF_IDE,1) = %p\n", (void*)di);
+        fflush(stdout);
+    }
     pci_ide_create_devs(dev);
+    printf("Chihiro: TRACE — after pci_ide_create_devs\n"); fflush(stdout);
     // idebus[0] = qdev_get_child_bus(&dev->qdev, "ide.0");
     // idebus[1] = qdev_get_child_bus(&dev->qdev, "ide.1");
 
@@ -382,9 +394,18 @@ void xbox_init_common(MachineState *machine,
             printf("Chihiro: LPC bridge revision set to 0xB4 (PATH_B)\n");
         }
 
+        /* Chihiro: disable Xbox EEPROM persistence.
+         * The service menu writes video/region settings that can corrupt
+         * subsequent boots. Game settings are in ic11/extmem (save system). */
+        Object *eeprom_obj = object_resolve_path_type("", "smbus-storage", NULL);
+        if (eeprom_obj) {
+            object_property_set_bool(eeprom_obj, "persist", false, NULL);
+        }
+
         /* Load baseboard flash ROM (SEGABOOT) from file.
          * Searches for fpr-23887/fpr21042 next to the BIOS file. */
         chihiro_load_flash_rom(g_config.sys.files.flashrom_path);
+        chihiro_ide_load_rom();
         chihiro_load_eeproms(g_config.sys.files.flashrom_path);
 
         /* Build FATX from game directory if dvd_path is a directory.
@@ -446,6 +467,9 @@ void xbox_init_common(MachineState *machine,
                             }
                         }
                     }
+                    if (fatx) {
+                        chihiro_fatx_populate(fatx, fatx_size);
+                    }
                     /* Store game dir for boot.id reading at QuickReboot */
                     {
                         extern char chihiro_game_dir[1024];
@@ -500,6 +524,9 @@ void xbox_init_common(MachineState *machine,
 
             /* Store globally for the hotplug timer */
             chihiro_usb_set_devices(qc, sc);
+
+            /* Load per-game saves (ic11 + extmem) and register exit flusher */
+            chihiro_save_init();
         } else {
             printf("Chihiro: WARNING — could not find USB bus on OHCI\n");
         }

@@ -117,6 +117,8 @@ typedef struct ChihiroUSBState {
     int  diag_zero_cycle_streak;
 } ChihiroUSBState;
 
+static ChihiroUSBState *chihiro_qc_instance;
+
 enum chihiro_usb_strings {
     STRING_SERIALNUMBER,
     STRING_MANUFACTURER,
@@ -402,6 +404,8 @@ static void handle_control(USBDevice *dev, USBPacket *p,
         setup[5] = (uint8_t)(index >> 8);
         setup[6] = (uint8_t)(length & 0xFF);
         setup[7] = (uint8_t)(length >> 8);
+
+
 
         const uint8_t *out_data = NULL;
         int out_len = 0;
@@ -804,15 +808,6 @@ static void handle_data(USBDevice *dev, USBPacket *p)
     /* LLE path: route bulk transfers through AN2131 firmware */
     if (s->use_lle) {
         if (p->pid == USB_TOKEN_IN) {
-            if (ep == 3 && s->is_qc) {
-                static int ep3in_poll_diag = 0;
-                if (ep3in_poll_diag < 50) {
-                    fprintf(stderr, "[EP3-IN-POLL] t=%lld pending=%d fw_arm=%d fw_bc=%d\n",
-                            TS_MS, s->ep_in[3].pending, s->an2131.ep[3].in_armed,
-                            s->an2131.ep[3].bc_in);
-                    ep3in_poll_diag++;
-                }
-            }
             /* HLE-excluded vendor requests (0x16/0x17 etc.) queue data on
              * s->ep_in[] buffers.  Serve those first so the host sees them
              * even though the bulk IN path is otherwise LLE-driven. */
@@ -911,14 +906,18 @@ static void handle_data(USBDevice *dev, USBPacket *p)
                     s->write_1f_addr += chunk;
                 }
                 s->write_1f_remaining -= chunk;
-                if (s->write_1f_remaining <= 0 && addr >= 0x8000) {
-                    s->acbu_response_ready = true;
-                }
                 if (addr == 0x8000 && chunk >= 4 &&
                     buf[0] == 'A' && buf[1] == 'C' &&
                     buf[2] == 'B' && buf[3] == 'U') {
                     memcpy(s->extmem + 0x8400, s->ic11, 128);
                     s->acbu_response_ready = true;
+                }
+                if (s->write_1f_remaining <= 0 && addr >= 0x8000) {
+                    s->acbu_response_ready = true;
+                    if (s->extmem[0x8000] == 'A' && s->extmem[0x8001] == 'C' &&
+                        s->extmem[0x8002] == 'B' && s->extmem[0x8003] == 'U') {
+                        memcpy(s->ic11, s->extmem + 0x8000, 128);
+                    }
                 }
             }
 
@@ -988,15 +987,19 @@ static void handle_data(USBDevice *dev, USBPacket *p)
                 s->write_1f_remaining -= copy;
                 s->acbu_last_ep3_out_ms = TS_MS;
 
-                if (s->write_1f_remaining <= 0 && addr >= 0x8000) {
-                    s->acbu_response_ready = true;
-                }
-
                 if (addr == 0x8000 && total >= 4 &&
                     buf[0] == 'A' && buf[1] == 'C' &&
                     buf[2] == 'B' && buf[3] == 'U') {
                     memcpy(s->extmem + 0x8400, s->ic11, 128);
                     s->acbu_response_ready = true;
+                }
+
+                if (s->write_1f_remaining <= 0 && addr >= 0x8000) {
+                    s->acbu_response_ready = true;
+                    if (s->extmem[0x8000] == 'A' && s->extmem[0x8001] == 'C' &&
+                        s->extmem[0x8002] == 'B' && s->extmem[0x8003] == 'U') {
+                        memcpy(s->ic11, s->extmem + 0x8000, 128);
+                    }
                 }
 
             }
@@ -1058,7 +1061,7 @@ static void chihiro_an2131qc_realize(USBDevice *dev, Error **errp)
     s->an2131.ic10_eeprom = s->eeprom;
     s->an2131.ic10_size = sizeof(s->eeprom);
     s->an2131.ic11_eeprom = s->ic11;
-    s->an2131.ic11_size = chihiro_ic11_data ? chihiro_ic11_size : 128;
+    s->an2131.ic11_size = 256;
     s->an2131.extmem = s->extmem;
     s->an2131.extmem_size = sizeof(s->extmem);
     s->an2131.usb_dev = s;
@@ -1072,6 +1075,8 @@ static void chihiro_an2131qc_realize(USBDevice *dev, Error **errp)
         timer_mod(s->lle_tick_timer,
                   qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 1);
     }
+
+    chihiro_qc_instance = s;
 
     printf("[%07lld] Chihiro QC: ic10=%s ic11=%s, "
            "region=0x%02X, serial=%.16s, LLE=%s\n",
@@ -1164,7 +1169,7 @@ static void chihiro_an2131sc_realize(USBDevice *dev, Error **errp)
     s->an2131.ic10_eeprom = s->eeprom;
     s->an2131.ic10_size = sizeof(s->eeprom);
     s->an2131.ic11_eeprom = s->ic11;
-    s->an2131.ic11_size = chihiro_ic11_data ? chihiro_ic11_size : 128;
+    s->an2131.ic11_size = 256;
     s->an2131.extmem = s->extmem;
     s->an2131.extmem_size = sizeof(s->extmem);
     s->an2131.usb_dev = s;
@@ -1223,6 +1228,66 @@ static const TypeInfo chihiro_an2131sc_info = {
     .instance_size = sizeof(ChihiroUSBState),
     .class_init    = chihiro_an2131sc_class_init,
 };
+
+#define CHIHIRO_SAVE_MAGIC 0x56534843  /* "CHSV" LE */
+#define CHIHIRO_SAVE_VERSION 1
+#define CHIHIRO_SAVE_IC11_SIZE 512
+#define CHIHIRO_SAVE_EXTMEM_OFF 0x8000
+#define CHIHIRO_SAVE_EXTMEM_SIZE 0x8000
+
+bool chihiro_usb_save_load(const char *path)
+{
+    if (!chihiro_qc_instance || !path) return false;
+
+    FILE *f = fopen(path, "rb");
+    if (!f) return false;
+
+    uint32_t magic, version;
+    if (fread(&magic, 4, 1, f) != 1 || magic != CHIHIRO_SAVE_MAGIC) {
+        fclose(f);
+        return false;
+    }
+    if (fread(&version, 4, 1, f) != 1 || version != CHIHIRO_SAVE_VERSION) {
+        fclose(f);
+        return false;
+    }
+
+    ChihiroUSBState *s = chihiro_qc_instance;
+    if (fread(s->ic11, 1, CHIHIRO_SAVE_IC11_SIZE, f) != CHIHIRO_SAVE_IC11_SIZE) {
+        fclose(f);
+        return false;
+    }
+    if (fread(s->extmem + CHIHIRO_SAVE_EXTMEM_OFF, 1, CHIHIRO_SAVE_EXTMEM_SIZE, f)
+        != CHIHIRO_SAVE_EXTMEM_SIZE) {
+        fclose(f);
+        return false;
+    }
+
+    fclose(f);
+    fprintf(stderr, "Chihiro: save loaded from %s\n", path);
+    return true;
+}
+
+bool chihiro_usb_save_flush(const char *path)
+{
+    if (!chihiro_qc_instance || !path) return false;
+
+    ChihiroUSBState *s = chihiro_qc_instance;
+
+    FILE *f = fopen(path, "wb");
+    if (!f) return false;
+
+    uint32_t magic = CHIHIRO_SAVE_MAGIC;
+    uint32_t version = CHIHIRO_SAVE_VERSION;
+    fwrite(&magic, 4, 1, f);
+    fwrite(&version, 4, 1, f);
+    fwrite(s->ic11, 1, CHIHIRO_SAVE_IC11_SIZE, f);
+    fwrite(s->extmem + CHIHIRO_SAVE_EXTMEM_OFF, 1, CHIHIRO_SAVE_EXTMEM_SIZE, f);
+
+    fclose(f);
+    fprintf(stderr, "Chihiro: save flushed to %s\n", path);
+    return true;
+}
 
 static void chihiro_usb_register_types(void)
 {

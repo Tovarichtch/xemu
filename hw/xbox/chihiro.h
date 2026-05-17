@@ -6,11 +6,15 @@
 /* Forward declaration */
 typedef struct USBDevice USBDevice;
 
-/* mbcom IDE hooks — called from IDE DMA path */
+/* MemoryRegion-backed IDE interface */
+void chihiro_ide_interface_init(void);
+void chihiro_ide_load_rom(void);
+void chihiro_fatx_populate(const uint8_t *fatx_data, uint32_t fatx_size);
+bool chihiro_mbcom_io(uint32_t lba, void *buf, bool is_write);
+bool chihiro_rom_io(uint32_t lba, void *buf, bool is_write);
+
+/* mbcom state */
 void chihiro_mbcom_init(void);
-bool chihiro_ide_read_sector(uint32_t lba, void *buffer);
-bool chihiro_ide_write_sector(uint32_t lba, const void *buffer);
-void chihiro_ide_dma_write_done(BlockBackend *blk, int64_t sector_num);
 
 /* USB delayed hotplug (AN2131 firmware boot simulation) */
 void chihiro_usb_set_devices(USBDevice *qc, USBDevice *sc);
@@ -32,5 +36,10 @@ void chihiro_on_quickreboot_signal(void);
 
 /* Called from SMC POWER handler to detect QuickReboot */
 bool chihiro_intercept_reset(void);
+
+/* Save file persistence (Phase 2): ic11 + extmem backup area */
+bool chihiro_usb_save_load(const char *path);
+bool chihiro_usb_save_flush(const char *path);
+void chihiro_save_init(void);
 
 #endif
