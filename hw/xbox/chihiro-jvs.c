@@ -23,6 +23,7 @@ static const uint8_t capabilities[] = {
     0x02, 0x02, 0x00, 0x00,   /* Coin: 2 slots */
     0x03, 0x08, 0x10, 0x00,   /* Analog: 8 channels, 16-bit */
     0x12, 0x06, 0x00, 0x00,   /* GP output: 6 channels */
+    0x15, 0x00, 0x00, 0x00,   /* Backup data */
     0x00                       /* Terminator */
 };
 
@@ -248,8 +249,6 @@ static int jvs_handle_command(ChihiroJVSState *s,
         return 3;
 
     default:
-        /* Unknown command — return InvalidParameter (NOT UnsupportedCommand,
-         * which would trigger Error 11 in the game) */
         PUT(JVS_REPORT_PARAM);
         *rpos = rp;
         return 1;
