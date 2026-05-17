@@ -2044,8 +2044,20 @@ bool chihiro_ide_serve(int dma_cmd, uint32_t lba, int n,
         }
     }
 
-    *irq = false;
-    return false;
+    /* Any unhandled LBA: return zeros (read) or discard (write).
+     * Never fall through to async block device — breaks JVS timing. */
+    if (dma_cmd == 0) {
+        int total = n * 512;
+        int sg_idx = 0, done = 0;
+        while (done < total && sg_idx < sg->nsg) {
+            int chunk = MIN(total - done, (int)sg->sg[sg_idx].len);
+            dma_memory_set(&address_space_memory, sg->sg[sg_idx].base,
+                           0, chunk, MEMTXATTRS_UNSPECIFIED);
+            done += chunk;
+            sg_idx++;
+        }
+    }
+    return true;
 }
 
 void chihiro_mbcom_init(void)
