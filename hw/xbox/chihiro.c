@@ -1967,60 +1967,84 @@ void chihiro_fatx_populate(const uint8_t *fatx_data, uint32_t fatx_size)
            copy_len / (1024 * 1024));
 }
 
-bool chihiro_rom_io(uint32_t lba, void *buf, bool is_write)
+static void sg_write(QEMUSGList *sg, const void *src, int len)
 {
-    if (!chihiro_flash_rom || !chihiro_flash_rom_size) return false;
-    if (lba < CHIHIRO_MBROM0) return false;
-
-    uint32_t rom_sector = lba - CHIHIRO_MBROM0;
-    uint32_t rom_offset = rom_sector * 512;
-    if (rom_offset + 512 > chihiro_flash_rom_size) return false;
-
-    if (!is_write) {
-        memcpy(buf, chihiro_flash_rom + rom_offset, 512);
+    int sg_idx = 0, done = 0;
+    while (done < len && sg_idx < sg->nsg) {
+        int chunk = MIN(len - done, (int)sg->sg[sg_idx].len);
+        dma_memory_write(&address_space_memory, sg->sg[sg_idx].base,
+                         (const uint8_t *)src + done, chunk,
+                         MEMTXATTRS_UNSPECIFIED);
+        done += chunk;
+        sg_idx++;
     }
-    return true;
 }
 
-bool chihiro_mbcom_io(uint32_t lba, void *buf, bool is_write)
+bool chihiro_ide_serve(int dma_cmd, uint32_t lba, int n,
+                       QEMUSGList *sg, bool *irq)
 {
-    if (!chihiro_mbcom_enabled) return false;
+    *irq = true;
 
-    if (!is_write) {
-        if (lba == CHIHIRO_MBCOM_RESPONSE) {
-            memset(buf, 0, 512);
-            memcpy(buf, chihiro_mbcom_response, 32);
-            return true;
-        }
-        if (lba == CHIHIRO_MBCOM_COMMAND) {
-            memset(buf, 0, 512);
-            memcpy(buf, chihiro_mbcom_command, 32);
-            return true;
-        }
-    } else {
-        if (lba == CHIHIRO_MBCOM_RESPONSE) {
-            if (!chihiro_game_running) {
-                memcpy(chihiro_mbcom_response, buf, 32);
+    if (dma_cmd == 0) { /* IDE_DMA_READ */
+        /* FATX: synchronous from MemoryRegion RAM (timing-critical) */
+        if (lba < CHIHIRO_MBCOM_BASE && chihiro_interface_ready) {
+            uint64_t offset = (uint64_t)lba * 512;
+            if (offset < CHIHIRO_FS_SIZE) {
+                void *src = (uint8_t *)memory_region_get_ram_ptr(
+                    &chihiro_interface_fs) + offset;
+                sg_write(sg, src, n * 512);
+                return true;
             }
+        }
+        /* mbcom response/command */
+        if (chihiro_mbcom_enabled &&
+            (lba == CHIHIRO_MBCOM_RESPONSE || lba == CHIHIRO_MBCOM_COMMAND)) {
+            uint8_t buf[512] = {0};
+            const uint8_t *src = (lba == CHIHIRO_MBCOM_RESPONSE)
+                ? chihiro_mbcom_response : chihiro_mbcom_command;
+            memcpy(buf, src, 32);
+            sg_write(sg, buf, 512);
             return true;
         }
-        if (lba == CHIHIRO_MBCOM_COMMAND) {
-            memcpy(chihiro_mbcom_command, buf, 32);
-            if (chihiro_game_running &&
-                (chihiro_mbcom_command[0] != 0 || chihiro_mbcom_command[1] != 0)) {
-                chihiro_mbcom_process();
-                memset(chihiro_mbcom_command, 0, 32);
-                if (chihiro_lpc_global) {
-                    chihiro_lpc_global->mbcom_e0_status |= 0x01;
-                }
-                if (chihiro_irq10_global) {
-                    qemu_irq_lower(chihiro_irq10_global);
-                    qemu_irq_raise(chihiro_irq10_global);
+        /* flash ROM */
+        if (lba >= CHIHIRO_MBROM0 && chihiro_flash_rom) {
+            uint32_t rom_off = (lba - CHIHIRO_MBROM0) * 512;
+            if (rom_off + (uint32_t)n * 512 <= chihiro_flash_rom_size) {
+                sg_write(sg, chihiro_flash_rom + rom_off, n * 512);
+                return true;
+            }
+        }
+    }
+
+    if (dma_cmd == 1) { /* IDE_DMA_WRITE */
+        if (chihiro_mbcom_enabled &&
+            (lba == CHIHIRO_MBCOM_RESPONSE || lba == CHIHIRO_MBCOM_COMMAND)) {
+            uint8_t buf[512];
+            dma_memory_read(&address_space_memory,
+                            sg->sg[0].base, buf, 512,
+                            MEMTXATTRS_UNSPECIFIED);
+            if (lba == CHIHIRO_MBCOM_RESPONSE) {
+                if (!chihiro_game_running)
+                    memcpy(chihiro_mbcom_response, buf, 32);
+            } else {
+                memcpy(chihiro_mbcom_command, buf, 32);
+                if (chihiro_game_running &&
+                    (chihiro_mbcom_command[0] || chihiro_mbcom_command[1])) {
+                    chihiro_mbcom_process();
+                    memset(chihiro_mbcom_command, 0, 32);
+                    if (chihiro_lpc_global)
+                        chihiro_lpc_global->mbcom_e0_status |= 0x01;
+                    if (chihiro_irq10_global) {
+                        qemu_irq_lower(chihiro_irq10_global);
+                        qemu_irq_raise(chihiro_irq10_global);
+                    }
                 }
             }
             return true;
         }
     }
+
+    *irq = false;
     return false;
 }
 

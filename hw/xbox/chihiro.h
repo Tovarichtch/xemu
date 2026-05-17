@@ -2,6 +2,7 @@
 #define HW_XBOX_CHIHIRO_H
 
 #include "system/block-backend.h"
+#include "system/dma.h"
 
 /* Forward declaration */
 typedef struct USBDevice USBDevice;
@@ -10,8 +11,8 @@ typedef struct USBDevice USBDevice;
 void chihiro_ide_interface_init(void);
 void chihiro_ide_load_rom(void);
 void chihiro_fatx_populate(const uint8_t *fatx_data, uint32_t fatx_size);
-bool chihiro_mbcom_io(uint32_t lba, void *buf, bool is_write);
-bool chihiro_rom_io(uint32_t lba, void *buf, bool is_write);
+bool chihiro_ide_serve(int dma_cmd, uint32_t lba, int n,
+                       QEMUSGList *sg, bool *irq);
 
 /* mbcom state */
 void chihiro_mbcom_init(void);

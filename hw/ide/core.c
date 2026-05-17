@@ -954,92 +954,18 @@ static void ide_dma_cb(void *opaque, int ret)
 
     trace_ide_dma_cb(s, sector_num, n, IDE_DMA_CMD_str(s->dma_cmd));
 
-    if (s->unit == 1 && sector_num >= 0xFC800 && sector_num <= 0xFC801) {
-        static int ide_mbcom_log = 0;
-        extern bool chihiro_game_running;
-        static bool ide_mbcom_game_reset = false;
-        if (chihiro_game_running && !ide_mbcom_game_reset) {
-            ide_mbcom_game_reset = true;
-            ide_mbcom_log = 0;
-        }
-        if (ide_mbcom_log < 100) { ide_mbcom_log++;
-            int64_t now = qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL);
-            fprintf(stderr, "[%07lld] IDE mbcom %s LBA=0x%lX n=%d\n",
-                    now, IDE_DMA_CMD_str(s->dma_cmd),
-                    (unsigned long)sector_num, n); }
-    }
-
-    /* Chihiro IDE slave intercepts: mbcom mailbox + flash ROM.
-     * mbcom (FC800/FC801): HLE mailbox, temporary until V850 LLE.
-     * ROM (0x8000000+): flash ROM served synchronously from loaded buffer.
-     * FATX (0-0xF7FFF): goes through MemoryRegion-backed block device. */
     if (s->unit == 1 && n > 0) {
-        extern bool chihiro_mbcom_io(uint32_t lba, void *buf, bool is_write);
-        extern bool chihiro_rom_io(uint32_t lba, void *buf, bool is_write);
-        uint8_t sector_buf[512];
-        if (s->dma_cmd == IDE_DMA_READ &&
-            (sector_num == 0xFC800 || sector_num == 0xFC801)) {
-            if (chihiro_mbcom_io((uint32_t)sector_num, sector_buf, false)) {
-                dma_memory_write(&address_space_memory,
-                                 s->sg.sg[0].base, sector_buf, 512,
-                                 MEMTXATTRS_UNSPECIFIED);
-                sector_num += 1;
-                ide_set_sector(s, sector_num);
-                s->nsector -= 1;
-                s->status = READY_STAT | SEEK_STAT;
-                ide_bus_set_irq(s->bus);
-                goto eot;
-            }
-        }
-        if (s->dma_cmd == IDE_DMA_READ && sector_num >= 0x8000000) {
-            if (chihiro_rom_io((uint32_t)sector_num, sector_buf, false)) {
-                int total = n;
-                int sg_idx = 0;
-                dma_addr_t sg_off = 0;
-                for (int i = 0; i < total; i++) {
-                    if (i > 0) {
-                        chihiro_rom_io((uint32_t)(sector_num + i), sector_buf, false);
-                    }
-                    int remaining = 512;
-                    int buf_pos = 0;
-                    while (remaining > 0) {
-                        while (sg_idx < s->sg.nsg && sg_off >= s->sg.sg[sg_idx].len) {
-                            sg_off -= s->sg.sg[sg_idx].len;
-                            sg_idx++;
-                        }
-                        if (sg_idx >= s->sg.nsg) break;
-                        dma_addr_t dest = s->sg.sg[sg_idx].base + sg_off;
-                        dma_addr_t avail = s->sg.sg[sg_idx].len - sg_off;
-                        int chunk = (remaining < (int)avail) ? remaining : (int)avail;
-                        dma_memory_write(&address_space_memory, dest,
-                                         sector_buf + buf_pos, chunk,
-                                         MEMTXATTRS_UNSPECIFIED);
-                        sg_off += chunk;
-                        buf_pos += chunk;
-                        remaining -= chunk;
-                    }
-                }
-                sector_num += total;
-                ide_set_sector(s, sector_num);
-                s->nsector -= total;
-                s->status = READY_STAT | SEEK_STAT;
-                ide_bus_set_irq(s->bus);
-                goto eot;
-            }
-        }
-        if (s->dma_cmd == IDE_DMA_WRITE &&
-            (sector_num == 0xFC800 || sector_num == 0xFC801)) {
-            dma_memory_read(&address_space_memory,
-                            s->sg.sg[0].base, sector_buf, 512,
-                            MEMTXATTRS_UNSPECIFIED);
-            if (chihiro_mbcom_io((uint32_t)sector_num, sector_buf, true)) {
-                sector_num += 1;
-                ide_set_sector(s, sector_num);
-                s->nsector -= 1;
-                s->status = READY_STAT | SEEK_STAT;
-                ide_bus_set_irq(s->bus);
-                goto eot;
-            }
+        extern bool chihiro_ide_serve(int, uint32_t, int,
+                                      QEMUSGList *, bool *);
+        bool irq = false;
+        if (chihiro_ide_serve(s->dma_cmd, (uint32_t)sector_num, n,
+                              &s->sg, &irq)) {
+            sector_num += n;
+            ide_set_sector(s, sector_num);
+            s->nsector -= n;
+            s->status = READY_STAT | SEEK_STAT;
+            if (irq) ide_bus_set_irq(s->bus);
+            goto eot;
         }
     }
 
@@ -1551,8 +1477,6 @@ static bool cmd_identify(IDEState *s, uint8_t cmd)
          * distinguish the baseboard from a regular HDD. Without it,
          * the kernel never creates \Device\MediaBoard partitions. */
         if (s->unit == 1) {
-            extern bool chihiro_game_running;
-            extern void chihiro_mbcom_init(void);
             uint16_t *p = (uint16_t *)s->identify_data;
             put_le16(p + 1, 65535);  /* cylinders */
             put_le16(p + 3, 255);    /* heads */
