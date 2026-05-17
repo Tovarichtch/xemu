@@ -55,18 +55,9 @@ typedef struct ChihiroUSBState {
     /* External memory (64KB, mapped at 0x0000–0xFFFF on the AN2131 8051) */
     uint8_t extmem[65536];
 
-    /* Pending write tracking for 0x1F (extmem via EP3 OUT, item E) */
-    uint16_t write_1f_addr;
-    int write_1f_remaining;
-
-
-
     /* Real AN2131 loads firmware from EEPROM after initial enumeration,
      * then disconnects and reconnects. SEGABOOT waits for the CSC
      * (Connect Status Change) from the reconnect to start Phase 2. */
-
-    /* ACBU protocol state (item E — EP3 OUT shadow, to be removed in Phase 2) */
-    bool acbu_response_ready;   /* write-complete flag for 0x18 status poll */
 
     /* JVS I/O board emulation state (shared between QC and SC paths) */
     ChihiroJVSState jvs;
@@ -586,46 +577,7 @@ static void handle_data(USBDevice *dev, USBPacket *p)
                 }
             }
             an2131_ep_out_write(&s->an2131, ep, buf, chunk);
-            if (ep == 3) {
-                static int ep3out_run_diag = 0;
-                if (ep3out_run_diag < 10)
-                    fprintf(stderr, "[EP3OUT-RUN] pre: out07irq=%02X cpu_run=%d in_int=%d\n",
-                            s->an2131.out07irq, s->an2131.cpu_running,
-                            s->an2131.cpu.in_interrupt);
-                an2131_run(&s->an2131, 5000);
-                if (ep3out_run_diag < 10) {
-                    fprintf(stderr, "[EP3OUT-RUN] post: out07irq=%02X in_int=%d PC=0x%04X\n",
-                            s->an2131.out07irq, s->an2131.cpu.in_interrupt,
-                            s->an2131.cpu.pc);
-                    ep3out_run_diag++;
-                }
-            } else {
-                an2131_run(&s->an2131, 2000);
-            }
-
-            /* Backup write HLE: track EP3 OUT writes and signal completion
-             * for the 0x18 count=0 status poll. */
-            if (ep == 3 && s->is_qc && chunk > 0) {
-                uint16_t addr = s->write_1f_addr;
-                if (addr + chunk <= 65536) {
-                    memcpy(s->extmem + addr, buf, chunk);
-                    s->write_1f_addr += chunk;
-                }
-                s->write_1f_remaining -= chunk;
-                if (addr == 0x8000 && chunk >= 4 &&
-                    buf[0] == 'A' && buf[1] == 'C' &&
-                    buf[2] == 'B' && buf[3] == 'U') {
-                    memcpy(s->extmem + 0x8400, s->ic11, 128);
-                    s->acbu_response_ready = true;
-                }
-                if (s->write_1f_remaining <= 0 && addr >= 0x8000) {
-                    s->acbu_response_ready = true;
-                    if (s->extmem[0x8000] == 'A' && s->extmem[0x8001] == 'C' &&
-                        s->extmem[0x8002] == 'B' && s->extmem[0x8003] == 'U') {
-                        memcpy(s->ic11, s->extmem + 0x8000, 128);
-                    }
-                }
-            }
+            an2131_run(&s->an2131, 2000);
 
             /* Point A: JVS command incoming to AN2131 via EP4 OUT */
         }
@@ -671,7 +623,6 @@ static void chihiro_an2131qc_realize(USBDevice *dev, Error **errp)
         memcpy(s->ic11, hotd3_ic11_24lc024, sizeof(hotd3_ic11_24lc024));
     }
     memset(s->extmem, 0, sizeof(s->extmem));
-    s->write_1f_addr = 0;
 
     /* Initialize EZ-USB firmware state */
     s->fw_bytes_written = 0;
@@ -766,7 +717,6 @@ static void chihiro_an2131sc_realize(USBDevice *dev, Error **errp)
         memcpy(s->ic11, hotd3_ic11_24lc024, sizeof(hotd3_ic11_24lc024));
     }
     memset(s->extmem, 0, sizeof(s->extmem));
-    s->write_1f_addr = 0;
 
     /* Initialize EZ-USB firmware state */
     s->fw_bytes_written = 0;

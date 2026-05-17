@@ -152,16 +152,7 @@ typedef struct ChihiroLPCState {
     bool     dimm_resp_ready;  /* true when response buffer has new data */
     uint32_t dimm_cmd_count;   /* total commands processed */
     uint16_t dimm_next_seq;    /* next sequence number for unsolicited events */
-    QEMUTimer *dimm_event_timer; /* fires after handshake to inject STATUS event */
     QEMUTimer *dimm_resp_timer;  /* delayed IRQ10 after execute trigger (Type-3) */
-    QEMUTimer *t3_heartbeat_timer; /* ')' mode: periodic IRQ10 to wake worker thread */
-    bool       t3_worker_alive;    /* set when game sends first E1=0xF in ')' mode */
-
-    /* Type-3 unsolicited handshake state:
-     * 0 = idle (waiting for game's cmd 0x0100 status query)
-     * 1 = scheduled: heartbeat timer will send unsolicited 0x0002
-     * 2 = sent: 0x0002 delivered, game will respond via EXEC cmd 0x0001 */
-    int        t3_handshake_state;
 
     int64_t    last_lpc_activity_ms; /* timestamp of last LPC read/write */
 
@@ -256,11 +247,7 @@ void chihiro_on_ohci_bus_start(void)
                 s->dimm_resp_ready = false;
                 memset(s->dimm_cmd, 0, sizeof(s->dimm_cmd));
                 memset(s->dimm_resp, 0, sizeof(s->dimm_resp));
-                timer_del(s->dimm_event_timer);
                 timer_del(s->dimm_resp_timer);
-                s->t3_worker_alive = false;
-                s->t3_handshake_state = 0;
-                timer_del(s->t3_heartbeat_timer);
                 timer_mod(s->diag_timer,
                           qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 50);
             }
@@ -778,13 +765,7 @@ void chihiro_on_quickreboot_signal(void)
         s->dimm_resp_ready = false;
         memset(s->dimm_cmd, 0, sizeof(s->dimm_cmd));
         memset(s->dimm_resp, 0, sizeof(s->dimm_resp));
-        timer_del(s->dimm_event_timer);
         timer_del(s->dimm_resp_timer);
-
-        /* Reset Type-3 state */
-        s->t3_worker_alive = false;
-        s->t3_handshake_state = 0;
-        timer_del(s->t3_heartbeat_timer);
 
         timer_mod(s->diag_timer,
                   qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 50);
@@ -806,11 +787,6 @@ bool chihiro_intercept_reset(void)
 /* warmboot_diag_cb removed — kernel handles QuickReboot natively via
  * STICKY section (LaunchDataPage) and MmPersistContiguousMemory.
  * See project_quickreboot_mechanism.md for details. */
-
-static void chihiro_dimm_event_timer_cb(void *opaque)
-{
-    (void)opaque;
-}
 
 static void chihiro_dimm_process_cmd(ChihiroLPCState *s)
 {
@@ -1270,8 +1246,9 @@ static void chihiro_lpc_io_write(void *opaque, hwaddr addr, uint64_t val,
                 /* ')' mode (Type-3 game): E1=0 is the game worker's
                  * confirmation that it processed the ARM cycle. Clear E0
                  * so the worker can proceed to read SADDR. */
-                if (!s->t3_worker_alive) {
-                    s->t3_worker_alive = true;
+                static bool t3_worker_logged;
+                if (!t3_worker_logged) {
+                    t3_worker_logged = true;
                     if (lpc_log_verbose) fprintf(stderr, "[%07lld] T3 WORKER ALIVE\n", TS_MS);
                 }
                 s->mbcom_e0_status &= ~0x01;
@@ -1474,17 +1451,6 @@ static void chihiro_dimm_resp_timer_cb(void *opaque)
     qemu_irq_raise(s->irq10);
 }
 
-static void chihiro_t3_heartbeat_cb(void *opaque)
-{
-    ChihiroLPCState *s = opaque;
-    if (!chihiro_game_running || !chihiro_board_type3) return;
-
-    /* V850 unsolicited 0x0002/0x0003 = RESET REQUESTS (acLibUpdateMedia
-     * → XLaunchNewImageA). Must NEVER be sent. Heartbeat reserved for
-     * future use if needed. */
-    (void)s;
-}
-
 static void chihiro_irq10_timer_cb(void *opaque)
 {
     ChihiroLPCState *s = opaque;
@@ -1526,7 +1492,6 @@ static void chihiro_irq10_timer_cb(void *opaque)
                     memset(chihiro_mbcom_command, 0, 32);
                     s->mbcom_resp_ready = false;
                     s->mbcom_e0_status = 0;
-                    timer_del(s->dimm_event_timer);
                     fprintf(stderr, "[%07lld] GAME XBE DETECTED (entry 0x%08X → 0x%08X)\n",
                             TS_MS, segaboot_entry, cur_entry);
                 } else {
@@ -1558,8 +1523,6 @@ static void chihiro_irq10_timer_cb(void *opaque)
                  * FUN_0014c580 to set up connection, then sends cmd 0x0001
                  * via EXEC. Our response (0x8001+DIMM_SIZE) serves as the
                  * handshake message. No proactive heartbeat needed. */
-                s->t3_worker_alive = false;
-                s->t3_handshake_state = 0;
                 fprintf(stderr, "[%07lld] *** GAME MBCOM BOOTSTRAP T3: reactive mode (no heartbeat) ***\n", TS_MS);
             } else {
                 /* '!' mode: fire DIMM_SIZE + IRQ10 immediately */
@@ -1725,15 +1688,8 @@ static void chihiro_lpc_realize(DeviceState *dev, Error **errp)
     /* Initialize mbcom protocol handler */
     chihiro_mbcom_init();
 
-    /* DIMM board event timer (not armed — armed after handshake completes) */
-    s->dimm_event_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL,
-                                        chihiro_dimm_event_timer_cb, s);
     s->dimm_resp_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL,
                                        chihiro_dimm_resp_timer_cb, s);
-    s->t3_heartbeat_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL,
-                                          chihiro_t3_heartbeat_cb, s);
-    s->t3_worker_alive = false;
-    s->t3_handshake_state = 0;
     s->dimm_cmd_count = 0;
     s->dimm_next_seq = 1;
 
