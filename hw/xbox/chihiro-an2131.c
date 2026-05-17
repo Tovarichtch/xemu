@@ -864,10 +864,6 @@ int an2131_ep_in_read(AN2131State *s, int ep_nr,
     /* Notify firmware: IN data was sent to host */
     s->in07irq |= (1 << ep_nr);
 
-    if (ep_nr == 4) {
-        s->jvs_ep4_consumed = true;
-    }
-
     return copy;
 }
 
@@ -891,10 +887,6 @@ void an2131_ep_out_write(AN2131State *s, int ep_nr,
         s->ep[ep_nr].cs_out |= EPCS_BSY;
 
     s->out07irq |= (1 << ep_nr);
-
-    if (ep_nr == 4) {
-        s->jvs_ep4_consumed = false;
-    }
 
     an2131_run(s, 2000);
 }

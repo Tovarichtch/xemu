@@ -309,18 +309,8 @@ void xbox_init_common(MachineState *machine,
         chihiro_ide_interface_init();
     }
 
-    printf("Chihiro: TRACE — before piix3-ide create\n"); fflush(stdout);
     PCIDevice *dev = pci_create_simple(pci_bus, PCI_DEVFN(9, 0), "piix3-ide");
-    printf("Chihiro: TRACE — before pci_ide_create_devs\n"); fflush(stdout);
-    {
-        DriveInfo *di = drive_get_by_index(IF_IDE, 1);
-        printf("Chihiro: TRACE — drive_get_by_index(IF_IDE,1) = %p\n", (void*)di);
-        fflush(stdout);
-    }
     pci_ide_create_devs(dev);
-    printf("Chihiro: TRACE — after pci_ide_create_devs\n"); fflush(stdout);
-    // idebus[0] = qdev_get_child_bus(&dev->qdev, "ide.0");
-    // idebus[1] = qdev_get_child_bus(&dev->qdev, "ide.1");
 
     /* smbus devices */
     /* Chihiro: SMC default 0x00 maps to VGA in arcade kernel.

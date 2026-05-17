@@ -266,7 +266,7 @@ typedef struct AN2131State {
     bool jvs_rx_pending;      /* RI1 cleared, next byte deferred until after RETI */
     uint64_t total_cycles;             /* cumulative CPU cycles (advances during bursts) */
     uint64_t jvs_response_set_cycles;  /* total_cycles when JVS response was generated */
-    bool jvs_ep4_consumed;    /* EP4 IN data read by host, pending_len should return to base */
+
 
     /* ── DIAG event counters (incremented in an2131, read in chihiro-usb) ── */
     uint64_t diag_t0_overflows;

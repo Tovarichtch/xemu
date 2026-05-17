@@ -209,14 +209,11 @@ static int jvs_handle_command(ChihiroJVSState *s,
         return 4;
     }
 
-    case 0x32: { /* General Purpose Output */
+    case 0x32: { /* General Purpose Output — accept and consume bank data */
         if (cmd_len < 2) return 1;
         int banks = cmd[1];
-        int consumed = 2;
-        for (int i = 0; i < banks && consumed < cmd_len; i++, consumed++) {
-            if (i < JVS_MAX_GP_OUTPUT)
-                s->gp_output[i] = cmd[consumed];
-        }
+        int consumed = 2 + banks;
+        if (consumed > cmd_len) consumed = cmd_len;
         PUT(JVS_REPORT_OK);
         *rpos = rp;
         return consumed;
@@ -263,7 +260,6 @@ int chihiro_jvs_process(ChihiroJVSState *s,
     if (in_len < 3 || in[0] != JVS_SYNC) return 0;
 
     uint8_t target = in[1];
-    s->last_target = target;
     int escaped_count = in[2];
 
     /* JVS over Chihiro USB is a raw byte stream — escape encoding (0xD0)
