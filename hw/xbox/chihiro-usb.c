@@ -81,6 +81,11 @@ typedef struct ChihiroUSBState {
     bool diag_prev_halted;
     bool diag_prev_cpu_running;
     int  diag_zero_cycle_streak;
+
+    /* Runtime copy of USB descriptor — populated from EEPROM B2 header
+     * (VID/PID/bcdDevice) at realize instead of hardcoded constants */
+    USBDesc runtime_desc;
+    USBDescID runtime_id;
 } ChihiroUSBState;
 
 static ChihiroUSBState *chihiro_qc_instance;
@@ -186,11 +191,15 @@ static const USBDescDevice desc_device_chihiro_an2131qc = {
     },
 };
 
+/* Pre-LLE descriptor template — used only for initial USB enumeration before
+ * ANCHOR_LOAD loads firmware into the 8051. After firmware load, the 8051
+ * handles GET_DESCRIPTOR natively from its own descriptor table (CODE:0B7A).
+ * VID/PID/bcdDevice overridden at realize from EEPROM B2 header. */
 static const USBDesc desc_chihiro_an2131qc = {
     .id = {
         .idVendor          = 0x0CA3,
         .idProduct         = 0x0002,
-        .bcdDevice         = 0x0108,
+        .bcdDevice         = 0x0108,  /* overridden from EEPROM[5:6] at realize */
         .iManufacturer     = STRING_MANUFACTURER,
         .iProduct          = STRING_PRODUCT,
         .iSerialNumber     = STRING_SERIALNUMBER,
@@ -264,11 +273,12 @@ static const USBDescDevice desc_device_chihiro_an2131sc = {
     },
 };
 
+/* Pre-LLE descriptor template — same as QC above */
 static const USBDesc desc_chihiro_an2131sc = {
     .id = {
         .idVendor          = 0x0CA3,
         .idProduct         = 0x0003,
-        .bcdDevice         = 0x0110,
+        .bcdDevice         = 0x0110,  /* overridden from EEPROM[5:6] at realize */
         .iManufacturer     = STRING_MANUFACTURER,
         .iProduct          = STRING_PRODUCT,
         .iSerialNumber     = STRING_SERIALNUMBER,
@@ -306,23 +316,20 @@ static void handle_control(USBDevice *dev, USBPacket *p,
     ChihiroUSBState *s = (ChihiroUSBState *)dev;
     const char *id = s->is_qc ? "QC" : "SC";
 
-    int ret = usb_desc_handle_control(dev, p, request, value, index,
-                                      length, data);
-    if (ret >= 0) {
-        return;
-    }
-
-    /* Vendor request — extract bRequest from combined field.
-     * QEMU encodes: request = (bmRequestType << 8) | bRequest */
     int bRequest = request & 0xFF;
 
-    /* LLE path: route ALL vendor requests through 8051 firmware.
-     * The EEPROM firmware (v0x08) has a full pre-dispatch in the
-     * default handler's 0x069B function that handles 0x16-0x30.
-     * Only ANCHOR_LOAD (0xA0) bypasses firmware (silicon-level). */
-    bool lle_exclude = (bRequest == 0xA0);
-
-    if (s->use_lle && !lle_exclude) {
+    /* LLE path: route ALL control requests through 8051 firmware.
+     * The firmware's SUDAV dispatch table (CODE:02C7) handles standard USB
+     * requests (GET_DESCRIPTOR at CODE:02E3, SET_CONFIGURATION at CODE:033B,
+     * etc.) AND vendor requests (0x16-0x30 via CODE:069B).
+     * Exceptions handled by AN2131 silicon, not firmware:
+     *   - SET_ADDRESS (0x05): silicon writes FNADDR automatically
+     *   - ANCHOR_LOAD (0xA0): silicon-level firmware download */
+    if (s->use_lle && bRequest != 0xA0) {
+        if (bRequest == 0x05) {
+            dev->addr = value;
+            return;
+        }
         uint8_t setup[8];
         setup[0] = (uint8_t)(request >> 8);  /* bmRequestType */
         setup[1] = (uint8_t)bRequest;
@@ -342,7 +349,7 @@ static void handle_control(USBDevice *dev, USBPacket *p,
             out_len = length;
         }
 
-        uint8_t resp[64];
+        uint8_t resp[256];
         int resp_len = an2131_setup_packet(&s->an2131, setup,
                                            out_data, out_len,
                                            resp, sizeof(resp));
@@ -418,22 +425,14 @@ static void handle_control(USBDevice *dev, USBPacket *p,
         return;
     }
 
-    /* Default response (MAME: every vendor request gets this).
-     * WARNING (item B): this overwrites data[0], corrupting ANCHOR_LOAD
-     * CPUCS writes (0x01 → 0x00). See audit for details. */
+    /* AN2131 port pin states — read by firmware for vendor request responses.
+     * These values are the hardware defaults for the baseboard DIP switches.
+     * PINSA bit2=0,bit4=0 = DIP3/DIP4 ON (horiz freq, avoids CAUTION 51) */
     for (int n = 0; n < length && n < 6; n++) {
         data[n] = 0x50 ^ n;
     }
-    data[0] = 0x00;  /* success */
-    data[1] = 0xCB;  /* PINSA (active low: 0=pressed/ON, 1=released/OFF)
-                      * bit0=1 DIP1 OFF
-                      * bit1=1 DIP2 OFF
-                      * bit2=0 DIP3 ON  (horiz freq — required to avoid CAUTION 51)
-                      * bit3=1 CS pin (ignored)
-                      * bit4=0 DIP4 ON  (horiz freq — required to avoid CAUTION 51)
-                      * bit5=0 DIP5 ON
-                      * bit6=1 TEST released
-                      * bit7=1 SERVICE released */
+    data[0] = 0x00;
+    data[1] = 0xCB;  /* PINSA: DIP1=OFF DIP2=OFF DIP3=ON DIP4=ON DIP5=ON TEST=OFF SERVICE=OFF */
     data[2] = 0x52 | (s->jvs.sense & 0x03);  /* PINSB with current JVS sense */
     data[3] = 0x53;  /* OUTB register */
 
@@ -594,7 +593,6 @@ static void chihiro_an2131qc_realize(USBDevice *dev, Error **errp)
 {
     ChihiroUSBState *s = (ChihiroUSBState *)dev;
     s->is_qc = true;
-    usb_desc_init(dev);
     dev->auto_attach = 0;  /* Attach later via hotplug timer */
 
     /* Load ic10 QC EEPROM firmware (8192 bytes).
@@ -606,6 +604,19 @@ static void chihiro_an2131qc_realize(USBDevice *dev, Error **errp)
         error_setg(errp, "Chihiro QC: ic10 EEPROM dump required (ic10_g24lc64.bin)");
         return;
     }
+
+    /* Read USB descriptors from EEPROM B2 header instead of hardcoding.
+     * AN2131 B2 boot format: [0]=0xB2, [1:2]=VID, [3:4]=PID, [5:6]=bcdDevice */
+    s->runtime_desc = desc_chihiro_an2131qc;
+    s->runtime_id = desc_chihiro_an2131qc.id;
+    if (s->eeprom[0] == 0xB2) {
+        s->runtime_id.idVendor  = s->eeprom[1] | (s->eeprom[2] << 8);
+        s->runtime_id.idProduct = s->eeprom[3] | (s->eeprom[4] << 8);
+        s->runtime_id.bcdDevice = s->eeprom[5] | (s->eeprom[6] << 8);
+    }
+    s->runtime_desc.id = s->runtime_id;
+    dev->usb_desc = &s->runtime_desc;
+    usb_desc_init(dev);
     /* Region byte at eeprom[0x1F00]: SEGABOOT checks boot.id[0x38] bitmask
      * against (1 << region). JPN-only games (e.g. Golf SBLF, bitmask=0x02)
      * fail with ERROR 05 if region=2. Region=1 (JPN) works for all known
@@ -696,7 +707,6 @@ static void chihiro_an2131sc_realize(USBDevice *dev, Error **errp)
 {
     ChihiroUSBState *s = (ChihiroUSBState *)dev;
     s->is_qc = false;
-    usb_desc_init(dev);
     dev->auto_attach = 0;  /* Attach later via hotplug timer */
 
     /* Load pc20 SC EEPROM firmware (8192 bytes). */
@@ -706,6 +716,18 @@ static void chihiro_an2131sc_realize(USBDevice *dev, Error **errp)
         error_setg(errp, "Chihiro SC: pc20 EEPROM dump required (pc20_g24lc64.bin)");
         return;
     }
+
+    /* Read USB descriptors from EEPROM B2 header */
+    s->runtime_desc = desc_chihiro_an2131sc;
+    s->runtime_id = desc_chihiro_an2131sc.id;
+    if (s->eeprom[0] == 0xB2) {
+        s->runtime_id.idVendor  = s->eeprom[1] | (s->eeprom[2] << 8);
+        s->runtime_id.idProduct = s->eeprom[3] | (s->eeprom[4] << 8);
+        s->runtime_id.bcdDevice = s->eeprom[5] | (s->eeprom[6] << 8);
+    }
+    s->runtime_desc.id = s->runtime_id;
+    dev->usb_desc = &s->runtime_desc;
+    usb_desc_init(dev);
 
     /* Load ic11 baseboard EEPROM (256 bytes, 24LC024) */
     memset(s->ic11, 0, sizeof(s->ic11));

@@ -827,6 +827,30 @@ int an2131_setup_packet(AN2131State *s, const uint8_t setup[8],
         s->ep0cs &= ~EP0CS_INBSY;
         return copy;
     }
+
+    /* SUDPTR-based EP0 IN (AN2131 silicon feature for standard USB requests):
+     * Firmware sets SUDPTRH:SUDPTRL to point to descriptor data in RAM,
+     * then sets EP0CS. The silicon reads from SUDPTR automatically.
+     * Vendor requests bypass this — they write IN0BUF + IN0BC directly. */
+    if (is_in && s->sudptr != 0) {
+        uint16_t ptr = s->sudptr;
+        if (ptr < AN2131_RAM_SIZE) {
+            int desc_len = s->ram[ptr];
+            if (ptr + 1 < AN2131_RAM_SIZE && s->ram[ptr + 1] == 0x02) {
+                desc_len = s->ram[ptr + 2] | (s->ram[ptr + 3] << 8);
+            }
+            int wLength = s->setupdat[6] | (s->setupdat[7] << 8);
+            if (desc_len > wLength) desc_len = wLength;
+            if (desc_len > resp_max) desc_len = resp_max;
+            if (ptr + desc_len <= AN2131_RAM_SIZE) {
+                memcpy(resp_buf, &s->ram[ptr], desc_len);
+                s->sudptr = 0;
+                return desc_len;
+            }
+        }
+        s->sudptr = 0;
+    }
+
     return 0;
 }
 
