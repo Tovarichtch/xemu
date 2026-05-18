@@ -778,9 +778,10 @@ int an2131_setup_packet(AN2131State *s, const uint8_t setup[8],
 
     bool is_in = setup[0] & 0x80;
     bool need_ep4 = (setup[1] == 0x19 && is_in);
+    bool need_ep2 = (setup[1] == 0x17 && is_in);
 
     int cycles = 0;
-    int limit = 10000;
+    int limit = need_ep2 ? 30000 : 10000;
     int drain = 0;
     bool mainloop_hit = false;
 
@@ -807,7 +808,8 @@ int an2131_setup_packet(AN2131State *s, const uint8_t setup[8],
 
         if (!drain) {
             if (is_in && s->ep[0].in_armed) {
-                if (!need_ep4 || s->ep[4].in_armed)
+                if ((!need_ep4 || s->ep[4].in_armed) &&
+                    (!need_ep2 || s->ep[2].in_armed))
                     drain = cycles;
             }
             if (!is_in && !(s->usbirq & USBIRQ_SUDAV)) drain = cycles;
@@ -862,7 +864,7 @@ int an2131_ep_in_poll(AN2131State *s, int ep_nr)
     if (ep_nr < 0 || ep_nr >= AN2131_EP_COUNT) return 0;
     if (!s->cpu_running) return 0;
 
-    an2131_run(s, 1000);
+    an2131_run(s, 6000);
 
     return s->ep[ep_nr].in_armed ? s->ep[ep_nr].bc_in : -1;
 }

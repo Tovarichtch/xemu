@@ -191,6 +191,8 @@ bool chihiro_game_running;  /* Set after QuickReboot — disables SEGABOOT DMA s
 static int game_mode_bus_starts;  /* BUS START count since game_running became true */
 static bool chihiro_boot3_reached; /* Set when SEGABOOT reaches boot=3 (checks complete) */
 static bool chihiro_quickreboot_pending; /* Set at QuickReboot, consumed by port 0x40F0 handler */
+static bool chihiro_mbcom_bootstrap_done; /* Reset on QuickReboot so game gets fresh DIMM_SIZE */
+static bool chihiro_e1_armed; /* Reset on QuickReboot to prevent premature response delivery */
 static char chihiro_game_filename[64]; /* Game XBE filename saved at boot=3 */
 char chihiro_game_dir[1024];   /* Game directory path (from dvd_path) */
 
@@ -276,6 +278,8 @@ void chihiro_on_ohci_bus_start(void)
             chihiro_game_running = false;
             chihiro_boot3_reached = false;
             chihiro_quickreboot_pending = true;
+            chihiro_mbcom_bootstrap_done = false;
+            chihiro_e1_armed = false;
             memset(chihiro_mbcom_command, 0, 32);
             memset(chihiro_mbcom_response, 0, 32);
             if (s) {
@@ -785,6 +789,8 @@ void chihiro_on_quickreboot_signal(void)
     chihiro_quickreboot_pending = true;
     chihiro_game_running = false;
     chihiro_boot3_reached = false;
+    chihiro_mbcom_bootstrap_done = false;
+    chihiro_e1_armed = false;
     memset(chihiro_mbcom_command, 0, 32);
     memset(chihiro_mbcom_response, 0, 32);
 
@@ -1270,7 +1276,6 @@ static void chihiro_lpc_io_write(void *opaque, hwaddr addr, uint64_t val,
                            *   Worker writes cmd to DMA (FC801), then E1=0xF, E1=0
                            *   E1=0 = "process the DMA command" (not scratch!)
                            * scratch 0x0102 = status register (bit8=busy), NOT a command */
-        static bool e1_armed = false;
         static int e1_log = 0;
         if (val != 0) {
             if (!chihiro_game_running &&
@@ -1282,14 +1287,14 @@ static void chihiro_lpc_io_write(void *opaque, hwaddr addr, uint64_t val,
                 qemu_irq_raise(s->irq10);
             } else {
                 /* ARM for E1=0 trigger (game mode or SEGABOOT ack) */
-                e1_armed = true;
+                chihiro_e1_armed = true;
                 if (lpc_log_verbose && e1_log < 2000) { e1_log++;
                     fprintf(stderr, "[%07lld] E1=0x%X ARM scratch=0x%04X dma=%02X%02X\n",
                             TS_MS, (unsigned)val, s->lpc_scratch_4026,
                             chihiro_mbcom_command[0], chihiro_mbcom_command[1]); }
             }
         } else {
-            if (chihiro_game_running && chihiro_board_type3 && e1_armed) {
+            if (chihiro_game_running && chihiro_board_type3 && chihiro_e1_armed) {
                 /* ')' mode (Type-3 game): E1=0 is the game worker's
                  * confirmation that it processed the ARM cycle. Clear E0
                  * so the worker can proceed to read SADDR. */
@@ -1304,7 +1309,7 @@ static void chihiro_lpc_io_write(void *opaque, hwaddr addr, uint64_t val,
                 if (lpc_log_verbose && e1_log < 2000) { e1_log++;
                     fprintf(stderr, "[%07lld] E1=0 T3_ACK e0=0x%02X irq10↓\n",
                             TS_MS, s->mbcom_e0_status); }
-            } else if (e1_armed && s->mbcom_resp_ready) {
+            } else if (chihiro_e1_armed && s->mbcom_resp_ready) {
                 /* RESP_DELIVER ('!' mode / SEGABOOT) */
                 s->mbcom_resp_ready = false;
                 qemu_irq_lower(s->irq10);
@@ -1314,7 +1319,7 @@ static void chihiro_lpc_io_write(void *opaque, hwaddr addr, uint64_t val,
                             TS_MS, s->lpc_scratch_4026,
                             chihiro_mbcom_response[0], chihiro_mbcom_response[1],
                             chihiro_mbcom_response[2], chihiro_mbcom_response[3]); }
-            } else if (e1_armed && (chihiro_mbcom_command[0] != 0 || chihiro_mbcom_command[1] != 0)) {
+            } else if (chihiro_e1_armed && (chihiro_mbcom_command[0] != 0 || chihiro_mbcom_command[1] != 0)) {
                 /* DMA_PROCESS ('!' mode / SEGABOOT) */
                 const uint8_t *w = chihiro_mbcom_command;
                 uint16_t seq = w[0] | (w[1] << 8);
@@ -1341,9 +1346,9 @@ static void chihiro_lpc_io_write(void *opaque, hwaddr addr, uint64_t val,
                 qemu_irq_lower(s->irq10);
                 if (lpc_log_verbose && e1_log < 2000) { e1_log++;
                     fprintf(stderr, "[%07lld] E1=0 LOWER armed=%d scratch=0x%04X\n",
-                            TS_MS, e1_armed, s->lpc_scratch_4026); }
+                            TS_MS, chihiro_e1_armed, s->lpc_scratch_4026); }
             }
-            e1_armed = false;
+            chihiro_e1_armed = false;
         }
         break;
     }
@@ -1560,8 +1565,7 @@ static void chihiro_irq10_timer_cb(void *opaque)
      * this state machine. After both handshakes, switch to reactive mode
      * where each EXEC gets an immediate response+E0+IRQ10. */
     if (chihiro_game_running && chihiro_mbcom_enabled) {
-        static bool bootstrap_done = false;
-        if (!bootstrap_done) {
+        if (!chihiro_mbcom_bootstrap_done) {
             memset(chihiro_mbcom_command, 0, 32);
 
             if (chihiro_board_type3) {
@@ -1582,7 +1586,7 @@ static void chihiro_irq10_timer_cb(void *opaque)
                 qemu_irq_raise(s->irq10);
                 fprintf(stderr, "[%07lld] *** GAME MBCOM BOOTSTRAP T1: 0x8001 loaded, IRQ10 edge fired ***\n", TS_MS);
             }
-            bootstrap_done = true;
+            chihiro_mbcom_bootstrap_done = true;
         }
 
         /* Type-3 unsolicited 0x0002 is scheduled by the EXEC handler
