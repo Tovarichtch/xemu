@@ -168,9 +168,9 @@ static uint8_t an2131_xdata_read(Cpu8051State *cpu, uint16_t addr)
         case AN_OUTC:     return s->outc;
         case AN_PINSA:    return s->pinsa;
         case AN_PINSB: {
-
-            uint8_t sense = chihiro_jvs_global ? (chihiro_jvs_global->sense & 0x03) : 0x03;
-            return (s->pinsb & ~0x03) | sense;
+            /* JVS sense is on bit 0 only. Bit 1 is a separate hardware pin (always high). */
+            uint8_t sense = chihiro_jvs_global ? (chihiro_jvs_global->sense & 0x01) : 0x01;
+            return (s->pinsb & ~0x01) | sense;
         }
         case AN_PINSC:    return s->pinsc;
         case AN_OEA:      return s->oea;
@@ -732,9 +732,12 @@ void an2131_set_cpucs(AN2131State *s, uint8_t val)
     s->cpucs = val;
 
     if (was_reset && !(val & CPUCS_8051RES)) {
+        /* Full 8051 core reset: SFR + IRAM to power-on defaults.
+         * AN2131 silicon resets the 8051 core when CPUCS[0] cycles 1→0.
+         * Without this, stale IRAM/SFR from the previous run causes the
+         * firmware to take wrong code paths on restart. */
+        cpu8051_reset(&s->cpu);
         s->cpu_running = true;
-        s->cpu.pc = 0x0000;
-        s->cpu.sp = 0x07;
         fprintf(stderr, "[AN2131] CPU released — running firmware from 0x0000\n");
         an2131_run(s, 8000000);
         fprintf(stderr, "[AN2131] Init done — PC=0x%04X SP=0x%02X IE=0x%02X "

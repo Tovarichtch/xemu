@@ -371,6 +371,13 @@ void xbox_init_common(MachineState *machine,
      * to detect the baseboard. */
     if (machine->ram_size > 64 * 1024 * 1024) {
         printf("Chihiro: 128MB RAM detected, enabling mediaboard LPC\n");
+
+        /* Load baseboard flash ROM BEFORE LPC device creation.
+         * mediaboard_init() (called during LPC realize) reads the serial
+         * from chihiro_flash_rom — must be populated first. */
+        chihiro_load_flash_rom(g_config.sys.files.flashrom_path);
+        chihiro_load_eeproms(g_config.sys.files.flashrom_path);
+
         isa_create_simple(isa_bus, "chihiro-lpc");
 
         /* Chihiro southbridge has revision >= 0xB4. This clears bit 0 of
@@ -392,11 +399,7 @@ void xbox_init_common(MachineState *machine,
             object_property_set_bool(eeprom_obj, "persist", false, NULL);
         }
 
-        /* Load baseboard flash ROM (SEGABOOT) from file.
-         * Searches for fpr-23887/fpr21042 next to the BIOS file. */
-        chihiro_load_flash_rom(g_config.sys.files.flashrom_path);
         chihiro_ide_load_rom();
-        chihiro_load_eeproms(g_config.sys.files.flashrom_path);
 
         /* Build FATX from game directory if dvd_path is a directory.
          * If dvd_path points to an XBE, use its parent directory. */

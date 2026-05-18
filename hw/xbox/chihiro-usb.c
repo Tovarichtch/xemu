@@ -425,17 +425,6 @@ static void handle_control(USBDevice *dev, USBPacket *p,
         return;
     }
 
-    /* AN2131 port pin states — read by firmware for vendor request responses.
-     * These values are the hardware defaults for the baseboard DIP switches.
-     * PINSA bit2=0,bit4=0 = DIP3/DIP4 ON (horiz freq, avoids CAUTION 51) */
-    for (int n = 0; n < length && n < 6; n++) {
-        data[n] = 0x50 ^ n;
-    }
-    data[0] = 0x00;
-    data[1] = 0xCB;  /* PINSA: DIP1=OFF DIP2=OFF DIP3=ON DIP4=ON DIP5=ON TEST=OFF SERVICE=OFF */
-    data[2] = 0x52 | (s->jvs.sense & 0x03);  /* PINSB with current JVS sense */
-    data[3] = 0x53;  /* OUTB register */
-
     /* Vendor request map (all handled by 8051 firmware in LLE mode):
      *
      * QC (baseboard controller):
@@ -490,6 +479,10 @@ static void handle_control(USBDevice *dev, USBPacket *p,
                 if (s->fw_cpu_held && !hold) {
                     s->fw_loaded = true;
                     s->use_lle = s->an2131.cpu_running;
+                    if (s->use_lle) {
+                        timer_mod(s->lle_tick_timer,
+                                  qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 1);
+                    }
                     fprintf(stderr, "[%07lld] chihiro-usb [%s]: FW LOADED — LLE %s\n",
                            TS_MS, id, s->use_lle ? "ACTIVE" : "INACTIVE (fallback HLE)");
                 }
