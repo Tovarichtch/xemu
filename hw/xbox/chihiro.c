@@ -79,7 +79,7 @@
 #   define SEGA_DIMM_SIZE_512M                  2
 #   define SEGA_DIMM_SIZE_1024M                 3
 
-/* mbcom command IDs — acMediaCmd names from acLib SDK (GXTX/Andy Anderson).
+/* mbcom command IDs — acMediaCmd names from acLib SDK (GXTX/GXTX).
  * Full command map: 0x001-0x0FF init/events, 0x100-0x1FF info queries,
  * 0x200-0x2FF unknown, 0x300-0x3FF tests, 0x400-0x4FF network sockets,
  * 0x500-0x7FF unknown groups. */
@@ -204,19 +204,14 @@ static void mediaboard_init(void)
 {
     mediaboard.dimm_factor = SEGA_DIMM_SIZE_512M;
     mediaboard.dimm_size   = 0x08000000u << mediaboard.dimm_factor; /* 512MB */
-    /* fw_version: on real hardware, the media board CPU (FPGA for Type-1,
-     * V850 for Type-3) responds to GET_VERSION (0x0101) from its own firmware.
-     * We don't emulate the media board CPU yet, so this is a default.
-     * When LLE media board runs, this goes away — same pattern as 8051/AN2131.
-     * 0x0317 = 3.17, from Andy Anderson's real Chihiro SYSTEM INFORMATION. */
+    /* On real hardware, the SH4 on the DIMM board (VxWorks) provides these
+     * values. 0x0317 = 3.17, from GXTX's real Chihiro SYSTEM INFO. */
     mediaboard.fw_version  = 0x0317;
     mediaboard.board_type  = 4; /* Chihiro */
-    /* TODO: MEDIA BOARD TEST in SEGABOOT service menu shows "CHECKING 0%"
-     * then "STATUS ----" because we always return READY/100% instantly.
-     * The real media board progresses through phases 0→5, progress 0→100%.
-     * For boot speed we skip this, but the service menu re-check expects
-     * to see the full progression. Needs a state machine triggered by
-     * MB_CMD_INIT to simulate (or real media board CPU to handle natively). */
+    /* Instant READY/100% — the real SH4/VxWorks on the DIMM board progresses
+     * through phases 0→5, 0→100%. This may cause MEDIA BOARD TEST in the
+     * service menu to show "CHECKING 0%" / "STATUS ----" instead of the
+     * full progression. Games don't care — they only check final state. */
     mediaboard.status      = MB_STATUS_READY;
     mediaboard.progress    = 100;
     mediaboard.net_ip      = 0x0100000A; /* 10.0.0.1 LE */
@@ -1033,14 +1028,9 @@ static uint64_t chihiro_lpc_io_read(void *opaque, hwaddr addr,
     case SEGA_XBAM_STRING_2:
         r = 0x4D41;     /* "MA" → full string reads as "XBAM" */
         break;
-    case 0xF0: /* Board mode / device count.
-               * SEGABOOT checks high byte: 0 = Type-1, non-zero = Type-3.
-               * Returning wrong type → SEGABOOT uses wrong comm path → error.
-               * acLib v0.71+ (WMMT1): high byte also selects device type:
-               *   0 → 0x21 ('!'), 1 → 0x29 (')').
-               * Type ')' triggers SC search → EEPROM version read.
-               * Without it, SC version stays 0 → Error 14.
-               * TODO: find correct Type-1 value that satisfies both. */
+    case 0xF0: /* Board mode. SEGABOOT checks high byte: 0=Type-1, non-zero=Type-3.
+               * acLib v0.71+ (WMMT1, Type-3): high byte selects device type
+               * '!' vs ')'. Type ')' triggers SC search → EEPROM version read. */
         r = chihiro_board_type3 ? 0x0100 : 0x0001;
         { static int f0_log = 0; if (lpc_log_verbose && f0_log < 500) { f0_log++;
             fprintf(stderr, "[%07lld] F0 READ → 0x%04X (type3=%d)\n",
@@ -2082,11 +2072,13 @@ void chihiro_mbcom_init(void)
     chihiro_mbcom_enabled = true;
 }
 
-/* TEMPORARY: Process mbcom command and generate hardcoded responses.
- * On real hardware, the PIC16 (sp5001.bin) handles these commands by
- * querying DIMM board state, GDROM status, and firmware registers.
- * Aligned with MAME chihiro.cpp::baseboard_ide_event().
- * TODO: Replace with PIC16 emulation for upstream LLE. */
+/* Process mbcom command and generate responses.
+ * On real hardware, the SH4 CPU on the DIMM board (running VxWorks) handles
+ * these commands via the 315-6322 ASIC. The PIC16C621A on the DIMM board only
+ * provides a DES key to the SH4 at boot — it never sees mbcom traffic.
+ * sp5001.bin is the JVS I/O board firmware (TMP90PH44N), unrelated to DIMM.
+ * Returning instant READY/100% may cause MEDIA BOARD TEST in the service menu
+ * to show "CHECKING 0%" then "STATUS ----" instead of progressing normally. */
 static void chihiro_mbcom_process(void)
 {
     const uint8_t *w = chihiro_mbcom_command;

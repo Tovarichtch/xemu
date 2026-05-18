@@ -748,14 +748,11 @@ static void chihiro_an2131sc_realize(USBDevice *dev, Error **errp)
     s->an2131.extmem_size = sizeof(s->extmem);
     s->an2131.usb_dev = s;
 
-    /* SC firmware init (0x1156) clears extmem[0x2601-0x2626] then polls
-     * extmem[0x260F] and [0x2635] for mailbox triggers from QC/baseboard.
-     * B2 boot runs 8M init cycles — firmware clears the area then stalls at
-     * the poll. Set triggers AFTER boot (clears done), run more cycles. */
+    /* SC firmware init (FUN_CODE_0e9e) completes during B2 boot:
+     * SCON/SCON1 |= 3 triggers serial ISRs, counters increment,
+     * spin-polls pass, sc_process_cmd() runs — all within 8M cycles. */
     an2131_b2_boot(&s->an2131, s->eeprom, sizeof(s->eeprom));
     if (s->an2131.cpu_running) {
-        s->extmem[0x260F] = 0x01;
-        s->extmem[0x2635] = 0x01;
         an2131_run(&s->an2131, 8000000);
     }
     s->use_lle = s->an2131.cpu_running;
