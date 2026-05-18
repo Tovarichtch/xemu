@@ -467,7 +467,11 @@ void xbox_init_common(MachineState *machine,
                         strncpy(chihiro_game_dir, game_dir, 1023);
                         chihiro_game_dir[1023] = 0;
                         /* Auto-detect Type-3 (ASIC) board:
-                         * Type-3 game dirs contain "firmware.asic" */
+                         * Type-3 game dirs contain "firmware.asic".
+                         * TODO: This heuristic is insufficient — some games (e.g. VC3)
+                         * have firmware.asic but are also Type-1 compatible. Replace
+                         * with UI setting (Chihiro > Settings > Board Type) so the
+                         * user can choose which media board to emulate. */
                         char det_path[1088];
                         struct stat det_st;
                         snprintf(det_path, sizeof(det_path),

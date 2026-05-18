@@ -79,15 +79,40 @@
 #   define SEGA_DIMM_SIZE_512M                  2
 #   define SEGA_DIMM_SIZE_1024M                 3
 
-/* mbcom command IDs (from CXBX MediaBoard.cpp + MAME chihiro.cpp) */
-#define MB_CMD_DIMM_SIZE            0x0001
-#define MB_CMD_STATUS               0x0100
-#define MB_CMD_FIRMWARE_VERSION     0x0101
-#define MB_CMD_SYSTEM_TYPE          0x0102
-#define MB_CMD_SERIAL_NUMBER        0x0103
-#define MB_CMD_HARDWARE_TEST        0x0301
+/* mbcom command IDs — acMediaCmd names from acLib SDK (GXTX/Andy Anderson).
+ * Full command map: 0x001-0x0FF init/events, 0x100-0x1FF info queries,
+ * 0x200-0x2FF unknown, 0x300-0x3FF tests, 0x400-0x4FF network sockets,
+ * 0x500-0x7FF unknown groups. */
+#define MB_CMD_INIT                 0x0001  /* acMediaCmd_InitAsync — returns DIMM size */
+#define MB_CMD_SEND_EVENT           0x0009  /* acMediaCmd_SendEventAsync */
+#define MB_CMD_STATUS               0x0100  /* boot phase + completion% */
+#define MB_CMD_GET_VERSION          0x0101  /* acMediaCmd_GetVersionAsync — fw version */
+#define MB_CMD_SYSTEM_TYPE          0x0102  /* board_type | fw_ver<<8 */
+#define MB_CMD_GET_SERIAL           0x0103  /* acMediaCmd_GetSerialIdAsync */
+#define MB_CMD_GET_NET_PROPERTY     0x0104  /* acMediaCmd_GetNetworkPropertyAsync */
+#define MB_CMD_HARDWARE_TEST        0x0301  /* writes "TEST OK" to result ptr */
 
 #define MB_STATUS_READY             5
+
+/* Media board state — single source of truth for all mbcom responses.
+ * On real hardware: jumpers (JP1/JP2) + firmware on the media board provide
+ * these values. The kernel reads DIMM factor via port 0x40F4, and the media
+ * board firmware responds to mbcom commands using the same underlying state.
+ * Serial comes from flash ROM MBDT header at 0xFFE10.
+ * See: https://newastrocity.wordpress.com/2013/08/04/sega-chihiro/ (jumpers)
+ *      GXTX: "there's a IO port which when queried returns the jumpers" */
+static struct {
+    uint8_t  dimm_factor;    /* 0=128M, 1=256M, 2=512M, 3=1024M (JP1/JP2 jumpers) */
+    uint32_t dimm_size;      /* computed: 0x08000000 << factor (bytes) */
+    uint16_t fw_version;     /* firmware version reported by mbcom 0x0101 */
+    uint8_t  board_type;     /* 0=NAOMI, 3=GD-ROM, 4=Chihiro */
+    uint8_t  status;         /* boot phase: 0-4=loading, 5=READY */
+    uint8_t  progress;       /* loading completion: 0-100 */
+    char     serial[17];     /* from flash ROM MBDT+0x10, or "0000000000000000" */
+    uint32_t net_ip;         /* network IP in LE (default 10.0.0.1 = 0x0A000001) */
+} mediaboard;
+
+static void mediaboard_init(void);
 
 /* #define DEBUG_CHIHIRO */
 
@@ -174,6 +199,36 @@ static bool chihiro_resolve_save_path(void);
 bool chihiro_board_type3;      /* true = ASIC (Type-3), false = FPGA (Type-1) */
 static uint8_t *chihiro_flash_rom;
 static uint32_t chihiro_flash_rom_size;
+
+static void mediaboard_init(void)
+{
+    mediaboard.dimm_factor = SEGA_DIMM_SIZE_512M;
+    mediaboard.dimm_size   = 0x08000000u << mediaboard.dimm_factor; /* 512MB */
+    /* fw_version: on real hardware, the media board CPU (FPGA for Type-1,
+     * V850 for Type-3) responds to GET_VERSION (0x0101) from its own firmware.
+     * We don't emulate the media board CPU yet, so this is a default.
+     * When LLE media board runs, this goes away — same pattern as 8051/AN2131.
+     * 0x0317 = 3.17, from Andy Anderson's real Chihiro SYSTEM INFORMATION. */
+    mediaboard.fw_version  = 0x0317;
+    mediaboard.board_type  = 4; /* Chihiro */
+    /* TODO: MEDIA BOARD TEST in SEGABOOT service menu shows "CHECKING 0%"
+     * then "STATUS ----" because we always return READY/100% instantly.
+     * The real media board progresses through phases 0→5, progress 0→100%.
+     * For boot speed we skip this, but the service menu re-check expects
+     * to see the full progression. Needs a state machine triggered by
+     * MB_CMD_INIT to simulate (or real media board CPU to handle natively). */
+    mediaboard.status      = MB_STATUS_READY;
+    mediaboard.progress    = 100;
+    mediaboard.net_ip      = 0x0100000A; /* 10.0.0.1 LE */
+    memset(mediaboard.serial, 0, sizeof(mediaboard.serial));
+
+    /* Read serial from flash ROM MBDT header if available */
+    if (chihiro_flash_rom && chihiro_flash_rom_size > 0xFFE20 &&
+        memcmp(chihiro_flash_rom + 0xFFE00, "MBDT", 4) == 0) {
+        memcpy(mediaboard.serial, chihiro_flash_rom + 0xFFE10, 16);
+    }
+}
+
 static ChihiroLPCState *chihiro_lpc_global;
 uint32_t chihiro_usb_sm_pa;  /* PA of USB state machine globals at VA 0xC3F10 */
 
@@ -804,18 +859,18 @@ static void chihiro_dimm_process_cmd(ChihiroLPCState *s)
         s->dimm_resp[0] = s->dimm_cmd[0] | 0x80000000;
 
         switch (cmd) {
-        case 0x0001: /* GetDIMMSize — 512MB */
-            s->dimm_resp[1] = 0x20000000;
+        case MB_CMD_INIT:
+            s->dimm_resp[1] = mediaboard.dimm_size;
             break;
-        case 0x0100: /* GetMediaBoardStatus — phase=5 (loaded), progress=100% */
-            s->dimm_resp[1] = 5;
-            s->dimm_resp[2] = 100;
+        case MB_CMD_STATUS:
+            s->dimm_resp[1] = mediaboard.status;
+            s->dimm_resp[2] = mediaboard.progress;
             break;
-        case 0x0101: /* GetSegaBootVersion — 3.17 */
-            s->dimm_resp[1] = 0x0317;
+        case MB_CMD_GET_VERSION:
+            s->dimm_resp[1] = mediaboard.fw_version;
             s->dimm_resp[2] = 1;
             break;
-        case 0x0102: { /* GetSystemFlags — Dolphin byte layout */
+        case MB_CMD_SYSTEM_TYPE: { /* Dolphin byte layout */
             uint8_t *p = (uint8_t *)&s->dimm_resp[1];
             p[0] = 1;    /* flag (must be nonzero) */
             p[1] = 1;    /* media type: GDROM=1 */
@@ -824,10 +879,8 @@ static void chihiro_dimm_process_cmd(ChihiroLPCState *s)
             s->dimm_resp[2] = 0; /* access count */
             break;
         }
-        case 0x0103: /* GetMediaBoardSerial — from flash ROM MBDT+0x10 */
-            if (chihiro_flash_rom && chihiro_flash_rom_size > 0xFFE20) {
-                memcpy(&s->dimm_resp[1], chihiro_flash_rom + 0xFFE10, 16);
-            }
+        case MB_CMD_GET_SERIAL:
+            memcpy(&s->dimm_resp[1], mediaboard.serial, 16);
             break;
         default:
             break;
@@ -843,23 +896,21 @@ static void chihiro_dimm_process_cmd(ChihiroLPCState *s)
         s->dimm_resp[1] = cmd | 0x8000;
 
         switch (cmd) {
-        case 0x0001: /* DIMM_SIZE — 512MB */
-            s->dimm_resp[2] = 0x20000000;
+        case MB_CMD_INIT:
+            s->dimm_resp[2] = mediaboard.dimm_size;
             break;
-        case 0x0100: /* STATUS — phase=5 (ready), completion=100% */
-            s->dimm_resp[2] = 5;
-            s->dimm_resp[3] = 100;
+        case MB_CMD_STATUS:
+            s->dimm_resp[2] = mediaboard.status;
+            s->dimm_resp[3] = mediaboard.progress;
             break;
-        case 0x0101: /* FW_VER */
-            s->dimm_resp[2] = 0x0317;
+        case MB_CMD_GET_VERSION:
+            s->dimm_resp[2] = mediaboard.fw_version;
             break;
-        case 0x0102: /* SYSTEM_TYPE — low byte must be >=2 to pass board check */
+        case MB_CMD_SYSTEM_TYPE: /* low byte must be >=2 to pass board check */
             s->dimm_resp[2] = 0x8002;
             break;
-        case 0x0103: /* SERIAL — from flash ROM MBDT+0x10 */
-            if (chihiro_flash_rom && chihiro_flash_rom_size > 0xFFE20) {
-                memcpy(&s->dimm_resp[2], chihiro_flash_rom + 0xFFE10, 16);
-            }
+        case MB_CMD_GET_SERIAL:
+            memcpy(&s->dimm_resp[2], mediaboard.serial, 16);
             break;
         default:
             break;
@@ -1000,7 +1051,7 @@ static uint64_t chihiro_lpc_io_read(void *opaque, hwaddr addr,
         }
         break;
     case SEGA_DIMM_SIZE:
-        r = SEGA_DIMM_SIZE_512M;        /* Kernel computes mbcom LBA from this:
+        r = mediaboard.dimm_factor;     /* JP1/JP2 jumpers. Kernel computes mbcom LBA:
                                          * mbcom_start = (0x40000 << factor) - 0x8000.
                                          * Must match IDE capacity and CHIHIRO_MBCOM_BASE. */
         if (chihiro_board_type3)
@@ -1577,15 +1628,11 @@ static void chihiro_irq10_timer_cb(void *opaque)
                 cpu_physical_memory_read(data_pa + 2, &cmd_opcode, 2);
                 uint32_t resp_data = 0, resp_data2 = 0;
                 switch (cmd_opcode) {
-                case 0x0001: resp_data = 0x20000000; break;
-                case 0x0100: resp_data = 5; resp_data2 = 100; break;
-                case 0x0101: resp_data = 0x0317; break;
-                case 0x0102: resp_data = 0x8002; break;
-                case 0x0103:
-                    if (chihiro_flash_rom && chihiro_flash_rom_size > 0xFFE20) {
-                        memcpy(&resp_data, chihiro_flash_rom + 0xFFE10, 4);
-                    }
-                    break;
+                case MB_CMD_INIT: resp_data = mediaboard.dimm_size; break;
+                case MB_CMD_STATUS: resp_data = mediaboard.status; resp_data2 = mediaboard.progress; break;
+                case MB_CMD_GET_VERSION: resp_data = mediaboard.fw_version; break;
+                case MB_CMD_SYSTEM_TYPE: resp_data = 0x8002; break;
+                case MB_CMD_GET_SERIAL: memcpy(&resp_data, mediaboard.serial, 4); break;
                 default: resp_data = 0; break;
                 }
                 meta_marker = 0x0001;
@@ -1693,6 +1740,9 @@ static void chihiro_lpc_realize(DeviceState *dev, Error **errp)
                                    chihiro_irq10_timer_cb, s);
     timer_mod(s->irq10_timer,
               qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 500);
+
+    /* Initialize media board state (single source for all mbcom responses) */
+    mediaboard_init();
 
     /* Initialize mbcom protocol handler */
     chihiro_mbcom_init();
@@ -2064,27 +2114,28 @@ static void chihiro_mbcom_process(void)
     }
 
     switch (cmd_code) {
-    case 0x0001: /* DIMM_SIZE — 512MB = 0x20000000 (matches port 0x40F4 factor=2) */
-        r[4] = 0x00; r[5] = 0x00; r[6] = 0x00; r[7] = 0x20;
+    case MB_CMD_INIT: { /* DIMM size in bytes (from JP1/JP2 jumpers) */
+        uint32_t sz = mediaboard.dimm_size;
+        memcpy(r + 4, &sz, 4);
         break;
-    case 0x0100: /* STATUS — phase=5 (READY), completion=100%
-                  * CXBX: MB_STATUS_READY=5, percentage=100 */
-        r[4] = 5; r[5] = 0; r[6] = 0; r[7] = 0;
-        r[8] = 100; r[9] = 0; r[10] = 0; r[11] = 0;  /* completion 100% */
+    }
+    case MB_CMD_STATUS: /* Boot phase + completion percentage */
+        r[4] = mediaboard.status; r[5] = 0; r[6] = 0; r[7] = 0;
+        r[8] = mediaboard.progress; r[9] = 0; r[10] = 0; r[11] = 0;
         break;
-    case 0x0101: /* FW_VER — Cxbx: 0x0317 */
-        r[4] = 0x17; r[5] = 0x03; r[6] = 0; r[7] = 0;
+    case MB_CMD_GET_VERSION: { /* Media board firmware version */
+        uint16_t v = mediaboard.fw_version;
+        memcpy(r + 4, &v, 2); r[6] = 0; r[7] = 0;
         break;
-    case 0x0102: /* SYSTEM_TYPE — firmware format: board_type | (fw_ver<<8) | (mode<<16)
-                  * board_type: 0=NAOMI, 3=GD-ROM, 4=Chihiro. SEGABOOT requires >=2 */
-        r[4] = 0x04; r[5] = 0x17; r[6] = 0x03; r[7] = 0;
+    }
+    case MB_CMD_SYSTEM_TYPE: /* board_type | (fw_ver << 8) */
+        r[4] = mediaboard.board_type;
+        r[5] = mediaboard.fw_version & 0xFF;
+        r[6] = (mediaboard.fw_version >> 8) & 0xFF;
+        r[7] = 0;
         break;
-    case 0x0103: /* SERIAL — from flash ROM MBDT header at offset 0xFFE10 */
-        if (chihiro_flash_rom && chihiro_flash_rom_size > 0xFFE20) {
-            memcpy(r + 4, chihiro_flash_rom + 0xFFE10, 16);
-        } else {
-            memset(r + 4, 0, 16);
-        }
+    case MB_CMD_GET_SERIAL: /* From flash ROM MBDT+0x10 */
+        memcpy(r + 4, mediaboard.serial, 16);
         break;
     case 0x0104: /* Cxbx: unknown, returns 0 */
         r[4] = 0; r[5] = 0; r[6] = 0; r[7] = 0;
@@ -2103,8 +2154,8 @@ static void chihiro_mbcom_process(void)
             }
         }
         break;
-    case 0x0415: /* Cxbx: returns IP 10.0.0.1 */
-        r[4] = 1; r[5] = 0; r[6] = 0; r[7] = 10; /* 10.0.0.1 LE */
+    case 0x0415: /* Network IP address */
+        memcpy(r + 4, &mediaboard.net_ip, 4);
         break;
     case 0x0601: /* Cxbx: returns 0 */
         r[4] = 0; r[5] = 0; r[6] = 0; r[7] = 0;
@@ -2120,8 +2171,8 @@ static void chihiro_mbcom_process(void)
         r[4] = 0; r[5] = 0; r[6] = 0; r[7] = 0;
         r[8] = 0; r[9] = 0; r[10] = 0; r[11] = 0;
         break;
-    case 0x0608: /* Cxbx: returns IP 10.0.0.1 */
-        r[4] = 1; r[5] = 0; r[6] = 0; r[7] = 10;
+    case 0x0608: /* Network IP address (same as 0x0415) */
+        memcpy(r + 4, &mediaboard.net_ip, 4);
         break;
     default:
         if (lpc_log_verbose) fprintf(stderr, "[%07lld] MBCOM UNHANDLED cmd=0x%04X\n", TS_MS, cmd_code);
