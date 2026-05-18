@@ -25,7 +25,6 @@
 #include "qapi/error.h"
 
 #include "qemu/timer.h"
-#include "chihiro-firmware.h"
 #include "chihiro.h"
 #include "chihiro-jvs.h"
 #include "chihiro-an2131.h"
@@ -604,23 +603,22 @@ static void chihiro_an2131qc_realize(USBDevice *dev, Error **errp)
     if (chihiro_ic10_data && chihiro_ic10_size == sizeof(s->eeprom)) {
         memcpy(s->eeprom, chihiro_ic10_data, sizeof(s->eeprom));
     } else {
-        memcpy(s->eeprom, hotd3_ic10_g24lc64, sizeof(s->eeprom));
+        error_setg(errp, "Chihiro QC: ic10 EEPROM dump required (ic10_g24lc64.bin)");
+        return;
     }
-
     /* Region byte at eeprom[0x1F00]: SEGABOOT checks boot.id[0x38] bitmask
      * against (1 << region). JPN-only games (e.g. Golf SBLF, bitmask=0x02)
      * fail with ERROR 05 if region=2. Region=1 (JPN) works for all known
-     * games since all bitmasks include bit 1. */
-    s->eeprom[0x1F00] = 0x01;  /* Region: 01=JPN, 02=USA, 03=EXP */
-    memcpy(&s->eeprom[0x1F10], "BEER-01A00000001", 16);
-
+     * games since all bitmasks include bit 1.
+     * Values: 01=JPN, 02=USA, 03=EXP. Comes from ic10 dump natively. */
 
     /* Load ic11 baseboard EEPROM (256 bytes, 24LC024) */
     memset(s->ic11, 0, sizeof(s->ic11));
     if (chihiro_ic11_data && chihiro_ic11_size <= sizeof(s->ic11)) {
         memcpy(s->ic11, chihiro_ic11_data, chihiro_ic11_size);
     } else {
-        memcpy(s->ic11, hotd3_ic11_24lc024, sizeof(hotd3_ic11_24lc024));
+        error_setg(errp, "Chihiro QC: ic11 EEPROM dump required (ic11_24lc024.bin)");
+        return;
     }
     memset(s->extmem, 0, sizeof(s->extmem));
 
@@ -705,16 +703,17 @@ static void chihiro_an2131sc_realize(USBDevice *dev, Error **errp)
     if (chihiro_pc20_data && chihiro_pc20_size == sizeof(s->eeprom)) {
         memcpy(s->eeprom, chihiro_pc20_data, sizeof(s->eeprom));
     } else {
-        memcpy(s->eeprom, hotd3_pc20_g24lc64, sizeof(s->eeprom));
+        error_setg(errp, "Chihiro SC: pc20 EEPROM dump required (pc20_g24lc64.bin)");
+        return;
     }
-
 
     /* Load ic11 baseboard EEPROM (256 bytes, 24LC024) */
     memset(s->ic11, 0, sizeof(s->ic11));
     if (chihiro_ic11_data && chihiro_ic11_size <= sizeof(s->ic11)) {
         memcpy(s->ic11, chihiro_ic11_data, chihiro_ic11_size);
     } else {
-        memcpy(s->ic11, hotd3_ic11_24lc024, sizeof(hotd3_ic11_24lc024));
+        error_setg(errp, "Chihiro SC: ic11 EEPROM dump required (ic11_24lc024.bin)");
+        return;
     }
     memset(s->extmem, 0, sizeof(s->extmem));
 

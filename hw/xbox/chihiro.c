@@ -172,6 +172,8 @@ char chihiro_game_dir[1024];   /* Game directory path (from dvd_path) */
 static char chihiro_save_path[2048];
 static bool chihiro_resolve_save_path(void);
 bool chihiro_board_type3;      /* true = ASIC (Type-3), false = FPGA (Type-1) */
+static uint8_t *chihiro_flash_rom;
+static uint32_t chihiro_flash_rom_size;
 static ChihiroLPCState *chihiro_lpc_global;
 uint32_t chihiro_usb_sm_pa;  /* PA of USB state machine globals at VA 0xC3F10 */
 
@@ -822,8 +824,10 @@ static void chihiro_dimm_process_cmd(ChihiroLPCState *s)
             s->dimm_resp[2] = 0; /* access count */
             break;
         }
-        case 0x0103: /* GetMediaBoardSerial */
-            memcpy(&s->dimm_resp[1], "AAEE-01A00000001", 16);
+        case 0x0103: /* GetMediaBoardSerial — from flash ROM MBDT+0x10 */
+            if (chihiro_flash_rom && chihiro_flash_rom_size > 0xFFE20) {
+                memcpy(&s->dimm_resp[1], chihiro_flash_rom + 0xFFE10, 16);
+            }
             break;
         default:
             break;
@@ -852,8 +856,10 @@ static void chihiro_dimm_process_cmd(ChihiroLPCState *s)
         case 0x0102: /* SYSTEM_TYPE — low byte must be >=2 to pass board check */
             s->dimm_resp[2] = 0x8002;
             break;
-        case 0x0103: /* SERIAL */
-            memcpy(&s->dimm_resp[2], "AAEE-01A00000001", 16);
+        case 0x0103: /* SERIAL — from flash ROM MBDT+0x10 */
+            if (chihiro_flash_rom && chihiro_flash_rom_size > 0xFFE20) {
+                memcpy(&s->dimm_resp[2], chihiro_flash_rom + 0xFFE10, 16);
+            }
             break;
         default:
             break;
@@ -1329,9 +1335,8 @@ static bool chihiro_mbcom_enabled = false;
 
 /* Flash ROM (SEGABOOT) loaded from file — serves mbrom0/mbrom1 reads.
  * On real hardware: fpr-23887_29lv160te.ic4 (2MB flash on MediaBoard).
- * Contains the SEGABOOT XBE that boots before the game. */
-static uint8_t *chihiro_flash_rom = NULL;
-static uint32_t chihiro_flash_rom_size = 0;
+ * Contains the SEGABOOT XBE that boots before the game.
+ * Also contains MBDT header at 0xFFE00 with media board serial. */
 
 uint8_t *chihiro_ic10_data = NULL;
 uint32_t chihiro_ic10_size = 0;
@@ -1576,7 +1581,11 @@ static void chihiro_irq10_timer_cb(void *opaque)
                 case 0x0100: resp_data = 5; resp_data2 = 100; break;
                 case 0x0101: resp_data = 0x0317; break;
                 case 0x0102: resp_data = 0x8002; break;
-                case 0x0103: resp_data = 0x6261632D; break;
+                case 0x0103:
+                    if (chihiro_flash_rom && chihiro_flash_rom_size > 0xFFE20) {
+                        memcpy(&resp_data, chihiro_flash_rom + 0xFFE10, 4);
+                    }
+                    break;
                 default: resp_data = 0; break;
                 }
                 meta_marker = 0x0001;
@@ -2070,8 +2079,12 @@ static void chihiro_mbcom_process(void)
                   * board_type: 0=NAOMI, 3=GD-ROM, 4=Chihiro. SEGABOOT requires >=2 */
         r[4] = 0x04; r[5] = 0x17; r[6] = 0x03; r[7] = 0;
         break;
-    case 0x0103: /* SERIAL — MAME: "-abc-abc12345678" */
-        memcpy(r + 4, "-abc-abc12345678", 16);
+    case 0x0103: /* SERIAL — from flash ROM MBDT header at offset 0xFFE10 */
+        if (chihiro_flash_rom && chihiro_flash_rom_size > 0xFFE20) {
+            memcpy(r + 4, chihiro_flash_rom + 0xFFE10, 16);
+        } else {
+            memset(r + 4, 0, 16);
+        }
         break;
     case 0x0104: /* Cxbx: unknown, returns 0 */
         r[4] = 0; r[5] = 0; r[6] = 0; r[7] = 0;
