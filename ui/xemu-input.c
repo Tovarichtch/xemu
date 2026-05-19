@@ -571,9 +571,15 @@ static void xemu_input_update_jvs(void)
         jvs->analog[2] = brake_key ? 0xFFFF : 0x0000;
 
         if (kbd[SDL_SCANCODE_LSHIFT])
+            sw0 |= 0x20;
+        if (kbd[SDL_SCANCODE_LCTRL])
             sw0 |= 0x10;
         if (kbd[SDL_SCANCODE_SPACE])
             sw0 |= 0x02;
+        if (kbd[SDL_SCANCODE_Z])
+            sw1 |= 0x20;
+        if (kbd[SDL_SCANCODE_X])
+            sw1 |= 0x10;
     } else {
         if (offscreen) {
             jvs->analog[0] = 0;
@@ -584,10 +590,13 @@ static void xemu_input_update_jvs(void)
         }
 
         if (trigger) sw0 |= 0x02;
-        if (reload)  sw0 |= 0x01;
+        if (reload)  sw1 |= 0x80;
 
         if (!offscreen && !reload)
-            sw1 |= 0x80;
+            sw0 |= 0x01;
+
+        if (kbd[SDL_SCANCODE_SPACE])
+            sw1 |= 0x40;
     }
 
     if (kbd[g_config.input.keyboard_controller_scancode_map.start])

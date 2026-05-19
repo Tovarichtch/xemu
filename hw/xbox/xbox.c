@@ -379,6 +379,7 @@ void xbox_init_common(MachineState *machine,
         chihiro_load_eeproms(g_config.sys.files.flashrom_path);
 
         isa_create_simple(isa_bus, "chihiro-lpc");
+        isa_create_simple(isa_bus, "lpc47m157");
 
         /* Chihiro southbridge has revision >= 0xB4. This clears bit 0 of
          * XboxHardwareInfo in the kernel, selecting PATH_B for USB topology

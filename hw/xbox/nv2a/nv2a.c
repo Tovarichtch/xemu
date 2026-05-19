@@ -208,17 +208,7 @@ static void nv2a_realtime_vblank_cb(void *opaque)
     perf_cnt_vblank++;
     perf_pcrtc_enabled = d->pcrtc.enabled_interrupts;
 
-    struct timespec t0, t1;
-    clock_gettime(CLOCK_MONOTONIC, &t0);
     nv2a_update_irq(d);
-    clock_gettime(CLOCK_MONOTONIC, &t1);
-    static uint64_t total_ns = 0, count = 0;
-    total_ns += (uint64_t)(t1.tv_sec - t0.tv_sec) * 1000000000ULL +
-                (uint64_t)(t1.tv_nsec - t0.tv_nsec);
-    count++;
-    if (count % 600 == 0)
-        fprintf(stderr, "IRQ avg: %luns (%lu calls)\n",
-                (unsigned long)(total_ns / count), (unsigned long)count);
 
     timer_mod(d->vblank_timer,
               qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 16);
