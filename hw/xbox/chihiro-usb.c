@@ -834,6 +834,9 @@ bool chihiro_usb_save_load(const char *path)
 
     fclose(f);
     fprintf(stderr, "Chihiro: save loaded from %s\n", path);
+
+    an2131_detect_sbfy(&s->an2131);
+
     return true;
 }
 
@@ -855,6 +858,7 @@ bool chihiro_usb_save_flush(const char *path)
 
     fclose(f);
     fprintf(stderr, "Chihiro: save flushed to %s\n", path);
+
     return true;
 }
 

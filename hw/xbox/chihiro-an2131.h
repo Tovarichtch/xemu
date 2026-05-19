@@ -224,6 +224,29 @@ typedef struct AN2131State {
     uint8_t *extmem;
     int      extmem_size;
 
+    /*
+     * SBFY backup workaround (Crazy Taxi only):
+     *
+     * The game's SBFY backup payload (extmem 0x840C-0xB1E7) overlaps the
+     * firmware's JVS TX buffer at 0xB000+. On real hardware the JVS bytes
+     * are deterministic (same inputs = same frames), so the checksum is
+     * stable. In emulation, timing differences cause byte-level drift.
+     *
+     * The v0x18 read transfer is non-atomic (184 EP3-IN chunks). JVS
+     * v0x19/v0x20 requests interleave during the transfer, modifying
+     * 0xB000+ mid-read. The game validates header checksum against the
+     * received payload — any drift causes validation failure and a
+     * silent reset to factory defaults.
+     *
+     * Fix: (1) recalculate the checksum from scratch before each v0x18
+     * SBFY read, and (2) freeze the payload range during the slot-2
+     * deferred dispatch so EP3-IN chunks are consistent.
+     */
+    uint16_t sbfy_pay_off;   /* first payload byte (0 = not detected) */
+    uint16_t sbfy_pay_end;   /* one past last payload byte */
+    uint16_t sbfy_chk_off;   /* checksum field in header */
+    bool     sbfy_reading;   /* v0x18 SBFY in progress — freeze payload */
+
     /* ── USB global registers ───────────────────────────────────── */
     uint8_t  cpucs;
     uint8_t  usbcs;
@@ -290,6 +313,7 @@ void an2131_b2_boot(AN2131State *s, const uint8_t *eeprom, int eeprom_size);
 
 void an2131_anchor_load(AN2131State *s, uint16_t addr,
                         const uint8_t *data, int len);
+void an2131_detect_sbfy(AN2131State *s);
 void an2131_set_cpucs(AN2131State *s, uint8_t val);
 
 int  an2131_setup_packet(AN2131State *s, const uint8_t setup[8],

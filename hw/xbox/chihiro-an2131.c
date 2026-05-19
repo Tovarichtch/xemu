@@ -370,6 +370,9 @@ static void an2131_xdata_write(Cpu8051State *cpu, uint16_t addr, uint8_t val)
 
     /* External SRAM: 0x2000-0x7B3F and 0x8000-0xFFFF */
     if (s->extmem) {
+        if (s->sbfy_reading && addr >= s->sbfy_pay_off && addr < s->sbfy_pay_end
+            && s->cpu.iram[0x2D] != 0)
+            return;
         s->extmem[addr] = val;
     }
 }
@@ -726,17 +729,46 @@ void an2131_anchor_load(AN2131State *s, uint16_t addr,
         s->ram[addr + i] = data[i];
 }
 
+void an2131_detect_sbfy(AN2131State *s)
+{
+    if (!s->extmem) return;
+    s->sbfy_pay_off = 0;
+    for (uint32_t off = 0x8000; off < 0xFFF0; off += 0x200) {
+        if (memcmp(s->extmem + off, "SBFY002", 7) == 0) {
+            uint16_t sz = s->extmem[off + 8] | (s->extmem[off + 9] << 8);
+            uint16_t pay = sz * 4;
+            if (pay > 0 && off + 12 + pay <= 0x10000) {
+                s->sbfy_pay_off = off + 12;
+                s->sbfy_pay_end = off + 12 + pay;
+                s->sbfy_chk_off = off + 10;
+                fprintf(stderr, "[SBFY-FIX] detected at 0x%04X payload=%u(0x%X) "
+                        "chk@0x%04X range [0x%04X,0x%04X)\n",
+                        off, pay, pay, s->sbfy_chk_off,
+                        s->sbfy_pay_off, s->sbfy_pay_end);
+                return;
+            }
+        }
+    }
+}
+
 void an2131_set_cpucs(AN2131State *s, uint8_t val)
 {
     bool was_reset = s->cpucs & CPUCS_8051RES;
     s->cpucs = val;
 
     if (was_reset && !(val & CPUCS_8051RES)) {
-        /* Full 8051 core reset: SFR + IRAM to power-on defaults.
-         * AN2131 silicon resets the 8051 core when CPUCS[0] cycles 1→0.
-         * Without this, stale IRAM/SFR from the previous run causes the
-         * firmware to take wrong code paths on restart. */
         cpu8051_reset(&s->cpu);
+
+        s->total_cycles = 0;
+        s->jvs_response_set_cycles = 0;
+        s->jvs_response_ready = false;
+        s->jvs_rx_pending = false;
+        s->jvs_rx_len = 0;
+        s->jvs_rx_pos = 0;
+        s->jvs_tx_len = 0;
+        s->jvs_tx_expected = 0;
+        s->jvs_tx_escape = false;
+
         s->cpu_running = true;
         fprintf(stderr, "[AN2131] CPU released — running firmware from 0x0000\n");
         an2131_run(s, 8000000);
@@ -758,6 +790,22 @@ int an2131_setup_packet(AN2131State *s, const uint8_t setup[8],
     if (!s->cpu_running) return -1;
 
     s->diag_setup_calls++;
+
+    /* v0x18 SBFY: recalculate checksum then freeze payload for consistent
+     * EP3 IN transfer. v0x19/v0x20 interleave — only v0x18/v0x1F touch flag. */
+    if (setup[1] == 0x1F)
+        s->sbfy_reading = false;
+    if (setup[1] == 0x18 && s->sbfy_pay_off) {
+        uint16_t wVal = setup[2] | (setup[3] << 8);
+        if (wVal >= 0x8400) {
+            uint16_t calc = 0;
+            for (uint32_t i = s->sbfy_pay_off; i < s->sbfy_pay_end; i++)
+                calc += s->extmem[i];
+            s->extmem[s->sbfy_chk_off]     = calc & 0xFF;
+            s->extmem[s->sbfy_chk_off + 1] = (calc >> 8) & 0xFF;
+            s->sbfy_reading = true;
+        }
+    }
 
     /* Force-clear stale interrupt state */
     s->cpu.in_interrupt = false;
