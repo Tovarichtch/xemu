@@ -64,6 +64,20 @@ public:
     void PopulateTableController(ControllerState *state);
 };
 
+class MainMenuChihiroView : public virtual MainMenuTabView
+{
+public:
+    std::unique_ptr<RebindingMap> m_rebinding;
+
+    MainMenuChihiroView() : m_rebinding{ nullptr }
+    {
+    }
+    bool ConsumeRebindEvent(SDL_Event *event);
+    bool IsInputRebinding();
+    void Draw() override;
+    void Hide() override;
+};
+
 class MainMenuDisplayView : public virtual MainMenuTabView
 {
 public:
@@ -182,6 +196,7 @@ protected:
                                     m_network_button,
                                     m_snapshots_button,
                                     m_system_button,
+                                    m_chihiro_button,
                                     m_about_button;
     std::vector<MainMenuTabView*>   m_views;
     MainMenuGeneralView             m_general_view;
@@ -191,6 +206,7 @@ protected:
     MainMenuNetworkView             m_network_view;
     MainMenuSnapshotsView           m_snapshots_view;
     MainMenuSystemView              m_system_view;
+    MainMenuChihiroView             m_chihiro_view;
     MainMenuAboutView               m_about_view;
 
 

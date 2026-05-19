@@ -370,3 +370,79 @@ perf:
   cache_shaders:
     type: bool
     default: true
+
+chihiro:
+  jvs:
+    profile:
+      type: enum
+      values: [driving, lightgun, ollie_king]
+      default: lightgun
+    start:
+      type: integer
+      default: 40
+    service:
+      type: integer
+      default: 38
+    coin:
+      type: integer
+      default: 34
+    test:
+      type: integer
+      default: 39
+    driving:
+      steer_left:
+        type: integer
+        default: 80
+      steer_right:
+        type: integer
+        default: 79
+      gas:
+        type: integer
+        default: 82
+      brake:
+        type: integer
+        default: 81
+      drive_gear:
+        type: integer
+        default: 225
+      reverse_view:
+        type: integer
+        default: 224
+      jump:
+        type: integer
+        default: 44
+      gear_up:
+        type: integer
+        default: 29
+      gear_down:
+        type: integer
+        default: 27
+    lightgun:
+      trigger:
+        type: integer
+        default: 0
+      body_button:
+        type: integer
+        default: 21
+      pedal_change:
+        type: integer
+        default: 44
+    ollie_king:
+      swing_left:
+        type: integer
+        default: 80
+      swing_right:
+        type: integer
+        default: 79
+      board_front:
+        type: integer
+        default: 82
+      board_rear:
+        type: integer
+        default: 81
+      left_grab:
+        type: integer
+        default: 29
+      right_grab:
+        type: integer
+        default: 27

@@ -163,6 +163,40 @@ int *g_keyboard_scancode_map[25] = {
     &g_config.input.keyboard_controller_scancode_map.rtrigger,
 };
 
+int *g_chihiro_universal_map[4] = {
+    &g_config.chihiro.jvs.start,
+    &g_config.chihiro.jvs.service,
+    &g_config.chihiro.jvs.coin,
+    &g_config.chihiro.jvs.test,
+};
+
+int *g_chihiro_driving_map[9] = {
+    &g_config.chihiro.jvs.driving.steer_left,
+    &g_config.chihiro.jvs.driving.steer_right,
+    &g_config.chihiro.jvs.driving.gas,
+    &g_config.chihiro.jvs.driving.brake,
+    &g_config.chihiro.jvs.driving.drive_gear,
+    &g_config.chihiro.jvs.driving.reverse_view,
+    &g_config.chihiro.jvs.driving.jump,
+    &g_config.chihiro.jvs.driving.gear_up,
+    &g_config.chihiro.jvs.driving.gear_down,
+};
+
+int *g_chihiro_lightgun_map[3] = {
+    &g_config.chihiro.jvs.lightgun.trigger,
+    &g_config.chihiro.jvs.lightgun.body_button,
+    &g_config.chihiro.jvs.lightgun.pedal_change,
+};
+
+int *g_chihiro_ollie_king_map[6] = {
+    &g_config.chihiro.jvs.ollie_king.swing_left,
+    &g_config.chihiro.jvs.ollie_king.swing_right,
+    &g_config.chihiro.jvs.ollie_king.board_front,
+    &g_config.chihiro.jvs.ollie_king.board_rear,
+    &g_config.chihiro.jvs.ollie_king.left_grab,
+    &g_config.chihiro.jvs.ollie_king.right_grab,
+};
+
 static void check_and_reset_in_range(int *btn, int min, int max,
                                      const char *message)
 {
@@ -513,104 +547,135 @@ void xemu_input_update_controller(ControllerState *state)
     state->last_input_updated_ts = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
 }
 
+static uint16_t jvs_axis_smooth(uint16_t pos, bool neg, bool posv)
+{
+    uint16_t target = 0x8000;
+    if (neg && !posv) target = 0x0000;
+    else if (posv && !neg) target = 0xFFFF;
+    int delta = (int)target - (int)pos;
+    int step = 0x1000;
+    if (delta > step) return pos + step;
+    if (delta < -step) return pos - step;
+    return target;
+}
+
 static void xemu_input_update_jvs(void)
 {
     if (!chihiro_jvs_global) return;
     ChihiroJVSState *jvs = chihiro_jvs_global;
 
     const bool *kbd = SDL_GetKeyboardState(NULL);
-    float mx, my;
-    uint32_t mouseBtn = SDL_GetMouseState(&mx, &my);
-
-    int32_t winW, winH;
-    SDL_GetWindowSize(m_window, &winW, &winH);
-
-    if (viewport_coords[2] > 0 && viewport_coords[3] > 0) {
-        int32_t drawW, drawH;
-        SDL_GetWindowSizeInPixels(m_window, &drawW, &drawH);
-        float scaleW = (float)winW / (float)drawW;
-        float scaleH = (float)winH / (float)drawH;
-        mx -= viewport_coords[0] * scaleW;
-        my -= viewport_coords[1] * scaleH;
-        winW = (int)(viewport_coords[2] * scaleW);
-        winH = (int)(viewport_coords[3] * scaleH);
-    }
-
-    bool offscreen = !(mx >= 0 && mx <= winW && my >= 0 && my <= winH);
-    bool trigger = (mouseBtn & SDL_BUTTON_MASK(SDL_BUTTON_LEFT)) != 0;
-    bool reload  = (mouseBtn & SDL_BUTTON_MASK(SDL_BUTTON_RIGHT)) != 0 ||
-                   kbd[SDL_SCANCODE_R];
-
-    bool steer_left  = kbd[SDL_SCANCODE_LEFT];
-    bool steer_right = kbd[SDL_SCANCODE_RIGHT];
-    bool gas_key     = kbd[SDL_SCANCODE_UP];
-    bool brake_key   = kbd[SDL_SCANCODE_DOWN];
-
-    static bool driving_mode = false;
-    if (steer_left || steer_right || gas_key || brake_key)
-        driving_mode = true;
-    if (trigger || reload)
-        driving_mode = false;
-
-    static uint16_t steer_pos = 0x8000;
-    uint16_t steer_target = 0x8000;
-    if (steer_left && !steer_right) steer_target = 0x0000;
-    else if (steer_right && !steer_left) steer_target = 0xFFFF;
-    int steer_delta = (int)steer_target - (int)steer_pos;
-    int steer_step = 0x1000;
-    if (steer_delta > steer_step) steer_pos += steer_step;
-    else if (steer_delta < -steer_step) steer_pos -= steer_step;
-    else steer_pos = steer_target;
-
     uint8_t sw0 = 0;
     uint8_t sw1 = 0;
 
-    if (driving_mode) {
-        jvs->analog[0] = steer_pos;
-        jvs->analog[1] = gas_key ? 0xFFFF : 0x0000;
-        jvs->analog[2] = brake_key ? 0xFFFF : 0x0000;
+    int profile = g_config.chihiro.jvs.profile;
 
-        if (kbd[SDL_SCANCODE_LSHIFT])
+    switch (profile) {
+    case CONFIG_CHIHIRO_JVS_PROFILE_DRIVING: {
+        bool sl = kbd[g_config.chihiro.jvs.driving.steer_left];
+        bool sr = kbd[g_config.chihiro.jvs.driving.steer_right];
+        bool gas = kbd[g_config.chihiro.jvs.driving.gas];
+        bool brk = kbd[g_config.chihiro.jvs.driving.brake];
+
+        static uint16_t steer_pos = 0x8000;
+        steer_pos = jvs_axis_smooth(steer_pos, sl, sr);
+
+        jvs->analog[0] = steer_pos;
+        jvs->analog[1] = gas ? 0xFFFF : 0x0000;
+        jvs->analog[2] = brk ? 0xFFFF : 0x0000;
+
+        if (kbd[g_config.chihiro.jvs.driving.drive_gear])
             sw0 |= 0x20;
-        if (kbd[SDL_SCANCODE_LCTRL])
+        if (kbd[g_config.chihiro.jvs.driving.reverse_view])
             sw0 |= 0x10;
-        if (kbd[SDL_SCANCODE_SPACE])
+        if (kbd[g_config.chihiro.jvs.driving.jump])
             sw0 |= 0x02;
-        if (kbd[SDL_SCANCODE_Z])
+        if (kbd[g_config.chihiro.jvs.driving.gear_up])
             sw1 |= 0x20;
-        if (kbd[SDL_SCANCODE_X])
+        if (kbd[g_config.chihiro.jvs.driving.gear_down])
             sw1 |= 0x10;
-    } else {
+        break;
+    }
+    case CONFIG_CHIHIRO_JVS_PROFILE_LIGHTGUN: {
+        float mx, my;
+        uint32_t mouseBtn = SDL_GetMouseState(&mx, &my);
+
+        int32_t winW, winH;
+        SDL_GetWindowSize(m_window, &winW, &winH);
+        if (viewport_coords[2] > 0 && viewport_coords[3] > 0) {
+            int32_t drawW, drawH;
+            SDL_GetWindowSizeInPixels(m_window, &drawW, &drawH);
+            float scaleW = (float)winW / (float)drawW;
+            float scaleH = (float)winH / (float)drawH;
+            mx -= viewport_coords[0] * scaleW;
+            my -= viewport_coords[1] * scaleH;
+            winW = (int)(viewport_coords[2] * scaleW);
+            winH = (int)(viewport_coords[3] * scaleH);
+        }
+
+        float safe = 0.01f;
+        bool offscreen = (mx < -safe * winW || mx > (1.0f + safe) * winW ||
+                          my < -safe * winH || my > (1.0f + safe) * winH);
+
         if (offscreen) {
             jvs->analog[0] = 0;
             jvs->analog[1] = 0;
         } else {
-            jvs->analog[0] = (uint16_t)(mx * 0xFFFF / winW);
-            jvs->analog[1] = (uint16_t)(my * 0xFFFF / winH);
+            float nx = mx / winW;
+            float ny = my / winH;
+            if (nx < 0) nx = 0; if (nx > 1) nx = 1;
+            if (ny < 0) ny = 0; if (ny > 1) ny = 1;
+            jvs->analog[0] = (uint16_t)(nx * 0xFFFF);
+            jvs->analog[1] = (uint16_t)(ny * 0xFFFF);
         }
 
+        int tkey = g_config.chihiro.jvs.lightgun.trigger;
+        int bkey = g_config.chihiro.jvs.lightgun.body_button;
+        bool trigger = (mouseBtn & SDL_BUTTON_MASK(SDL_BUTTON_LEFT)) != 0 ||
+                       (tkey > 0 && kbd[tkey]);
+        bool body = (mouseBtn & SDL_BUTTON_MASK(SDL_BUTTON_RIGHT)) != 0 ||
+                    (bkey > 0 && kbd[bkey]);
+
         if (trigger) sw0 |= 0x02;
-        if (reload)  sw1 |= 0x80;
-
-        if (!offscreen && !reload)
+        if (body)    sw1 |= 0x80;
+        if (!offscreen && !body)
             sw0 |= 0x01;
-
-        if (kbd[SDL_SCANCODE_SPACE])
+        if (kbd[g_config.chihiro.jvs.lightgun.pedal_change])
             sw1 |= 0x40;
+        break;
+    }
+    case CONFIG_CHIHIRO_JVS_PROFILE_OLLIE_KING: {
+        bool sl = kbd[g_config.chihiro.jvs.ollie_king.swing_left];
+        bool sr = kbd[g_config.chihiro.jvs.ollie_king.swing_right];
+
+        static uint16_t swing_pos = 0x8000;
+        swing_pos = jvs_axis_smooth(swing_pos, sl, sr);
+        jvs->analog[1] = swing_pos;
+
+        if (kbd[g_config.chihiro.jvs.ollie_king.board_front])
+            sw0 |= 0x20;
+        if (kbd[g_config.chihiro.jvs.ollie_king.board_rear])
+            sw0 |= 0x10;
+        if (kbd[g_config.chihiro.jvs.ollie_king.left_grab])
+            sw0 |= 0x02;
+        if (kbd[g_config.chihiro.jvs.ollie_king.right_grab])
+            sw0 |= 0x01;
+        break;
+    }
     }
 
-    if (kbd[g_config.input.keyboard_controller_scancode_map.start])
+    if (kbd[g_config.chihiro.jvs.start])
         sw0 |= 0x80;
-    if (kbd[SDL_SCANCODE_9])
+    if (kbd[g_config.chihiro.jvs.service])
         sw0 |= 0x40;
 
     jvs->player_switches[0][0] = sw0;
     jvs->player_switches[0][1] = sw1;
 
-    jvs->system_switches = kbd[SDL_SCANCODE_0] ? 0x80 : 0x00;
+    jvs->system_switches = kbd[g_config.chihiro.jvs.test] ? 0x80 : 0x00;
 
     static bool coin_prev;
-    bool coin_key = kbd[SDL_SCANCODE_5];
+    bool coin_key = kbd[g_config.chihiro.jvs.coin];
     if (coin_key && !coin_prev)
         jvs->coin_count[0]++;
     coin_prev = coin_key;

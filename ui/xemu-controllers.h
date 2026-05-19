@@ -69,4 +69,14 @@ public:
     }
 };
 
+struct ChihiroKeyboardRebindingMap : public virtual RebindingMap {
+    int **m_scancode_map;
+
+    ChihiroKeyboardRebindingMap(int table_row, int **scancode_map)
+        : RebindingMap(table_row), m_scancode_map(scancode_map)
+    {
+    }
+    RebindEventResult ConsumeRebindEvent(SDL_Event *event) override;
+};
+
 #endif // XEMU_CONTROLLERS_H

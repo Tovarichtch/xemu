@@ -123,6 +123,16 @@ ControllerGamepadRebindingMap::HandleAxisEvent(SDL_GamepadAxisEvent *event)
 }
 
 RebindEventResult
+ChihiroKeyboardRebindingMap::ConsumeRebindEvent(SDL_Event *event)
+{
+    if (event->type == SDL_EVENT_KEY_UP) {
+        *(m_scancode_map[m_table_row]) = event->key.scancode;
+        return RebindEventResult::Complete;
+    }
+    return RebindEventResult::Ignore;
+}
+
+RebindEventResult
 ControllerGamepadRebindingMap::ConsumeRebindEvent(SDL_Event *event)
 {
     switch (event->type) {

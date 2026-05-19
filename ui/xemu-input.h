@@ -143,6 +143,10 @@ extern "C" {
 #endif
 
 extern int *g_keyboard_scancode_map[25];
+extern int *g_chihiro_universal_map[4];
+extern int *g_chihiro_driving_map[9];
+extern int *g_chihiro_lightgun_map[3];
+extern int *g_chihiro_ollie_king_map[6];
 
 void xemu_input_init(void);
 void xemu_input_process_sdl_events(const SDL_Event *event); // SDL_EVENT_GAMEPAD_ADDED, SDL_EVENT_GAMEPAD_REMOVED
