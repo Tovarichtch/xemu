@@ -4,9 +4,9 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-/* Build FATX image in memory from game directory.
- * Returns malloc'd buffer (caller frees), sets *out_size. */
-uint8_t *chihiro_fatx_build(const char *game_dir, uint32_t *out_size,
-                            uint32_t partition_sectors);
+/* Build FATX image directly into a destination buffer.
+ * Returns bytes written, or 0 on failure. */
+uint32_t chihiro_fatx_build(const char *game_dir, uint8_t *dest,
+                            uint32_t dest_size, uint32_t partition_sectors);
 
 #endif

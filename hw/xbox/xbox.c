@@ -370,6 +370,7 @@ void xbox_init_common(MachineState *machine,
      * This provides the XBAM identification string that SEGABOOT checks
      * to detect the baseboard. */
     if (machine->ram_size > 64 * 1024 * 1024) {
+        gint64 init_t0 = g_get_monotonic_time();
         printf("Chihiro: 128MB RAM detected, enabling mediaboard LPC\n");
 
         /* TODO: Wire g_config.chihiro.roms.* paths here instead of
@@ -446,14 +447,18 @@ void xbox_init_common(MachineState *machine,
                             if (slash) *slash = '\0';
                         }
                     }
-                    uint32_t fatx_size = 0;
+                    uint32_t fs_size = 0;
+                    uint8_t *fs_buf = chihiro_fatx_get_buffer(&fs_size);
                     /* mbfs: partition = DIMM_sectors - 0x8000 (512MB → 0xF8000) */
                     uint32_t mbfs_sectors = 0x100000 - 0x8000;
-                    uint8_t *fatx = chihiro_fatx_build(game_dir, &fatx_size,
-                                                       mbfs_sectors);
-                    if (fatx) {
-                        printf("Chihiro: FATX built from '%s' (%u MB)\n",
-                               game_dir, fatx_size / (1024*1024));
+                    gint64 fatx_t0 = g_get_monotonic_time();
+                    uint32_t fatx_size = fs_buf ?
+                        chihiro_fatx_build(game_dir, fs_buf, fs_size,
+                                           mbfs_sectors) : 0;
+                    if (fatx_size) {
+                        printf("Chihiro: FATX built from '%s' (%u MB, %lld ms)\n",
+                               game_dir, fatx_size / (1024*1024),
+                               (long long)(g_get_monotonic_time() - fatx_t0) / 1000);
 
                         /* TODO: delete — FATX boot.id patching hack.
                          * Will be removed with FATX when real DIMM board is emulated. */
@@ -462,23 +467,20 @@ void xbox_init_common(MachineState *machine,
                             const char *rel = dvd + gd_len;
                             if (*rel == '/' || *rel == '\\') rel++;
                             for (uint32_t off = 0; off + 480 <= fatx_size; off++) {
-                                if (memcmp(fatx + off, "BTID", 4) == 0 &&
-                                    memcmp(fatx + off + 0x20, "XBAM", 4) == 0) {
+                                if (memcmp(fs_buf + off, "BTID", 4) == 0 &&
+                                    memcmp(fs_buf + off + 0x20, "XBAM", 4) == 0) {
                                     char patched[32];
                                     memset(patched, 0, 32);
                                     snprintf(patched, 32, "\\%s", rel);
                                     for (int i = 0; i < 32; i++)
                                         if (patched[i] == '/') patched[i] = '\\';
-                                    memcpy(fatx + off + 0xA0, patched, 32);
+                                    memcpy(fs_buf + off + 0xA0, patched, 32);
                                     printf("Chihiro: boot.id patched → '%s'\n",
                                            patched);
                                     break;
                                 }
                             }
                         }
-                    }
-                    if (fatx) {
-                        chihiro_fatx_populate(fatx, fatx_size);
                     }
                     /* Store game dir for boot.id reading at QuickReboot */
                     {
@@ -542,6 +544,8 @@ void xbox_init_common(MachineState *machine,
         } else {
             printf("Chihiro: WARNING — could not find USB bus on OHCI\n");
         }
+        printf("Chihiro: init complete (%lld ms)\n",
+               (long long)(g_get_monotonic_time() - init_t0) / 1000);
     }
 }
 

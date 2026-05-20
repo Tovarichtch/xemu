@@ -15,7 +15,7 @@
  */
 
 #include "qemu/osdep.h"
-#include "qemu/timer.h"
+#include "chihiro_fatx.h"
 #include <dirent.h>
 #include <sys/stat.h>
 
@@ -45,7 +45,6 @@ typedef struct {
 /* Builder state */
 uint32_t fatx_diag_lba = 0; /* LBA of XBE section 11 critical sector (extern) */
 uint32_t fatx_diag_lba_sec0 = 0; /* LBA of XBE section 0 critical sector (VA 0x135000) */
-static bool fatx_log_verbose = false;
 static uint8_t *fatx_image = NULL;
 static uint32_t fatx_image_size = 0;
 static FATXFileEntry fatx_files[FATX_MAX_FILES];
@@ -171,7 +170,10 @@ static int fatx_scan_dir(const char *host_dir, int parent_idx)
         FATXFileEntry *fe = &fatx_files[fatx_file_count];
         memset(fe, 0, sizeof(*fe));
 
-        strncpy(fe->name, ent->d_name, FATX_MAX_NAME);
+        int nlen = strlen(ent->d_name);
+        if (nlen > FATX_MAX_NAME) nlen = FATX_MAX_NAME;
+        memcpy(fe->name, ent->d_name, nlen);
+        fe->name[nlen] = '\0';
         snprintf(fe->host_path, sizeof(fe->host_path), "%s/%s", host_dir, ent->d_name);
         fe->parent_idx = parent_idx;
 
@@ -202,12 +204,11 @@ static int fatx_scan_dir(const char *host_dir, int parent_idx)
 }
 
 /*
- * Build FATX image in memory from a host directory.
- * Returns pointer to image data and sets *out_size.
- * Caller must g_free() the returned pointer.
+ * Build FATX image directly into a caller-provided buffer.
+ * Returns bytes written, or 0 on failure.
  */
-uint8_t *chihiro_fatx_build(const char *game_dir, uint32_t *out_size,
-                            uint32_t partition_sectors)
+uint32_t chihiro_fatx_build(const char *game_dir, uint8_t *dest,
+                            uint32_t dest_size, uint32_t partition_sectors)
 {
     fatx_file_count = 0;
     fatx_next_cluster = 1;
@@ -216,7 +217,7 @@ uint8_t *chihiro_fatx_build(const char *game_dir, uint32_t *out_size,
     fprintf(stderr, "[FATX] Scanning: %s\n", game_dir);
     if (fatx_scan_dir(game_dir, -1) < 0) {
         fprintf(stderr, "[FATX] ERROR: cannot open directory '%s'\n", game_dir);
-        return NULL;
+        return 0;
     }
     fprintf(stderr, "[FATX] Found %d files/dirs\n", fatx_file_count);
 
@@ -258,16 +259,23 @@ uint8_t *chihiro_fatx_build(const char *game_dir, uint32_t *out_size,
         (uint32_t)(file_data / FATX_CLUSTER_SIZE) + 256;
     fatx_image_size = fatx_data_offset + needed_clusters * FATX_CLUSTER_SIZE;
 
+    if (fatx_image_size > dest_size) {
+        fprintf(stderr, "[FATX] ERROR: image %u bytes exceeds buffer %u bytes\n",
+                fatx_image_size, dest_size);
+        return 0;
+    }
+
     fprintf(stderr, "[FATX] Clusters: %u, FAT: %u bytes, Image: %u bytes (%.1f MB)\n",
            fatx_total_clusters, fat_bytes, fatx_image_size,
            fatx_image_size / (1024.0 * 1024.0));
 
-    /* Allocate image */
-    fatx_image = (uint8_t *)g_malloc0(fatx_image_size);
+    fatx_image = dest;
+    memset(fatx_image + fatx_fat_offset, 0, fat_aligned);
     fatx_fat = (uint16_t *)(fatx_image + fatx_fat_offset);
 
     /* Phase 3: Write superblock */
     uint8_t *sb = fatx_image;
+    memset(sb, 0, FATX_SUPERBLOCK_SIZE);
     sb[0] = 0x46; sb[1] = 0x41; sb[2] = 0x54; sb[3] = 0x58; /* FATX */
     sb[4] = 0x78; sb[5] = 0x56; sb[6] = 0x34; sb[7] = 0x12; /* volume ID */
     sb[8] = FATX_CLUSTER_SECTS; sb[9] = 0; sb[10] = 0; sb[11] = 0;
@@ -304,7 +312,10 @@ uint8_t *chihiro_fatx_build(const char *game_dir, uint32_t *out_size,
                     uint32_t chunk = remaining > FATX_CLUSTER_SIZE ?
                                      FATX_CLUSTER_SIZE : remaining;
                     if (off + chunk <= fatx_image_size) {
-                        fread(fatx_image + off, 1, chunk, f);
+                        if (fread(fatx_image + off, 1, chunk, f) != chunk) {
+                            printf("[FATX] WARNING: short read '%s'\n",
+                                   fe->host_path);
+                        }
                     }
                     remaining -= chunk;
                     if (fatx_fat[cluster] == FATX_FAT_END) break;
@@ -333,8 +344,10 @@ uint8_t *chihiro_fatx_build(const char *game_dir, uint32_t *out_size,
             FILE *vf = fopen(fe->host_path, "rb");
             uint8_t orig29 = 0, orig7e = 0;
             if (vf) {
-                fseek(vf, 0x1BE029, SEEK_SET); fread(&orig29, 1, 1, vf);
-                fseek(vf, 0x1BE07E, SEEK_SET); fread(&orig7e, 1, 1, vf);
+                fseek(vf, 0x1BE029, SEEK_SET);
+                if (fread(&orig29, 1, 1, vf) != 1) { orig29 = 0; }
+                fseek(vf, 0x1BE07E, SEEK_SET);
+                if (fread(&orig7e, 1, 1, vf) != 1) { orig7e = 0; }
                 fclose(vf);
             }
             fatx_diag_lba = (img_off) / FATX_SECTOR_SIZE;
@@ -355,7 +368,7 @@ uint8_t *chihiro_fatx_build(const char *game_dir, uint32_t *out_size,
                 FILE *vf2 = fopen(fe->host_path, "rb");
                 if (vf2) {
                     fseek(vf2, 0x125000, SEEK_SET);
-                    fread(f0, 1, 4, vf2);
+                    if (fread(f0, 1, 4, vf2) != 4) { memset(f0, 0, 4); }
                     fclose(vf2);
                 }
                 fatx_diag_lba_sec0 = cl0_off / FATX_SECTOR_SIZE;
@@ -457,7 +470,7 @@ uint8_t *chihiro_fatx_build(const char *game_dir, uint32_t *out_size,
         }
     }
 
-    *out_size = fatx_image_size;
-    return fatx_image;
+    fatx_image = NULL;
+    return fatx_image_size;
 }
 

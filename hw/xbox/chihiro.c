@@ -1982,17 +1982,14 @@ void chihiro_ide_load_rom(void)
            chihiro_flash_rom_size);
 }
 
-void chihiro_fatx_populate(const uint8_t *fatx_data, uint32_t fatx_size)
+uint8_t *chihiro_fatx_get_buffer(uint32_t *out_size)
 {
     if (!chihiro_interface_ready) {
-        fprintf(stderr, "Chihiro: ERROR — fatx_populate called before interface_init\n");
-        return;
+        fprintf(stderr, "Chihiro: ERROR — fatx_get_buffer called before interface_init\n");
+        return NULL;
     }
-    void *fs_ptr = memory_region_get_ram_ptr(&chihiro_interface_fs);
-    uint32_t copy_len = MIN(fatx_size, (uint32_t)CHIHIRO_FS_SIZE);
-    memcpy(fs_ptr, fatx_data, copy_len);
-    printf("Chihiro: FATX populated (%u MB into filesystem region)\n",
-           copy_len / (1024 * 1024));
+    *out_size = (uint32_t)CHIHIRO_FS_SIZE;
+    return (uint8_t *)memory_region_get_ram_ptr(&chihiro_interface_fs);
 }
 
 static void sg_write(QEMUSGList *sg, const void *src, int len)

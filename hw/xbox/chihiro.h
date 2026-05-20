@@ -10,7 +10,7 @@ typedef struct USBDevice USBDevice;
 /* MemoryRegion-backed IDE interface */
 void chihiro_ide_interface_init(void);
 void chihiro_ide_load_rom(void);
-void chihiro_fatx_populate(const uint8_t *fatx_data, uint32_t fatx_size);
+uint8_t *chihiro_fatx_get_buffer(uint32_t *out_size);
 bool chihiro_ide_serve(int dma_cmd, uint32_t lba, int n,
                        QEMUSGList *sg, bool *irq);
 
