@@ -123,10 +123,18 @@ ControllerGamepadRebindingMap::HandleAxisEvent(SDL_GamepadAxisEvent *event)
 }
 
 RebindEventResult
-ChihiroKeyboardRebindingMap::ConsumeRebindEvent(SDL_Event *event)
+ChihiroRebindingMap::ConsumeRebindEvent(SDL_Event *event)
 {
     if (event->type == SDL_EVENT_KEY_UP) {
         *(m_scancode_map[m_table_row]) = event->key.scancode;
+        return RebindEventResult::Complete;
+    }
+    if (event->type == SDL_EVENT_MOUSE_BUTTON_UP) {
+        *(m_scancode_map[m_table_row]) = CHIHIRO_MOUSE_BUTTON_BASE - 1 + event->button.button;
+        return RebindEventResult::Complete;
+    }
+    if (event->type == SDL_EVENT_GAMEPAD_BUTTON_UP) {
+        *(m_scancode_map[m_table_row]) = CHIHIRO_GAMEPAD_BUTTON_BASE + event->gbutton.button;
         return RebindEventResult::Complete;
     }
     return RebindEventResult::Ignore;

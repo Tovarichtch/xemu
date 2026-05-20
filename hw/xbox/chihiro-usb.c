@@ -298,11 +298,59 @@ static void lle_tick_cb(void *opaque)
     }
 }
 
+/* Freeplay: set coin mode 10 in ACBU coin config (ic11 EEPROM).
+ * ic11 layout: 2x 64-byte ACBU0001 slots (12-byte header + 52-byte payload).
+ * Coin config sits at payload offset 0x10 (ic11 offsets 0x1C/0x5C).
+ * Byte 6 = coin mode (0-10), byte 7 = freeplay flag.
+ * The game's validator (acLib FUN_000f31c0 in VC3) cross-checks byte 7
+ * against a reference table indexed by byte 6. Only entry 10 expects
+ * freeplay=1; all other entries expect 0. Setting byte 7 alone fails
+ * validation and falls back to defaults (freeplay=OFF).
+ * When disabling: restore byte 6 to mode 1 (default) if it was 10.
+ * Checksum at header bytes 0x0A-0x0B = 16-bit sum of 52 payload bytes.
+ * Called from realize, save_load, and handle_reset. */
+static void chihiro_apply_freeplay(ChihiroUSBState *s)
+{
+    if (s->ic11[0] != 'A' || s->ic11[1] != 'C') {
+        return;
+    }
+    static const uint8_t freeplay_defaults[20] = {
+        0x63, 0x09, 0x04, 0x00, 0x01, 0x01, 0x0A, 0x01,
+        0x01, 0x01, 0x00, 0x01, 0x01, 0x01, 0x01, 0x01,
+        0x01, 0x01, 0x01, 0x01,
+    };
+    for (int slot = 0; slot < 2; slot++) {
+        int base = slot * 0x40;
+        int cfg = base + 0x1C;
+        if (chihiro_freeplay_setting) {
+            if (s->ic11[cfg] <= 8 || s->ic11[cfg] >= 100) {
+                memcpy(&s->ic11[cfg], freeplay_defaults, 20);
+            } else {
+                s->ic11[base + 0x22] = 0x0A;
+                s->ic11[base + 0x23] = 0x01;
+            }
+        } else if (s->ic11[base + 0x22] == 0x0A) {
+            s->ic11[base + 0x22] = 0x01;
+            s->ic11[base + 0x23] = 0x00;
+        }
+        uint16_t sum = 0;
+        for (int i = 0; i < 52; i++) {
+            sum += s->ic11[base + 0x0C + i];
+        }
+        s->ic11[base + 0x0A] = sum & 0xFF;
+        s->ic11[base + 0x0B] = (sum >> 8) & 0xFF;
+    }
+}
+
 static void handle_reset(USBDevice *dev)
 {
     ChihiroUSBState *s = (ChihiroUSBState *)dev;
     const char *id = s->is_qc ? "QC" : "SC";
     fprintf(stderr, "[%07lld] chihiro-usb [%s]: USB RESET (lle=%d)\n", TS_MS, id, s->use_lle);
+    if (s->is_qc) {
+        s->eeprom[0x1F00] = (uint8_t)(chihiro_region_setting + 1);
+        chihiro_apply_freeplay(s);
+    }
     if (s->use_lle) {
         s->an2131.usbirq |= USBIRQ_URES;
         an2131_run(&s->an2131, 10000);
@@ -615,6 +663,7 @@ static void chihiro_an2131qc_realize(USBDevice *dev, Error **errp)
      * fail with ERROR 05 if region=2. Region=1 (JPN) works for all known
      * games since all bitmasks include bit 1.
      * Values: 01=JPN, 02=USA, 03=EXP. Comes from ic10 dump natively. */
+    s->eeprom[0x1F00] = (uint8_t)(chihiro_region_setting + 1);
 
     /* Load ic11 baseboard EEPROM (256 bytes, 24LC024) */
     memset(s->ic11, 0, sizeof(s->ic11));
@@ -624,6 +673,8 @@ static void chihiro_an2131qc_realize(USBDevice *dev, Error **errp)
         error_setg(errp, "Chihiro QC: ic11 EEPROM dump required (ic11_24lc024.bin)");
         return;
     }
+
+    chihiro_apply_freeplay(s);
     memset(s->extmem, 0, sizeof(s->extmem));
 
     /* Initialize EZ-USB firmware state */
@@ -834,6 +885,8 @@ bool chihiro_usb_save_load(const char *path)
 
     fclose(f);
     fprintf(stderr, "Chihiro: save loaded from %s\n", path);
+
+    chihiro_apply_freeplay(s);
 
     an2131_detect_sbfy(&s->an2131);
 

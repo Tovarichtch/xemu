@@ -375,8 +375,8 @@ chihiro:
   jvs:
     profile:
       type: enum
-      values: [driving, lightgun, ollie_king]
-      default: lightgun
+      values: [hotd3, vc3, gs, ctx, or2, ok]
+      default: hotd3
     start:
       type: integer
       default: 40
@@ -389,7 +389,34 @@ chihiro:
     test:
       type: integer
       default: 39
-    driving:
+    hotd3:
+      trigger:
+        type: integer
+        default: 1001
+      body_button:
+        type: integer
+        default: 1003
+    vc3:
+      trigger:
+        type: integer
+        default: 1001
+      body_button:
+        type: integer
+        default: 1003
+      pedal:
+        type: integer
+        default: 44
+    gs:
+      trigger:
+        type: integer
+        default: 1001
+      body_button:
+        type: integer
+        default: 1003
+      change:
+        type: integer
+        default: 44
+    ctx:
       steer_left:
         type: integer
         default: 80
@@ -405,29 +432,35 @@ chihiro:
       drive_gear:
         type: integer
         default: 225
-      reverse_view:
+      reverse:
         type: integer
         default: 224
       jump:
         type: integer
         default: 44
+    or2:
+      steer_left:
+        type: integer
+        default: 80
+      steer_right:
+        type: integer
+        default: 79
+      gas:
+        type: integer
+        default: 82
+      brake:
+        type: integer
+        default: 81
       gear_up:
         type: integer
         default: 29
       gear_down:
         type: integer
         default: 27
-    lightgun:
-      trigger:
+      view_change:
         type: integer
-        default: 0
-      body_button:
-        type: integer
-        default: 21
-      pedal_change:
-        type: integer
-        default: 44
-    ollie_king:
+        default: 224
+    ok:
       swing_left:
         type: integer
         default: 80
@@ -446,3 +479,130 @@ chihiro:
       right_grab:
         type: integer
         default: 27
+  jvs_p2:
+    start:
+      type: integer
+      default: 0
+    service:
+      type: integer
+      default: 0
+    coin:
+      type: integer
+      default: 0
+    test:
+      type: integer
+      default: 0
+    hotd3_trigger:
+      type: integer
+      default: 0
+    hotd3_body_button:
+      type: integer
+      default: 0
+    vc3_trigger:
+      type: integer
+      default: 0
+    vc3_body_button:
+      type: integer
+      default: 0
+    vc3_pedal:
+      type: integer
+      default: 0
+    gs_trigger:
+      type: integer
+      default: 0
+    gs_body_button:
+      type: integer
+      default: 0
+    gs_change:
+      type: integer
+      default: 0
+    ctx_steer_left:
+      type: integer
+      default: 0
+    ctx_steer_right:
+      type: integer
+      default: 0
+    ctx_gas:
+      type: integer
+      default: 0
+    ctx_brake:
+      type: integer
+      default: 0
+    ctx_drive_gear:
+      type: integer
+      default: 0
+    ctx_reverse:
+      type: integer
+      default: 0
+    ctx_jump:
+      type: integer
+      default: 0
+    or2_steer_left:
+      type: integer
+      default: 0
+    or2_steer_right:
+      type: integer
+      default: 0
+    or2_gas:
+      type: integer
+      default: 0
+    or2_brake:
+      type: integer
+      default: 0
+    or2_gear_up:
+      type: integer
+      default: 0
+    or2_gear_down:
+      type: integer
+      default: 0
+    or2_view_change:
+      type: integer
+      default: 0
+    ok_swing_left:
+      type: integer
+      default: 0
+    ok_swing_right:
+      type: integer
+      default: 0
+    ok_board_front:
+      type: integer
+      default: 0
+    ok_board_rear:
+      type: integer
+      default: 0
+    ok_left_grab:
+      type: integer
+      default: 0
+    ok_right_grab:
+      type: integer
+      default: 0
+  settings:
+    lightgun_mode:
+      type: bool
+      default: false
+    freeplay:
+      type: bool
+      default: false
+    region:
+      type: enum
+      values: [jp, us, ex]
+      default: jp
+    force_feedback:
+      type: bool
+      default: false
+  roms:
+    bios_path:
+      type: string
+      default: ""
+    mediaboard_path:
+      type: string
+      default: ""
+    ic10_path:
+      type: string
+      default: ""
+    ic11_path:
+      type: string
+      default: ""
+    pc20_path:
+      type: string
+      default: ""

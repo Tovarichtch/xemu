@@ -36,6 +36,7 @@
 
 #include "system/blockdev.h"
 #include "hw/xbox/chihiro-jvs.h"
+#include "hw/xbox/chihiro.h"
 
 extern SDL_Window *m_window;
 extern int viewport_coords[4];
@@ -170,31 +171,103 @@ int *g_chihiro_universal_map[4] = {
     &g_config.chihiro.jvs.test,
 };
 
-int *g_chihiro_driving_map[9] = {
-    &g_config.chihiro.jvs.driving.steer_left,
-    &g_config.chihiro.jvs.driving.steer_right,
-    &g_config.chihiro.jvs.driving.gas,
-    &g_config.chihiro.jvs.driving.brake,
-    &g_config.chihiro.jvs.driving.drive_gear,
-    &g_config.chihiro.jvs.driving.reverse_view,
-    &g_config.chihiro.jvs.driving.jump,
-    &g_config.chihiro.jvs.driving.gear_up,
-    &g_config.chihiro.jvs.driving.gear_down,
+int *g_chihiro_hotd3_map[2] = {
+    &g_config.chihiro.jvs.hotd3.trigger,
+    &g_config.chihiro.jvs.hotd3.body_button,
 };
 
-int *g_chihiro_lightgun_map[3] = {
-    &g_config.chihiro.jvs.lightgun.trigger,
-    &g_config.chihiro.jvs.lightgun.body_button,
-    &g_config.chihiro.jvs.lightgun.pedal_change,
+int *g_chihiro_vc3_map[3] = {
+    &g_config.chihiro.jvs.vc3.trigger,
+    &g_config.chihiro.jvs.vc3.body_button,
+    &g_config.chihiro.jvs.vc3.pedal,
 };
 
-int *g_chihiro_ollie_king_map[6] = {
-    &g_config.chihiro.jvs.ollie_king.swing_left,
-    &g_config.chihiro.jvs.ollie_king.swing_right,
-    &g_config.chihiro.jvs.ollie_king.board_front,
-    &g_config.chihiro.jvs.ollie_king.board_rear,
-    &g_config.chihiro.jvs.ollie_king.left_grab,
-    &g_config.chihiro.jvs.ollie_king.right_grab,
+int *g_chihiro_gs_map[3] = {
+    &g_config.chihiro.jvs.gs.trigger,
+    &g_config.chihiro.jvs.gs.body_button,
+    &g_config.chihiro.jvs.gs.change,
+};
+
+int *g_chihiro_ctx_map[7] = {
+    &g_config.chihiro.jvs.ctx.steer_left,
+    &g_config.chihiro.jvs.ctx.steer_right,
+    &g_config.chihiro.jvs.ctx.gas,
+    &g_config.chihiro.jvs.ctx.brake,
+    &g_config.chihiro.jvs.ctx.drive_gear,
+    &g_config.chihiro.jvs.ctx.reverse,
+    &g_config.chihiro.jvs.ctx.jump,
+};
+
+int *g_chihiro_or2_map[7] = {
+    &g_config.chihiro.jvs.or2.steer_left,
+    &g_config.chihiro.jvs.or2.steer_right,
+    &g_config.chihiro.jvs.or2.gas,
+    &g_config.chihiro.jvs.or2.brake,
+    &g_config.chihiro.jvs.or2.gear_up,
+    &g_config.chihiro.jvs.or2.gear_down,
+    &g_config.chihiro.jvs.or2.view_change,
+};
+
+int *g_chihiro_ok_map[6] = {
+    &g_config.chihiro.jvs.ok.swing_left,
+    &g_config.chihiro.jvs.ok.swing_right,
+    &g_config.chihiro.jvs.ok.board_front,
+    &g_config.chihiro.jvs.ok.board_rear,
+    &g_config.chihiro.jvs.ok.left_grab,
+    &g_config.chihiro.jvs.ok.right_grab,
+};
+
+int *g_chihiro_p2_universal_map[4] = {
+    &g_config.chihiro.jvs_p2.start,
+    &g_config.chihiro.jvs_p2.service,
+    &g_config.chihiro.jvs_p2.coin,
+    &g_config.chihiro.jvs_p2.test,
+};
+
+int *g_chihiro_p2_hotd3_map[2] = {
+    &g_config.chihiro.jvs_p2.hotd3_trigger,
+    &g_config.chihiro.jvs_p2.hotd3_body_button,
+};
+
+int *g_chihiro_p2_vc3_map[3] = {
+    &g_config.chihiro.jvs_p2.vc3_trigger,
+    &g_config.chihiro.jvs_p2.vc3_body_button,
+    &g_config.chihiro.jvs_p2.vc3_pedal,
+};
+
+int *g_chihiro_p2_gs_map[3] = {
+    &g_config.chihiro.jvs_p2.gs_trigger,
+    &g_config.chihiro.jvs_p2.gs_body_button,
+    &g_config.chihiro.jvs_p2.gs_change,
+};
+
+int *g_chihiro_p2_ctx_map[7] = {
+    &g_config.chihiro.jvs_p2.ctx_steer_left,
+    &g_config.chihiro.jvs_p2.ctx_steer_right,
+    &g_config.chihiro.jvs_p2.ctx_gas,
+    &g_config.chihiro.jvs_p2.ctx_brake,
+    &g_config.chihiro.jvs_p2.ctx_drive_gear,
+    &g_config.chihiro.jvs_p2.ctx_reverse,
+    &g_config.chihiro.jvs_p2.ctx_jump,
+};
+
+int *g_chihiro_p2_or2_map[7] = {
+    &g_config.chihiro.jvs_p2.or2_steer_left,
+    &g_config.chihiro.jvs_p2.or2_steer_right,
+    &g_config.chihiro.jvs_p2.or2_gas,
+    &g_config.chihiro.jvs_p2.or2_brake,
+    &g_config.chihiro.jvs_p2.or2_gear_up,
+    &g_config.chihiro.jvs_p2.or2_gear_down,
+    &g_config.chihiro.jvs_p2.or2_view_change,
+};
+
+int *g_chihiro_p2_ok_map[6] = {
+    &g_config.chihiro.jvs_p2.ok_swing_left,
+    &g_config.chihiro.jvs_p2.ok_swing_right,
+    &g_config.chihiro.jvs_p2.ok_board_front,
+    &g_config.chihiro.jvs_p2.ok_board_rear,
+    &g_config.chihiro.jvs_p2.ok_left_grab,
+    &g_config.chihiro.jvs_p2.ok_right_grab,
 };
 
 static void check_and_reset_in_range(int *btn, int min, int max,
@@ -559,49 +632,47 @@ static uint16_t jvs_axis_smooth(uint16_t pos, bool neg, bool posv)
     return target;
 }
 
+static bool chihiro_check_input(int binding, const bool *kbd, uint32_t mouseBtn)
+{
+    if (binding >= CHIHIRO_GAMEPAD_BUTTON_BASE) {
+        ControllerState *pad = bound_controllers[0];
+        if (pad && pad->sdl_gamepad) {
+            return SDL_GetGamepadButton(pad->sdl_gamepad,
+                       (SDL_GamepadButton)(binding - CHIHIRO_GAMEPAD_BUTTON_BASE));
+        }
+        return false;
+    }
+    if (binding >= CHIHIRO_MOUSE_BUTTON_BASE) {
+        int btn = binding - CHIHIRO_MOUSE_BUTTON_BASE + 1;
+        return (mouseBtn & SDL_BUTTON_MASK(btn)) != 0;
+    }
+    return (binding > 0 && kbd[binding]);
+}
+
 static void xemu_input_update_jvs(void)
 {
     if (!chihiro_jvs_global) return;
     ChihiroJVSState *jvs = chihiro_jvs_global;
 
     const bool *kbd = SDL_GetKeyboardState(NULL);
+    float fmx, fmy;
+    uint32_t mouseBtn = SDL_GetMouseState(&fmx, &fmy);
     uint8_t sw0 = 0;
     uint8_t sw1 = 0;
 
-    int profile = g_config.chihiro.jvs.profile;
+    ControllerState *pad = bound_controllers[0];
+    int16_t *pa = pad ? pad->gp.axis : NULL;
+
+    int profile = chihiro_detected_game_profile();
+    if (profile < 0) profile = g_config.chihiro.jvs.profile;
 
     switch (profile) {
-    case CONFIG_CHIHIRO_JVS_PROFILE_DRIVING: {
-        bool sl = kbd[g_config.chihiro.jvs.driving.steer_left];
-        bool sr = kbd[g_config.chihiro.jvs.driving.steer_right];
-        bool gas = kbd[g_config.chihiro.jvs.driving.gas];
-        bool brk = kbd[g_config.chihiro.jvs.driving.brake];
-
-        static uint16_t steer_pos = 0x8000;
-        steer_pos = jvs_axis_smooth(steer_pos, sl, sr);
-
-        jvs->analog[0] = steer_pos;
-        jvs->analog[1] = gas ? 0xFFFF : 0x0000;
-        jvs->analog[2] = brk ? 0xFFFF : 0x0000;
-
-        if (kbd[g_config.chihiro.jvs.driving.drive_gear])
-            sw0 |= 0x20;
-        if (kbd[g_config.chihiro.jvs.driving.reverse_view])
-            sw0 |= 0x10;
-        if (kbd[g_config.chihiro.jvs.driving.jump])
-            sw0 |= 0x02;
-        if (kbd[g_config.chihiro.jvs.driving.gear_up])
-            sw1 |= 0x20;
-        if (kbd[g_config.chihiro.jvs.driving.gear_down])
-            sw1 |= 0x10;
-        break;
-    }
-    case CONFIG_CHIHIRO_JVS_PROFILE_LIGHTGUN: {
-        float mx, my;
-        uint32_t mouseBtn = SDL_GetMouseState(&mx, &my);
-
+    case CONFIG_CHIHIRO_JVS_PROFILE_HOTD3:
+    case CONFIG_CHIHIRO_JVS_PROFILE_VC3:
+    case CONFIG_CHIHIRO_JVS_PROFILE_GS: {
         int32_t winW, winH;
         SDL_GetWindowSize(m_window, &winW, &winH);
+        float mx = fmx, my = fmy;
         if (viewport_coords[2] > 0 && viewport_coords[3] > 0) {
             int32_t drawW, drawH;
             SDL_GetWindowSizeInPixels(m_window, &drawW, &drawH);
@@ -614,8 +685,8 @@ static void xemu_input_update_jvs(void)
         }
 
         float safe = 0.01f;
-        bool offscreen = (mx < -safe * winW || mx > (1.0f + safe) * winW ||
-                          my < -safe * winH || my > (1.0f + safe) * winH);
+        bool offscreen = (mx < safe * winW || mx > (1.0f - safe) * winW ||
+                          my < safe * winH || my > (1.0f - safe) * winH);
 
         if (offscreen) {
             jvs->analog[0] = 0;
@@ -623,59 +694,134 @@ static void xemu_input_update_jvs(void)
         } else {
             float nx = mx / winW;
             float ny = my / winH;
-            if (nx < 0) nx = 0; if (nx > 1) nx = 1;
-            if (ny < 0) ny = 0; if (ny > 1) ny = 1;
+            if (nx < 0) nx = 0;
+            if (nx > 1) nx = 1;
+            if (ny < 0) ny = 0;
+            if (ny > 1) ny = 1;
             jvs->analog[0] = (uint16_t)(nx * 0xFFFF);
             jvs->analog[1] = (uint16_t)(ny * 0xFFFF);
         }
 
-        int tkey = g_config.chihiro.jvs.lightgun.trigger;
-        int bkey = g_config.chihiro.jvs.lightgun.body_button;
-        bool trigger = (mouseBtn & SDL_BUTTON_MASK(SDL_BUTTON_LEFT)) != 0 ||
-                       (tkey > 0 && kbd[tkey]);
-        bool body = (mouseBtn & SDL_BUTTON_MASK(SDL_BUTTON_RIGHT)) != 0 ||
-                    (bkey > 0 && kbd[bkey]);
+        int tkey, bkey;
+        if (profile == CONFIG_CHIHIRO_JVS_PROFILE_HOTD3) {
+            tkey = g_config.chihiro.jvs.hotd3.trigger;
+            bkey = g_config.chihiro.jvs.hotd3.body_button;
+        } else if (profile == CONFIG_CHIHIRO_JVS_PROFILE_VC3) {
+            tkey = g_config.chihiro.jvs.vc3.trigger;
+            bkey = g_config.chihiro.jvs.vc3.body_button;
+        } else {
+            tkey = g_config.chihiro.jvs.gs.trigger;
+            bkey = g_config.chihiro.jvs.gs.body_button;
+        }
+
+        bool trigger = chihiro_check_input(tkey, kbd, mouseBtn);
+        bool body = chihiro_check_input(bkey, kbd, mouseBtn);
 
         if (trigger) sw0 |= 0x02;
         if (body)    sw1 |= 0x80;
-        if (!offscreen && !body)
-            sw0 |= 0x01;
-        if (kbd[g_config.chihiro.jvs.lightgun.pedal_change])
-            sw1 |= 0x40;
+
+        if (profile == CONFIG_CHIHIRO_JVS_PROFILE_HOTD3) {
+            if (offscreen) sw0 |= 0x01;
+        } else if (profile == CONFIG_CHIHIRO_JVS_PROFILE_VC3) {
+            if (offscreen && trigger) sw0 |= 0x01;
+        }
+
+        if (profile == CONFIG_CHIHIRO_JVS_PROFILE_VC3) {
+            if (chihiro_check_input(g_config.chihiro.jvs.vc3.pedal, kbd, mouseBtn))
+                sw1 |= 0x40;
+        }
+        if (profile == CONFIG_CHIHIRO_JVS_PROFILE_GS) {
+            if (chihiro_check_input(g_config.chihiro.jvs.gs.change, kbd, mouseBtn))
+                sw1 |= 0x40;
+        }
         break;
     }
-    case CONFIG_CHIHIRO_JVS_PROFILE_OLLIE_KING: {
-        bool sl = kbd[g_config.chihiro.jvs.ollie_king.swing_left];
-        bool sr = kbd[g_config.chihiro.jvs.ollie_king.swing_right];
+    case CONFIG_CHIHIRO_JVS_PROFILE_CTX:
+    case CONFIG_CHIHIRO_JVS_PROFILE_OR2: {
+        bool sl, sr, gas, brk;
+        if (profile == CONFIG_CHIHIRO_JVS_PROFILE_CTX) {
+            sl  = chihiro_check_input(g_config.chihiro.jvs.ctx.steer_left, kbd, mouseBtn);
+            sr  = chihiro_check_input(g_config.chihiro.jvs.ctx.steer_right, kbd, mouseBtn);
+            gas = chihiro_check_input(g_config.chihiro.jvs.ctx.gas, kbd, mouseBtn);
+            brk = chihiro_check_input(g_config.chihiro.jvs.ctx.brake, kbd, mouseBtn);
+        } else {
+            sl  = chihiro_check_input(g_config.chihiro.jvs.or2.steer_left, kbd, mouseBtn);
+            sr  = chihiro_check_input(g_config.chihiro.jvs.or2.steer_right, kbd, mouseBtn);
+            gas = chihiro_check_input(g_config.chihiro.jvs.or2.gas, kbd, mouseBtn);
+            brk = chihiro_check_input(g_config.chihiro.jvs.or2.brake, kbd, mouseBtn);
+        }
+
+        static uint16_t steer_pos = 0x8000;
+        if (pa) {
+            int32_t lx = pa[CONTROLLER_AXIS_LSTICK_X];
+            jvs->analog[0] = (uint16_t)((lx + 32768) & 0xFFFF);
+        } else {
+            steer_pos = jvs_axis_smooth(steer_pos, sl, sr);
+            jvs->analog[0] = steer_pos;
+        }
+
+        if (pa) {
+            jvs->analog[1] = (uint16_t)(pa[CONTROLLER_AXIS_RTRIG] * 2);
+            jvs->analog[2] = (uint16_t)(pa[CONTROLLER_AXIS_LTRIG] * 2);
+        } else {
+            jvs->analog[1] = gas ? 0xFFFF : 0x0000;
+            jvs->analog[2] = brk ? 0xFFFF : 0x0000;
+        }
+
+        if (profile == CONFIG_CHIHIRO_JVS_PROFILE_CTX) {
+            if (chihiro_check_input(g_config.chihiro.jvs.ctx.drive_gear, kbd, mouseBtn))
+                sw0 |= 0x20;
+            if (chihiro_check_input(g_config.chihiro.jvs.ctx.reverse, kbd, mouseBtn))
+                sw0 |= 0x10;
+            if (chihiro_check_input(g_config.chihiro.jvs.ctx.jump, kbd, mouseBtn))
+                sw0 |= 0x02;
+        } else {
+            if (chihiro_check_input(g_config.chihiro.jvs.or2.gear_up, kbd, mouseBtn))
+                sw1 |= 0x20;
+            if (chihiro_check_input(g_config.chihiro.jvs.or2.gear_down, kbd, mouseBtn))
+                sw1 |= 0x10;
+            if (chihiro_check_input(g_config.chihiro.jvs.or2.view_change, kbd, mouseBtn))
+                sw0 |= 0x10;
+        }
+        break;
+    }
+    case CONFIG_CHIHIRO_JVS_PROFILE_OK: {
+        bool sl = chihiro_check_input(g_config.chihiro.jvs.ok.swing_left, kbd, mouseBtn);
+        bool sr = chihiro_check_input(g_config.chihiro.jvs.ok.swing_right, kbd, mouseBtn);
 
         static uint16_t swing_pos = 0x8000;
-        swing_pos = jvs_axis_smooth(swing_pos, sl, sr);
-        jvs->analog[1] = swing_pos;
+        if (pa) {
+            int32_t lx = pa[CONTROLLER_AXIS_LSTICK_X];
+            jvs->analog[1] = (uint16_t)((lx + 32768) & 0xFFFF);
+        } else {
+            swing_pos = jvs_axis_smooth(swing_pos, sl, sr);
+            jvs->analog[1] = swing_pos;
+        }
 
-        if (kbd[g_config.chihiro.jvs.ollie_king.board_front])
+        if (chihiro_check_input(g_config.chihiro.jvs.ok.board_front, kbd, mouseBtn))
             sw0 |= 0x20;
-        if (kbd[g_config.chihiro.jvs.ollie_king.board_rear])
+        if (chihiro_check_input(g_config.chihiro.jvs.ok.board_rear, kbd, mouseBtn))
             sw0 |= 0x10;
-        if (kbd[g_config.chihiro.jvs.ollie_king.left_grab])
+        if (chihiro_check_input(g_config.chihiro.jvs.ok.left_grab, kbd, mouseBtn))
             sw0 |= 0x02;
-        if (kbd[g_config.chihiro.jvs.ollie_king.right_grab])
+        if (chihiro_check_input(g_config.chihiro.jvs.ok.right_grab, kbd, mouseBtn))
             sw0 |= 0x01;
         break;
     }
     }
 
-    if (kbd[g_config.chihiro.jvs.start])
+    if (chihiro_check_input(g_config.chihiro.jvs.start, kbd, mouseBtn))
         sw0 |= 0x80;
-    if (kbd[g_config.chihiro.jvs.service])
+    if (chihiro_check_input(g_config.chihiro.jvs.service, kbd, mouseBtn))
         sw0 |= 0x40;
 
     jvs->player_switches[0][0] = sw0;
     jvs->player_switches[0][1] = sw1;
 
-    jvs->system_switches = kbd[g_config.chihiro.jvs.test] ? 0x80 : 0x00;
+    jvs->system_switches = chihiro_check_input(g_config.chihiro.jvs.test, kbd, mouseBtn) ? 0x80 : 0x00;
 
     static bool coin_prev;
-    bool coin_key = kbd[g_config.chihiro.jvs.coin];
+    bool coin_key = chihiro_check_input(g_config.chihiro.jvs.coin, kbd, mouseBtn);
     if (coin_key && !coin_prev)
         jvs->coin_count[0]++;
     coin_prev = coin_key;

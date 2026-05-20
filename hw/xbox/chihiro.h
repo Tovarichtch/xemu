@@ -22,6 +22,7 @@ void chihiro_usb_set_devices(USBDevice *qc, USBDevice *sc);
 
 /* Load baseboard flash ROM (SEGABOOT) from file */
 void chihiro_load_flash_rom(const char *bios_path);
+bool chihiro_flash_rom_loaded(void);
 
 /* Load baseboard EEPROMs (ic10, ic11, pc20) from BIOS directory */
 void chihiro_load_eeproms(const char *bios_path);
@@ -31,6 +32,18 @@ extern uint8_t *chihiro_ic11_data;
 extern uint32_t chihiro_ic11_size;
 extern uint8_t *chihiro_pc20_data;
 extern uint32_t chihiro_pc20_size;
+
+/* Game state */
+extern char chihiro_game_dir[1024];
+extern bool chihiro_board_type3;
+extern int chihiro_region_setting;
+extern bool chihiro_freeplay_setting;
+int chihiro_detected_game_profile(void);
+
+/* Called from OHCI when bus starts */
+void chihiro_on_ohci_bus_start(void);
+uint32_t chihiro_va_to_pa(uint32_t va);
+extern uint32_t chihiro_usb_sm_pa;
 
 /* Called from SMC when SCRATCH=0x04 (QuickReboot signal) */
 void chihiro_on_quickreboot_signal(void);

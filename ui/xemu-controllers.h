@@ -69,10 +69,10 @@ public:
     }
 };
 
-struct ChihiroKeyboardRebindingMap : public virtual RebindingMap {
+struct ChihiroRebindingMap : public virtual RebindingMap {
     int **m_scancode_map;
 
-    ChihiroKeyboardRebindingMap(int table_row, int **scancode_map)
+    ChihiroRebindingMap(int table_row, int **scancode_map)
         : RebindingMap(table_row), m_scancode_map(scancode_map)
     {
     }

@@ -199,6 +199,8 @@ char chihiro_game_dir[1024];   /* Game directory path (from dvd_path) */
 static char chihiro_save_path[2048];
 static bool chihiro_resolve_save_path(void);
 bool chihiro_board_type3;      /* true = ASIC (Type-3), false = FPGA (Type-1) */
+int chihiro_region_setting;   /* 0=JP, 1=US, 2=EX → eeprom[0x1F00] = value+1 */
+bool chihiro_freeplay_setting; /* ic11 byte 0x23/0x63 = freeplay in ACBU coin struct */
 static uint8_t *chihiro_flash_rom;
 static uint32_t chihiro_flash_rom_size;
 
@@ -983,7 +985,7 @@ static uint64_t chihiro_lpc_io_read(void *opaque, hwaddr addr,
                 r = 0x00000002; /* V850 firmware state: 2 = CRC OK / ready */
                 static int a1e60_log = 0;
                 if (lpc_log_verbose && a1e60_log < 20) { a1e60_log++;
-                    fprintf(stderr, "[%07lld] SADDR READ 0xA0001E60 → 0x%08X (fw state)\n", TS_MS, r); }
+                    fprintf(stderr, "[%07lld] SADDR READ 0xA0001E60 → 0x%08X (fw state)\n", TS_MS, (unsigned)r); }
             } else {
                 static int unknown_saddr_log = 0;
                 if (lpc_log_verbose && unknown_saddr_log < 200) {
@@ -1060,7 +1062,7 @@ static uint64_t chihiro_lpc_io_read(void *opaque, hwaddr addr,
         r = s->mbcom_e0_status;
         static int e0_log = 0; if (lpc_log_verbose && e0_log < 2000) { e0_log++;
             fprintf(stderr, "[%07lld] E0 READ → 0x%02X (bit0=%d bit2=%d)\n",
-                    TS_MS, (unsigned)r, (r & 1), (r >> 2) & 1); }
+                    TS_MS, (unsigned)r, (int)(r & 1), (int)((r >> 2) & 1)); }
         break;
     }
     case 0x84:  /* Port 0x4084 — MbcomCommand session handle */
@@ -1391,13 +1393,32 @@ uint32_t chihiro_ic11_size = 0;
 uint8_t *chihiro_pc20_data = NULL;
 uint32_t chihiro_pc20_size = 0;
 
-/* Load flash ROM from a file path. Called during LPC device init.
- * Searches for fpr-23887 or fpr21042 in the same directory as the BIOS. */
+bool chihiro_flash_rom_loaded(void)
+{
+    return chihiro_flash_rom != NULL;
+}
+
+int chihiro_detected_game_profile(void)
+{
+    if (!chihiro_game_filename[0]) return -1;
+
+    if (strcasecmp(chihiro_game_filename, "hod3xb.xbe") == 0)   return 0;
+    if (strcasecmp(chihiro_game_filename, "vc3.xbe") == 0)       return 1;
+    if (strcasecmp(chihiro_game_filename, "vsg.xbe") == 0)       return 2;
+    if (strcasecmp(chihiro_game_filename, "ctx_ac[r].xbe") == 0) return 3;
+    if (strcasecmp(chihiro_game_filename, "outrun2.xbe") == 0)   return 4;
+    if (strcasecmp(chihiro_game_filename, "OllieKing.xbe") == 0) return 5;
+
+    return -1;
+}
+
+/* TODO: Replace auto-discovery with explicit paths from g_config.chihiro.roms.*
+ * (bios_path, mediaboard_path, ic10_path, ic11_path, pc20_path).
+ * Once wired, remove this function and chihiro_load_eeproms entirely. */
 void chihiro_load_flash_rom(const char *bios_path)
 {
     if (chihiro_flash_rom) return; /* already loaded */
 
-    /* Try to find flash ROM in same directory as BIOS */
     char dir[1024] = {0};
     const char *last_sep = strrchr(bios_path, '/');
     if (!last_sep) last_sep = strrchr(bios_path, '\\');
@@ -1409,8 +1430,8 @@ void chihiro_load_flash_rom(const char *bios_path)
     }
 
     const char *flash_names[] = {
-        "fpr21042_m29w160et.bin",        /* Cxbx version — matches our patches */
-        "fpr-23887_29lv160te.ic4",       /* MAME version — different SEGABOOT */
+        "fpr21042_m29w160et.bin",
+        "fpr-23887_29lv160te.ic4",
         "fpr-23887.bin",
         NULL
     };
@@ -1420,7 +1441,6 @@ void chihiro_load_flash_rom(const char *bios_path)
         snprintf(path, sizeof(path), "%s%s", dir, flash_names[i]);
         FILE *f = fopen(path, "rb");
         if (!f) {
-            /* Also try parent directory */
             snprintf(path, sizeof(path), "%s../%s", dir, flash_names[i]);
             f = fopen(path, "rb");
         }
@@ -1468,6 +1488,7 @@ static uint8_t *load_eeprom_file(const char *dir, const char *name,
     return buf;
 }
 
+/* TODO: Replace with explicit paths from g_config.chihiro.roms.* */
 void chihiro_load_eeproms(const char *bios_path)
 {
     if (chihiro_ic10_data) return;
@@ -1801,8 +1822,6 @@ type_init(chihiro_register_types)
  * Persists QC ic11 (512B) + extmem backup region (32KB) per game.
  * File: ~/.local/share/xemu/xemu/saves/<game>.sav
  * ═══════════════════════════════════════════════════════════════════════ */
-
-static char chihiro_save_path[2048];
 
 static bool chihiro_resolve_save_path(void)
 {

@@ -372,11 +372,27 @@ void xbox_init_common(MachineState *machine,
     if (machine->ram_size > 64 * 1024 * 1024) {
         printf("Chihiro: 128MB RAM detected, enabling mediaboard LPC\n");
 
-        /* Load baseboard flash ROM BEFORE LPC device creation.
-         * mediaboard_init() (called during LPC realize) reads the serial
-         * from chihiro_flash_rom — must be populated first. */
+        /* TODO: Wire g_config.chihiro.roms.* paths here instead of
+         * auto-discovery from the Xbox BIOS directory. Then remove
+         * chihiro_load_flash_rom/chihiro_load_eeproms auto-discovery. */
         chihiro_load_flash_rom(g_config.sys.files.flashrom_path);
         chihiro_load_eeproms(g_config.sys.files.flashrom_path);
+
+        chihiro_region_setting = g_config.chihiro.settings.region;
+        chihiro_freeplay_setting = g_config.chihiro.settings.freeplay;
+
+        if (!chihiro_flash_rom_loaded()) {
+            fprintf(stderr, "Chihiro: ERROR — Flash ROM media board not found "
+                    "(fpr21042_m29w160et.bin). Set path in Settings > Chihiro > Files.\n");
+        }
+        if (!chihiro_ic10_data) {
+            fprintf(stderr, "Chihiro: WARNING — EEPROM QC not found "
+                    "(ic10_g24lc64.bin). GAME TEST settings will not persist.\n");
+        }
+        if (!chihiro_ic11_data) {
+            fprintf(stderr, "Chihiro: WARNING — EEPROM Baseboard not found "
+                    "(ic11_24lc024.bin). JVS settings will not persist.\n");
+        }
 
         isa_create_simple(isa_bus, "chihiro-lpc");
         isa_create_simple(isa_bus, "lpc47m157");
@@ -466,8 +482,6 @@ void xbox_init_common(MachineState *machine,
                     }
                     /* Store game dir for boot.id reading at QuickReboot */
                     {
-                        extern char chihiro_game_dir[1024];
-                        extern bool chihiro_board_type3;
                         strncpy(chihiro_game_dir, game_dir, 1023);
                         chihiro_game_dir[1023] = 0;
                         /* Auto-detect Type-3 (ASIC) board:
@@ -506,7 +520,7 @@ void xbox_init_common(MachineState *machine,
          * then attach them via a timer 1.5s after boot. */
         USBBus *usb0_bus = NULL;
         for (int i = 0; i < 4 && !usb0_bus; i++) {
-            char bn[16]; snprintf(bn, sizeof(bn), "usb-bus.%d", i);
+            char bn[32]; snprintf(bn, sizeof(bn), "usb-bus.%d", i);
             BusState *bs = qdev_get_child_bus(DEVICE(usb0), bn);
             if (bs) usb0_bus = USB_BUS(bs);
         }

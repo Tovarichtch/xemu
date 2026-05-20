@@ -233,7 +233,8 @@ void xemu_hud_update(void)
         float alpha = 1.0;
         const uint32_t timeout = 5000;
         const float fade_duration = 1000.0;
-        bool menu_wakeup = g_input_mgr.MouseMoved();
+        bool menu_wakeup = g_input_mgr.MouseMoved() &&
+                           !g_config.chihiro.settings.lightgun_mode;
         if (menu_wakeup) {
             last_check = now;
         }
@@ -292,10 +293,12 @@ void xemu_hud_update(void)
             g_scene_mgr.PushScene(g_popup_menu);
         } else if (menu_button ||
                    (!xemu_input_lightgun_active() &&
+                    !g_config.chihiro.settings.lightgun_mode &&
                     ImGui::IsMouseClicked(ImGuiMouseButton_Right) &&
                     !ImGui::IsAnyItemFocused() && !ImGui::IsAnyItemHovered())) {
             g_scene_mgr.PushScene(g_popup_menu);
         } else if (!xemu_input_lightgun_active() &&
+                   !g_config.chihiro.settings.lightgun_mode &&
                    ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
             xemu_toggle_fullscreen();
         }

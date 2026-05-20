@@ -38,6 +38,7 @@
 #include "hw/qdev-properties.h"
 #include "trace.h"
 #include "hcd-ohci.h"
+#include "hw/xbox/chihiro.h"
 
 /* This causes frames to occur 1000x slower */
 /*#define OHCI_TIME_WARP 1*/
@@ -1058,7 +1059,7 @@ static int ohci_service_td(OHCIState *ohci, struct ohci_ed *ed)
         usb_packet_addbuf(&ohci->usb_packet, ohci->usb_buf, pktlen);
         usb_handle_packet(dev, &ohci->usb_packet);
         if (TS_MS > 5900)
-            if(0) printf("[%07lld] OHCI TD RESULT: FA=%d EN=%d dir=%s status=%d len=%zd\n", TS_MS,
+            if(0) printf("[%07lld] OHCI TD RESULT: FA=%d EN=%d dir=%s status=%d len=%d\n", TS_MS,
                    OHCI_BM(ed->flags, ED_FA), OHCI_BM(ed->flags, ED_EN),
                    str, ohci->usb_packet.status,
                    ohci->usb_packet.actual_length);
@@ -1401,7 +1402,6 @@ static void ohci_frame_boundary(void *opaque)
             uint8_t devtab_flags = 0xFF;
             uint32_t devtab_class = 0xDEAD;
             uint32_t cdrv_tbl1 = 0xDEAD;
-            extern uint32_t chihiro_va_to_pa(uint32_t va);
             if (ctx_ptr != 0) {
                 uint32_t ctx_pa = chihiro_va_to_pa(ctx_ptr);
                 if (ctx_pa != 0xFFFFFFFF) {
@@ -1588,7 +1588,6 @@ static void ohci_frame_boundary(void *opaque)
             uint32_t ctx_ptr_w = 0;
             cpu_physical_memory_read(0x0F1D18, &ctx_ptr_w, 4);
             if (ctx_ptr_w != 0) {
-                extern uint32_t chihiro_va_to_pa(uint32_t va);
                 uint32_t cpa = chihiro_va_to_pa(ctx_ptr_w);
                 if (cpa != 0xFFFFFFFF) {
                     uint32_t sv = 0;
@@ -1610,7 +1609,6 @@ static void ohci_frame_boundary(void *opaque)
             uint32_t ctx_ptr_h = 0;
             cpu_physical_memory_read(0x0F1D18, &ctx_ptr_h, 4);
             if (ctx_ptr_h != 0) {
-                extern uint32_t chihiro_va_to_pa(uint32_t va);
                 uint32_t cpa_h = chihiro_va_to_pa(ctx_ptr_h);
                 if (cpa_h != 0xFFFFFFFF) {
                     uint32_t hv = 0;
@@ -1629,7 +1627,6 @@ static void ohci_frame_boundary(void *opaque)
             uint32_t ctx_ptr_c = 0;
             cpu_physical_memory_read(0x0F1D18, &ctx_ptr_c, 4);
             if (ctx_ptr_c != 0) {
-                extern uint32_t chihiro_va_to_pa(uint32_t va);
                 uint32_t cpa_c = chihiro_va_to_pa(ctx_ptr_c);
                 if (cpa_c != 0xFFFFFFFF) {
                     uint32_t cv = 0;
@@ -1645,7 +1642,6 @@ static void ohci_frame_boundary(void *opaque)
         /* v292: EDFL-WATCH — detect any ED free list change per frame */
         {
             static uint32_t prev_edfl = 0xDEADDEAD;
-            extern uint32_t chihiro_va_to_pa(uint32_t va);
             uint32_t fl_pa = chihiro_va_to_pa(0xEFBC8);
             if (fl_pa != 0xFFFFFFFF) {
                 uint32_t cur_edfl = 0;
@@ -1662,7 +1658,6 @@ static void ohci_frame_boundary(void *opaque)
             static uint8_t prev_dtf0 = 0xFF;
             static uint8_t prev_dtf2 = 0xFF;
             static uint8_t prev_dtf3 = 0xFF;
-            extern uint32_t chihiro_va_to_pa(uint32_t va);
             uint32_t dtf_pa = chihiro_va_to_pa(0xE9BD4);
             if (dtf_pa != 0xFFFFFFFF) {
                 uint8_t cur_dtf0 = 0;
@@ -1795,7 +1790,6 @@ static int ohci_bus_start(OHCIState *ohci)
     /* v205: Notify Chihiro to schedule USB device hotplug.
      * Devices attach AFTER the kernel enables RHSC so fresh CSC
      * events trigger full USB enumeration including SET_CONFIG. */
-    extern void chihiro_on_ohci_bus_start(void);
     chihiro_on_ohci_bus_start();
 
     /*
@@ -2036,7 +2030,6 @@ static void ohci_port_set_status(OHCIState *ohci, int portnum, uint32_t val)
          * Now allowing normal OHCI port disable/enable flow. */
         port->ctrl &= ~OHCI_PORT_PES;
         port->ctrl |= OHCI_PORT_PESC;
-        extern uint32_t chihiro_usb_sm_pa;
         if (0 && TS_MS > 5900 && chihiro_usb_sm_pa != 0) {
             uint8_t sm[4] = {0};
             cpu_physical_memory_read(chihiro_usb_sm_pa, sm, 4);
@@ -2210,7 +2203,6 @@ static uint64_t ohci_mem_read(void *opaque,
         uint32_t r_ctx = 0;
         cpu_physical_memory_read(0x0F1D18, &r_ctx, 4);
         if (r_ctx != 0) {
-            extern uint32_t chihiro_va_to_pa(uint32_t va);
             uint32_t r_pa = chihiro_va_to_pa(r_ctx);
             if (r_pa != 0xFFFFFFFF) {
                 uint32_t r_sl = 0, r_cd = 0;
@@ -2257,7 +2249,6 @@ static void ohci_mem_write(void *opaque,
         uint32_t w_ctx = 0;
         cpu_physical_memory_read(0x0F1D18, &w_ctx, 4);
         if (w_ctx != 0) {
-            extern uint32_t chihiro_va_to_pa(uint32_t va);
             uint32_t w_pa = chihiro_va_to_pa(w_ctx);
             if (w_pa != 0xFFFFFFFF) {
                 uint32_t w_sl = 0, w_cd = 0;
@@ -2291,7 +2282,7 @@ static void ohci_mem_write(void *opaque,
     case 2: /* HcCommandStatus */
         if (TS_MS > 5900 && (val & 0x06))
             if(0) printf("[%07lld] OHCI HcCommandStatus: val=0x%08X [%s%s] ctrl_head=0x%08X bulk_head=0x%08X\n",
-                   TS_MS, val,
+                   TS_MS, (unsigned)val,
                    (val & 0x02) ? "CLF " : "", (val & 0x04) ? "BLF " : "",
                    ohci->ctrl_head, ohci->bulk_head);
         /* SOC is read-only */
@@ -2309,8 +2300,7 @@ static void ohci_mem_write(void *opaque,
         if (0 && TS_MS > 5900 && (val & OHCI_INTR_WD)) {
             if(0) printf("[%07lld] OHCI WDH ACK: guest clears WDH (val=0x%08lX)\n",
                    TS_MS, (unsigned long)val);
-            extern uint32_t chihiro_usb_sm_pa;
-            if (chihiro_usb_sm_pa != 0) {
+                if (chihiro_usb_sm_pa != 0) {
                 uint8_t sm[4] = {0};
                 uint8_t sm88 = 0;
                 uint32_t sm8c = 0, sm90 = 0;

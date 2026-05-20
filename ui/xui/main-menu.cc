@@ -42,6 +42,11 @@
 
 #include "../thirdparty/fatx/fatx.h"
 
+extern "C" {
+extern int chihiro_region_setting;
+extern bool chihiro_freeplay_setting;
+}
+
 #define DEFAULT_XMU_SIZE 8388608
 
 MainMenuScene g_main_menu;
@@ -821,6 +826,36 @@ void MainMenuChihiroView::Hide()
     m_rebinding = nullptr;
 }
 
+static const char *chihiro_gamepad_button_name(int btn)
+{
+    static const char *names[] = {
+        "GP South (A)", "GP East (B)", "GP West (X)", "GP North (Y)",
+        "GP Back", "GP Guide", "GP Start",
+        "GP Left Stick", "GP Right Stick",
+        "GP LB", "GP RB",
+        "GP DPad Up", "GP DPad Down", "GP DPad Left", "GP DPad Right",
+    };
+    if (btn >= 0 && btn < (int)(sizeof(names) / sizeof(names[0])))
+        return names[btn];
+    return "GP Unknown";
+}
+
+static const char *chihiro_binding_name(int value)
+{
+    if (value >= CHIHIRO_GAMEPAD_BUTTON_BASE)
+        return chihiro_gamepad_button_name(value - CHIHIRO_GAMEPAD_BUTTON_BASE);
+    switch (value) {
+    case 1001: return "Left Click";
+    case 1002: return "Middle Click";
+    case 1003: return "Right Click";
+    case 0:    return "None";
+    default: {
+        const char *n = SDL_GetScancodeName(static_cast<SDL_Scancode>(value));
+        return (n && *n) ? n : "Unknown";
+    }
+    }
+}
+
 static void ChihiroRebindRow(const char *label, int *scancode,
                               int row, std::unique_ptr<RebindingMap> &rebinding,
                               int **map)
@@ -831,13 +866,11 @@ static void ChihiroRebindRow(const char *label, int *scancode,
     ImGui::TableSetColumnIndex(1);
 
     if (rebinding && rebinding->GetTableRow() == row) {
-        ImGui::Text("Press a key to rebind");
+        ImGui::Text("Press key, mouse, or gamepad button");
         return;
     }
 
-    const char *key_name = SDL_GetScancodeName(static_cast<SDL_Scancode>(*scancode));
-    if (!key_name || !*key_name || *scancode == 0)
-        key_name = "None";
+    const char *key_name = chihiro_binding_name(*scancode);
 
     ImGui::PushID(row);
     float tw = ImGui::CalcTextSize(key_name).x;
@@ -846,7 +879,7 @@ static void ChihiroRebindRow(const char *label, int *scancode,
     float min_w = ImGui::GetColumnWidth(1) / 2;
     float w = std::max(min_w, max_w);
     if (ImGui::Button(key_name, ImVec2(w, 0))) {
-        rebinding = std::make_unique<ChihiroKeyboardRebindingMap>(row, map);
+        rebinding = std::make_unique<ChihiroRebindingMap>(row, map);
     }
     ImGui::PopID();
 }
@@ -865,23 +898,55 @@ void MainMenuChihiroView::Draw()
     SectionTitle("Input");
     ImGui::PushFont(g_font_mgr.m_menu_font_small);
 
+    static int active_player = 0;
+    float player_w = ImGui::GetContentRegionAvail().x;
+    ImGui::Columns(3, "##chihiro_player", false);
+    ImGui::SetColumnWidth(0, player_w * 0.25f);
+    ImGui::Text("Player");
+    ImGui::NextColumn();
+    for (int i = 0; i < 2; i++) {
+        bool is_selected = (i == active_player);
+        if (is_selected)
+            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.50f, 0.86f, 0.54f, 0.12f));
+        char label[4];
+        snprintf(label, sizeof(label), "P%d", i + 1);
+        if (ImGui::Button(label, ImVec2(60, 0))) {
+            active_player = i;
+            m_rebinding = nullptr;
+        }
+        if (is_selected)
+            ImGui::PopStyleColor();
+        if (i == 0) ImGui::SameLine();
+    }
+    ImGui::NextColumn();
+    ImGui::Columns(1);
+
+    bool is_p2 = (active_player == 1);
+
+    int **map_hotd3 = is_p2 ? g_chihiro_p2_hotd3_map : g_chihiro_hotd3_map;
+    int **map_vc3   = is_p2 ? g_chihiro_p2_vc3_map   : g_chihiro_vc3_map;
+    int **map_gs    = is_p2 ? g_chihiro_p2_gs_map     : g_chihiro_gs_map;
+    int **map_ctx   = is_p2 ? g_chihiro_p2_ctx_map    : g_chihiro_ctx_map;
+    int **map_or2   = is_p2 ? g_chihiro_p2_or2_map    : g_chihiro_or2_map;
+    int **map_ok    = is_p2 ? g_chihiro_p2_ok_map     : g_chihiro_ok_map;
+    int **map_uni   = is_p2 ? g_chihiro_p2_universal_map : g_chihiro_universal_map;
+
+    float content_w = ImGui::GetContentRegionAvail().x;
     ImGui::Columns(2, "", false);
-    ImGui::SetColumnWidth(0, ImGui::GetWindowWidth() * 0.25);
-    ImGui::Text("Profile");
+    ImGui::SetColumnWidth(0, content_w * 0.25f);
+    ImGui::Text("Game Profile");
     ImGui::NextColumn();
     ImGui::SetNextItemWidth(-FLT_MIN);
     ChevronCombo("###ChihiroProfile", &g_config.chihiro.jvs.profile,
-                 "Driving\0"
-                 "Light Gun\0"
+                 "The House of the Dead III\0"
+                 "Virtua Cop 3\0"
+                 "Ghost Squad\0"
+                 "Crazy Taxi: High Roller\0"
+                 "OutRun 2\0"
                  "Ollie King\0",
-                 "Select JVS input profile for the current game type");
+                 "Select JVS input profile for the current game");
     ImGui::NextColumn();
 
-    ImGui::Text("Input Device");
-    ImGui::NextColumn();
-    ImGui::SetNextItemWidth(-FLT_MIN);
-    ImGui::TextDisabled("Keyboard & Mouse");
-    ImGui::NextColumn();
     ImGui::Columns(1);
 
     float p = ImGui::GetFrameHeight() * 0.3;
@@ -896,38 +961,65 @@ void MainMenuChihiroView::Draw()
         int row = 0;
 
         switch (profile) {
-        case CONFIG_CHIHIRO_JVS_PROFILE_DRIVING: {
+        case CONFIG_CHIHIRO_JVS_PROFILE_HOTD3: {
+            ChihiroInfoRow("Gun Aim", "Mouse Movement");
             static const char *labels[] = {
-                "Steer Left", "Steer Right", "Gas", "Brake",
-                "Drive Gear (CTX)", "Reverse / View", "Jump (CTX)",
-                "Gear Up (OR2)", "Gear Down (OR2)"
+                "Trigger", "Pump Reload"
             };
-            for (int i = 0; i < 9; i++)
-                ChihiroRebindRow(labels[i], g_chihiro_driving_map[i],
-                                 row++, m_rebinding, g_chihiro_driving_map);
+            for (int i = 0; i < 2; i++)
+                ChihiroRebindRow(labels[i], map_hotd3[i],
+                                 row++, m_rebinding, map_hotd3);
             break;
         }
-        case CONFIG_CHIHIRO_JVS_PROFILE_LIGHTGUN: {
+        case CONFIG_CHIHIRO_JVS_PROFILE_VC3: {
             ChihiroInfoRow("Gun Aim", "Mouse Movement");
-
             static const char *labels[] = {
-                "Trigger", "Body Button (Grip/Change/Action)",
-                "Pedal (VC3) / Change (GS)"
+                "Trigger", "Change Weapon", "Pedal (Justice Shot)"
             };
             for (int i = 0; i < 3; i++)
-                ChihiroRebindRow(labels[i], g_chihiro_lightgun_map[i],
-                                 row++, m_rebinding, g_chihiro_lightgun_map);
+                ChihiroRebindRow(labels[i], map_vc3[i],
+                                 row++, m_rebinding, map_vc3);
             break;
         }
-        case CONFIG_CHIHIRO_JVS_PROFILE_OLLIE_KING: {
+        case CONFIG_CHIHIRO_JVS_PROFILE_GS: {
+            ChihiroInfoRow("Gun Aim", "Mouse Movement");
+            static const char *labels[] = {
+                "Trigger", "Action Button", "Change Firerate"
+            };
+            for (int i = 0; i < 3; i++)
+                ChihiroRebindRow(labels[i], map_gs[i],
+                                 row++, m_rebinding, map_gs);
+            break;
+        }
+        case CONFIG_CHIHIRO_JVS_PROFILE_CTX: {
+            static const char *labels[] = {
+                "Steer Left", "Steer Right", "Gas", "Brake",
+                "Drive Gear", "Reverse", "Jump"
+            };
+            for (int i = 0; i < 7; i++)
+                ChihiroRebindRow(labels[i], map_ctx[i],
+                                 row++, m_rebinding, map_ctx);
+            break;
+        }
+        case CONFIG_CHIHIRO_JVS_PROFILE_OR2: {
+            static const char *labels[] = {
+                "Steer Left", "Steer Right", "Gas", "Brake",
+                "Gear Up", "Gear Down", "View Change"
+            };
+            for (int i = 0; i < 7; i++)
+                ChihiroRebindRow(labels[i], map_or2[i],
+                                 row++, m_rebinding, map_or2);
+            break;
+        }
+        case CONFIG_CHIHIRO_JVS_PROFILE_OK: {
             static const char *labels[] = {
                 "Swing Left", "Swing Right",
                 "Board Front", "Board Rear",
                 "Left Grab", "Right Grab"
             };
             for (int i = 0; i < 6; i++)
-                ChihiroRebindRow(labels[i], g_chihiro_ollie_king_map[i],
-                                 row++, m_rebinding, g_chihiro_ollie_king_map);
+                ChihiroRebindRow(labels[i], map_ok[i],
+                                 row++, m_rebinding, map_ok);
             break;
         }
         }
@@ -936,40 +1028,132 @@ void MainMenuChihiroView::Draw()
             "Start", "Service", "Coin", "Test"
         };
         for (int i = 0; i < 4; i++)
-            ChihiroRebindRow(universal_labels[i], g_chihiro_universal_map[i],
-                             row++, m_rebinding, g_chihiro_universal_map);
+            ChihiroRebindRow(universal_labels[i], map_uni[i],
+                             row++, m_rebinding, map_uni);
 
         ImGui::EndTable();
     }
     ImGui::PopStyleVar();
 
     if (ImGui::Button("Reset to Default")) {
-        g_config.chihiro.jvs.driving.steer_left = 80;
-        g_config.chihiro.jvs.driving.steer_right = 79;
-        g_config.chihiro.jvs.driving.gas = 82;
-        g_config.chihiro.jvs.driving.brake = 81;
-        g_config.chihiro.jvs.driving.drive_gear = 225;
-        g_config.chihiro.jvs.driving.reverse_view = 224;
-        g_config.chihiro.jvs.driving.jump = 44;
-        g_config.chihiro.jvs.driving.gear_up = 29;
-        g_config.chihiro.jvs.driving.gear_down = 27;
-        g_config.chihiro.jvs.lightgun.trigger = 0;
-        g_config.chihiro.jvs.lightgun.body_button = 21;
-        g_config.chihiro.jvs.lightgun.pedal_change = 44;
-        g_config.chihiro.jvs.ollie_king.swing_left = 80;
-        g_config.chihiro.jvs.ollie_king.swing_right = 79;
-        g_config.chihiro.jvs.ollie_king.board_front = 82;
-        g_config.chihiro.jvs.ollie_king.board_rear = 81;
-        g_config.chihiro.jvs.ollie_king.left_grab = 29;
-        g_config.chihiro.jvs.ollie_king.right_grab = 27;
-        g_config.chihiro.jvs.start = 40;
-        g_config.chihiro.jvs.service = 38;
-        g_config.chihiro.jvs.coin = 34;
-        g_config.chihiro.jvs.test = 39;
+        if (is_p2) {
+            g_config.chihiro.jvs_p2.hotd3_trigger = 0;
+            g_config.chihiro.jvs_p2.hotd3_body_button = 0;
+            g_config.chihiro.jvs_p2.vc3_trigger = 0;
+            g_config.chihiro.jvs_p2.vc3_body_button = 0;
+            g_config.chihiro.jvs_p2.vc3_pedal = 0;
+            g_config.chihiro.jvs_p2.gs_trigger = 0;
+            g_config.chihiro.jvs_p2.gs_body_button = 0;
+            g_config.chihiro.jvs_p2.gs_change = 0;
+            g_config.chihiro.jvs_p2.ctx_steer_left = 0;
+            g_config.chihiro.jvs_p2.ctx_steer_right = 0;
+            g_config.chihiro.jvs_p2.ctx_gas = 0;
+            g_config.chihiro.jvs_p2.ctx_brake = 0;
+            g_config.chihiro.jvs_p2.ctx_drive_gear = 0;
+            g_config.chihiro.jvs_p2.ctx_reverse = 0;
+            g_config.chihiro.jvs_p2.ctx_jump = 0;
+            g_config.chihiro.jvs_p2.or2_steer_left = 0;
+            g_config.chihiro.jvs_p2.or2_steer_right = 0;
+            g_config.chihiro.jvs_p2.or2_gas = 0;
+            g_config.chihiro.jvs_p2.or2_brake = 0;
+            g_config.chihiro.jvs_p2.or2_gear_up = 0;
+            g_config.chihiro.jvs_p2.or2_gear_down = 0;
+            g_config.chihiro.jvs_p2.or2_view_change = 0;
+            g_config.chihiro.jvs_p2.ok_swing_left = 0;
+            g_config.chihiro.jvs_p2.ok_swing_right = 0;
+            g_config.chihiro.jvs_p2.ok_board_front = 0;
+            g_config.chihiro.jvs_p2.ok_board_rear = 0;
+            g_config.chihiro.jvs_p2.ok_left_grab = 0;
+            g_config.chihiro.jvs_p2.ok_right_grab = 0;
+            g_config.chihiro.jvs_p2.start = 0;
+            g_config.chihiro.jvs_p2.service = 0;
+            g_config.chihiro.jvs_p2.coin = 0;
+            g_config.chihiro.jvs_p2.test = 0;
+        } else {
+            g_config.chihiro.jvs.hotd3.trigger = 1001;
+            g_config.chihiro.jvs.hotd3.body_button = 1003;
+            g_config.chihiro.jvs.vc3.trigger = 1001;
+            g_config.chihiro.jvs.vc3.body_button = 1003;
+            g_config.chihiro.jvs.vc3.pedal = 44;
+            g_config.chihiro.jvs.gs.trigger = 1001;
+            g_config.chihiro.jvs.gs.body_button = 1003;
+            g_config.chihiro.jvs.gs.change = 44;
+            g_config.chihiro.jvs.ctx.steer_left = 80;
+            g_config.chihiro.jvs.ctx.steer_right = 79;
+            g_config.chihiro.jvs.ctx.gas = 82;
+            g_config.chihiro.jvs.ctx.brake = 81;
+            g_config.chihiro.jvs.ctx.drive_gear = 225;
+            g_config.chihiro.jvs.ctx.reverse = 224;
+            g_config.chihiro.jvs.ctx.jump = 44;
+            g_config.chihiro.jvs.or2.steer_left = 80;
+            g_config.chihiro.jvs.or2.steer_right = 79;
+            g_config.chihiro.jvs.or2.gas = 82;
+            g_config.chihiro.jvs.or2.brake = 81;
+            g_config.chihiro.jvs.or2.gear_up = 29;
+            g_config.chihiro.jvs.or2.gear_down = 27;
+            g_config.chihiro.jvs.or2.view_change = 224;
+            g_config.chihiro.jvs.ok.swing_left = 80;
+            g_config.chihiro.jvs.ok.swing_right = 79;
+            g_config.chihiro.jvs.ok.board_front = 82;
+            g_config.chihiro.jvs.ok.board_rear = 81;
+            g_config.chihiro.jvs.ok.left_grab = 29;
+            g_config.chihiro.jvs.ok.right_grab = 27;
+            g_config.chihiro.jvs.start = 40;
+            g_config.chihiro.jvs.service = 38;
+            g_config.chihiro.jvs.coin = 34;
+            g_config.chihiro.jvs.test = 39;
+        }
         xemu_settings_save();
     }
 
     ImGui::PopFont();
+
+    if (ImGui::CollapsingHeader("Arcade Settings")) {
+        Toggle("Light Gun Mode", &g_config.chihiro.settings.lightgun_mode,
+               "Prevent mouse from triggering menus. Press F1 for settings.");
+        Toggle("Freeplay", &g_config.chihiro.settings.freeplay,
+               "Disable coin requirement (applies on reset)");
+        chihiro_freeplay_setting = g_config.chihiro.settings.freeplay;
+        ChevronCombo("Region", &g_config.chihiro.settings.region,
+                     "Japan\0USA\0Export\0",
+                     "Arcade region setting (applies on reset)");
+        chihiro_region_setting = g_config.chihiro.settings.region;
+        ImGui::BeginDisabled();
+        int board_dummy = 0;
+        ChevronCombo("Board Type", &board_dummy,
+                     "Type-1 (FPGA)\0",
+                     "Type-3 (ASIC) support coming soon");
+        ImGui::EndDisabled();
+        Toggle("Force Feedback", &g_config.chihiro.settings.force_feedback,
+               "Enable force feedback for driving games (OutRun 2)");
+    }
+
+    if (ImGui::CollapsingHeader("Files")) {
+        static const SDL_DialogFileFilter rom_filters[] = {
+            { "ROM Files", "bin;rom;ic2" },
+            { "All Files", "*" }
+        };
+        FilePicker("BIOS (chihiro_xbox_bios)", g_config.chihiro.roms.bios_path,
+                   rom_filters, 2, false, [](const char *path) {
+            xemu_settings_set_string(&g_config.chihiro.roms.bios_path, path);
+        });
+        FilePicker("Flash ROM Media Board (fpr21042)", g_config.chihiro.roms.mediaboard_path,
+                   rom_filters, 2, false, [](const char *path) {
+            xemu_settings_set_string(&g_config.chihiro.roms.mediaboard_path, path);
+        });
+        FilePicker("EEPROM QC (ic10)", g_config.chihiro.roms.ic10_path,
+                   rom_filters, 2, false, [](const char *path) {
+            xemu_settings_set_string(&g_config.chihiro.roms.ic10_path, path);
+        });
+        FilePicker("EEPROM Baseboard (ic11)", g_config.chihiro.roms.ic11_path,
+                   rom_filters, 2, false, [](const char *path) {
+            xemu_settings_set_string(&g_config.chihiro.roms.ic11_path, path);
+        });
+        FilePicker("EEPROM SC (pc20)", g_config.chihiro.roms.pc20_path,
+                   rom_filters, 2, false, [](const char *path) {
+            xemu_settings_set_string(&g_config.chihiro.roms.pc20_path, path);
+        });
+    }
 }
 
 void MainMenuDisplayView::Draw()

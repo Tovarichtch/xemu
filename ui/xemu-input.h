@@ -142,11 +142,24 @@ extern const char *bound_drivers[4];
 extern "C" {
 #endif
 
+#define CHIHIRO_MOUSE_BUTTON_BASE 1001
+#define CHIHIRO_GAMEPAD_BUTTON_BASE 2001
+
 extern int *g_keyboard_scancode_map[25];
 extern int *g_chihiro_universal_map[4];
-extern int *g_chihiro_driving_map[9];
-extern int *g_chihiro_lightgun_map[3];
-extern int *g_chihiro_ollie_king_map[6];
+extern int *g_chihiro_hotd3_map[2];
+extern int *g_chihiro_vc3_map[3];
+extern int *g_chihiro_gs_map[3];
+extern int *g_chihiro_ctx_map[7];
+extern int *g_chihiro_or2_map[7];
+extern int *g_chihiro_ok_map[6];
+extern int *g_chihiro_p2_universal_map[4];
+extern int *g_chihiro_p2_hotd3_map[2];
+extern int *g_chihiro_p2_vc3_map[3];
+extern int *g_chihiro_p2_gs_map[3];
+extern int *g_chihiro_p2_ctx_map[7];
+extern int *g_chihiro_p2_or2_map[7];
+extern int *g_chihiro_p2_ok_map[6];
 
 void xemu_input_init(void);
 void xemu_input_process_sdl_events(const SDL_Event *event); // SDL_EVENT_GAMEPAD_ADDED, SDL_EVENT_GAMEPAD_REMOVED
