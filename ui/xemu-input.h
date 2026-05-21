@@ -185,6 +185,7 @@ void xemu_input_set_test_mode(int enabled);
 int xemu_input_get_test_mode(void);
 void xemu_input_reset_input_mapping(ControllerState *state);
 int xemu_input_lightgun_active(void);
+int xemu_input_get_lightgun_pos(int player_index, int16_t *x, int16_t *y);
 
 #ifdef __cplusplus
 }

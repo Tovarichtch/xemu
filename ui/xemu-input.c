@@ -1427,3 +1427,16 @@ int xemu_input_lightgun_active(void)
     }
     return 0;
 }
+
+int xemu_input_get_lightgun_pos(int player_index, int16_t *x, int16_t *y)
+{
+    if (player_index < 0 || player_index >= 4) return 0;
+    if (!bound_drivers[player_index] ||
+        strcmp(bound_drivers[player_index], DRIVER_LIGHT_GUN) != 0)
+        return 0;
+    ControllerState *s = bound_controllers[player_index];
+    if (!s || s->lg.status != 0x20) return 0;
+    *x = s->lg.axis[0];
+    *y = s->lg.axis[1];
+    return 1;
+}

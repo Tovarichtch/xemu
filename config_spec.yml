@@ -590,6 +590,25 @@ chihiro:
     force_feedback:
       type: bool
       default: false
+    show_crosshair:
+      type: bool
+      default: true
+    crosshair_scale:
+      type: integer
+      default: 100
+    crosshair_path:
+      type: string
+      default: ""
+    sinden_border:
+      type: bool
+      default: false
+    sinden_border_style:
+      type: enum
+      values: [game, fullscreen]
+      default: game
+    sinden_border_size:
+      type: integer
+      default: 2
   roms:
     bios_path:
       type: string

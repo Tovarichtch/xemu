@@ -1110,7 +1110,34 @@ void MainMenuChihiroView::Draw()
 
     if (ImGui::CollapsingHeader("Arcade Settings")) {
         Toggle("Light Gun Mode", &g_config.chihiro.settings.lightgun_mode,
-               "Prevent mouse from triggering menus. Press F1 for settings.");
+               "Hides system cursor and prevents mouse from triggering menus. Toggle with F3.");
+        Toggle("Show Crosshair", &g_config.chihiro.settings.show_crosshair,
+               "Display aiming crosshair for light gun games");
+        if (g_config.chihiro.settings.show_crosshair) {
+            ImGui::SliderInt("Crosshair Scale",
+                             &g_config.chihiro.settings.crosshair_scale,
+                             50, 300, "%d%%");
+            static const SDL_DialogFileFilter img_filters[] = {
+                { "Image Files", "png;jpg;bmp" },
+                { "All Files", "*" }
+            };
+            FilePicker("Custom Crosshair", g_config.chihiro.settings.crosshair_path,
+                       img_filters, 2, false, [](const char *path) {
+                xemu_settings_set_string(
+                    &g_config.chihiro.settings.crosshair_path, path);
+            });
+        }
+        Toggle("Sinden Border", &g_config.chihiro.settings.sinden_border,
+               "White border for Sinden light gun tracking");
+        if (g_config.chihiro.settings.sinden_border) {
+            ChevronCombo("Border Style",
+                         &g_config.chihiro.settings.sinden_border_style,
+                         "Game (4:3)\0Fullscreen (16:9)\0",
+                         "Game = around viewport, Fullscreen = around window");
+            ImGui::SliderInt("Border Size",
+                             &g_config.chihiro.settings.sinden_border_size,
+                             2, 30, "%d px");
+        }
         Toggle("Freeplay", &g_config.chihiro.settings.freeplay,
                "Disable coin requirement (applies on reset)");
         chihiro_freeplay_setting = g_config.chihiro.settings.freeplay;

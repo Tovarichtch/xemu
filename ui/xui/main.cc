@@ -54,11 +54,17 @@
 #if defined(_WIN32)
 #include "update.hh"
 #endif
+#include <stb_image.h>
+#include "crosshair_default.png.h"
 
 bool g_screenshot_pending;
 const char *g_snapshot_pending_load_name;
 
 float g_main_menu_height;
+
+extern "C" {
+extern int viewport_coords[4];
+}
 
 static ImGuiStyle g_base_style;
 static float g_last_scale;
@@ -66,6 +72,129 @@ static int g_vsync;
 static GLuint g_tex;
 static bool g_flip_req;
 
+
+static GLuint g_crosshair_tex = 0;
+static int g_crosshair_w = 0, g_crosshair_h = 0;
+static std::string g_crosshair_loaded_path;
+
+static void LoadCrosshairTexture(void)
+{
+    const char *custom = g_config.chihiro.settings.crosshair_path;
+    std::string want = custom ? custom : "";
+
+    if (g_crosshair_tex && g_crosshair_loaded_path == want)
+        return;
+
+    if (g_crosshair_tex) {
+        glDeleteTextures(1, &g_crosshair_tex);
+        g_crosshair_tex = 0;
+    }
+
+    int w, h, ch;
+    unsigned char *data = NULL;
+    stbi_set_flip_vertically_on_load(0);
+
+    if (!want.empty()) {
+        data = stbi_load(want.c_str(), &w, &h, &ch, 4);
+    }
+    if (!data) {
+        data = stbi_load_from_memory(crosshair_default_data,
+                                     crosshair_default_size, &w, &h, &ch, 4);
+    }
+    if (!data) return;
+
+    glGenTextures(1, &g_crosshair_tex);
+    glBindTexture(GL_TEXTURE_2D, g_crosshair_tex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA,
+                 GL_UNSIGNED_BYTE, data);
+    g_crosshair_w = w;
+    g_crosshair_h = h;
+    g_crosshair_loaded_path = want;
+    stbi_image_free(data);
+}
+
+static void RenderSindenBorder(float vx, float vy, float vw, float vh,
+                               int winW, int winH)
+{
+    if (!g_config.chihiro.settings.sinden_border)
+        return;
+
+    float t = (float)g_config.chihiro.settings.sinden_border_size;
+    if (t < 2) t = 2;
+    if (t > 30) t = 30;
+
+    float bx, by, bw, bh;
+    if (g_config.chihiro.settings.sinden_border_style ==
+        CONFIG_CHIHIRO_SETTINGS_SINDEN_BORDER_STYLE_FULLSCREEN) {
+        bx = 0; by = 0; bw = (float)winW; bh = (float)winH;
+    } else {
+        bx = vx; by = vy; bw = vw; bh = vh;
+    }
+
+    ImU32 white = IM_COL32(255, 255, 255, 255);
+    auto dl = ImGui::GetForegroundDrawList();
+    dl->AddRectFilled(ImVec2(bx, by), ImVec2(bx + bw, by + t), white);
+    dl->AddRectFilled(ImVec2(bx, by + bh - t), ImVec2(bx + bw, by + bh), white);
+    dl->AddRectFilled(ImVec2(bx, by + t), ImVec2(bx + t, by + bh - t), white);
+    dl->AddRectFilled(ImVec2(bx + bw - t, by + t), ImVec2(bx + bw, by + bh - t), white);
+}
+
+static void RenderLightGunOverlays(void)
+{
+    if (g_config.chihiro.settings.lightgun_mode)
+        SDL_HideCursor();
+    else
+        SDL_ShowCursor();
+
+    if (viewport_coords[2] <= 0 || viewport_coords[3] <= 0)
+        return;
+
+    int drawW, drawH, winW, winH;
+    SDL_GetWindowSizeInPixels(xemu_get_window(), &drawW, &drawH);
+    SDL_GetWindowSize(xemu_get_window(), &winW, &winH);
+    float sx = (float)winW / (float)drawW;
+    float sy = (float)winH / (float)drawH;
+
+    float vx = viewport_coords[0] * sx;
+    float vy = viewport_coords[1] * sy;
+    float vw = viewport_coords[2] * sx;
+    float vh = viewport_coords[3] * sy;
+
+    RenderSindenBorder(vx, vy, vw, vh, winW, winH);
+
+    if (!g_config.chihiro.settings.show_crosshair)
+        return;
+    if (!xemu_input_lightgun_active())
+        return;
+
+    LoadCrosshairTexture();
+    if (!g_crosshair_tex) return;
+
+    float scale = g_config.chihiro.settings.crosshair_scale / 100.0f;
+    float half_w = (g_crosshair_w * scale) / 2.0f;
+    float half_h = (g_crosshair_h * scale) / 2.0f;
+
+    for (int i = 0; i < 4; i++) {
+        int16_t ax, ay;
+        if (!xemu_input_get_lightgun_pos(i, &ax, &ay))
+            continue;
+
+        float nx = (ax + 32768.0f) / 65535.0f;
+        float ny = 1.0f - (ay + 32768.0f) / 65535.0f;
+        float cx = vx + nx * vw;
+        float cy = vy + ny * vh;
+
+        ImU32 tint = (i == 0) ? IM_COL32(255, 255, 255, 220)
+                              : IM_COL32(100, 150, 255, 220);
+        auto dl = ImGui::GetForegroundDrawList();
+        dl->AddImage((ImTextureID)(intptr_t)g_crosshair_tex,
+                     ImVec2(cx - half_w, cy - half_h),
+                     ImVec2(cx + half_w, cy + half_h),
+                     ImVec2(0, 0), ImVec2(1, 1), tint);
+    }
+}
 
 static void InitializeStyle()
 {
@@ -218,6 +347,7 @@ void xemu_hud_update(void)
     g_input_mgr.Update();
 
     ImGui::NewFrame();
+    RenderLightGunOverlays();
     ProcessKeyboardShortcuts();
 
 #if defined(CONFIG_RENDERDOC)
@@ -285,6 +415,11 @@ void xemu_hud_update(void)
         if ((buttons & CONTROLLER_BUTTON_BACK) &&
             (buttons & CONTROLLER_BUTTON_START)) {
             menu_button = true;
+        }
+
+        if (ImGui::IsKeyPressed(ImGuiKey_F3)) {
+            g_config.chihiro.settings.lightgun_mode =
+                !g_config.chihiro.settings.lightgun_mode;
         }
 
         if (ImGui::IsKeyPressed(ImGuiKey_F1)) {
