@@ -35,8 +35,8 @@
 #include <stdlib.h>
 
 #include "system/blockdev.h"
-#include "hw/xbox/chihiro-jvs.h"
-#include "hw/xbox/chihiro.h"
+#include "hw/xbox/chihiro/chihiro-jvs.h"
+#include "hw/xbox/chihiro/chihiro.h"
 
 extern SDL_Window *m_window;
 extern int viewport_coords[4];

@@ -58,7 +58,7 @@
 
 #include "hw/xbox/xbox.h"
 #include "smbus.h"
-#include "chihiro.h"
+#include "chihiro/chihiro.h"
 
 #define MAX_IDE_BUS 2
 

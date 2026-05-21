@@ -33,7 +33,7 @@
 #include "qemu/config-file.h"
 #include "qapi/error.h"
 #include "system/block-backend.h"
-#include "chihiro.h"
+#include "chihiro/chihiro.h"
 #include "system/blockdev.h"
 #include "system/system.h"
 #include "smbus.h"

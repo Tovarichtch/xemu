@@ -38,7 +38,7 @@
 #include "hw/qdev-properties.h"
 #include "trace.h"
 #include "hcd-ohci.h"
-#include "hw/xbox/chihiro.h"
+#include "hw/xbox/chihiro/chihiro.h"
 
 /* This causes frames to occur 1000x slower */
 /*#define OHCI_TIME_WARP 1*/
