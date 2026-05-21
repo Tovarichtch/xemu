@@ -3116,13 +3116,14 @@ void qemu_init(int argc, char **argv)
             format_suffix = ",format=raw";
         }
 
-        /* Chihiro: if dvd_path is a directory or XBE, skip the -drive for
-         * index=1 entirely. The IDE slave is registered programmatically
+        /* Chihiro: if dvd_path is a directory, XBE, or FATX .bin, skip the
+         * -drive for index=1. The IDE slave is registered programmatically
          * by chihiro_ide_interface_init() with a MemoryRegion-backed device. */
         struct stat dvd_st;
         if (stat(dvd_path, &dvd_st) == 0 &&
             (S_ISDIR(dvd_st.st_mode) ||
-             g_ascii_strcasecmp(ext, ".xbe") == 0)) {
+             g_ascii_strcasecmp(ext, ".xbe") == 0 ||
+             g_ascii_strcasecmp(ext, ".bin") == 0)) {
             free(escaped_dvd_path);
             escaped_dvd_path = NULL;
         }

@@ -35,6 +35,7 @@ extern uint32_t chihiro_pc20_size;
 
 /* Game state */
 extern char chihiro_game_dir[1024];
+extern char chihiro_game_filename[64];
 extern bool chihiro_board_type3;
 extern int chihiro_region_setting;
 extern bool chihiro_freeplay_setting;

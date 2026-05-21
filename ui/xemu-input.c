@@ -752,20 +752,20 @@ static void xemu_input_update_jvs(void)
         }
 
         static uint16_t steer_pos = 0x8000;
-        if (pa) {
-            int32_t lx = pa[CONTROLLER_AXIS_LSTICK_X];
-            jvs->analog[0] = (uint16_t)((lx + 32768) & 0xFFFF);
-        } else {
+        {
+            uint16_t steer_val = pa ? (uint16_t)((pa[CONTROLLER_AXIS_LSTICK_X] + 32768) & 0xFFFF) : 0x8000;
             steer_pos = jvs_axis_smooth(steer_pos, sl, sr);
-            jvs->analog[0] = steer_pos;
+            if (sl || sr) steer_val = steer_pos;
+            jvs->analog[0] = steer_val;
         }
 
-        if (pa) {
-            jvs->analog[1] = (uint16_t)(pa[CONTROLLER_AXIS_RTRIG] * 2);
-            jvs->analog[2] = (uint16_t)(pa[CONTROLLER_AXIS_LTRIG] * 2);
-        } else {
-            jvs->analog[1] = gas ? 0xFFFF : 0x0000;
-            jvs->analog[2] = brk ? 0xFFFF : 0x0000;
+        {
+            uint16_t gas_val = pa ? (uint16_t)(pa[CONTROLLER_AXIS_RTRIG] * 2) : 0;
+            uint16_t brk_val = pa ? (uint16_t)(pa[CONTROLLER_AXIS_LTRIG] * 2) : 0;
+            if (gas) gas_val = 0xFFFF;
+            if (brk) brk_val = 0xFFFF;
+            jvs->analog[1] = gas_val;
+            jvs->analog[2] = brk_val;
         }
 
         if (profile == CONFIG_CHIHIRO_JVS_PROFILE_CTX) {
@@ -790,12 +790,11 @@ static void xemu_input_update_jvs(void)
         bool sr = chihiro_check_input(g_config.chihiro.jvs.ok.swing_right, kbd, mouseBtn);
 
         static uint16_t swing_pos = 0x8000;
-        if (pa) {
-            int32_t lx = pa[CONTROLLER_AXIS_LSTICK_X];
-            jvs->analog[1] = (uint16_t)((lx + 32768) & 0xFFFF);
-        } else {
+        {
+            uint16_t swing_val = pa ? (uint16_t)((pa[CONTROLLER_AXIS_LSTICK_X] + 32768) & 0xFFFF) : 0x8000;
             swing_pos = jvs_axis_smooth(swing_pos, sl, sr);
-            jvs->analog[1] = swing_pos;
+            if (sl || sr) swing_val = swing_pos;
+            jvs->analog[1] = swing_val;
         }
 
         if (chihiro_check_input(g_config.chihiro.jvs.ok.board_front, kbd, mouseBtn))

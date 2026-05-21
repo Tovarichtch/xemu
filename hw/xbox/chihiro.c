@@ -31,7 +31,6 @@
 #include "system/address-spaces.h"
 #include "system/block-backend.h"
 #include "chihiro.h"
-#include "chihiro_fatx.h"
 #include "system/blockdev.h"
 #include "system/system.h"
 #include "block/blkmemory.h"
@@ -193,7 +192,7 @@ static bool chihiro_boot3_reached; /* Set when SEGABOOT reaches boot=3 (checks c
 static bool chihiro_quickreboot_pending; /* Set at QuickReboot, consumed by port 0x40F0 handler */
 static bool chihiro_mbcom_bootstrap_done; /* Reset on QuickReboot so game gets fresh DIMM_SIZE */
 static bool chihiro_e1_armed; /* Reset on QuickReboot to prevent premature response delivery */
-static char chihiro_game_filename[64]; /* Game XBE filename saved at boot=3 */
+char chihiro_game_filename[64]; /* Game XBE filename saved at boot=3 */
 char chihiro_game_dir[1024];   /* Game directory path (from dvd_path) */
 
 static char chihiro_save_path[2048];
@@ -559,8 +558,6 @@ static void chihiro_diag_timer_cb(void *opaque)
              * marks it persistent, and fills launch data. Kernel's STICKY
              * section preserves LaunchDataPage pointer across QuickReboot. */
 
-            /* Load per-game save (ic11 calibration + extmem) now that
-             * game filename is known — must happen before game XBE reads ic11 */
             if (chihiro_game_filename[0] && !chihiro_save_path[0]) {
                 if (chihiro_resolve_save_path()) {
                     if (!chihiro_usb_save_load(chihiro_save_path)) {

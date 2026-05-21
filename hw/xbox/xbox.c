@@ -59,7 +59,6 @@
 #include "hw/xbox/xbox.h"
 #include "smbus.h"
 #include "chihiro.h"
-#include "chihiro_fatx.h"
 
 #define MAX_IDE_BUS 2
 
@@ -419,89 +418,67 @@ void xbox_init_common(MachineState *machine,
 
         chihiro_ide_load_rom();
 
-        /* Build FATX from game directory if dvd_path is a directory.
-         * If dvd_path points to an XBE, use its parent directory. */
+        /* Load pre-built FATX netboot image into DIMM buffer */
         {
             const char *dvd = g_config.sys.files.dvd_path;
             if (dvd && strlen(dvd) > 0) {
-                struct stat st;
-                if (stat(dvd, &st) == 0) {
-                    char game_dir[2048];
-                    if (S_ISDIR(st.st_mode)) {
-                        snprintf(game_dir, sizeof(game_dir), "%s", dvd);
-                    } else {
-                        /* XBE file: use parent directory */
-                        snprintf(game_dir, sizeof(game_dir), "%s", dvd);
-                        char *slash = strrchr(game_dir, '/');
-                        if (!slash) slash = strrchr(game_dir, '\\');
-                        if (slash) *slash = '\0';
-                        /* TODO: delete — FATX hack for subdirectory games (WMMT1).
-                         * Will be removed when FATX is replaced by real DIMM board. */
-                        char bootid_check[2112];
-                        snprintf(bootid_check, sizeof(bootid_check),
-                                 "%s/boot.id", game_dir);
-                        struct stat bid_st;
-                        if (stat(bootid_check, &bid_st) != 0) {
-                            slash = strrchr(game_dir, '/');
-                            if (!slash) slash = strrchr(game_dir, '\\');
-                            if (slash) *slash = '\0';
-                        }
-                    }
-                    uint32_t fs_size = 0;
-                    uint8_t *fs_buf = chihiro_fatx_get_buffer(&fs_size);
-                    /* mbfs: partition = DIMM_sectors - 0x8000 (512MB → 0xF8000) */
-                    uint32_t mbfs_sectors = 0x100000 - 0x8000;
-                    gint64 fatx_t0 = g_get_monotonic_time();
-                    uint32_t fatx_size = fs_buf ?
-                        chihiro_fatx_build(game_dir, fs_buf, fs_size,
-                                           mbfs_sectors) : 0;
-                    if (fatx_size) {
-                        printf("Chihiro: FATX built from '%s' (%u MB, %lld ms)\n",
-                               game_dir, fatx_size / (1024*1024),
-                               (long long)(g_get_monotonic_time() - fatx_t0) / 1000);
+                uint32_t fs_size = 0;
+                uint8_t *fs_buf = chihiro_fatx_get_buffer(&fs_size);
+                if (fs_buf) {
+                    FILE *f = fopen(dvd, "rb");
+                    if (f) {
+                        uint8_t magic[4];
+                        if (fread(magic, 1, 4, f) == 4 &&
+                            memcmp(magic, "FATX", 4) == 0) {
+                            rewind(f);
+                            gint64 t0 = g_get_monotonic_time();
+                            struct stat st;
+                            fstat(fileno(f), &st);
+                            uint32_t file_size = (uint32_t)st.st_size;
+                            if (file_size > fs_size) file_size = fs_size;
+                            size_t nread = fread(fs_buf, 1, file_size, f);
+                            printf("Chihiro: FATX image loaded '%s'"
+                                   " (%zu bytes, %lld ms)\n",
+                                   dvd, nread,
+                                   (long long)(g_get_monotonic_time() - t0)
+                                   / 1000);
 
-                        /* TODO: delete — FATX boot.id patching hack.
-                         * Will be removed with FATX when real DIMM board is emulated. */
-                        if (!S_ISDIR(st.st_mode)) {
-                            size_t gd_len = strlen(game_dir);
-                            const char *rel = dvd + gd_len;
-                            if (*rel == '/' || *rel == '\\') rel++;
-                            for (uint32_t off = 0; off + 480 <= fatx_size; off++) {
+                            /* Extract game filename from boot.id */
+                            for (uint32_t off = 0; off + 480 <= file_size;
+                                 off++) {
                                 if (memcmp(fs_buf + off, "BTID", 4) == 0 &&
-                                    memcmp(fs_buf + off + 0x20, "XBAM", 4) == 0) {
-                                    char patched[32];
-                                    memset(patched, 0, 32);
-                                    snprintf(patched, 32, "\\%s", rel);
-                                    for (int i = 0; i < 32; i++)
-                                        if (patched[i] == '/') patched[i] = '\\';
-                                    memcpy(fs_buf + off + 0xA0, patched, 32);
-                                    printf("Chihiro: boot.id patched → '%s'\n",
-                                           patched);
+                                    memcmp(fs_buf + off + 0x20,
+                                           "XBAM", 4) == 0) {
+                                    char name_buf[32];
+                                    memcpy(name_buf,
+                                           fs_buf + off + 0xA0, 31);
+                                    name_buf[31] = '\0';
+                                    char *n = name_buf;
+                                    while (*n == '\\' || *n == '/') n++;
+                                    if (*n) {
+                                        strncpy(chihiro_game_filename,
+                                                n, 63);
+                                        chihiro_game_filename[63] = '\0';
+                                        printf("Chihiro: game → '%s'\n",
+                                               chihiro_game_filename);
+                                    }
                                     break;
                                 }
                             }
+                        } else {
+                            fprintf(stderr,
+                                    "Chihiro: '%s' is not a FATX image\n",
+                                    dvd);
                         }
-                    }
-                    /* Store game dir for boot.id reading at QuickReboot */
-                    {
-                        strncpy(chihiro_game_dir, game_dir, 1023);
-                        chihiro_game_dir[1023] = 0;
-                        /* Auto-detect Type-3 (ASIC) board:
-                         * Type-3 game dirs contain "firmware.asic".
-                         * TODO: This heuristic is insufficient — some games (e.g. VC3)
-                         * have firmware.asic but are also Type-1 compatible. Replace
-                         * with UI setting (Chihiro > Settings > Board Type) so the
-                         * user can choose which media board to emulate. */
-                        char det_path[1088];
-                        struct stat det_st;
-                        snprintf(det_path, sizeof(det_path),
-                                 "%s/firmware.asic", game_dir);
-                        chihiro_board_type3 = (stat(det_path, &det_st) == 0);
-                        if (chihiro_board_type3) {
-                            printf("Chihiro: Type-3 (ASIC) board detected\n");
-                        }
+                        fclose(f);
                     }
                 }
+                /* Store parent dir for QuickReboot fallback */
+                snprintf(chihiro_game_dir, sizeof(chihiro_game_dir),
+                         "%s", dvd);
+                char *slash = strrchr(chihiro_game_dir, '/');
+                if (!slash) slash = strrchr(chihiro_game_dir, '\\');
+                if (slash) *slash = '\0';
             }
         }
 
