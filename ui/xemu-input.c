@@ -720,7 +720,8 @@ static void xemu_input_update_jvs(void)
         if (trigger) sw0 |= 0x02;
         if (body)    sw1 |= 0x80;
 
-        if (profile == CONFIG_CHIHIRO_JVS_PROFILE_HOTD3) {
+        if (profile == CONFIG_CHIHIRO_JVS_PROFILE_HOTD3 ||
+            profile == CONFIG_CHIHIRO_JVS_PROFILE_GS) {
             if (offscreen) sw0 |= 0x01;
         } else if (profile == CONFIG_CHIHIRO_JVS_PROFILE_VC3) {
             if (offscreen && trigger) sw0 |= 0x01;
@@ -733,6 +734,8 @@ static void xemu_input_update_jvs(void)
         if (profile == CONFIG_CHIHIRO_JVS_PROFILE_GS) {
             if (chihiro_check_input(g_config.chihiro.jvs.gs.change, kbd, mouseBtn))
                 sw1 |= 0x40;
+            if (g_config.chihiro.card_reader.enable)
+                sw1 |= 0x20;
         }
         break;
     }

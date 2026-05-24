@@ -609,6 +609,10 @@ chihiro:
     sinden_border_size:
       type: integer
       default: 2
+  card_reader:
+    enable:
+      type: bool
+      default: true
   roms:
     bios_path:
       type: string

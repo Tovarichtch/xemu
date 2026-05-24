@@ -52,6 +52,12 @@ void chihiro_on_quickreboot_signal(void);
 /* Called from SMC POWER handler to detect QuickReboot */
 bool chihiro_intercept_reset(void);
 
+/* Card reader emulation (CRP-1231 via ring buffer tap/injection) */
+bool chihiro_card_reader_present(int player);
+bool chihiro_get_card_inject(int player, uint8_t *buf, int *len);
+void chihiro_card_tap_byte(int player, uint8_t byte);
+void chihiro_card_set_ignore_usb(int player, bool val);
+
 /* Save file persistence (Phase 2): ic11 + extmem backup area */
 bool chihiro_usb_save_load(const char *path);
 bool chihiro_usb_save_flush(const char *path);

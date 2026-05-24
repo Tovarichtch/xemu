@@ -38,10 +38,12 @@
 #include "block/block_int-global-state.h"
 #include "qemu/main-loop.h"
 #include "hw/usb.h"
+#include "ui/xemu-settings.h"
 #include "target/i386/cpu.h"
 #include "exec/watchpoint.h"
 #include "ui/input.h"
 #include "chihiro-jvs.h"
+#include "chihiro-card-reader.h"
 
 /*
  * Chihiro Mediaboard LPC I/O
@@ -397,6 +399,39 @@ uint32_t chihiro_va_to_pa(uint32_t va)
     return (pte & 0xFFFFF000) | (va & 0xFFF);
 }
 
+/* Card reader state: 2 players, ring buffer tap/injection */
+static CardReaderState card_state[2];
+static bool card_reader_initialized;
+
+bool chihiro_card_reader_present(int player)
+{
+    if (player < 0 || player > 1) return false;
+    return card_state[player].card_present;
+}
+
+bool chihiro_get_card_inject(int player, uint8_t *buf, int *len)
+{
+    if (player < 0 || player > 1) return false;
+    CardReaderState *s = &card_state[player];
+    if (!s->inject_pending) return false;
+    memcpy(buf, s->inject_buf, s->inject_len);
+    *len = s->inject_len;
+    s->inject_pending = false;
+    return true;
+}
+
+void chihiro_card_tap_byte(int player, uint8_t byte)
+{
+    if (player < 0 || player > 1) return;
+    card_reader_tap_byte(&card_state[player], byte);
+}
+
+void chihiro_card_set_ignore_usb(int player, bool val)
+{
+    if (player < 0 || player > 1) return;
+    card_state[player].ignore_usb = val;
+}
+
 /*
  * Diagnostic: periodically dump CheckErrors state machine variables.
  * PAs are computed via x86 page table walk at patch time.
@@ -410,8 +445,241 @@ static void chihiro_diag_timer_cb(void *opaque)
     ChihiroLPCState *s = (ChihiroLPCState *)opaque;
 
     if (chihiro_game_running) {
+        static int card_tick = 0;
+        card_tick++;
+
+        if (g_config.chihiro.card_reader.enable) {
+            if (!card_reader_initialized) {
+                card_reader_init(&card_state[0]);
+                card_reader_init(&card_state[1]);
+                char path[1024];
+                snprintf(path, sizeof(path), "%s/card_p1.bin",
+                         chihiro_game_dir);
+                card_reader_insert(&card_state[0], path);
+                snprintf(path, sizeof(path), "%s/card_p2.bin",
+                         chihiro_game_dir);
+                card_reader_insert(&card_state[1], path);
+                chihiro_card_set_ignore_usb(0, true);
+                chihiro_card_set_ignore_usb(1, true);
+                card_reader_initialized = true;
+                fprintf(stderr, "[%07lld] CARD: initialized, dir=%s\n",
+                        TS_MS, chihiro_game_dir);
+            }
+
+            /* serial_flag=0: keeps module alive (sf==3 kills it) */
+            {
+                uint32_t sf_pa = chihiro_va_to_pa(0x467fd0);
+                if (sf_pa != 0xFFFFFFFF) {
+                    uint32_t v = 0;
+                    cpu_physical_memory_write(sf_pa, &v, 4);
+                }
+            }
+            /* card_en=1: tells game card reader HW is present */
+            {
+                uint32_t ce_pa = chihiro_va_to_pa(0x447265);
+                if (ce_pa != 0xFFFFFFFF) {
+                    uint8_t v = 1;
+                    cpu_physical_memory_write(ce_pa, &v, 1);
+                }
+            }
+            /* sched_mode=0: disable closing-time card scheduler.
+             * DAT_00447270=1 → FUN_00033120()=1 → detection SM sets bit8
+             * per player → module bit3 set → FUN_0002c750()=0 → no card screen */
+            {
+                uint32_t sm_pa = chihiro_va_to_pa(0x447270);
+                if (sm_pa != 0xFFFFFFFF) {
+                    uint32_t v = 0;
+                    cpu_physical_memory_write(sm_pa, &v, 4);
+                }
+            }
+            /* module 0x22 bit0=1: card_module_init_cb reads card_en at boot
+             * (before our force), so module header bit0 stays 0 for US region.
+             * Walk the hardware module linked list to find and force it.
+             * Re-scan each tick until the game has initialized the data block
+             * (flags != 0 after masking bit 0), since the module list may be
+             * rebuilt across SEGABOOT → game transitions. */
+            {
+                static uint32_t mod22_data_va = 0;
+                static bool mod22_locked = false;
+
+                uint32_t node_va = 0x451030;
+                uint32_t found_data = 0;
+                for (int i = 0; i < 32 && node_va != 0; i++) {
+                    uint32_t node_pa = chihiro_va_to_pa(node_va);
+                    if (node_pa == 0xFFFFFFFF) break;
+                    uint32_t id;
+                    cpu_physical_memory_read(node_pa, &id, 4);
+                    if (id == 0x22) {
+                        cpu_physical_memory_read(node_pa + 0x10,
+                                                 &found_data, 4);
+                        break;
+                    }
+                    cpu_physical_memory_read(node_pa + 0x38, &node_va, 4);
+                }
+
+                if (found_data != 0) {
+                    if (found_data != mod22_data_va) {
+                        fprintf(stderr,
+                            "[%07lld] CARD: module 0x22 data at 0x%08X"
+                            " (was 0x%08X)\n",
+                            TS_MS, found_data, mod22_data_va);
+                        mod22_data_va = found_data;
+                        mod22_locked = false;
+                    }
+
+                    uint32_t data_pa = chihiro_va_to_pa(mod22_data_va);
+                    if (data_pa != 0xFFFFFFFF) {
+                        uint32_t flags;
+                        cpu_physical_memory_read(data_pa, &flags, 4);
+
+                        if (!mod22_locked && flags != 0) {
+                            mod22_locked = true;
+                            uint32_t sched_mode = 0;
+                            uint32_t sm_pa = chihiro_va_to_pa(0x447270);
+                            if (sm_pa != 0xFFFFFFFF)
+                                cpu_physical_memory_read(sm_pa, &sched_mode, 4);
+                            fprintf(stderr,
+                                "[%07lld] CARD: module 0x22 locked "
+                                "(flags=0x%08X sched=%d)\n",
+                                TS_MS, flags, sched_mode);
+                            for (int p = 0; p < 2; p++) {
+                                uint32_t pp_va =
+                                    mod22_data_va + 8 + p * 0x12a0;
+                                uint32_t pp_pa = chihiro_va_to_pa(pp_va);
+                                if (pp_pa == 0xFFFFFFFF) continue;
+                                uint32_t pf, det_st = 0;
+                                cpu_physical_memory_read(pp_pa, &pf, 4);
+                                cpu_physical_memory_read(pp_pa + 0x14,
+                                                         &det_st, 4);
+                                fprintf(stderr,
+                                    "[%07lld] CARD: P%d pflags=0x%08X "
+                                    "bit8=%d det_st=%d\n",
+                                    TS_MS, p, pf, (pf >> 8) & 1, det_st);
+                            }
+                        }
+
+                        uint32_t want = (flags | 1) & ~8u;
+                        if (flags != want) {
+                            if (card_tick % 300 == 0)
+                                fprintf(stderr,
+                                    "[%07lld] CARD: module 0x22 "
+                                    "flags=0x%08X → 0x%08X\n",
+                                    TS_MS, flags, want);
+                            cpu_physical_memory_write(data_pa, &want, 4);
+                        }
+
+                        for (int p = 0; p < 2; p++) {
+                            uint32_t pp_va =
+                                mod22_data_va + 8 + p * 0x12a0;
+                            uint32_t pp_pa = chihiro_va_to_pa(pp_va);
+                            if (pp_pa == 0xFFFFFFFF) continue;
+                            uint32_t pf;
+                            cpu_physical_memory_read(pp_pa, &pf, 4);
+                            if (!(pf & 1)) {
+                                fprintf(stderr,
+                                    "[%07lld] CARD: P%d bit0=0, "
+                                    "forcing (flags=0x%08X)\n",
+                                    TS_MS, p, pf);
+                                pf |= 1;
+                                cpu_physical_memory_write(pp_pa, &pf, 4);
+                            }
+                        }
+                    }
+                }
+            }
+            /* CARD_IN is set via JVS sw1 |= 0x20 (PUSH5) in xemu-input.c.
+             * The game's remap function (FUN_00085550) produces bit 12 in
+             * the IO struct naturally — no timer-based forcing needed. */
+            /* TX ring buffer tap: read commands from game's TX buffer */
+            {
+                static uint16_t tx_tap_pos[2] = {0xFFFF, 0xFFFF};
+
+                for (int p = 0; p < 2; p++) {
+                    uint32_t rb_va = (p == 0) ? 0x4bf550 : 0x4bf584;
+                    uint32_t txbp_pa = chihiro_va_to_pa(rb_va + 0x14);
+                    uint32_t txcp_pa = chihiro_va_to_pa(rb_va + 0x18);
+                    uint32_t txwp_pa = chihiro_va_to_pa(rb_va + 0x1A);
+                    if (txbp_pa == 0xFFFFFFFF || txcp_pa == 0xFFFFFFFF ||
+                        txwp_pa == 0xFFFFFFFF)
+                        continue;
+
+                    uint32_t tx_buf_va;
+                    uint16_t tx_cap, tx_wp;
+                    cpu_physical_memory_read(txbp_pa, &tx_buf_va, 4);
+                    cpu_physical_memory_read(txcp_pa, &tx_cap, 2);
+                    cpu_physical_memory_read(txwp_pa, &tx_wp, 2);
+
+                    if (tx_cap == 0 || tx_buf_va == 0)
+                        continue;
+
+                    if (tx_tap_pos[p] == 0xFFFF)
+                        tx_tap_pos[p] = tx_wp;
+
+                    int fed = 0;
+                    while (tx_tap_pos[p] != tx_wp && fed < 64) {
+                        uint32_t bpa =
+                            chihiro_va_to_pa(tx_buf_va + tx_tap_pos[p]);
+                        if (bpa == 0xFFFFFFFF) break;
+                        uint8_t byte;
+                        cpu_physical_memory_read(bpa, &byte, 1);
+                        chihiro_card_tap_byte(p, byte);
+                        tx_tap_pos[p] = (tx_tap_pos[p] + 1) % tx_cap;
+                        fed++;
+                    }
+                }
+            }
+            /* RX ring buffer injection: deliver card reader responses */
+            {
+                for (int p = 0; p < 2; p++) {
+                    uint8_t ibuf[256];
+                    int ilen;
+                    if (!chihiro_get_card_inject(p, ibuf, &ilen))
+                        continue;
+
+                    uint32_t rb_va = (p == 0) ? 0x4bf550 : 0x4bf584;
+                    uint32_t bp_pa = chihiro_va_to_pa(rb_va + 0x20);
+                    uint32_t cp_pa = chihiro_va_to_pa(rb_va + 0x24);
+                    uint32_t wp_pa = chihiro_va_to_pa(rb_va + 0x26);
+                    if (bp_pa == 0xFFFFFFFF || cp_pa == 0xFFFFFFFF ||
+                        wp_pa == 0xFFFFFFFF)
+                        continue;
+
+                    uint32_t buf_va;
+                    uint16_t cap, wp;
+                    cpu_physical_memory_read(bp_pa, &buf_va, 4);
+                    cpu_physical_memory_read(cp_pa, &cap, 2);
+                    cpu_physical_memory_read(wp_pa, &wp, 2);
+
+                    if (cap == 0 || buf_va == 0)
+                        continue;
+
+                    for (int i = 0; i < ilen; i++) {
+                        uint32_t bpa = chihiro_va_to_pa(buf_va + wp);
+                        if (bpa != 0xFFFFFFFF)
+                            cpu_physical_memory_write(bpa, &ibuf[i], 1);
+                        wp = (wp + 1) % cap;
+                    }
+                    cpu_physical_memory_write(wp_pa, &wp, 2);
+                    fprintf(stderr, "[CARD] P%d: cmd=0x%02X len=%d\n",
+                            p, ibuf[1], ilen);
+                }
+            }
+            if ((card_tick % 312) == 0 && card_tick <= 3120) {
+                uint8_t ce = 0;
+                uint32_t sf = 0;
+                uint32_t ce_pa = chihiro_va_to_pa(0x447265);
+                uint32_t sf_pa = chihiro_va_to_pa(0x467fd0);
+                if (ce_pa != 0xFFFFFFFF)
+                    cpu_physical_memory_read(ce_pa, &ce, 1);
+                if (sf_pa != 0xFFFFFFFF)
+                    cpu_physical_memory_read(sf_pa, &sf, 4);
+                fprintf(stderr, "[CARD] t=%d ce=%d sf=%d\n",
+                        card_tick, ce, sf);
+            }
+        }
+
         timer_mod(s->diag_timer,
-                  qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 1000);
+                  qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 16);
         return;
     }
 

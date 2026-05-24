@@ -1153,6 +1153,9 @@ void MainMenuChihiroView::Draw()
         ImGui::EndDisabled();
         Toggle("Force Feedback", &g_config.chihiro.settings.force_feedback,
                "Enable force feedback for driving games (OutRun 2)");
+        ImGui::Separator();
+        Toggle("Card Reader", &g_config.chihiro.card_reader.enable,
+               "CRP-1231 IC card reader emulation (Ghost Squad, Gundam)");
     }
 
     if (ImGui::CollapsingHeader("Files")) {
