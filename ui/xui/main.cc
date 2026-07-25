@@ -166,7 +166,13 @@ static void RenderLightGunOverlays(void)
 
     if (!g_config.chihiro.settings.show_crosshair)
         return;
-    if (!xemu_input_lightgun_active())
+    /* JVS aiming reads the mouse directly, so a bound light gun device is not
+     * required — a gun game profile (or Light Gun Mode) is enough. */
+    if (!xemu_input_lightgun_active() &&
+        !g_config.chihiro.settings.lightgun_mode &&
+        g_config.chihiro.jvs.profile != CONFIG_CHIHIRO_JVS_PROFILE_HOTD3 &&
+        g_config.chihiro.jvs.profile != CONFIG_CHIHIRO_JVS_PROFILE_VC3 &&
+        g_config.chihiro.jvs.profile != CONFIG_CHIHIRO_JVS_PROFILE_GS)
         return;
 
     LoadCrosshairTexture();

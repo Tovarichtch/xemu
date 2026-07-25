@@ -3055,6 +3055,11 @@ void qemu_init(int argc, char **argv)
     }
 
     const char *flashrom_path = g_config.sys.files.flashrom_path;
+    /* Chihiro: an explicit BIOS from Settings > Chihiro > Files wins. */
+    if ((int)g_config.sys.mem_limit >= 1 && g_config.chihiro.roms.bios_path &&
+        g_config.chihiro.roms.bios_path[0]) {
+        flashrom_path = g_config.chihiro.roms.bios_path;
+    }
     if (g_config.general.show_welcome) {
         // Don't display an error if this is the first boot. Give user a chance
         // to configure the path.

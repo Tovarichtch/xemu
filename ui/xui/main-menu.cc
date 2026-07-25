@@ -895,6 +895,33 @@ static void ChihiroInfoRow(const char *label, const char *value)
 
 void MainMenuChihiroView::Draw()
 {
+    SectionTitle("Game");
+    ImGui::PushFont(g_font_mgr.m_menu_font_small);
+
+    bool chihiro_mode = (int)g_config.sys.mem_limit >= 1;
+    if (!chihiro_mode) {
+        ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.2f, 1.0f),
+                           "Chihiro mode is off: system memory is set to 64 MiB.");
+        if (ImGui::Button("Enable Chihiro mode (128 MiB)")) {
+            g_config.sys.mem_limit = 1;
+        }
+        ImGui::SameLine();
+        ImGui::TextDisabled("(applies on reset)");
+    }
+
+    static const SDL_DialogFileFilter netboot_filters[] = {
+        { "Chihiro netboot image (*.bin)", "bin" },
+        { "All Files", "*" }
+    };
+    FilePicker("Game image (netboot .bin)", g_config.sys.files.dvd_path,
+               netboot_filters, 2, false, [](const char *path) {
+        xemu_settings_set_string(&g_config.sys.files.dvd_path, path);
+    });
+    ImGui::TextDisabled("Converted from a MAME romset with chihiro-netboot.py "
+                        "(applies on reset)");
+
+    ImGui::PopFont();
+
     SectionTitle("Input");
     ImGui::PushFont(g_font_mgr.m_menu_font_small);
 
@@ -1159,6 +1186,8 @@ void MainMenuChihiroView::Draw()
     }
 
     if (ImGui::CollapsingHeader("Files")) {
+        ImGui::TextDisabled("Leave empty to look next to the Xbox BIOS "
+                            "(applies on reset)");
         static const SDL_DialogFileFilter rom_filters[] = {
             { "ROM Files", "bin;rom;ic2" },
             { "All Files", "*" }
