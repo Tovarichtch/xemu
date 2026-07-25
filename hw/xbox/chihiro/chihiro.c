@@ -28,6 +28,7 @@
 #include "qemu/error-report.h"
 #include "qemu/timer.h"
 #define TS_MS ((long long)(qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL)))
+#include "chihiro-log.h"
 #include "system/address-spaces.h"
 #include "system/block-backend.h"
 #include "chihiro.h"
@@ -225,6 +226,7 @@ static void mediaboard_init(void)
 static ChihiroLPCState *chihiro_lpc_global;
 uint32_t chihiro_usb_sm_pa;  /* PA of USB state machine globals at VA 0xC3F10 */
 
+unsigned chihiro_log_mask;
 bool lpc_log_verbose = false;
 
 static uint8_t chihiro_mbcom_command[512];
@@ -503,9 +505,9 @@ static void chihiro_card_force_module22(int tick)
 
     uint32_t want = (flags | 1) & ~8u;
     if (flags != want) {
-        if (lpc_log_verbose && tick % 300 == 0)
-            fprintf(stderr, "[%07lld] CARD: module 0x22 flags=0x%08X → 0x%08X\n",
-                    TS_MS, flags, want);
+        if (tick % 300 == 0)
+            CHIHIRO_LOGF(CARD, "module 0x22 flags=0x%08X → 0x%08X\n",
+                         flags, want);
         cpu_physical_memory_write(data_pa, &want, 4);
     }
 
@@ -646,8 +648,8 @@ static void chihiro_segaboot_report_state(uint32_t state, uint32_t counter)
         case 7: desc = "SERVICE_MENU"; break;
         case 8: desc = "GAME_TEST"; break;
     }
-    fprintf(stderr, "[%07lld] SEGABOOT: state %u → %u (%s)\n",
-            TS_MS, prev_state, state, desc);
+    CHIHIRO_LOGF(BOOT, "SEGABOOT: state %u → %u (%s)\n",
+                 prev_state, state, desc);
 
     if (state == 6 && counter > 0) {
         static const char *err_causes[] = {
@@ -667,8 +669,7 @@ static void chihiro_segaboot_report_state(uint32_t state, uint32_t counter)
         const char *cause = (counter < ARRAY_SIZE(err_causes) &&
                              err_causes[counter]) ? err_causes[counter]
                                                   : "unknown";
-        fprintf(stderr, "[%07lld] SEGABOOT: *** ERROR %02u — %s ***\n",
-                TS_MS, counter, cause);
+        CHIHIRO_ERRF("SEGABOOT: *** ERROR %02u — %s ***\n", counter, cause);
     }
     prev_state = state;
 }
@@ -1932,6 +1933,9 @@ static void chihiro_lpc_realize(DeviceState *dev, Error **errp)
     ChihiroLPCState *s = CHIHIRO_LPC_DEVICE(dev);
     ISADevice *isa = ISA_DEVICE(dev);
 
+    chihiro_log_init();
+    lpc_log_verbose = !!(chihiro_log_mask & CHIHIRO_LOG_VERBOSE);
+
     chihiro_active = true;
     chihiro_lpc_global = s;
     memory_region_init_io(&s->ioport, OBJECT(dev), &chihiro_lpc_io_ops, s,
@@ -2397,7 +2401,7 @@ static void chihiro_mbcom_process(void)
         memcpy(r + 4, &mediaboard.net_ip, 4);
         break;
     default:
-        if (lpc_log_verbose) fprintf(stderr, "[%07lld] MBCOM UNHANDLED cmd=0x%04X\n", TS_MS, cmd_code);
+        CHIHIRO_LOGF(MBCOM, "UNHANDLED cmd=0x%04X\n", cmd_code);
         break;
     }
 
