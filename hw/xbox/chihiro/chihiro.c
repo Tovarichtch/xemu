@@ -146,11 +146,6 @@ typedef struct ChihiroLPCState {
 
     /* Diagnostic: periodic state machine dump */
     QEMUTimer *diag_timer;
-    uint32_t diag_state_pa;    /* PA of CheckErrors state [VA 0x87AFC] */
-    uint32_t diag_counter_pa;  /* PA of CheckErrors counter [VA 0x87AE8] */
-    uint32_t diag_ready_pa;    /* PA of CheckErrors ready [VA 0x87AF8] */
-    uint32_t diag_gate_pa;     /* PA of gate variable [VA 0x89C38] */
-    uint32_t diag_bootstate_pa;/* PA of MbcomBootSequence state [VA 0x89C48] */
 
     /* LPC port read counters for v136 instrumentation */
     uint32_t lpc_401e_reads;   /* MbcomCommand (state 2) — port 0x401E (firmware) */
@@ -436,405 +431,369 @@ void chihiro_card_set_ignore_usb(int player, bool val)
  *   VA [0x87AF8] = ready flag
  */
 
+/*
+ * Card reader plumbing — WORKAROUND, not LLE.
+ *
+ * The game talks to the CRP-1231 over the baseboard serial link, but the
+ * Xbox USBD stack never completes the bulk IRPs that would carry it (root
+ * cause still open). Until that is fixed we tap the game's TX ring buffer
+ * and inject responses into its RX ring buffer from this timer, and force
+ * the operator settings the card screen gates on.
+ */
+static void chihiro_card_force_operator_settings(void)
+{
+    /* serial_flag=0: keeps module alive (sf==3 kills it) */
+    uint32_t sf_pa = chihiro_va_to_pa(0x467fd0);
+    if (sf_pa != 0xFFFFFFFF) {
+        uint32_t v = 0;
+        cpu_physical_memory_write(sf_pa, &v, 4);
+    }
+    /* card_en=1: tells game card reader HW is present */
+    uint32_t ce_pa = chihiro_va_to_pa(0x447265);
+    if (ce_pa != 0xFFFFFFFF) {
+        uint8_t v = 1;
+        cpu_physical_memory_write(ce_pa, &v, 1);
+    }
+    /* sched_mode=0: disable closing-time card scheduler.
+     * DAT_00447270=1 → FUN_00033120()=1 → detection SM sets bit8
+     * per player → module bit3 set → FUN_0002c750()=0 → no card screen */
+    uint32_t sm_pa = chihiro_va_to_pa(0x447270);
+    if (sm_pa != 0xFFFFFFFF) {
+        uint32_t v = 0;
+        cpu_physical_memory_write(sm_pa, &v, 4);
+    }
+}
+
+/*
+ * module 0x22 bit0=1: card_module_init_cb reads card_en at boot (before our
+ * force), so the module header bit0 stays 0 for the US region. Walk the
+ * hardware module linked list to find and force it. Re-scan each tick until
+ * the game has initialized the data block (flags != 0 after masking bit 0),
+ * since the module list may be rebuilt across SEGABOOT → game transitions.
+ */
+static void chihiro_card_force_module22(int tick)
+{
+    static uint32_t mod22_data_va;
+
+    uint32_t node_va = 0x451030;
+    uint32_t found_data = 0;
+    for (int i = 0; i < 32 && node_va != 0; i++) {
+        uint32_t node_pa = chihiro_va_to_pa(node_va);
+        if (node_pa == 0xFFFFFFFF) break;
+        uint32_t id;
+        cpu_physical_memory_read(node_pa, &id, 4);
+        if (id == 0x22) {
+            cpu_physical_memory_read(node_pa + 0x10, &found_data, 4);
+            break;
+        }
+        cpu_physical_memory_read(node_pa + 0x38, &node_va, 4);
+    }
+
+    if (found_data == 0)
+        return;
+
+    mod22_data_va = found_data;
+
+    uint32_t data_pa = chihiro_va_to_pa(mod22_data_va);
+    if (data_pa == 0xFFFFFFFF)
+        return;
+
+    uint32_t flags;
+    cpu_physical_memory_read(data_pa, &flags, 4);
+
+    uint32_t want = (flags | 1) & ~8u;
+    if (flags != want) {
+        if (lpc_log_verbose && tick % 300 == 0)
+            fprintf(stderr, "[%07lld] CARD: module 0x22 flags=0x%08X → 0x%08X\n",
+                    TS_MS, flags, want);
+        cpu_physical_memory_write(data_pa, &want, 4);
+    }
+
+    for (int p = 0; p < 2; p++) {
+        uint32_t pp_pa = chihiro_va_to_pa(mod22_data_va + 8 + p * 0x12a0);
+        if (pp_pa == 0xFFFFFFFF) continue;
+        uint32_t pf;
+        cpu_physical_memory_read(pp_pa, &pf, 4);
+        if (!(pf & 1)) {
+            pf |= 1;
+            cpu_physical_memory_write(pp_pa, &pf, 4);
+        }
+    }
+}
+
+/* Read the bytes the game wrote to its serial TX ring and feed the reader. */
+static void chihiro_card_tap_tx_rings(void)
+{
+    static uint16_t tx_tap_pos[2] = { 0xFFFF, 0xFFFF };
+
+    for (int p = 0; p < 2; p++) {
+        uint32_t rb_va = (p == 0) ? 0x4bf550 : 0x4bf584;
+        uint32_t txbp_pa = chihiro_va_to_pa(rb_va + 0x14);
+        uint32_t txcp_pa = chihiro_va_to_pa(rb_va + 0x18);
+        uint32_t txwp_pa = chihiro_va_to_pa(rb_va + 0x1A);
+        if (txbp_pa == 0xFFFFFFFF || txcp_pa == 0xFFFFFFFF ||
+            txwp_pa == 0xFFFFFFFF)
+            continue;
+
+        uint32_t tx_buf_va;
+        uint16_t tx_cap, tx_wp;
+        cpu_physical_memory_read(txbp_pa, &tx_buf_va, 4);
+        cpu_physical_memory_read(txcp_pa, &tx_cap, 2);
+        cpu_physical_memory_read(txwp_pa, &tx_wp, 2);
+
+        if (tx_cap == 0 || tx_buf_va == 0)
+            continue;
+
+        if (tx_tap_pos[p] == 0xFFFF)
+            tx_tap_pos[p] = tx_wp;
+
+        int fed = 0;
+        while (tx_tap_pos[p] != tx_wp && fed < 64) {
+            uint32_t bpa = chihiro_va_to_pa(tx_buf_va + tx_tap_pos[p]);
+            if (bpa == 0xFFFFFFFF) break;
+            uint8_t byte;
+            cpu_physical_memory_read(bpa, &byte, 1);
+            chihiro_card_tap_byte(p, byte);
+            tx_tap_pos[p] = (tx_tap_pos[p] + 1) % tx_cap;
+            fed++;
+        }
+    }
+}
+
+/* Push pending card reader responses into the game's serial RX ring. */
+static void chihiro_card_inject_rx_rings(void)
+{
+    for (int p = 0; p < 2; p++) {
+        uint8_t ibuf[256];
+        int ilen;
+        if (!chihiro_get_card_inject(p, ibuf, &ilen))
+            continue;
+
+        uint32_t rb_va = (p == 0) ? 0x4bf550 : 0x4bf584;
+        uint32_t bp_pa = chihiro_va_to_pa(rb_va + 0x20);
+        uint32_t cp_pa = chihiro_va_to_pa(rb_va + 0x24);
+        uint32_t wp_pa = chihiro_va_to_pa(rb_va + 0x26);
+        if (bp_pa == 0xFFFFFFFF || cp_pa == 0xFFFFFFFF ||
+            wp_pa == 0xFFFFFFFF)
+            continue;
+
+        uint32_t buf_va;
+        uint16_t cap, wp;
+        cpu_physical_memory_read(bp_pa, &buf_va, 4);
+        cpu_physical_memory_read(cp_pa, &cap, 2);
+        cpu_physical_memory_read(wp_pa, &wp, 2);
+
+        if (cap == 0 || buf_va == 0)
+            continue;
+
+        for (int i = 0; i < ilen; i++) {
+            uint32_t bpa = chihiro_va_to_pa(buf_va + wp);
+            if (bpa != 0xFFFFFFFF)
+                cpu_physical_memory_write(bpa, &ibuf[i], 1);
+            wp = (wp + 1) % cap;
+        }
+        cpu_physical_memory_write(wp_pa, &wp, 2);
+    }
+}
+
+static void chihiro_card_reader_tick(void)
+{
+    static int card_tick;
+    card_tick++;
+
+    if (!card_reader_initialized) {
+        card_reader_init(&card_state[0]);
+        card_reader_init(&card_state[1]);
+        char path[sizeof(chihiro_game_dir) + 16];
+        snprintf(path, sizeof(path), "%s/card_p1.bin", chihiro_game_dir);
+        card_reader_insert(&card_state[0], path);
+        snprintf(path, sizeof(path), "%s/card_p2.bin", chihiro_game_dir);
+        card_reader_insert(&card_state[1], path);
+        chihiro_card_set_ignore_usb(0, true);
+        chihiro_card_set_ignore_usb(1, true);
+        card_reader_initialized = true;
+        fprintf(stderr, "Chihiro: card reader enabled (dir=%s)\n",
+                chihiro_game_dir);
+    }
+
+    chihiro_card_force_operator_settings();
+    chihiro_card_force_module22(card_tick);
+    /* CARD_IN is set via JVS sw1 |= 0x20 (PUSH5) in xemu-input.c. The game's
+     * remap function (FUN_00085550) produces bit 12 in the IO struct
+     * naturally — no timer-based forcing needed. */
+    chihiro_card_tap_tx_rings();
+    chihiro_card_inject_rx_rings();
+}
+
+/* Report SEGABOOT state transitions, and decode the error code on entry
+ * into ERROR_DISPLAY. */
+static void chihiro_segaboot_report_state(uint32_t state, uint32_t counter)
+{
+    static uint32_t prev_state;
+
+    if (state == prev_state)
+        return;
+
+    const char *desc = "";
+    switch (state) {
+        case 0: desc = "INIT"; break;
+        case 1: desc = "CHECK_ERRORS"; break;
+        case 2: desc = "CAUTION (boot handshake)"; break;
+        case 3: desc = "CAUTION_WAIT"; break;
+        case 4: desc = "GAME_READY"; break;
+        case 5: desc = "GAME_RUNNING"; break;
+        case 6: desc = "ERROR_DISPLAY"; break;
+        case 7: desc = "SERVICE_MENU"; break;
+        case 8: desc = "GAME_TEST"; break;
+    }
+    fprintf(stderr, "[%07lld] SEGABOOT: state %u → %u (%s)\n",
+            TS_MS, prev_state, state, desc);
+
+    if (state == 6 && counter > 0) {
+        static const char *err_causes[] = {
+            [1]  = "Hardware initialization failed",
+            [2]  = "USB enumeration failed (QC/SC not found)",
+            [3]  = "Main board serial invalid",
+            [4]  = "Media board serial invalid",
+            [5]  = "Region mismatch (EEPROM vs boot.id)",
+            [6]  = "DIMM board communication failed",
+            [11] = "JVS I/O board not connected",
+            [14] = "Network board error (SC EEPROM version timeout)",
+            [21] = "SYSTEM_TYPE check failed",
+            [22] = "SADDR communication timeout (V850 not present)",
+            [27] = "GetBootData returned NULL",
+            [31] = "SYSTEM_TYPE is zero",
+        };
+        const char *cause = (counter < ARRAY_SIZE(err_causes) &&
+                             err_causes[counter]) ? err_causes[counter]
+                                                  : "unknown";
+        fprintf(stderr, "[%07lld] SEGABOOT: *** ERROR %02u — %s ***\n",
+                TS_MS, counter, cause);
+    }
+    prev_state = state;
+}
+
+/*
+ * SEGABOOT reached boot=3 (checks complete). Recover the game executable
+ * name so the save file can be resolved: boot.id is loaded at PA 0x4F000
+ * with magic "BTID", "XBAM" at +0x20 and the executable at +0xA0
+ * (e.g. "\hod3xb.xbe"). Fall back to scanning SEGABOOT data for ".xbe".
+ */
+static void chihiro_capture_game_filename(void)
+{
+    chihiro_game_filename[0] = 0;
+
+    uint8_t btid[4];
+    cpu_physical_memory_read(0x4F000, btid, 4);
+    if (memcmp(btid, "BTID", 4) == 0) {
+        uint8_t xbam[4];
+        cpu_physical_memory_read(0x4F020, xbam, 4);
+        if (memcmp(xbam, "XBAM", 4) == 0) {
+            uint8_t game_exec[32] = {0};
+            cpu_physical_memory_read(0x4F0A0, game_exec, 31);
+            char *name = (char *)game_exec;
+            while (*name == '\\' || *name == '/') name++;
+            if (name[0] && strlen(name) < 60) {
+                strncpy(chihiro_game_filename, name, 63);
+                chihiro_game_filename[63] = 0;
+            }
+        }
+    }
+
+    if (chihiro_game_filename[0])
+        return;
+
+    for (uint32_t pa = 0x50000; pa < 0x56000; pa++) {
+        uint8_t buf[4];
+        cpu_physical_memory_read(pa, buf, 4);
+        if (memcmp(buf, ".xbe", 4) != 0 && memcmp(buf, ".XBE", 4) != 0)
+            continue;
+
+        int start = 0;
+        uint8_t fname[64];
+        for (int back = 1; back <= 42; back++) {
+            uint8_t c;
+            cpu_physical_memory_read(pa - back, &c, 1);
+            if (c < 0x20 || c >= 0x7F || c == '\\' || c == '/' || c == ':') {
+                start = back - 1;
+                break;
+            }
+            start = back;
+        }
+        if (start > 0) {
+            cpu_physical_memory_read(pa - start, fname, start + 4);
+            fname[start + 4] = 0;
+            int len = start + 4;
+            if (len > 4 && len < 60) {
+                memcpy(chihiro_game_filename, fname, len + 1);
+                break;
+            }
+        }
+    }
+}
+
+static void chihiro_on_boot3(void)
+{
+    chihiro_boot3_reached = true;
+    chihiro_capture_game_filename();
+
+    /* LLE: SEGABOOT calls XLaunchNewImageA which allocates LDP, marks it
+     * persistent, and fills launch data. Kernel's STICKY section preserves
+     * the LaunchDataPage pointer across QuickReboot. */
+
+    if (!chihiro_game_filename[0] || chihiro_save_path[0])
+        return;
+
+    if (!chihiro_resolve_save_path()) {
+        fprintf(stderr, "Chihiro: save path resolve failed (dir='%s' file='%s')\n",
+                chihiro_game_dir, chihiro_game_filename);
+        return;
+    }
+    if (!chihiro_usb_save_load(chihiro_save_path))
+        fprintf(stderr, "Chihiro: no save found at %s\n", chihiro_save_path);
+}
+
+/*
+ * Periodic tick: drives the card reader workaround while a game runs, and
+ * watches the SEGABOOT state machine before that.
+ */
 static void chihiro_diag_timer_cb(void *opaque)
 {
     ChihiroLPCState *s = (ChihiroLPCState *)opaque;
 
     if (chihiro_game_running) {
-        static int card_tick = 0;
-        card_tick++;
-
-        if (g_config.chihiro.card_reader.enable) {
-            if (!card_reader_initialized) {
-                card_reader_init(&card_state[0]);
-                card_reader_init(&card_state[1]);
-                char path[1024];
-                snprintf(path, sizeof(path), "%s/card_p1.bin",
-                         chihiro_game_dir);
-                card_reader_insert(&card_state[0], path);
-                snprintf(path, sizeof(path), "%s/card_p2.bin",
-                         chihiro_game_dir);
-                card_reader_insert(&card_state[1], path);
-                chihiro_card_set_ignore_usb(0, true);
-                chihiro_card_set_ignore_usb(1, true);
-                card_reader_initialized = true;
-                fprintf(stderr, "[%07lld] CARD: initialized, dir=%s\n",
-                        TS_MS, chihiro_game_dir);
-            }
-
-            /* serial_flag=0: keeps module alive (sf==3 kills it) */
-            {
-                uint32_t sf_pa = chihiro_va_to_pa(0x467fd0);
-                if (sf_pa != 0xFFFFFFFF) {
-                    uint32_t v = 0;
-                    cpu_physical_memory_write(sf_pa, &v, 4);
-                }
-            }
-            /* card_en=1: tells game card reader HW is present */
-            {
-                uint32_t ce_pa = chihiro_va_to_pa(0x447265);
-                if (ce_pa != 0xFFFFFFFF) {
-                    uint8_t v = 1;
-                    cpu_physical_memory_write(ce_pa, &v, 1);
-                }
-            }
-            /* sched_mode=0: disable closing-time card scheduler.
-             * DAT_00447270=1 → FUN_00033120()=1 → detection SM sets bit8
-             * per player → module bit3 set → FUN_0002c750()=0 → no card screen */
-            {
-                uint32_t sm_pa = chihiro_va_to_pa(0x447270);
-                if (sm_pa != 0xFFFFFFFF) {
-                    uint32_t v = 0;
-                    cpu_physical_memory_write(sm_pa, &v, 4);
-                }
-            }
-            /* module 0x22 bit0=1: card_module_init_cb reads card_en at boot
-             * (before our force), so module header bit0 stays 0 for US region.
-             * Walk the hardware module linked list to find and force it.
-             * Re-scan each tick until the game has initialized the data block
-             * (flags != 0 after masking bit 0), since the module list may be
-             * rebuilt across SEGABOOT → game transitions. */
-            {
-                static uint32_t mod22_data_va = 0;
-                static bool mod22_locked = false;
-
-                uint32_t node_va = 0x451030;
-                uint32_t found_data = 0;
-                for (int i = 0; i < 32 && node_va != 0; i++) {
-                    uint32_t node_pa = chihiro_va_to_pa(node_va);
-                    if (node_pa == 0xFFFFFFFF) break;
-                    uint32_t id;
-                    cpu_physical_memory_read(node_pa, &id, 4);
-                    if (id == 0x22) {
-                        cpu_physical_memory_read(node_pa + 0x10,
-                                                 &found_data, 4);
-                        break;
-                    }
-                    cpu_physical_memory_read(node_pa + 0x38, &node_va, 4);
-                }
-
-                if (found_data != 0) {
-                    if (found_data != mod22_data_va) {
-                        fprintf(stderr,
-                            "[%07lld] CARD: module 0x22 data at 0x%08X"
-                            " (was 0x%08X)\n",
-                            TS_MS, found_data, mod22_data_va);
-                        mod22_data_va = found_data;
-                        mod22_locked = false;
-                    }
-
-                    uint32_t data_pa = chihiro_va_to_pa(mod22_data_va);
-                    if (data_pa != 0xFFFFFFFF) {
-                        uint32_t flags;
-                        cpu_physical_memory_read(data_pa, &flags, 4);
-
-                        if (!mod22_locked && flags != 0) {
-                            mod22_locked = true;
-                            uint32_t sched_mode = 0;
-                            uint32_t sm_pa = chihiro_va_to_pa(0x447270);
-                            if (sm_pa != 0xFFFFFFFF)
-                                cpu_physical_memory_read(sm_pa, &sched_mode, 4);
-                            fprintf(stderr,
-                                "[%07lld] CARD: module 0x22 locked "
-                                "(flags=0x%08X sched=%d)\n",
-                                TS_MS, flags, sched_mode);
-                            for (int p = 0; p < 2; p++) {
-                                uint32_t pp_va =
-                                    mod22_data_va + 8 + p * 0x12a0;
-                                uint32_t pp_pa = chihiro_va_to_pa(pp_va);
-                                if (pp_pa == 0xFFFFFFFF) continue;
-                                uint32_t pf, det_st = 0;
-                                cpu_physical_memory_read(pp_pa, &pf, 4);
-                                cpu_physical_memory_read(pp_pa + 0x14,
-                                                         &det_st, 4);
-                                fprintf(stderr,
-                                    "[%07lld] CARD: P%d pflags=0x%08X "
-                                    "bit8=%d det_st=%d\n",
-                                    TS_MS, p, pf, (pf >> 8) & 1, det_st);
-                            }
-                        }
-
-                        uint32_t want = (flags | 1) & ~8u;
-                        if (flags != want) {
-                            if (card_tick % 300 == 0)
-                                fprintf(stderr,
-                                    "[%07lld] CARD: module 0x22 "
-                                    "flags=0x%08X → 0x%08X\n",
-                                    TS_MS, flags, want);
-                            cpu_physical_memory_write(data_pa, &want, 4);
-                        }
-
-                        for (int p = 0; p < 2; p++) {
-                            uint32_t pp_va =
-                                mod22_data_va + 8 + p * 0x12a0;
-                            uint32_t pp_pa = chihiro_va_to_pa(pp_va);
-                            if (pp_pa == 0xFFFFFFFF) continue;
-                            uint32_t pf;
-                            cpu_physical_memory_read(pp_pa, &pf, 4);
-                            if (!(pf & 1)) {
-                                pf |= 1;
-                                cpu_physical_memory_write(pp_pa, &pf, 4);
-                            }
-                        }
-                    }
-                }
-            }
-            /* CARD_IN is set via JVS sw1 |= 0x20 (PUSH5) in xemu-input.c.
-             * The game's remap function (FUN_00085550) produces bit 12 in
-             * the IO struct naturally — no timer-based forcing needed. */
-            /* TX ring buffer tap: read commands from game's TX buffer */
-            {
-                static uint16_t tx_tap_pos[2] = {0xFFFF, 0xFFFF};
-
-                for (int p = 0; p < 2; p++) {
-                    uint32_t rb_va = (p == 0) ? 0x4bf550 : 0x4bf584;
-                    uint32_t txbp_pa = chihiro_va_to_pa(rb_va + 0x14);
-                    uint32_t txcp_pa = chihiro_va_to_pa(rb_va + 0x18);
-                    uint32_t txwp_pa = chihiro_va_to_pa(rb_va + 0x1A);
-                    if (txbp_pa == 0xFFFFFFFF || txcp_pa == 0xFFFFFFFF ||
-                        txwp_pa == 0xFFFFFFFF)
-                        continue;
-
-                    uint32_t tx_buf_va;
-                    uint16_t tx_cap, tx_wp;
-                    cpu_physical_memory_read(txbp_pa, &tx_buf_va, 4);
-                    cpu_physical_memory_read(txcp_pa, &tx_cap, 2);
-                    cpu_physical_memory_read(txwp_pa, &tx_wp, 2);
-
-                    if (tx_cap == 0 || tx_buf_va == 0)
-                        continue;
-
-                    if (tx_tap_pos[p] == 0xFFFF)
-                        tx_tap_pos[p] = tx_wp;
-
-                    int fed = 0;
-                    while (tx_tap_pos[p] != tx_wp && fed < 64) {
-                        uint32_t bpa =
-                            chihiro_va_to_pa(tx_buf_va + tx_tap_pos[p]);
-                        if (bpa == 0xFFFFFFFF) break;
-                        uint8_t byte;
-                        cpu_physical_memory_read(bpa, &byte, 1);
-                        chihiro_card_tap_byte(p, byte);
-                        tx_tap_pos[p] = (tx_tap_pos[p] + 1) % tx_cap;
-                        fed++;
-                    }
-                }
-            }
-            /* RX ring buffer injection: deliver card reader responses */
-            {
-                for (int p = 0; p < 2; p++) {
-                    uint8_t ibuf[256];
-                    int ilen;
-                    if (!chihiro_get_card_inject(p, ibuf, &ilen))
-                        continue;
-
-                    uint32_t rb_va = (p == 0) ? 0x4bf550 : 0x4bf584;
-                    uint32_t bp_pa = chihiro_va_to_pa(rb_va + 0x20);
-                    uint32_t cp_pa = chihiro_va_to_pa(rb_va + 0x24);
-                    uint32_t wp_pa = chihiro_va_to_pa(rb_va + 0x26);
-                    if (bp_pa == 0xFFFFFFFF || cp_pa == 0xFFFFFFFF ||
-                        wp_pa == 0xFFFFFFFF)
-                        continue;
-
-                    uint32_t buf_va;
-                    uint16_t cap, wp;
-                    cpu_physical_memory_read(bp_pa, &buf_va, 4);
-                    cpu_physical_memory_read(cp_pa, &cap, 2);
-                    cpu_physical_memory_read(wp_pa, &wp, 2);
-
-                    if (cap == 0 || buf_va == 0)
-                        continue;
-
-                    for (int i = 0; i < ilen; i++) {
-                        uint32_t bpa = chihiro_va_to_pa(buf_va + wp);
-                        if (bpa != 0xFFFFFFFF)
-                            cpu_physical_memory_write(bpa, &ibuf[i], 1);
-                        wp = (wp + 1) % cap;
-                    }
-                    cpu_physical_memory_write(wp_pa, &wp, 2);
-                }
-            }
-            if ((card_tick % 312) == 0 && card_tick <= 3120) {
-                uint8_t ce = 0;
-                uint32_t sf = 0;
-                uint32_t ce_pa = chihiro_va_to_pa(0x447265);
-                uint32_t sf_pa = chihiro_va_to_pa(0x467fd0);
-                if (ce_pa != 0xFFFFFFFF)
-                    cpu_physical_memory_read(ce_pa, &ce, 1);
-                if (sf_pa != 0xFFFFFFFF)
-                    cpu_physical_memory_read(sf_pa, &sf, 4);
-                fprintf(stderr, "[CARD] t=%d ce=%d sf=%d\n",
-                        card_tick, ce, sf);
-            }
-        }
-
-        timer_mod(s->diag_timer,
-                  qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 16);
+        if (g_config.chihiro.card_reader.enable)
+            chihiro_card_reader_tick();
+        timer_mod(s->diag_timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 16);
         return;
     }
 
-
-    uint32_t state = 0, counter = 0, ready = 0, gate = 0, bootstate = 0;
-    uint32_t bootflag = 0, slotcount = 0, mainflag = 0;
-    uint8_t slotflag0 = 0;
-
-    /* RE-RESOLVE PAs every tick to detect page-table changes.
-     * If the game changes CR3 after initial resolution, stale PAs would read wrong data. */
+    /* Re-resolve PAs every tick: the game may change CR3, and stale PAs
+     * would read the wrong data. */
+    uint32_t state = 0, counter = 0, bootstate = 0;
     uint32_t state_pa     = chihiro_va_to_pa(0x87AFC);
     uint32_t counter_pa   = chihiro_va_to_pa(0x87AE8);
-    uint32_t ready_pa     = chihiro_va_to_pa(0x87AF8);
-    uint32_t gate_pa      = chihiro_va_to_pa(0x89C38);
     uint32_t bootstate_pa = chihiro_va_to_pa(0x89C48);
-    uint32_t bootflag_pa  = chihiro_va_to_pa(0x89C4C);  /* MbcomNegotiate flag (0x21 on success) */
-    uint32_t slotcount_pa = chihiro_va_to_pa(0x896A8);  /* Mbcom slot count */
-    uint32_t slotflag0_pa = chihiro_va_to_pa(0x896B4);  /* Slot[0].flag */
-    uint32_t mainflag_pa  = chihiro_va_to_pa(0x8A128);  /* MainUpdate [0x8A128] */
 
-    s->diag_state_pa   = state_pa;
-    s->diag_counter_pa = counter_pa;
-    s->diag_ready_pa   = ready_pa;
-    s->diag_gate_pa    = gate_pa;
-    s->diag_bootstate_pa = bootstate_pa;
-
-    if (state_pa != 0xFFFFFFFF) cpu_physical_memory_read(state_pa, &state, 4);
-    if (counter_pa != 0xFFFFFFFF) cpu_physical_memory_read(counter_pa, &counter, 4);
-    if (ready_pa != 0xFFFFFFFF) cpu_physical_memory_read(ready_pa, &ready, 4);
-    if (gate_pa != 0xFFFFFFFF) cpu_physical_memory_read(gate_pa, &gate, 4);
-    if (bootstate_pa != 0xFFFFFFFF) cpu_physical_memory_read(bootstate_pa, &bootstate, 4);
-    if (bootflag_pa != 0xFFFFFFFF) cpu_physical_memory_read(bootflag_pa, &bootflag, 4);
-    if (slotcount_pa != 0xFFFFFFFF) cpu_physical_memory_read(slotcount_pa, &slotcount, 4);
-    if (slotflag0_pa != 0xFFFFFFFF) cpu_physical_memory_read(slotflag0_pa, &slotflag0, 1);
-    if (mainflag_pa != 0xFFFFFFFF) cpu_physical_memory_read(mainflag_pa, &mainflag, 4);
-
-    /* SEGABOOT state change logger — always active (error detection) */
-    {
-        static uint32_t prev_state = 0;
-        if (state != prev_state && state_pa != 0xFFFFFFFF) {
-            const char *desc = "";
-            switch (state) {
-                case 0: desc = "INIT"; break;
-                case 1: desc = "CHECK_ERRORS"; break;
-                case 2: desc = "CAUTION (boot handshake)"; break;
-                case 3: desc = "CAUTION_WAIT"; break;
-                case 4: desc = "GAME_READY"; break;
-                case 5: desc = "GAME_RUNNING"; break;
-                case 6: desc = "ERROR_DISPLAY"; break;
-                case 7: desc = "SERVICE_MENU"; break;
-                case 8: desc = "GAME_TEST"; break;
-            }
-            fprintf(stderr, "[%07lld] SEGABOOT: state %u → %u (%s)\n",
-                    TS_MS, prev_state, state, desc);
-
-            /* If entering ERROR_DISPLAY, read error code from counter */
-            if (state == 6 && counter > 0 && counter <= 53) {
-                static const char *err_causes[] = {
-                    [1]  = "Hardware initialization failed",
-                    [2]  = "USB enumeration failed (QC/SC not found)",
-                    [3]  = "Main board serial invalid",
-                    [4]  = "Media board serial invalid",
-                    [5]  = "Region mismatch (EEPROM vs boot.id)",
-                    [6]  = "DIMM board communication failed",
-                    [11] = "JVS I/O board not connected",
-                    [14] = "Network board error (SC EEPROM version timeout)",
-                    [21] = "SYSTEM_TYPE check failed",
-                    [22] = "SADDR communication timeout (V850 not present)",
-                    [27] = "GetBootData returned NULL",
-                    [31] = "SYSTEM_TYPE is zero",
-                };
-                const char *cause = (counter < 54 && err_causes[counter])
-                                   ? err_causes[counter] : "unknown";
-                fprintf(stderr, "[%07lld] SEGABOOT: *** ERROR %02u — %s ***\n",
-                        TS_MS, counter, cause);
-            }
-            prev_state = state;
-        }
+    if (state_pa != 0xFFFFFFFF) {
+        cpu_physical_memory_read(state_pa, &state, 4);
+        if (counter_pa != 0xFFFFFFFF)
+            cpu_physical_memory_read(counter_pa, &counter, 4);
+        chihiro_segaboot_report_state(state, counter);
     }
 
+    if (bootstate_pa != 0xFFFFFFFF)
+        cpu_physical_memory_read(bootstate_pa, &bootstate, 4);
+
     /* Detect bootstate changes between ticks (guard against garbage VAs) */
-    if (bootstate != s->last_bootstate && bootstate < 100 && s->last_bootstate < 100) {
-        if (bootstate == 3) {
-            chihiro_boot3_reached = true;
-            /* Save game filename from boot.id (loaded by SEGABOOT at PA 0x4F000).
-             * boot.id structure: magic "BTID", "XBAM" at +0x20,
-             * gameExecutable at +0xA0 (e.g. "\hod3xb.xbe").
-             * Fallback: scan RAM for ".xbe" if boot.id not found. */
-            chihiro_game_filename[0] = 0;
-
-            /* Try boot.id first */
-            {
-                uint8_t btid[4];
-                cpu_physical_memory_read(0x4F000, btid, 4);
-                if (memcmp(btid, "BTID", 4) == 0) {
-                    uint8_t xbam[4];
-                    cpu_physical_memory_read(0x4F020, xbam, 4);
-                    if (memcmp(xbam, "XBAM", 4) == 0) {
-                        uint8_t game_exec[32] = {0};
-                        cpu_physical_memory_read(0x4F0A0, game_exec, 31);
-                        char *name = (char*)game_exec;
-                        while (*name == '\\' || *name == '/') name++;
-                        if (name[0] && strlen(name) < 60) {
-                            strncpy(chihiro_game_filename, name, 63);
-                            chihiro_game_filename[63] = 0;
-                        }
-                    }
-                }
-            }
-
-            /* Fallback: scan for .xbe in SEGABOOT data */
-            if (!chihiro_game_filename[0]) {
-                for (uint32_t pa = 0x50000; pa < 0x56000; pa++) {
-                    uint8_t buf[4];
-                    cpu_physical_memory_read(pa, buf, 4);
-                    if (memcmp(buf, ".xbe", 4) == 0 ||
-                        memcmp(buf, ".XBE", 4) == 0) {
-                        int start = 0;
-                        uint8_t fname[64];
-                        for (int back = 1; back <= 42; back++) {
-                            uint8_t c;
-                            cpu_physical_memory_read(pa - back, &c, 1);
-                            if (c < 0x20 || c >= 0x7F || c == '\\' ||
-                                c == '/' || c == ':') {
-                                start = back - 1;
-                                break;
-                            }
-                            start = back;
-                        }
-                        if (start > 0) {
-                            cpu_physical_memory_read(pa - start, fname, start + 4);
-                            fname[start + 4] = 0;
-                            int len = start + 4;
-                            if (len > 4 && len < 60) {
-                                memcpy(chihiro_game_filename, fname, len + 1);
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-
-            /* LLE: SEGABOOT calls XLaunchNewImageA which allocates LDP,
-             * marks it persistent, and fills launch data. Kernel's STICKY
-             * section preserves LaunchDataPage pointer across QuickReboot. */
-
-            if (chihiro_game_filename[0] && !chihiro_save_path[0]) {
-                if (chihiro_resolve_save_path()) {
-                    if (!chihiro_usb_save_load(chihiro_save_path)) {
-                        fprintf(stderr, "Chihiro: no save found at %s\n", chihiro_save_path);
-                    }
-                } else {
-                    fprintf(stderr, "Chihiro: save path resolve failed (dir='%s' file='%s')\n",
-                            chihiro_game_dir, chihiro_game_filename);
-                }
-            }
-        }
+    if (bootstate != s->last_bootstate && bootstate < 100 &&
+        s->last_bootstate < 100) {
+        if (bootstate == 3)
+            chihiro_on_boot3();
         s->last_bootstate = bootstate;
     }
 
-    /* Suppress unused-variable warnings for read-but-not-logged fields */
-    (void)ready; (void)gate; (void)bootflag; (void)slotcount; (void)slotflag0; (void)mainflag;
-
-    timer_mod(s->diag_timer,
-              qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 1000);
+    timer_mod(s->diag_timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 1000);
 }
 
 /*
