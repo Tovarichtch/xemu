@@ -141,8 +141,8 @@ typedef struct ChihiroLPCState {
     /* USB hotplug timers (simulates staggered AN2131 I2C firmware boot) */
     QEMUTimer *usb_hotplug_timer;     /* QC at T+1500ms */
     QEMUTimer *usb_hotplug_sc_timer;  /* SC at T+1700ms */
-    QEMUTimer *usb_poll_patch_timer;  /* Patch UsbPollQC/SC to return 0 */
-    bool usb_poll_patched;
+    QEMUTimer *diag_arm_timer;   /* arms the SEGABOOT diagnostic timer */
+    bool diag_armed;
 
     /* Diagnostic: periodic state machine dump */
     QEMUTimer *diag_timer;
@@ -153,9 +153,7 @@ typedef struct ChihiroLPCState {
     uint32_t diag_bootstate_pa;/* PA of MbcomBootSequence state [VA 0x89C48] */
 
     /* LPC port read counters for v136 instrumentation */
-    uint32_t lpc_40f0_reads;   /* MbcomNegotiate (state 1) — port 0x40F0 */
     uint32_t lpc_401e_reads;   /* MbcomCommand (state 2) — port 0x401E (firmware) */
-    uint32_t lpc_4084_reads;   /* MbcomCommand (state 2) — port 0x4084 (session) */
     uint32_t last_bootstate;   /* previous bootstate to detect changes */
     uint16_t lpc_scratch_4026;    /* Port 0x4026 read-write scratch register */
     uint8_t  mbcom_e0_status;     /* Port 0x40E0 status bits: bit0=data, bit2=cmd_complete */
@@ -286,12 +284,10 @@ void chihiro_on_ohci_bus_start(void)
             memset(chihiro_mbcom_command, 0, 32);
             memset(chihiro_mbcom_response, 0, 32);
             if (s) {
-                s->usb_poll_patched = false;
-                timer_mod(s->usb_poll_patch_timer,
+                s->diag_armed = false;
+                timer_mod(s->diag_arm_timer,
                           qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 50);
                 s->lpc_401e_reads = 0;
-                s->lpc_40f0_reads = 0;
-                s->lpc_4084_reads = 0;
                 s->lpc_scratch_4026 = 0;
                 s->mbcom_e0_status = 0;
                 s->mbcom_resp_ready = false;
@@ -576,10 +572,6 @@ static void chihiro_diag_timer_cb(void *opaque)
                             uint32_t pf;
                             cpu_physical_memory_read(pp_pa, &pf, 4);
                             if (!(pf & 1)) {
-                                fprintf(stderr,
-                                    "[%07lld] CARD: P%d bit0=0, "
-                                    "forcing (flags=0x%08X)\n",
-                                    TS_MS, p, pf);
                                 pf |= 1;
                                 cpu_physical_memory_write(pp_pa, &pf, 4);
                             }
@@ -660,8 +652,6 @@ static void chihiro_diag_timer_cb(void *opaque)
                         wp = (wp + 1) % cap;
                     }
                     cpu_physical_memory_write(wp_pa, &wp, 2);
-                    fprintf(stderr, "[CARD] P%d: cmd=0x%02X len=%d\n",
-                            p, ibuf[1], ilen);
                 }
             }
             if ((card_tick % 312) == 0 && card_tick <= 3120) {
@@ -998,14 +988,14 @@ static void chihiro_diag_timer_cb(void *opaque)
  * flags → all JVS communication failed. Fix: let SEGABOOT run unmodified,
  * USB devices in chihiro-usb.c handle enumeration via OHCI natively.
  */
-static void chihiro_usb_poll_patch_cb(void *opaque)
+static void chihiro_arm_diag_cb(void *opaque)
 {
     ChihiroLPCState *s = opaque;
-    if (s->usb_poll_patched) return;
+    if (s->diag_armed) return;
     if (chihiro_game_running) return;
 
-    /* No patches to apply — mark done and start diag timer */
-    s->usb_poll_patched = true;
+    /* SEGABOOT is up: arm the diagnostic timer */
+    s->diag_armed = true;
 
     /* Start diagnostic timer to monitor SEGABOOT state machine */
     s->diag_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, chihiro_diag_timer_cb, s);
@@ -1026,7 +1016,7 @@ void chihiro_on_quickreboot_signal(void)
     /* Ignore SCRATCH=0x04 during first kernel init — the kernel writes
      * SCRATCH as part of normal boot before SEGABOOT even loads.
      * Only react after SEGABOOT has been patched at least once. */
-    if (!chihiro_lpc_global || !chihiro_lpc_global->usb_poll_patched) {
+    if (!chihiro_lpc_global || !chihiro_lpc_global->diag_armed) {
         return;
     }
 
@@ -1066,12 +1056,10 @@ void chihiro_on_quickreboot_signal(void)
      * Kernel code stays patched (QuickReboot keeps kernel in RAM). */
     if (chihiro_lpc_global) {
         ChihiroLPCState *s = chihiro_lpc_global;
-        s->usb_poll_patched = false;
-        timer_mod(s->usb_poll_patch_timer,
+        s->diag_armed = false;
+        timer_mod(s->diag_arm_timer,
                   qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 50);
         s->lpc_401e_reads = 0;
-        s->lpc_40f0_reads = 0;
-        s->lpc_4084_reads = 0;
         s->lpc_scratch_4026 = 0;
         s->mbcom_e0_status = 0;
         s->mbcom_resp_ready = false;
@@ -1308,7 +1296,6 @@ static uint64_t chihiro_lpc_io_read(void *opaque, hwaddr addr,
         { static int f0_log = 0; if (lpc_log_verbose && f0_log < 500) { f0_log++;
             fprintf(stderr, "[%07lld] F0 READ → 0x%04X (type3=%d)\n",
                     TS_MS, (unsigned)r, chihiro_board_type3); } }
-        s->lpc_40f0_reads++;
         if (chihiro_quickreboot_pending) {
             chihiro_quickreboot_pending = false;
         }
@@ -1332,7 +1319,6 @@ static uint64_t chihiro_lpc_io_read(void *opaque, hwaddr addr,
     }
     case 0x84:  /* Port 0x4084 — MbcomCommand session handle */
         r = 0x0000;
-        s->lpc_4084_reads++;
         break;
     default: {
         static int unknown_port_log = 0;
@@ -1882,7 +1868,7 @@ static void chihiro_irq10_timer_cb(void *opaque)
 
     /* DMA META scan: provide mbcom slot responses to SEGABOOT */
     if (chihiro_mbcom_enabled && !chihiro_game_running
-        && chihiro_lpc_global && chihiro_lpc_global->usb_poll_patched) {
+        && chihiro_lpc_global && chihiro_lpc_global->diag_armed) {
         static const struct { uint32_t slot_va; uint32_t meta_va; uint32_t stride; }
             slot_layouts[] = {
                 { 0xAA7B0, 0xAA790, 0x60 },
@@ -2049,11 +2035,11 @@ static void chihiro_lpc_realize(DeviceState *dev, Error **errp)
                                             chihiro_usb_hotplug_sc_cb, s);
     /* Timer NOT armed yet — will be armed by chihiro_on_ohci_bus_start() */
 
-    /* UsbPollQC/SC patch — retry every 1ms until SEGABOOT is loaded */
-    s->usb_poll_patched = false;
-    s->usb_poll_patch_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL,
-                                            chihiro_usb_poll_patch_cb, s);
-    timer_mod(s->usb_poll_patch_timer,
+    /* Arm the diagnostic timer once SEGABOOT is loaded — retry every 1ms */
+    s->diag_armed = false;
+    s->diag_arm_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL,
+                                            chihiro_arm_diag_cb, s);
+    timer_mod(s->diag_arm_timer,
               qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 10);
 
     qemu_input_handler_register(dev, &chihiro_kbd_handler);

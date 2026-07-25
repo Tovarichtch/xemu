@@ -76,8 +76,6 @@ static void build_response(CardReaderState *s, uint8_t cmd)
         uint16_t block_count = (s->rx_buf[8] << 8) | s->rx_buf[9];
         uint32_t byte_offset = block_start * CARD_BLOCK_SIZE;
         uint32_t byte_count = block_count * CARD_BLOCK_SIZE;
-        fprintf(stderr, "[CARD] READ blk=%d+%d (off=0x%X len=%d)\n",
-                block_start, block_count, byte_offset, byte_count);
         if (byte_offset + byte_count <= CARD_TOTAL_SIZE &&
             byte_count + 6 < sizeof(s->tx_buf)) {
             payload_len = byte_count + 2;
@@ -224,23 +222,12 @@ void card_reader_tap_byte(CardReaderState *s, uint8_t byte)
     }
 
     if (s->rx_pos >= 5 && s->rx_pos == s->rx_expected) {
-        fprintf(stderr, "[CARD] RX cmd: ");
-        for (int i = 0; i < s->rx_pos && i < 16; i++)
-            fprintf(stderr, "%02X ", s->rx_buf[i]);
-        fprintf(stderr, "(%d bytes)\n", s->rx_pos);
-
         build_response(s, s->rx_buf[1]);
 
         if (s->tx_len > 0 && s->tx_len <= (int)sizeof(s->inject_buf)) {
             memcpy(s->inject_buf, s->tx_buf, s->tx_len);
             s->inject_len = s->tx_len;
             s->inject_pending = true;
-
-            fprintf(stderr, "[CARD] TX rsp: ");
-            for (int i = 0; i < s->tx_len && i < 16; i++)
-                fprintf(stderr, "%02X ", s->tx_buf[i]);
-            if (s->tx_len > 16) fprintf(stderr, "...");
-            fprintf(stderr, "(%d bytes)\n", s->tx_len);
         }
 
         s->rx_pos = 0;
