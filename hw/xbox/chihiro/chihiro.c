@@ -633,6 +633,10 @@ static void chihiro_segaboot_report_state(uint32_t state, uint32_t counter)
 {
     static uint32_t prev_state;
 
+    /* Before SEGABOOT initializes its state variable the VA reads garbage;
+     * only known states are meaningful (and give the stuck-point if any). */
+    if (state > 8)
+        return;
     if (state == prev_state)
         return;
 

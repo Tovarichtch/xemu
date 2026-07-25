@@ -29,34 +29,6 @@
 #include "debug.h"
 #include "renderer.h"
 
-/* Shader compilation instrumentation */
-static struct {
-    int compiled;
-    int from_cache;
-    int bind_calls;
-    double compile_ms;
-    int64_t last_report_ns;
-} shader_stats = {0};
-
-static void shader_stats_report(void)
-{
-    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
-    if (shader_stats.last_report_ns == 0) {
-        shader_stats.last_report_ns = now;
-    }
-    int64_t elapsed_ms = (now - shader_stats.last_report_ns) / 1000000;
-    if (elapsed_ms >= 2000 && (shader_stats.compiled > 0 || shader_stats.from_cache > 0)) {
-        fprintf(stderr, "SHADER-STATS: compiled=%d (%.1fms) cached=%d binds=%d\n",
-               shader_stats.compiled, shader_stats.compile_ms,
-               shader_stats.from_cache, shader_stats.bind_calls);
-        shader_stats.compiled = 0;
-        shader_stats.from_cache = 0;
-        shader_stats.bind_calls = 0;
-        shader_stats.compile_ms = 0;
-        shader_stats.last_report_ns = now;
-    }
-}
-
 static GLenum get_gl_primitive_mode(enum ShaderPolygonMode polygon_mode, enum ShaderPrimitiveMode primitive_mode)
 {
     switch (primitive_mode) {
@@ -219,7 +191,6 @@ static GLuint get_shader_module_for_key(PGRAPHGLState *r,
 
 static void generate_shaders(PGRAPHGLState *r, ShaderBinding *binding)
 {
-    int64_t t0 = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
     GLuint program = glCreateProgram();
 
     ShaderState *state = &binding->state;
@@ -267,11 +238,9 @@ static void generate_shaders(PGRAPHGLState *r, ShaderBinding *binding)
     set_texture_sampler_uniforms(binding);
 
     /* validate the program */
-    int64_t tv0 = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
     GLint valid = 0;
     glValidateProgram(program);
     glGetProgramiv(program, GL_VALIDATE_STATUS, &valid);
-    int64_t tv1 = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
     if (!valid) {
         GLchar log[1024];
         glGetProgramInfoLog(program, 1024, NULL, log);
@@ -280,18 +249,6 @@ static void generate_shaders(PGRAPHGLState *r, ShaderBinding *binding)
     }
 
     update_shader_uniform_locs(binding);
-
-    int64_t t1 = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
-    double validate_ms = (tv1 - tv0) / 1e6;
-    double total_ms = (t1 - t0) / 1e6;
-    shader_stats.compiled++;
-    shader_stats.compile_ms += total_ms;
-    if (total_ms > 5.0) {
-        fprintf(stderr, "SHADER-SLOW: compile=%.1fms (validate=%.1fms) geom=%d ff=%d\n",
-               total_ms, validate_ms,
-               pgraph_glsl_need_geom(&binding->state.geom),
-               binding->state.vsh.is_fixed_function);
-    }
 }
 
 static const char *shader_gl_vendor = NULL;
@@ -838,8 +795,6 @@ void pgraph_gl_bind_shaders(PGRAPHState *pg)
         if (g_config.perf.cache_shaders) {
             pgraph_gl_shader_cache_to_disk(binding);
         }
-    } else if (binding->initialized) {
-        shader_stats.from_cache++;
     }
     assert(binding->initialized);
     r->shader_binding = binding;
@@ -854,9 +809,6 @@ void pgraph_gl_bind_shaders(PGRAPHState *pg)
     }
 
     NV2A_GL_DGROUP_END();
-
-    shader_stats.bind_calls++;
-    shader_stats_report();
 
 update_uniforms:
     assert(r->shader_binding);
