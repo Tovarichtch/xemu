@@ -50,6 +50,9 @@
 #include "welcome.hh"
 #include "../xemu-input.h"
 #include "hw/xbox/chihiro/chihiro-jvs.h"
+
+/* chihiro.h itself is not C++-safe (it pulls in block-backend.h). */
+extern "C" int chihiro_detected_game_profile(void);
 #include "menubar.hh"
 #include "compat.hh"
 #if defined(_WIN32)
@@ -167,13 +170,19 @@ static void RenderLightGunOverlays(void)
 
     if (!g_config.chihiro.settings.show_crosshair)
         return;
+    /* Same profile the input layer uses: the running game wins over the
+     * configured one. */
+    int profile = chihiro_detected_game_profile();
+    if (profile < 0)
+        profile = g_config.chihiro.jvs.profile;
+    bool gun_game = profile == CONFIG_CHIHIRO_JVS_PROFILE_HOTD3 ||
+                    profile == CONFIG_CHIHIRO_JVS_PROFILE_VC3 ||
+                    profile == CONFIG_CHIHIRO_JVS_PROFILE_GS;
+
     /* JVS aiming reads the mouse directly, so a bound light gun device is not
-     * required — a gun game profile (or Light Gun Mode) is enough. */
+     * required — a gun game (or Light Gun Mode) is enough. */
     if (!xemu_input_lightgun_active() &&
-        !g_config.chihiro.settings.lightgun_mode &&
-        g_config.chihiro.jvs.profile != CONFIG_CHIHIRO_JVS_PROFILE_HOTD3 &&
-        g_config.chihiro.jvs.profile != CONFIG_CHIHIRO_JVS_PROFILE_VC3 &&
-        g_config.chihiro.jvs.profile != CONFIG_CHIHIRO_JVS_PROFILE_GS)
+        !g_config.chihiro.settings.lightgun_mode && !gun_game)
         return;
 
     LoadCrosshairTexture();
@@ -204,7 +213,9 @@ static void RenderLightGunOverlays(void)
                 1.0f - (ay + 32768.0f) / 65535.0f, i);
         drawn = true;
     }
-    if (drawn || !chihiro_jvs_global)
+    /* Only guns aim with analog[0..1]; on a driving game those are the wheel
+     * and the pedals. */
+    if (drawn || !gun_game || !chihiro_jvs_global)
         return;
 
     /* No light gun device bound: JVS aims with the mouse, so follow the very
