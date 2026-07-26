@@ -133,8 +133,7 @@ typedef struct ChihiroLPCState {
     uint8_t mbcom_write_buffer[32];
 
     /* Kernel-loaded detection timer (polls until 2BL decrypts kernel) */
-    QEMUTimer *kernel_ready_timer;
-    bool kernel_ready;
+    bool host_seen;   /* the guest has talked to us at least once */
     uint32_t lpc_reg_addr;        /* MediaBoard register address (set via port 0x4004) */
     uint32_t lpc_reg_data;        /* MediaBoard register data (read via port 0x4000) */
 
@@ -1155,6 +1154,7 @@ static uint64_t chihiro_lpc_io_read(void *opaque, hwaddr addr,
 
     ChihiroLPCState *s = CHIHIRO_LPC_DEVICE(opaque);
     s->last_lpc_activity_ms = TS_MS;
+    s->host_seen = true;
 
     if (chihiro_game_running) {
         static int game_lpc_read_log = 0;
@@ -1312,6 +1312,7 @@ static void chihiro_lpc_io_write(void *opaque, hwaddr addr, uint64_t val,
 {
     ChihiroLPCState *s = CHIHIRO_LPC_DEVICE(opaque);
     s->last_lpc_activity_ms = TS_MS;
+    s->host_seen = true;
 
     if (chihiro_game_running) {
         static int game_lpc_write_log = 0;
@@ -1774,8 +1775,10 @@ static void chihiro_dimm_resp_timer_cb(void *opaque)
 static void chihiro_irq10_timer_cb(void *opaque)
 {
     ChihiroLPCState *s = opaque;
-    /* IRQ10 for SEGABOOT baseboard communication */
-    if (s->kernel_ready && !chihiro_game_running) {
+    /* IRQ10 for SEGABOOT baseboard communication. The board only signals a
+     * host that is already talking to it — the first LPC access is that
+     * proof, and it is a bus event rather than a peek into guest memory. */
+    if (s->host_seen && !chihiro_game_running) {
         qemu_irq_raise(s->irq10);
     }
 
@@ -1920,44 +1923,6 @@ static void chihiro_irq10_timer_cb(void *opaque)
 }
 
 
-/*
- * Kernel-loaded detection.
- *
- * The Chihiro kernel is encrypted in the BIOS and gets decrypted by the
- * 2BL at runtime. We poll PA 0x3B744 for the expected JNZ opcode (0x75 0x22)
- * to detect when the kernel is in RAM and set the kernel_ready flag.
- *
- * This flag gates IRQ10 delivery — baseboard interrupts must not fire
- * before the kernel's interrupt handlers are installed.
- *
- * No RAM patches are applied. All former hacks are now handled by proper
- * emulation:
- *   - EEPROM: generated with debug key (XBOX_EEPROM_VERSION_D)
- *   - XBE digests: XCCalcDigest uses SHA1(size_le32 || data), FATX data matches
- *   - SEGABOOT: all checks pass via correct baseboard/USB emulation
- */
-
-static void chihiro_kernel_ready_cb(void *opaque)
-{
-    ChihiroLPCState *s = opaque;
-
-    if (!s->kernel_ready) {
-        /* WORKAROUND: poll for a known opcode pair at a fixed physical
-         * address to know the kernel is up. Host-side plumbing — the real
-         * baseboard just waits for the first LPC access. */
-        uint8_t check[2];
-        address_space_read(&address_space_memory, 0x3B744,
-                           MEMTXATTRS_UNSPECIFIED, check, 2);
-
-        if (check[0] == 0x75 && check[1] == 0x22) {
-            s->kernel_ready = true;
-            return;
-        }
-        timer_mod(s->kernel_ready_timer,
-                  qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 1);
-    }
-}
-
 static void chihiro_kbd_event(DeviceState *dev, QemuConsole *src,
                               InputEvent *evt)
 {
@@ -1996,14 +1961,6 @@ static void chihiro_lpc_realize(DeviceState *dev, Error **errp)
      * FUN_0014c580 skips ALL DMA buffer setup (return 5) and
      * the game can never send/receive mbcom via SADDR. */
     s->asic_cpu_ctrl = 1;
-
-    /* Detect when 2BL has decrypted the kernel into RAM.
-     * Gates IRQ10 delivery until kernel interrupt handlers are ready. */
-    s->kernel_ready = false;
-    s->kernel_ready_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL,
-                                         chihiro_kernel_ready_cb, s);
-    timer_mod(s->kernel_ready_timer,
-              qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 10);
 
     /* Initialize IRQ10 for baseboard communication */
     s->irq10 = isa_get_irq(isa, 10);
