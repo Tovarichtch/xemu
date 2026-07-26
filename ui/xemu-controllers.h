@@ -70,10 +70,13 @@ public:
 };
 
 struct ChihiroRebindingMap : public virtual RebindingMap {
-    int **m_scancode_map;
+    /* The binding itself, not a table to index: the row number counts every
+     * row on screen, which is not the position of the binding in its own
+     * group. */
+    int *m_scancode;
 
-    ChihiroRebindingMap(int table_row, int **scancode_map)
-        : RebindingMap(table_row), m_scancode_map(scancode_map)
+    ChihiroRebindingMap(int table_row, int *scancode)
+        : RebindingMap(table_row), m_scancode(scancode)
     {
     }
     RebindEventResult ConsumeRebindEvent(SDL_Event *event) override;

@@ -857,8 +857,7 @@ static const char *chihiro_binding_name(int value)
 }
 
 static void ChihiroRebindRow(const char *label, int *scancode,
-                              int row, std::unique_ptr<RebindingMap> &rebinding,
-                              int **map)
+                              int row, std::unique_ptr<RebindingMap> &rebinding)
 {
     ImGui::TableNextRow();
     ImGui::TableSetColumnIndex(0);
@@ -879,7 +878,7 @@ static void ChihiroRebindRow(const char *label, int *scancode,
     float min_w = ImGui::GetColumnWidth(1) / 2;
     float w = std::max(min_w, max_w);
     if (ImGui::Button(key_name, ImVec2(w, 0))) {
-        rebinding = std::make_unique<ChihiroRebindingMap>(row, map);
+        rebinding = std::make_unique<ChihiroRebindingMap>(row, scancode);
     }
     ImGui::PopID();
 }
@@ -980,7 +979,7 @@ void MainMenuChihiroView::Draw()
             };
             for (int i = 0; i < 2; i++)
                 ChihiroRebindRow(labels[i], map_hotd3[i],
-                                 row++, m_rebinding, map_hotd3);
+                                 row++, m_rebinding);
             break;
         }
         case CONFIG_CHIHIRO_JVS_PROFILE_VC3: {
@@ -990,7 +989,7 @@ void MainMenuChihiroView::Draw()
             };
             for (int i = 0; i < 3; i++)
                 ChihiroRebindRow(labels[i], map_vc3[i],
-                                 row++, m_rebinding, map_vc3);
+                                 row++, m_rebinding);
             break;
         }
         case CONFIG_CHIHIRO_JVS_PROFILE_GS: {
@@ -1000,7 +999,7 @@ void MainMenuChihiroView::Draw()
             };
             for (int i = 0; i < 3; i++)
                 ChihiroRebindRow(labels[i], map_gs[i],
-                                 row++, m_rebinding, map_gs);
+                                 row++, m_rebinding);
             break;
         }
         case CONFIG_CHIHIRO_JVS_PROFILE_CTX: {
@@ -1010,7 +1009,7 @@ void MainMenuChihiroView::Draw()
             };
             for (int i = 0; i < 7; i++)
                 ChihiroRebindRow(labels[i], map_ctx[i],
-                                 row++, m_rebinding, map_ctx);
+                                 row++, m_rebinding);
             break;
         }
         case CONFIG_CHIHIRO_JVS_PROFILE_OR2: {
@@ -1020,7 +1019,7 @@ void MainMenuChihiroView::Draw()
             };
             for (int i = 0; i < 7; i++)
                 ChihiroRebindRow(labels[i], map_or2[i],
-                                 row++, m_rebinding, map_or2);
+                                 row++, m_rebinding);
             break;
         }
         case CONFIG_CHIHIRO_JVS_PROFILE_OK: {
@@ -1031,7 +1030,7 @@ void MainMenuChihiroView::Draw()
             };
             for (int i = 0; i < 6; i++)
                 ChihiroRebindRow(labels[i], map_ok[i],
-                                 row++, m_rebinding, map_ok);
+                                 row++, m_rebinding);
             break;
         }
         }
@@ -1041,7 +1040,7 @@ void MainMenuChihiroView::Draw()
         };
         for (int i = 0; i < 4; i++)
             ChihiroRebindRow(universal_labels[i], map_uni[i],
-                             row++, m_rebinding, map_uni);
+                             row++, m_rebinding);
 
         ImGui::EndTable();
     }
