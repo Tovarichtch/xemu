@@ -430,14 +430,6 @@ void chihiro_card_set_ignore_usb(int player, bool val)
 }
 
 /*
- * Diagnostic: periodically dump CheckErrors state machine variables.
- * PAs are computed via x86 page table walk at patch time.
- *   VA [0x87AFC] = state (0-10)
- *   VA [0x87AE8] = counter
- *   VA [0x87AF8] = ready flag
- */
-
-/*
  * Card reader plumbing — WORKAROUND, not LLE.
  *
  * The game talks to the CRP-1231 over the baseboard serial link, but the
@@ -631,55 +623,178 @@ static void chihiro_card_reader_tick(void)
     chihiro_card_inject_rx_rings();
 }
 
-/* Report SEGABOOT state transitions, and decode the error code on entry
- * into ERROR_DISPLAY. */
-static void chihiro_segaboot_report_state(uint32_t state, uint32_t counter)
+/*
+ * SEGABOOT observation.
+ *
+ * SEGABOOT drives its boot screen from a C++ object (CLogo) that holds the
+ * boot state machine. Reading it tells us exactly where a boot stops and
+ * lets us print the very message the screen shows. This only reads: nothing
+ * here is written back into the guest.
+ *
+ * The baseboard flash holds one SEGABOOT build per megabyte and the board
+ * boots the second; the addresses below are read from that one. They are
+ * execution VAs: the build is an XBE with image base 0x10000 and a single
+ * section at 0x11000 whose raw offset is 0x1000, so VA = offset within its
+ * own megabyte + 0x10000. Other flash dumps carry other builds, which is why
+ * chihiro_segaboot_identify() says out loud which one is on board.
+ *
+ * The object is found by its vtable rather than by a fixed address, because
+ * operator new places it differently whenever the boot path changes. That is
+ * what quietly broke the previous probe.
+ */
+#define SEGABOOT_VERSION    "2.13.0"
+#define SEGABOOT_LOGO_VTABLE 0x0001F60C  /* CLogo vtable */
+#define SEGABOOT_LOGO_UPDATE 0x000259D0  /* its second entry, CLogo::Update */
+#define SEGABOOT_APP_VTABLE  0x0001F0C0  /* application object vtable */
+#define SEGABOOT_APP_LOGO    0x440       /* app field holding the CLogo pointer */
+
+/* Read guest virtual memory, walking page by page. */
+static bool sb_read_va(uint32_t va, void *buf, unsigned len)
 {
-    static uint32_t prev_state;
+    uint8_t *p = buf;
 
-    /* Before SEGABOOT initializes its state variable the VA reads garbage;
-     * only known states are meaningful (and give the stuck-point if any). */
-    if (state > 8)
-        return;
-    if (state == prev_state)
-        return;
-
-    const char *desc = "";
-    switch (state) {
-        case 0: desc = "INIT"; break;
-        case 1: desc = "CHECK_ERRORS"; break;
-        case 2: desc = "CAUTION (boot handshake)"; break;
-        case 3: desc = "CAUTION_WAIT"; break;
-        case 4: desc = "GAME_READY"; break;
-        case 5: desc = "GAME_RUNNING"; break;
-        case 6: desc = "ERROR_DISPLAY"; break;
-        case 7: desc = "SERVICE_MENU"; break;
-        case 8: desc = "GAME_TEST"; break;
+    while (len) {
+        uint32_t pa = chihiro_va_to_pa(va);
+        if (pa == 0xFFFFFFFF)
+            return false;
+        unsigned n = 0x1000 - (va & 0xFFF);
+        if (n > len)
+            n = len;
+        cpu_physical_memory_read(pa, p, n);
+        va += n;
+        p += n;
+        len -= n;
     }
-    CHIHIRO_LOGF(BOOT, "SEGABOOT: state %u → %u (%s)\n",
-                 prev_state, state, desc);
+    return true;
+}
 
-    if (state == 6 && counter > 0) {
-        static const char *err_causes[] = {
-            [1]  = "Hardware initialization failed",
-            [2]  = "USB enumeration failed (QC/SC not found)",
-            [3]  = "Main board serial invalid",
-            [4]  = "Media board serial invalid",
-            [5]  = "Region mismatch (EEPROM vs boot.id)",
-            [6]  = "DIMM board communication failed",
-            [11] = "JVS I/O board not connected",
-            [14] = "Network board error (SC EEPROM version timeout)",
-            [21] = "SYSTEM_TYPE check failed",
-            [22] = "SADDR communication timeout (V850 not present)",
-            [27] = "GetBootData returned NULL",
-            [31] = "SYSTEM_TYPE is zero",
-        };
-        const char *cause = (counter < ARRAY_SIZE(err_causes) &&
-                             err_causes[counter]) ? err_causes[counter]
-                                                  : "unknown";
-        CHIHIRO_ERRF("SEGABOOT: *** ERROR %02u — %s ***\n", counter, cause);
+/* True while SEGABOOT is the image mapped at the XBE load address. */
+static bool sb_resident(void)
+{
+    uint32_t update;
+
+    return sb_read_va(SEGABOOT_LOGO_VTABLE + 4, &update, 4) &&
+           update == SEGABOOT_LOGO_UPDATE;
+}
+
+/*
+ * Find the CLogo instance: a dword equal to its vtable, confirmed by walking
+ * to the application object and back through its CLogo field. Both hops must
+ * agree, so a stray copy of the constant cannot be mistaken for the object.
+ */
+static uint32_t sb_find_logo(void)
+{
+    /* SEGABOOT loads at 0x10000 and takes about a megabyte; its heap follows
+     * right after, so this window has room to spare. */
+    for (uint32_t va = 0x00010000; va < 0x00800000; va += 0x1000) {
+        uint32_t pa = chihiro_va_to_pa(va);
+        if (pa == 0xFFFFFFFF)
+            continue;
+
+        uint32_t page[1024];
+        cpu_physical_memory_read(pa, page, sizeof(page));
+
+        for (unsigned i = 0; i < ARRAY_SIZE(page); i++) {
+            if (page[i] != SEGABOOT_LOGO_VTABLE)
+                continue;
+
+            uint32_t obj = va + i * 4, app, app_vtable, back;
+            if (!sb_read_va(obj + 4, &app, 4) ||
+                !sb_read_va(app, &app_vtable, 4) ||
+                app_vtable != SEGABOOT_APP_VTABLE ||
+                !sb_read_va(app + SEGABOOT_APP_LOGO, &back, 4) || back != obj)
+                continue;
+
+            return obj;
+        }
     }
-    prev_state = state;
+    return 0;
+}
+
+/* The message SEGABOOT prints under the error number, taken from its own
+ * table at VA 0x1CEE0, which the code indexes directly. Codes absent from it
+ * all point at the same "Unknown error occurred." entry. */
+static const char *sb_error_message(uint32_t code)
+{
+    static const char *messages[] = {
+        [1]  = "This game is not acceptable by main board.",
+        [2]  = "Main board malfunctioning.",
+        [3]  = "Bad serial number on main board.",
+        [4]  = "Bad serial number on media board.",
+        [5]  = "This game is not acceptable by main board.",
+        [6]  = "This game is not available on this system.",
+        [11] = "JVS I/O board is not connected to main board.",
+        [12] = "JVS I/O board does not fulfill the game spec.",
+        [13] = "Communication error occurred between main board and JVS I/O board.",
+        [14] = "Network firmware version does not fulfill the game spec.",
+        [21] = "This game is not acceptable by main board.",
+        [22] = "Communication error occurred between main board and media board.",
+        [23] = "GD-ROM drive cover is open.",
+        [24] = "GD-ROM is not found.",
+        [25] = "Cannot access GD-ROM drive.",
+        [26] = "Media board malfunctioning.",
+        [27] = "DIMM memory is not enough.",
+        [31] = "This game is not acceptable by main board.",
+        [32] = "DIMM memory is not enough.",
+        [33] = "Gateway is not found.",
+        [34] = "Gateway cannot be found.",
+        [51] = "Wrong video output setting of horizontal scanning frequency.",
+        [52] = "Wrong video output setting of horizontal/vertical screen.",
+        [53] = "Wrong DIMM memory size setting.",
+    };
+
+    if (code < ARRAY_SIZE(messages) && messages[code])
+        return messages[code];
+    return "Unknown error occurred.";
+}
+
+/* Report SEGABOOT state transitions and the error it puts on screen. */
+static void chihiro_segaboot_poll(void)
+{
+    static const char *const states[] = {
+        "logo fade in", "init", "logo hold", "waiting for media board",
+        "verifying game", "fade out", "launching", "ERROR DISPLAY", "done"
+    };
+    static uint32_t logo_va, prev_state = UINT32_MAX, prev_error;
+    static unsigned attempts;
+
+    if (!sb_resident()) {
+        logo_va = 0;
+        attempts = 0;
+        return;
+    }
+    if (!logo_va) {
+        /* The object appears a couple of seconds after the image does; give
+         * up rather than sweep memory for a boot that will never show it. */
+        if (attempts++ > 100)
+            return;
+        logo_va = sb_find_logo();
+        if (!logo_va)
+            return;
+        CHIHIRO_LOGF(BOOT, "SEGABOOT: state machine at VA %#x\n", logo_va);
+        prev_state = UINT32_MAX;
+        prev_error = 0;
+    }
+
+    uint32_t f[2];  /* CLogo +0x10: error code then state */
+    if (!sb_read_va(logo_va + 0x10, f, sizeof(f))) {
+        logo_va = 0;
+        return;
+    }
+    uint32_t error = f[0], state = f[1];
+
+    if (state != prev_state && state < ARRAY_SIZE(states)) {
+        CHIHIRO_LOGF(BOOT, "SEGABOOT: state %u — %s\n", state, states[state]);
+        prev_state = state;
+    }
+    if (error && error != prev_error) {
+        /* SEGABOOT itself titles codes below 50 "Error" and the rest
+         * "Caution" (FUN_0002E590). */
+        CHIHIRO_ERRF("SEGABOOT: *** %s %02u — %s ***\n",
+                     error < 50 ? "Error" : "Caution", error,
+                     sb_error_message(error));
+        prev_error = error;
+    }
 }
 
 /*
@@ -777,19 +892,12 @@ static void chihiro_diag_timer_cb(void *opaque)
         return;
     }
 
+    chihiro_segaboot_poll();
+
     /* Re-resolve PAs every tick: the game may change CR3, and stale PAs
      * would read the wrong data. */
-    uint32_t state = 0, counter = 0, bootstate = 0;
-    uint32_t state_pa     = chihiro_va_to_pa(0x87AFC);
-    uint32_t counter_pa   = chihiro_va_to_pa(0x87AE8);
+    uint32_t bootstate = 0;
     uint32_t bootstate_pa = chihiro_va_to_pa(0x89C48);
-
-    if (state_pa != 0xFFFFFFFF) {
-        cpu_physical_memory_read(state_pa, &state, 4);
-        if (counter_pa != 0xFFFFFFFF)
-            cpu_physical_memory_read(counter_pa, &counter, 4);
-        chihiro_segaboot_report_state(state, counter);
-    }
 
     if (bootstate_pa != 0xFFFFFFFF)
         cpu_physical_memory_read(bootstate_pa, &bootstate, 4);
@@ -802,7 +910,9 @@ static void chihiro_diag_timer_cb(void *opaque)
         s->last_bootstate = bootstate;
     }
 
-    timer_mod(s->diag_timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 1000);
+    /* SEGABOOT runs for about eight seconds; poll fast enough to see each
+     * state it goes through. */
+    timer_mod(s->diag_timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 100);
 }
 
 /*
@@ -816,15 +926,12 @@ static void chihiro_diag_timer_cb(void *opaque)
  *   5. InitMbcom()           → initializes mediaboard DMA communication
  *   6. return 0              → SUCCESS
  *
- * CheckErrors state machine (VA 0x87AFC):
- *   0=INIT, 1=CHECK_ERRORS, 2=CAUTION (boot handshake), 3=CAUTION_WAIT,
- *   4=GAME_READY, 5=GAME_RUNNING, 6=ERROR_DISPLAY, 7=SERVICE_MENU, 8=GAME_TEST
- *
- * Error codes set in counter (VA 0x87AE8) when state=6:
- *   02=USB enum fail, 03=main serial bad, 04=media serial bad, 05=region mismatch,
- *   06=DIMM comm fail, 11=JVS not connected, 14=SC EEPROM version timeout,
- *   21=SYSTEM_TYPE fail, 22=SADDR timeout (no V850), 27=GetBootData NULL,
- *   31=SYSTEM_TYPE zero
+ * Boot state machine (CLogo::Update at VA 0x2EC00, decompiled):
+ *   0 logo fade in → 1 init → 2 logo hold → 3 wait for the media board
+ *   → 4 verify the game → 5 fade out → 6 launch → 8 done.
+ *   Any error jumps to 7, which is the screen that shows the code.
+ *   State 3 gives up after 0x95F ticks with error 22; state 4 runs the
+ *   serial, region and boot.id checks. See chihiro_segaboot_poll().
  *
  * Serial format: "%%%@-##@########" (e.g. "BEER-01A00000001")
  *   Main serial from ic10 EEPROM [0x1F10], media serial from mbcom CMD 0x0103.
@@ -2230,11 +2337,37 @@ void chihiro_ide_interface_init(void)
     fflush(stdout);
 }
 
+/*
+ * Name the SEGABOOT the board is about to run. It sits in the second half of
+ * the flash, the first holding an older build that is never booted. Dumps
+ * differ, and the boot indicator only knows the addresses of one build, so
+ * say plainly when this dump carries another one.
+ */
+static void chihiro_segaboot_identify(void)
+{
+    if (chihiro_flash_rom_size < 0x200000)
+        return;
+
+    const uint8_t *half = chihiro_flash_rom + 0x100000;
+    const char *tag = "SegaBoot Ver.";
+    const uint8_t *p = memmem(half, 0x100000, tag, strlen(tag));
+    if (!p) {
+        printf("Chihiro: no SEGABOOT in this flash dump\n");
+        return;
+    }
+
+    const char *version = (const char *)p + strlen(tag);
+    printf("Chihiro: SEGABOOT Ver.%.6s%s\n", version,
+           strncmp(version, SEGABOOT_VERSION, strlen(SEGABOOT_VERSION))
+               ? " — boot state reporting unavailable for this build" : "");
+}
+
 void chihiro_ide_load_rom(void)
 {
     if (!chihiro_flash_rom) return;
     printf("Chihiro: flash ROM (%u bytes) ready for IDE hook\n",
            chihiro_flash_rom_size);
+    chihiro_segaboot_identify();
 }
 
 uint8_t *chihiro_fatx_get_buffer(uint32_t *out_size)
