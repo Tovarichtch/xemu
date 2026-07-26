@@ -144,12 +144,37 @@ static void RenderSindenBorder(float vx, float vy, float vw, float vh,
     dl->AddRectFilled(ImVec2(bx + bw - t, by + t), ImVec2(bx + bw, by + bh - t), white);
 }
 
+/*
+ * Whether a light gun game is on screen right now. Everything light gun
+ * hangs off this: a crosshair, a Sinden border or a hidden pointer on a
+ * driving or skating game is always wrong, and so is any of it outside
+ * Chihiro mode. The running game wins over the configured profile.
+ */
+static bool ChihiroGunGame(void)
+{
+    if ((int)g_config.sys.mem_limit < 1)
+        return false;
+
+    int profile = chihiro_detected_game_profile();
+    if (profile < 0)
+        profile = g_config.chihiro.jvs.profile;
+
+    return profile == CONFIG_CHIHIRO_JVS_PROFILE_HOTD3 ||
+           profile == CONFIG_CHIHIRO_JVS_PROFILE_VC3 ||
+           profile == CONFIG_CHIHIRO_JVS_PROFILE_GS;
+}
+
 static void RenderLightGunOverlays(void)
 {
-    if (g_config.chihiro.settings.lightgun_mode)
+    bool gun_game = ChihiroGunGame();
+
+    if (gun_game && g_config.chihiro.settings.lightgun_mode)
         SDL_HideCursor();
     else
         SDL_ShowCursor();
+
+    if (!gun_game)
+        return;
 
     if (viewport_coords[2] <= 0 || viewport_coords[3] <= 0)
         return;
@@ -168,18 +193,6 @@ static void RenderLightGunOverlays(void)
     RenderSindenBorder(vx, vy, vw, vh, winW, winH);
 
     if (!g_config.chihiro.settings.show_crosshair)
-        return;
-
-    /* A crosshair on a driving or skating game is always wrong, whatever is
-     * plugged in: the game must be a light gun game, no exception. Use the
-     * same profile as the input layer — the running game wins over the
-     * configured one. */
-    int profile = chihiro_detected_game_profile();
-    if (profile < 0)
-        profile = g_config.chihiro.jvs.profile;
-    if (profile != CONFIG_CHIHIRO_JVS_PROFILE_HOTD3 &&
-        profile != CONFIG_CHIHIRO_JVS_PROFILE_VC3 &&
-        profile != CONFIG_CHIHIRO_JVS_PROFILE_GS)
         return;
 
     LoadCrosshairTexture();
@@ -390,7 +403,8 @@ void xemu_hud_update(void)
         const uint32_t timeout = 5000;
         const float fade_duration = 1000.0;
         bool menu_wakeup = g_input_mgr.MouseMoved() &&
-                           !g_config.chihiro.settings.lightgun_mode;
+                           !(ChihiroGunGame() &&
+                             g_config.chihiro.settings.lightgun_mode);
         if (menu_wakeup) {
             last_check = now;
         }
