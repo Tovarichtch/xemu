@@ -36,6 +36,7 @@
 
 #include "system/blockdev.h"
 #include "hw/xbox/chihiro/chihiro-jvs.h"
+#include "hw/xbox/chihiro/chihiro-driveboard.h"
 #include "hw/xbox/chihiro/chihiro.h"
 
 extern SDL_Window *m_window;
@@ -649,6 +650,64 @@ static bool chihiro_check_input(int binding, const bool *kbd, uint32_t mouseBtn)
     return (binding > 0 && kbd[binding]);
 }
 
+/*
+ * Player 2 switches. Only the light gun games have a second player; the
+ * driving and skating cabinets have a single set of controls. Aiming for P2
+ * would need a second pointing device, so only the buttons and CARD_IN are
+ * wired here.
+ */
+static void chihiro_update_jvs_p2(ChihiroJVSState *jvs, const bool *kbd,
+                                  uint32_t mouseBtn, int profile)
+{
+    uint8_t sw0 = 0, sw1 = 0;
+    int tkey = 0, bkey = 0, xkey = 0;
+
+    switch (profile) {
+    case CONFIG_CHIHIRO_JVS_PROFILE_HOTD3:
+        tkey = g_config.chihiro.jvs_p2.hotd3_trigger;
+        bkey = g_config.chihiro.jvs_p2.hotd3_body_button;
+        break;
+    case CONFIG_CHIHIRO_JVS_PROFILE_VC3:
+        tkey = g_config.chihiro.jvs_p2.vc3_trigger;
+        bkey = g_config.chihiro.jvs_p2.vc3_body_button;
+        xkey = g_config.chihiro.jvs_p2.vc3_pedal;
+        break;
+    case CONFIG_CHIHIRO_JVS_PROFILE_GS:
+        tkey = g_config.chihiro.jvs_p2.gs_trigger;
+        bkey = g_config.chihiro.jvs_p2.gs_body_button;
+        xkey = g_config.chihiro.jvs_p2.gs_change;
+        break;
+    default:
+        jvs->player_switches[1][0] = 0;
+        jvs->player_switches[1][1] = 0;
+        return;
+    }
+
+    if (chihiro_check_input(tkey, kbd, mouseBtn)) sw0 |= 0x02;
+    if (chihiro_check_input(bkey, kbd, mouseBtn)) sw1 |= 0x80;
+    if (chihiro_check_input(xkey, kbd, mouseBtn)) sw1 |= 0x40;
+
+    if (chihiro_check_input(g_config.chihiro.jvs_p2.start, kbd, mouseBtn))
+        sw0 |= 0x80;
+    if (chihiro_check_input(g_config.chihiro.jvs_p2.service, kbd, mouseBtn))
+        sw0 |= 0x40;
+
+    /* The second reader reports its card the same way the first one does. */
+    if (profile == CONFIG_CHIHIRO_JVS_PROFILE_GS &&
+        g_config.chihiro.card_reader.enable)
+        sw1 |= 0x20;
+
+    jvs->player_switches[1][0] = sw0;
+    jvs->player_switches[1][1] = sw1;
+
+    static bool coin_prev;
+    bool coin_key = chihiro_check_input(g_config.chihiro.jvs_p2.coin, kbd,
+                                        mouseBtn);
+    if (coin_key && !coin_prev)
+        jvs->coin_count[1]++;
+    coin_prev = coin_key;
+}
+
 static void xemu_input_update_jvs(void)
 {
     if (!chihiro_jvs_global) return;
@@ -820,6 +879,8 @@ static void xemu_input_update_jvs(void)
     jvs->player_switches[0][0] = sw0;
     jvs->player_switches[0][1] = sw1;
 
+    chihiro_update_jvs_p2(jvs, kbd, mouseBtn, profile);
+
     jvs->system_switches = chihiro_check_input(g_config.chihiro.jvs.test, kbd, mouseBtn) ? 0x80 : 0x00;
 
     static bool coin_prev;
@@ -839,6 +900,15 @@ void xemu_input_update_controllers(void)
         xemu_input_update_rumble(iter);
     }
     xemu_input_update_jvs();
+
+    if (chihiro_driveboard_global) {
+        ControllerState *p1 = bound_controllers[0];
+        if (p1 && p1->type == INPUT_DEVICE_SDL_GAMEPAD) {
+            uint16_t r = driveboard_get_rumble(chihiro_driveboard_global);
+            p1->gp.rumble_l = r;
+            p1->gp.rumble_r = r;
+        }
+    }
 }
 
 void xemu_input_update_sdl_kbd_controller_state(ControllerState *state)
