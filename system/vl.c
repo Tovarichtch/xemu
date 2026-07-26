@@ -3114,7 +3114,12 @@ void qemu_init(int argc, char **argv)
     char *escaped_dvd_path = strdup_double_commas(dvd_path);
     const char *dvd_media = "cdrom";
     const char *format_suffix = "";
-    if (mem > 64 && strlen(dvd_path) > 4) {
+    if (mem > 64 && dvd_path[0] == '\0') {
+        /* Chihiro without an image: the IDE slave is already registered by
+         * chihiro_ide_interface_init(); a second -drive at index=1 collides. */
+        free(escaped_dvd_path);
+        escaped_dvd_path = NULL;
+    } else if (mem > 64 && strlen(dvd_path) > 4) {
         const char *ext = dvd_path + strlen(dvd_path) - 4;
         if (g_ascii_strcasecmp(ext, ".iso") != 0) {
             dvd_media = "disk";

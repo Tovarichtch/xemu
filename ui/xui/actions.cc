@@ -27,6 +27,11 @@
 
 void ActionEjectDisc(void)
 {
+    /* Chihiro has no tray: ejecting would only wipe the configured image. */
+    if ((int)g_config.sys.mem_limit >= 1) {
+        return;
+    }
+
     Error *err = NULL;
     xemu_eject_disc(&err);
     if (err) {
@@ -64,13 +69,13 @@ void ActionLoadDiscFile(const char *file_path)
 {
     Error *err = NULL;
 
-    /* A Chihiro netboot image is mapped into the baseboard at machine init,
-     * not swapped in like a disc: record it and let the user reset. */
+    /* A Chihiro netboot image is mapped into the baseboard when the machine
+     * is created, so it only takes effect on the next launch. */
     if ((int)g_config.sys.mem_limit >= 1 &&
         std::filesystem::path(file_path).extension() == ".bin") {
         xemu_settings_set_string(&g_config.sys.files.dvd_path, file_path);
         remember_games_dir(file_path);
-        xemu_queue_notification("Chihiro image selected. Reset to boot it.");
+        xemu_queue_notification("Chihiro image selected. Restart xemu to boot it.");
         return;
     }
 
