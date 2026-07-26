@@ -1179,26 +1179,30 @@ void xemu_input_bind(int index, ControllerState *state, int save)
 
     // Unbind existing controller
     if (bound_controllers[index]) {
-        assert(bound_controllers[index]->device != NULL);
-        Error *err = NULL;
+        // A Chihiro pad is bound without a USB device of its own, so there is
+        // nothing to unplug: its input reaches the game through JVS.
+        if (bound_controllers[index]->device) {
+            Error *err = NULL;
 
-        // Unbind any XMUs
-        for (int i = 0; i < 2; i++) {
-            if (bound_controllers[index]->peripherals[i]) {
-                // If this was an XMU, unbind the XMU
-                if (bound_controllers[index]->peripheral_types[i] ==
-                    PERIPHERAL_XMU)
-                    xemu_input_unbind_xmu(index, i);
+            // Unbind any XMUs
+            for (int i = 0; i < 2; i++) {
+                if (bound_controllers[index]->peripherals[i]) {
+                    // If this was an XMU, unbind the XMU
+                    if (bound_controllers[index]->peripheral_types[i] ==
+                        PERIPHERAL_XMU)
+                        xemu_input_unbind_xmu(index, i);
 
-                // Free up the XmuState and set the peripheral type to none
-                g_free(bound_controllers[index]->peripherals[i]);
-                bound_controllers[index]->peripherals[i] = NULL;
-                bound_controllers[index]->peripheral_types[i] = PERIPHERAL_NONE;
+                    // Free up the XmuState and set the peripheral type to none
+                    g_free(bound_controllers[index]->peripherals[i]);
+                    bound_controllers[index]->peripherals[i] = NULL;
+                    bound_controllers[index]->peripheral_types[i] =
+                        PERIPHERAL_NONE;
+                }
             }
-        }
 
-        qdev_unplug((DeviceState *)bound_controllers[index]->device, &err);
-        assert(err == NULL);
+            qdev_unplug((DeviceState *)bound_controllers[index]->device, &err);
+            assert(err == NULL);
+        }
 
         bound_controllers[index]->bound = -1;
         bound_controllers[index]->device = NULL;
