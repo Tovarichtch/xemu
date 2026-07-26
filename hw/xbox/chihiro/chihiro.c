@@ -63,8 +63,11 @@
  *   0xF4: DIMM size (0=128M, 1=256M, 2=512M, 3=1024M)
  *
  * SEGABOOT checks "XBAM" at 0x4022-0x4024 and uses 0x401E/0x4020 for DIMM
- * base address. Game XBE checks "XBAM" at 0x401E/0x4020 instead. Values are
- * switched after QuickReboot via chihiro_game_running flag.
+ * base address. Game XBE checks "XBAM" at 0x401E/0x4020 instead.
+ *
+ * WORKAROUND: the two readers are told apart by counting reads of 0x401E
+ * (first read answers the DIMM base, later ones answer "XBAM") rather than by
+ * anything the hardware exposes. Real hardware has no such counter.
  */
 
 #define SEGA_FIRMWARE_VERSION               0x1E
@@ -152,7 +155,8 @@ typedef struct ChihiroLPCState {
     uint32_t lpc_401e_reads;   /* MbcomCommand (state 2) — port 0x401E (firmware) */
     uint32_t last_bootstate;   /* previous bootstate to detect changes */
     uint16_t lpc_scratch_4026;    /* Port 0x4026 read-write scratch register */
-    uint8_t  mbcom_e0_status;     /* Port 0x40E0 status bits: bit0=data, bit2=cmd_complete */
+    uint8_t  mbcom_e0_status;     /* Port 0x40E0 interrupt source: bit0=ASIC (0x29),
+                                   * bit2=Ether/NetDIMM (0xA9) — per acLib */
     bool     mbcom_resp_ready;    /* Game-mode: response pending → port 0x40F0 returns 0x0100 */
 
     /* Baseboard DMA register state (indirect access via 0x4004/0x4000) */
@@ -1175,7 +1179,9 @@ static uint64_t chihiro_lpc_io_read(void *opaque, hwaddr addr,
             break;
         case 0x80000160: r = 0x00; break; /* bit0=0 → Ethernet present */
         case 0x80000164: r = 0x01; break;
-        case 0xA0001E60: r = 0x00000002; break; /* V850 firmware state: 2 = CRC OK / ready */
+        /* DMA control register (acLib indexes the table {0,1,2,4,8,0x10,0x20});
+         * the game writes 8 here. We answer a constant instead of latching. */
+        case 0xA0001E60: r = 0x00000002; break;
         case 0xA0000000: {
             /* Indirect read: return value at address in bb_reg_addr (0xA0000020) */
             uint32_t target = s->bb_reg_addr;
@@ -1200,10 +1206,10 @@ static uint64_t chihiro_lpc_io_read(void *opaque, hwaddr addr,
                 uint32_t idx = (target - 0x84000000) / 4;
                 r = s->dimm_resp[idx];
             } else if (target == 0xA0001E60) {
-                r = 0x00000002; /* V850 firmware state: 2 = CRC OK / ready */
+                r = 0x00000002; /* DMA control register — see above */
                 static int a1e60_log = 0;
                 if (lpc_log_verbose && a1e60_log < 20) { a1e60_log++;
-                    fprintf(stderr, "[%07lld] SADDR READ 0xA0001E60 → 0x%08X (fw state)\n", TS_MS, (unsigned)r); }
+                    fprintf(stderr, "[%07lld] SADDR READ 0xA0001E60 → 0x%08X (DMA ctrl)\n", TS_MS, (unsigned)r); }
             } else {
                 static int unknown_saddr_log = 0;
                 if (lpc_log_verbose && unknown_saddr_log < 200) {
@@ -1282,7 +1288,7 @@ static uint64_t chihiro_lpc_io_read(void *opaque, hwaddr addr,
                     TS_MS, (unsigned)r, (int)(r & 1), (int)((r >> 2) & 1)); }
         break;
     }
-    case 0x84:  /* Port 0x4084 — MbcomCommand session handle */
+    case 0x84:  /* Port 0x4084 — baseboard status word (acLib names it Status) */
         r = 0x0000;
         break;
     default: {
@@ -1775,7 +1781,10 @@ static void chihiro_irq10_timer_cb(void *opaque)
 
     /* Game XBE detection: entry point change signals game loaded.
      * Arm after entry is stable for 50 ticks (800ms) — avoids false
-     * positive on kernel→SEGABOOT transition during first boot. */
+     * positive on kernel→SEGABOOT transition during first boot.
+     *
+     * WORKAROUND: watching guest RAM from the host. The baseboard cannot see
+     * which XBE runs; the real one is told by the mbcom traffic itself. */
     if (!chihiro_game_running && chihiro_active) {
         static uint32_t segaboot_entry = 0;
         static int stable_count = 0;
@@ -1933,6 +1942,9 @@ static void chihiro_kernel_ready_cb(void *opaque)
     ChihiroLPCState *s = opaque;
 
     if (!s->kernel_ready) {
+        /* WORKAROUND: poll for a known opcode pair at a fixed physical
+         * address to know the kernel is up. Host-side plumbing — the real
+         * baseboard just waits for the first LPC access. */
         uint8_t check[2];
         address_space_read(&address_space_memory, 0x3B744,
                            MEMTXATTRS_UNSPECIFIED, check, 2);
