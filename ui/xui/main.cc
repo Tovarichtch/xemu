@@ -50,9 +50,6 @@
 #include "welcome.hh"
 #include "../xemu-input.h"
 #include "hw/xbox/chihiro/chihiro-jvs.h"
-
-/* chihiro.h itself is not C++-safe (it pulls in block-backend.h). */
-extern "C" int chihiro_detected_game_profile(void);
 #include "menubar.hh"
 #include "compat.hh"
 #if defined(_WIN32)
@@ -68,6 +65,8 @@ float g_main_menu_height;
 
 extern "C" {
 extern int viewport_coords[4];
+/* chihiro.h itself is not C++-safe (it pulls in block-backend.h). */
+int chihiro_detected_game_profile(void);
 }
 
 static ImGuiStyle g_base_style;
