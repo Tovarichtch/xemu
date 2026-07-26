@@ -39,31 +39,48 @@ void ActionLoadDisc(void)
 {
     static const SDL_DialogFileFilter filters[] = {
         { "Disc Image Files (*.iso, *.xiso)", "iso;xiso" },
+        { "Chihiro Netboot Image (*.bin)", "bin" },
         { "All Files", "*" }
     };
     const char *default_path = g_config.sys.files.dvd_path;
     if (!default_path || !default_path[0]) {
         default_path = g_config.general.games_dir;
     }
-    ShowOpenFileDialog(filters, 2, default_path, [](const char *path) {
+    ShowOpenFileDialog(filters, 3, default_path, [](const char *path) {
         ActionLoadDiscFile(path);
     });
+}
+
+static void remember_games_dir(const char *file_path)
+{
+    const char *games_dir = g_config.general.games_dir;
+    if (!games_dir || !games_dir[0]) {
+        std::string dir = std::filesystem::path(file_path).parent_path().string();
+        xemu_settings_set_string(&g_config.general.games_dir, dir.c_str());
+    }
 }
 
 void ActionLoadDiscFile(const char *file_path)
 {
     Error *err = NULL;
+
+    /* A Chihiro netboot image is mapped into the baseboard at machine init,
+     * not swapped in like a disc: record it and let the user reset. */
+    if ((int)g_config.sys.mem_limit >= 1 &&
+        std::filesystem::path(file_path).extension() == ".bin") {
+        xemu_settings_set_string(&g_config.sys.files.dvd_path, file_path);
+        remember_games_dir(file_path);
+        xemu_queue_notification("Chihiro image selected. Reset to boot it.");
+        return;
+    }
+
     xemu_load_disc(file_path, &err);
 
     if (err) {
         xemu_queue_error_message(error_get_pretty(err));
         error_free(err);
     } else {
-        const char *games_dir = g_config.general.games_dir;
-        if (!games_dir || !games_dir[0]) {
-            std::string dir = std::filesystem::path(file_path).parent_path().string();
-            xemu_settings_set_string(&g_config.general.games_dir, dir.c_str());
-        }
+        remember_games_dir(file_path);
     }
 }
 
