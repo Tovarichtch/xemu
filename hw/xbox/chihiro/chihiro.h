@@ -43,6 +43,7 @@ int chihiro_detected_game_profile(void);
 
 /* Called from OHCI when bus starts */
 void chihiro_on_ohci_bus_start(void);
+void chihiro_on_ohci_bus_stop(void);
 uint32_t chihiro_va_to_pa(uint32_t va);
 extern uint32_t chihiro_usb_sm_pa;
 

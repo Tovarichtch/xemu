@@ -1315,6 +1315,9 @@ void ohci_bus_stop(OHCIState *ohci)
 {
     printf("[%07lld] OHCI BUS STOP\n", TS_MS);
     trace_usb_ohci_stop(ohci->name);
+
+    chihiro_on_ohci_bus_stop();
+
     timer_del(ohci->eof_timer);
 }
 

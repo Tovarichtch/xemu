@@ -254,9 +254,12 @@ static USBDevice *chihiro_usb_sc = NULL;
  * sees fresh CSC=1 events (not stale ones cleared during OHCI init).
  */
 static int ohci_bus_start_count = 0;
+static bool ohci_bus_running;
 
 void chihiro_on_ohci_bus_start(void)
 {
+    ohci_bus_running = true;
+
     if (!chihiro_active) {
         return;
     }
@@ -326,6 +329,30 @@ void chihiro_on_ohci_bus_start(void)
 
     /* Schedule SC hotplug at BUS_START + 100ms */
     timer_mod(s->usb_hotplug_sc_timer, now + 100);
+}
+
+/*
+ * The host controller was stopped after having been running: SEGABOOT has
+ * torn the bus down to hand the machine over to the game. The baseboard sees
+ * the same thing on real hardware, so this replaces watching the guest's XBE
+ * header for an entry point that changes.
+ */
+void chihiro_on_ohci_bus_stop(void)
+{
+    bool was_running = ohci_bus_running;
+    ohci_bus_running = false;
+
+    ChihiroLPCState *s = chihiro_lpc_global;
+    if (!was_running || !chihiro_active || chihiro_game_running || !s) {
+        return;
+    }
+
+    chihiro_game_running = true;
+    game_mode_bus_starts = 0;
+    memset(chihiro_mbcom_command, 0, 32);
+    s->mbcom_resp_ready = false;
+    s->mbcom_e0_status = 0;
+    CHIHIRO_LOGF(BOOT, "game started (bus stopped by SEGABOOT)\n");
 }
 
 
@@ -1887,52 +1914,6 @@ static void chihiro_irq10_timer_cb(void *opaque)
      * proof, and it is a bus event rather than a peek into guest memory. */
     if (s->host_seen && !chihiro_game_running) {
         qemu_irq_raise(s->irq10);
-    }
-
-    /* Game XBE detection: entry point change signals game loaded.
-     * Arm after entry is stable for 50 ticks (800ms) — avoids false
-     * positive on kernel→SEGABOOT transition during first boot.
-     *
-     * WORKAROUND: watching guest RAM from the host. The baseboard cannot see
-     * which XBE runs; the real one is told by the mbcom traffic itself. */
-    if (!chihiro_game_running && chihiro_active) {
-        static uint32_t segaboot_entry = 0;
-        static int stable_count = 0;
-        static bool armed = false;
-        uint32_t entry_pa = chihiro_va_to_pa(0x10000 + 0x128);
-        {
-            static int detect_log = 0;
-            if (lpc_log_verbose && (detect_log < 10 || (detect_log < 200 && (detect_log % 50) == 0))) {
-                uint32_t cur = 0;
-                if (entry_pa != 0xFFFFFFFF)
-                    cpu_physical_memory_read(entry_pa, &cur, 4);
-                fprintf(stderr, "[%07lld] DETECT: pa=0x%08X entry=0x%08X seg=0x%08X armed=%d stable=%d\n",
-                        TS_MS, entry_pa, cur, segaboot_entry, armed, stable_count);
-            }
-            detect_log++;
-        }
-        if (entry_pa != 0xFFFFFFFF) {
-            uint32_t cur_entry = 0;
-            cpu_physical_memory_read(entry_pa, &cur_entry, 4);
-            if (cur_entry > 0x10000 && cur_entry < 0x08000000) {
-                if (cur_entry == segaboot_entry) {
-                    if (!armed && ++stable_count >= 50) {
-                        armed = true;
-                    }
-                } else if (armed) {
-                    chihiro_game_running = true;
-                    game_mode_bus_starts = 0;
-                    memset(chihiro_mbcom_command, 0, 32);
-                    s->mbcom_resp_ready = false;
-                    s->mbcom_e0_status = 0;
-                    fprintf(stderr, "[%07lld] GAME XBE DETECTED (entry 0x%08X → 0x%08X)\n",
-                            TS_MS, segaboot_entry, cur_entry);
-                } else {
-                    segaboot_entry = cur_entry;
-                    stable_count = 0;
-                }
-            }
-        }
     }
 
     /* Game-mode mbcom bootstrap.
