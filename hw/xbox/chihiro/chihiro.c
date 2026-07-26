@@ -193,6 +193,7 @@ char chihiro_game_dir[1024];   /* Game directory path (from dvd_path) */
 
 static char chihiro_save_path[2048];
 static bool chihiro_resolve_save_path(void);
+static void chihiro_resolve_card_path(int player, char *out, size_t out_len);
 bool chihiro_board_type3;      /* true = ASIC (Type-3), false = FPGA (Type-1) */
 int chihiro_region_setting;   /* 0=JP, 1=US, 2=EX → eeprom[0x1F00] = value+1 */
 bool chihiro_freeplay_setting; /* ic11 byte 0x23/0x63 = freeplay in ACBU coin struct */
@@ -606,11 +607,11 @@ static void chihiro_card_reader_tick(void)
     if (!card_reader_initialized) {
         card_reader_init(&card_state[0]);
         card_reader_init(&card_state[1]);
-        char path[sizeof(chihiro_game_dir) + 16];
-        snprintf(path, sizeof(path), "%s/card_p1.bin", chihiro_game_dir);
-        card_reader_insert(&card_state[0], path);
-        snprintf(path, sizeof(path), "%s/card_p2.bin", chihiro_game_dir);
-        card_reader_insert(&card_state[1], path);
+        char path[1200];
+        for (int p = 0; p < 2; p++) {
+            chihiro_resolve_card_path(p, path, sizeof(path));
+            card_reader_insert(&card_state[p], path);
+        }
         chihiro_card_set_ignore_usb(0, true);
         chihiro_card_set_ignore_usb(1, true);
         card_reader_initialized = true;
@@ -2067,7 +2068,21 @@ type_init(chihiro_register_types)
  * File: ~/.local/share/xemu/xemu/saves/<game>.sav
  * ═══════════════════════════════════════════════════════════════════════ */
 
-static bool chihiro_resolve_save_path(void)
+/* Per-game data goes where the rest of xemu keeps its state (see the shader
+ * cache): xemu_settings_get_base_path() honours portable mode and is correct
+ * on Windows and macOS, unlike a hand-built $HOME path. */
+static bool chihiro_data_dir(const char *name, char *out, size_t out_len)
+{
+    const char *base = xemu_settings_get_base_path();
+    if (!base || !base[0]) return false;
+    snprintf(out, out_len, "%s%s", base, name);
+    g_mkdir_with_parents(out, 0755);
+    return true;
+}
+
+/* Game name without its .xbe extension, e.g. "vsg" — the stem shared by the
+ * save file and the memory cards. */
+static bool chihiro_game_base_name(char *base, size_t base_len)
 {
     if (!chihiro_game_dir[0]) return false;
 
@@ -2094,26 +2109,53 @@ static bool chihiro_resolve_save_path(void)
 
     if (!chihiro_game_filename[0]) return false;
 
-    /* Strip .xbe extension for save filename */
-    char base[64];
-    strncpy(base, chihiro_game_filename, 63);
-    base[63] = 0;
+    strncpy(base, chihiro_game_filename, base_len - 1);
+    base[base_len - 1] = 0;
     char *dot = strrchr(base, '.');
     if (dot) *dot = 0;
+    return base[0] != 0;
+}
 
-    /* Build saves directory path */
-    const char *home = getenv("HOME");
-    if (!home) home = "/tmp";
+static bool chihiro_resolve_save_path(void)
+{
+    char base[64];
     char saves_dir[1024];
-    snprintf(saves_dir, sizeof(saves_dir),
-             "%s/.local/share/xemu/xemu/saves", home);
-
-    /* Create directory if needed */
-    g_mkdir_with_parents(saves_dir, 0755);
+    if (!chihiro_game_base_name(base, sizeof(base)) ||
+        !chihiro_data_dir("saves", saves_dir, sizeof(saves_dir)))
+        return false;
 
     snprintf(chihiro_save_path, sizeof(chihiro_save_path),
              "%s/%s.sav", saves_dir, base);
     return true;
+}
+
+/* Cards live with the other per-game data, not next to the disc image: moving
+ * a game folder used to lose them. An existing card beside the image is
+ * migrated once. */
+static void chihiro_resolve_card_path(int player, char *out, size_t out_len)
+{
+    char base[64];
+    char cards_dir[1024];
+    if (!chihiro_game_base_name(base, sizeof(base)) ||
+        !chihiro_data_dir("cards", cards_dir, sizeof(cards_dir))) {
+        snprintf(out, out_len, "%s/card_p%d.bin", chihiro_game_dir, player + 1);
+        return;
+    }
+
+    snprintf(out, out_len, "%s/%s_p%d.bin", cards_dir, base, player + 1);
+    if (g_file_test(out, G_FILE_TEST_EXISTS)) return;
+
+    char legacy[1100];
+    snprintf(legacy, sizeof(legacy), "%s/card_p%d.bin", chihiro_game_dir,
+             player + 1);
+    char *data = NULL;
+    gsize len = 0;
+    if (g_file_get_contents(legacy, &data, &len, NULL)) {
+        if (g_file_set_contents(out, data, len, NULL)) {
+            fprintf(stderr, "Chihiro: migrated card %s -> %s\n", legacy, out);
+        }
+        g_free(data);
+    }
 }
 
 static void chihiro_exit_notify(Notifier *notifier, void *data)
