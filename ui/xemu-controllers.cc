@@ -137,6 +137,15 @@ ChihiroRebindingMap::ConsumeRebindEvent(SDL_Event *event)
         *m_scancode = CHIHIRO_GAMEPAD_BUTTON_BASE + event->gbutton.button;
         return RebindEventResult::Complete;
     }
+    /* Push a stick or a trigger well past its rest position to bind it: the
+     * threshold keeps a resting stick's noise from binding by itself, and
+     * the direction of travel is part of the binding. */
+    if (event->type == SDL_EVENT_GAMEPAD_AXIS_MOTION &&
+        abs(event->gaxis.value) > 24000) {
+        *m_scancode = CHIHIRO_AXIS_BINDING(event->gaxis.axis,
+                                           event->gaxis.value > 0);
+        return RebindEventResult::Complete;
+    }
     return RebindEventResult::Ignore;
 }
 

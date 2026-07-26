@@ -632,8 +632,49 @@ static uint16_t jvs_axis_smooth(uint16_t pos, bool neg, bool posv)
     return target;
 }
 
+/* Travel of a bound axis in its own direction, 0..1. Zero for anything that
+ * is not an axis, and below the deadzone. */
+static float chihiro_axis_travel(int binding)
+{
+    if (!CHIHIRO_BINDING_IS_AXIS(binding))
+        return 0.0f;
+
+    ControllerState *pad = bound_controllers[0];
+    if (!pad || !pad->sdl_gamepad)
+        return 0.0f;
+
+    int16_t raw = SDL_GetGamepadAxis(
+        pad->sdl_gamepad, (SDL_GamepadAxis)CHIHIRO_BINDING_AXIS(binding));
+    float v = raw / 32767.0f;
+    if (!CHIHIRO_BINDING_AXIS_POSITIVE(binding))
+        v = -v;
+    if (v < 0.12f)
+        return 0.0f;
+    return v > 1.0f ? 1.0f : v;
+}
+
+static bool chihiro_check_input(int binding, const bool *kbd, uint32_t mouseBtn);
+
+/*
+ * How far an input is pressed, 0..1. A key or a button is all or nothing; an
+ * axis reports its travel, so the same binding drives a digital switch and an
+ * analog channel alike. A wheel needs no control of its own: its two
+ * directions are two bindings, and pointing them at the two halves of one
+ * stick makes that stick the wheel.
+ */
+static float chihiro_input_travel(int binding, const bool *kbd,
+                                  uint32_t mouseBtn)
+{
+    if (CHIHIRO_BINDING_IS_AXIS(binding))
+        return chihiro_axis_travel(binding);
+    return chihiro_check_input(binding, kbd, mouseBtn) ? 1.0f : 0.0f;
+}
+
 static bool chihiro_check_input(int binding, const bool *kbd, uint32_t mouseBtn)
 {
+    if (CHIHIRO_BINDING_IS_AXIS(binding))
+        return chihiro_axis_travel(binding) > 0.5f;
+
     if (binding >= CHIHIRO_GAMEPAD_BUTTON_BASE) {
         ControllerState *pad = bound_controllers[0];
         if (pad && pad->sdl_gamepad) {
@@ -718,9 +759,6 @@ static void xemu_input_update_jvs(void)
     uint8_t sw0 = 0;
     uint8_t sw1 = 0;
 
-    ControllerState *pad = bound_controllers[0];
-    int16_t *pa = pad ? pad->gp.axis : NULL;
-
     int profile = chihiro_detected_game_profile();
     if (profile < 0) profile = g_config.chihiro.jvs.profile;
 
@@ -799,35 +837,42 @@ static void xemu_input_update_jvs(void)
     }
     case CONFIG_CHIHIRO_JVS_PROFILE_CTX:
     case CONFIG_CHIHIRO_JVS_PROFILE_OR2: {
-        bool sl, sr, gas, brk;
+        int b_sl, b_sr, b_gas, b_brk;
         if (profile == CONFIG_CHIHIRO_JVS_PROFILE_CTX) {
-            sl  = chihiro_check_input(g_config.chihiro.jvs.ctx.steer_left, kbd, mouseBtn);
-            sr  = chihiro_check_input(g_config.chihiro.jvs.ctx.steer_right, kbd, mouseBtn);
-            gas = chihiro_check_input(g_config.chihiro.jvs.ctx.gas, kbd, mouseBtn);
-            brk = chihiro_check_input(g_config.chihiro.jvs.ctx.brake, kbd, mouseBtn);
+            b_sl  = g_config.chihiro.jvs.ctx.steer_left;
+            b_sr  = g_config.chihiro.jvs.ctx.steer_right;
+            b_gas = g_config.chihiro.jvs.ctx.gas;
+            b_brk = g_config.chihiro.jvs.ctx.brake;
         } else {
-            sl  = chihiro_check_input(g_config.chihiro.jvs.or2.steer_left, kbd, mouseBtn);
-            sr  = chihiro_check_input(g_config.chihiro.jvs.or2.steer_right, kbd, mouseBtn);
-            gas = chihiro_check_input(g_config.chihiro.jvs.or2.gas, kbd, mouseBtn);
-            brk = chihiro_check_input(g_config.chihiro.jvs.or2.brake, kbd, mouseBtn);
+            b_sl  = g_config.chihiro.jvs.or2.steer_left;
+            b_sr  = g_config.chihiro.jvs.or2.steer_right;
+            b_gas = g_config.chihiro.jvs.or2.gas;
+            b_brk = g_config.chihiro.jvs.or2.brake;
         }
+
+        bool sl = chihiro_check_input(b_sl, kbd, mouseBtn);
+        bool sr = chihiro_check_input(b_sr, kbd, mouseBtn);
 
         static uint16_t steer_pos = 0x8000;
         {
-            uint16_t steer_val = pa ? (uint16_t)((pa[CONTROLLER_AXIS_LSTICK_X] + 32768) & 0xFFFF) : 0x8000;
-            steer_pos = jvs_axis_smooth(steer_pos, sl, sr);
-            if (sl || sr) steer_val = steer_pos;
+            /* Keys reach full lock through a ramp, so a keyboard still
+             * steers smoothly; a bound axis is already progressive. */
+            uint16_t steer_val;
+            if (CHIHIRO_BINDING_IS_AXIS(b_sl) || CHIHIRO_BINDING_IS_AXIS(b_sr)) {
+                float a = chihiro_input_travel(b_sr, kbd, mouseBtn) -
+                          chihiro_input_travel(b_sl, kbd, mouseBtn);
+                steer_val = (uint16_t)(0x8000 + (int)(a * 32767.0f));
+            } else {
+                steer_pos = jvs_axis_smooth(steer_pos, sl, sr);
+                steer_val = (sl || sr) ? steer_pos : 0x8000;
+            }
             jvs->analog[0] = steer_val;
         }
 
-        {
-            uint16_t gas_val = pa ? (uint16_t)(pa[CONTROLLER_AXIS_RTRIG] * 2) : 0;
-            uint16_t brk_val = pa ? (uint16_t)(pa[CONTROLLER_AXIS_LTRIG] * 2) : 0;
-            if (gas) gas_val = 0xFFFF;
-            if (brk) brk_val = 0xFFFF;
-            jvs->analog[1] = gas_val;
-            jvs->analog[2] = brk_val;
-        }
+        jvs->analog[1] =
+            (uint16_t)(chihiro_input_travel(b_gas, kbd, mouseBtn) * 65535.0f);
+        jvs->analog[2] =
+            (uint16_t)(chihiro_input_travel(b_brk, kbd, mouseBtn) * 65535.0f);
 
         if (profile == CONFIG_CHIHIRO_JVS_PROFILE_CTX) {
             if (chihiro_check_input(g_config.chihiro.jvs.ctx.drive_gear, kbd, mouseBtn))
@@ -852,9 +897,17 @@ static void xemu_input_update_jvs(void)
 
         static uint16_t swing_pos = 0x8000;
         {
-            uint16_t swing_val = pa ? (uint16_t)((pa[CONTROLLER_AXIS_LSTICK_X] + 32768) & 0xFFFF) : 0x8000;
-            swing_pos = jvs_axis_smooth(swing_pos, sl, sr);
-            if (sl || sr) swing_val = swing_pos;
+            int b_sl = g_config.chihiro.jvs.ok.swing_left;
+            int b_sr = g_config.chihiro.jvs.ok.swing_right;
+            uint16_t swing_val;
+            if (CHIHIRO_BINDING_IS_AXIS(b_sl) || CHIHIRO_BINDING_IS_AXIS(b_sr)) {
+                float a = chihiro_input_travel(b_sr, kbd, mouseBtn) -
+                          chihiro_input_travel(b_sl, kbd, mouseBtn);
+                swing_val = (uint16_t)(0x8000 + (int)(a * 32767.0f));
+            } else {
+                swing_pos = jvs_axis_smooth(swing_pos, sl, sr);
+                swing_val = (sl || sr) ? swing_pos : 0x8000;
+            }
             jvs->analog[1] = swing_val;
         }
 

@@ -840,8 +840,25 @@ static const char *chihiro_gamepad_button_name(int btn)
     return "GP Unknown";
 }
 
+static const char *chihiro_gamepad_axis_name(int value)
+{
+    static const char *names[] = {
+        "GP LStick X", "GP LStick Y", "GP RStick X", "GP RStick Y",
+        "GP LTrigger", "GP RTrigger",
+    };
+    static char buf[32];
+    int axis = CHIHIRO_BINDING_AXIS(value);
+    const char *n = (axis >= 0 && axis < (int)(sizeof(names) / sizeof(names[0])))
+                        ? names[axis] : "GP Axis";
+    snprintf(buf, sizeof(buf), "%s %c", n,
+             CHIHIRO_BINDING_AXIS_POSITIVE(value) ? '+' : '-');
+    return buf;
+}
+
 static const char *chihiro_binding_name(int value)
 {
+    if (CHIHIRO_BINDING_IS_AXIS(value))
+        return chihiro_gamepad_axis_name(value);
     if (value >= CHIHIRO_GAMEPAD_BUTTON_BASE)
         return chihiro_gamepad_button_name(value - CHIHIRO_GAMEPAD_BUTTON_BASE);
     switch (value) {
