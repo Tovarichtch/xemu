@@ -49,6 +49,7 @@
 #include "debug.hh"
 #include "welcome.hh"
 #include "../xemu-input.h"
+#include "hw/xbox/chihiro/chihiro-jvs.h"
 #include "menubar.hh"
 #include "compat.hh"
 #if defined(_WIN32)
@@ -182,23 +183,36 @@ static void RenderLightGunOverlays(void)
     float half_w = (g_crosshair_w * scale) / 2.0f;
     float half_h = (g_crosshair_h * scale) / 2.0f;
 
+    auto draw_at = [&](float nx, float ny, int player) {
+        float cx = vx + nx * vw;
+        float cy = vy + ny * vh;
+        ImU32 tint = (player == 0) ? IM_COL32(255, 255, 255, 220)
+                                   : IM_COL32(100, 150, 255, 220);
+        ImGui::GetForegroundDrawList()->AddImage(
+            (ImTextureID)(intptr_t)g_crosshair_tex,
+            ImVec2(cx - half_w, cy - half_h),
+            ImVec2(cx + half_w, cy + half_h),
+            ImVec2(0, 0), ImVec2(1, 1), tint);
+    };
+
+    bool drawn = false;
     for (int i = 0; i < 4; i++) {
         int16_t ax, ay;
         if (!xemu_input_get_lightgun_pos(i, &ax, &ay))
             continue;
+        draw_at((ax + 32768.0f) / 65535.0f,
+                1.0f - (ay + 32768.0f) / 65535.0f, i);
+        drawn = true;
+    }
+    if (drawn || !chihiro_jvs_global)
+        return;
 
-        float nx = (ax + 32768.0f) / 65535.0f;
-        float ny = 1.0f - (ay + 32768.0f) / 65535.0f;
-        float cx = vx + nx * vw;
-        float cy = vy + ny * vh;
-
-        ImU32 tint = (i == 0) ? IM_COL32(255, 255, 255, 220)
-                              : IM_COL32(100, 150, 255, 220);
-        auto dl = ImGui::GetForegroundDrawList();
-        dl->AddImage((ImTextureID)(intptr_t)g_crosshair_tex,
-                     ImVec2(cx - half_w, cy - half_h),
-                     ImVec2(cx + half_w, cy + half_h),
-                     ImVec2(0, 0), ImVec2(1, 1), tint);
+    /* No light gun device bound: JVS aims with the mouse, so follow the very
+     * position the game receives (0,0 means offscreen — draw nothing). */
+    uint16_t jx = chihiro_jvs_global->analog[0];
+    uint16_t jy = chihiro_jvs_global->analog[1];
+    if (jx || jy) {
+        draw_at(jx / 65535.0f, jy / 65535.0f, 0);
     }
 }
 

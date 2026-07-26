@@ -4,6 +4,10 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #define JVS_MAX_PLAYERS    2
 #define JVS_MAX_COINS      2
 #define JVS_MAX_ANALOG     8
@@ -44,5 +48,9 @@ void chihiro_jvs_init(ChihiroJVSState *s);
 int  chihiro_jvs_process(ChihiroJVSState *s,
                           const uint8_t *in, int in_len,
                           uint8_t *out, int out_max);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif
