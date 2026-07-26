@@ -36,7 +36,6 @@
 
 #include "system/blockdev.h"
 #include "hw/xbox/chihiro/chihiro-jvs.h"
-#include "hw/xbox/chihiro/chihiro-driveboard.h"
 #include "hw/xbox/chihiro/chihiro.h"
 
 extern SDL_Window *m_window;
@@ -901,14 +900,6 @@ void xemu_input_update_controllers(void)
     }
     xemu_input_update_jvs();
 
-    if (chihiro_driveboard_global) {
-        ControllerState *p1 = bound_controllers[0];
-        if (p1 && p1->type == INPUT_DEVICE_SDL_GAMEPAD) {
-            uint16_t r = driveboard_get_rumble(chihiro_driveboard_global);
-            p1->gp.rumble_l = r;
-            p1->gp.rumble_r = r;
-        }
-    }
 }
 
 void xemu_input_update_sdl_kbd_controller_state(ControllerState *state)
