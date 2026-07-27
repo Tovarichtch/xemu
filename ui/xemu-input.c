@@ -899,13 +899,14 @@ static void xemu_input_update_jvs(void)
         {
             int b_sl = g_config.chihiro.jvs.ok.swing_left;
             int b_sr = g_config.chihiro.jvs.ok.swing_right;
+            /* The board reads left above centre and right below it. */
             uint16_t swing_val;
             if (CHIHIRO_BINDING_IS_AXIS(b_sl) || CHIHIRO_BINDING_IS_AXIS(b_sr)) {
-                float a = chihiro_input_travel(b_sr, kbd, mouseBtn) -
-                          chihiro_input_travel(b_sl, kbd, mouseBtn);
+                float a = chihiro_input_travel(b_sl, kbd, mouseBtn) -
+                          chihiro_input_travel(b_sr, kbd, mouseBtn);
                 swing_val = (uint16_t)(0x8000 + (int)(a * 32767.0f));
             } else {
-                swing_pos = jvs_axis_smooth(swing_pos, sl, sr);
+                swing_pos = jvs_axis_smooth(swing_pos, sr, sl);
                 swing_val = (sl || sr) ? swing_pos : 0x8000;
             }
             jvs->analog[1] = swing_val;
