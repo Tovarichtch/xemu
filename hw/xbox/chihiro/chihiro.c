@@ -331,12 +331,7 @@ void chihiro_on_ohci_bus_start(void)
     timer_mod(s->usb_hotplug_sc_timer, now + 100);
 }
 
-/*
- * The host controller was stopped after having been running: SEGABOOT has
- * torn the bus down to hand the machine over to the game. The baseboard sees
- * the same thing on real hardware, so this replaces watching the guest's XBE
- * header for an entry point that changes.
- */
+/* SEGABOOT tears the bus down to hand the machine over to the game. */
 void chihiro_on_ohci_bus_stop(void)
 {
     bool was_running = ohci_bus_running;
@@ -650,32 +645,14 @@ static void chihiro_card_reader_tick(void)
     chihiro_card_inject_rx_rings();
 }
 
-/*
- * SEGABOOT observation.
- *
- * SEGABOOT drives its boot screen from a C++ object (CLogo) that holds the
- * boot state machine. Reading it tells us exactly where a boot stops and
- * lets us print the very message the screen shows. This only reads: nothing
- * here is written back into the guest.
- *
- * The baseboard flash holds one SEGABOOT build per megabyte and the board
- * boots the second; the addresses below are read from that one. They are
- * execution VAs: the build is an XBE with image base 0x10000 and a single
- * section at 0x11000 whose raw offset is 0x1000, so VA = offset within its
- * own megabyte + 0x10000. Other flash dumps carry other builds, which is why
- * chihiro_segaboot_identify() says out loud which one is on board.
- *
- * The object is found by its vtable rather than by a fixed address, because
- * operator new places it differently whenever the boot path changes. That is
- * what quietly broke the previous probe.
- */
+/* Execution VAs of the SEGABOOT the board boots: the second megabyte of the
+ * flash. Other dumps carry other builds. */
 #define SEGABOOT_VERSION    "2.13.0"
 #define SEGABOOT_LOGO_VTABLE 0x0001F60C  /* CLogo vtable */
 #define SEGABOOT_LOGO_UPDATE 0x000259D0  /* its second entry, CLogo::Update */
 #define SEGABOOT_APP_VTABLE  0x0001F0C0  /* application object vtable */
 #define SEGABOOT_APP_LOGO    0x440       /* app field holding the CLogo pointer */
 
-/* Read guest virtual memory, walking page by page. */
 static bool sb_read_va(uint32_t va, void *buf, unsigned len)
 {
     uint8_t *p = buf;
@@ -695,7 +672,6 @@ static bool sb_read_va(uint32_t va, void *buf, unsigned len)
     return true;
 }
 
-/* True while SEGABOOT is the image mapped at the XBE load address. */
 static bool sb_resident(void)
 {
     uint32_t update;
@@ -704,15 +680,10 @@ static bool sb_resident(void)
            update == SEGABOOT_LOGO_UPDATE;
 }
 
-/*
- * Find the CLogo instance: a dword equal to its vtable, confirmed by walking
- * to the application object and back through its CLogo field. Both hops must
- * agree, so a stray copy of the constant cannot be mistaken for the object.
- */
+/* Located by vtable, not by address: operator new moves it. The two hops
+ * back through the app object rule out a stray copy of the constant. */
 static uint32_t sb_find_logo(void)
 {
-    /* SEGABOOT loads at 0x10000 and takes about a megabyte; its heap follows
-     * right after, so this window has room to spare. */
     for (uint32_t va = 0x00010000; va < 0x00800000; va += 0x1000) {
         uint32_t pa = chihiro_va_to_pa(va);
         if (pa == 0xFFFFFFFF)
@@ -738,9 +709,7 @@ static uint32_t sb_find_logo(void)
     return 0;
 }
 
-/* The message SEGABOOT prints under the error number, taken from its own
- * table at VA 0x1CEE0, which the code indexes directly. Codes absent from it
- * all point at the same "Unknown error occurred." entry. */
+/* SEGABOOT's own table, VA 0x1CEE0. */
 static const char *sb_error_message(uint32_t code)
 {
     static const char *messages[] = {
@@ -791,8 +760,6 @@ static void chihiro_segaboot_poll(void)
         return;
     }
     if (!logo_va) {
-        /* The object appears a couple of seconds after the image does; give
-         * up rather than sweep memory for a boot that will never show it. */
         if (attempts++ > 100)
             return;
         logo_va = sb_find_logo();
@@ -815,8 +782,6 @@ static void chihiro_segaboot_poll(void)
         prev_state = state;
     }
     if (error && error != prev_error) {
-        /* SEGABOOT itself titles codes below 50 "Error" and the rest
-         * "Caution" (FUN_0002E590). */
         CHIHIRO_ERRF("SEGABOOT: *** %s %02u — %s ***\n",
                      error < 50 ? "Error" : "Caution", error,
                      sb_error_message(error));
@@ -937,8 +902,6 @@ static void chihiro_diag_timer_cb(void *opaque)
         s->last_bootstate = bootstate;
     }
 
-    /* SEGABOOT runs for about eight seconds; poll fast enough to see each
-     * state it goes through. */
     timer_mod(s->diag_timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 100);
 }
 
@@ -2318,12 +2281,6 @@ void chihiro_ide_interface_init(void)
     fflush(stdout);
 }
 
-/*
- * Name the SEGABOOT the board is about to run. It sits in the second half of
- * the flash, the first holding an older build that is never booted. Dumps
- * differ, and the boot indicator only knows the addresses of one build, so
- * say plainly when this dump carries another one.
- */
 static void chihiro_segaboot_identify(void)
 {
     if (chihiro_flash_rom_size < 0x200000)

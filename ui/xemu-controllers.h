@@ -70,9 +70,7 @@ public:
 };
 
 struct ChihiroRebindingMap : public virtual RebindingMap {
-    /* The binding itself, not a table to index: the row number counts every
-     * row on screen, which is not the position of the binding in its own
-     * group. */
+    /* The binding itself: the row number is not its index in its group. */
     int *m_scancode;
 
     ChihiroRebindingMap(int table_row, int *scancode)

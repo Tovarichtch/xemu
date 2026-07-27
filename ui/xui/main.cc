@@ -144,12 +144,7 @@ static void RenderSindenBorder(float vx, float vy, float vw, float vh,
     dl->AddRectFilled(ImVec2(bx + bw - t, by + t), ImVec2(bx + bw, by + bh - t), white);
 }
 
-/*
- * Whether a light gun game is on screen right now. Everything light gun
- * hangs off this: a crosshair, a Sinden border or a hidden pointer on a
- * driving or skating game is always wrong, and so is any of it outside
- * Chihiro mode. The running game wins over the configured profile.
- */
+/* No crosshair, border or hidden pointer outside a Chihiro gun game. */
 static bool ChihiroGunGame(void)
 {
     if ((int)g_config.sys.mem_limit < 1)

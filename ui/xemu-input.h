@@ -145,15 +145,7 @@ extern "C" {
 #define CHIHIRO_MOUSE_BUTTON_BASE 1001
 #define CHIHIRO_GAMEPAD_BUTTON_BASE 2001
 
-/*
- * A JVS input can also be bound to a gamepad axis. Unlike a console pad,
- * which means the same thing on every machine, a JVS harness only carries
- * bytes whose meaning the cabinet decides — so which stick steers is the
- * player's to choose, not ours to hardcode.
- *
- * The direction is part of the binding: it picks the half of the axis for
- * an on/off input or a pedal, and selects the sense of travel for a wheel.
- */
+/* A JVS input may also be bound to one half of a gamepad axis. */
 #define CHIHIRO_GAMEPAD_AXIS_BASE 3001
 #define CHIHIRO_AXIS_BINDING(axis, positive) \
     (CHIHIRO_GAMEPAD_AXIS_BASE + (axis) * 2 + ((positive) ? 1 : 0))

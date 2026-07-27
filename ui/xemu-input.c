@@ -632,8 +632,6 @@ static uint16_t jvs_axis_smooth(uint16_t pos, bool neg, bool posv)
     return target;
 }
 
-/* Travel of a bound axis in its own direction, 0..1. Zero for anything that
- * is not an axis, and below the deadzone. */
 static float chihiro_axis_travel(int binding)
 {
     if (!CHIHIRO_BINDING_IS_AXIS(binding))
@@ -655,13 +653,7 @@ static float chihiro_axis_travel(int binding)
 
 static bool chihiro_check_input(int binding, const bool *kbd, uint32_t mouseBtn);
 
-/*
- * How far an input is pressed, 0..1. A key or a button is all or nothing; an
- * axis reports its travel, so the same binding drives a digital switch and an
- * analog channel alike. A wheel needs no control of its own: its two
- * directions are two bindings, and pointing them at the two halves of one
- * stick makes that stick the wheel.
- */
+/* How far an input is pressed, 0..1. */
 static float chihiro_input_travel(int binding, const bool *kbd,
                                   uint32_t mouseBtn)
 {
@@ -855,8 +847,7 @@ static void xemu_input_update_jvs(void)
 
         static uint16_t steer_pos = 0x8000;
         {
-            /* Keys reach full lock through a ramp, so a keyboard still
-             * steers smoothly; a bound axis is already progressive. */
+            /* Keys ramp to full lock; an axis is already progressive. */
             uint16_t steer_val;
             if (CHIHIRO_BINDING_IS_AXIS(b_sl) || CHIHIRO_BINDING_IS_AXIS(b_sr)) {
                 float a = chihiro_input_travel(b_sr, kbd, mouseBtn) -
@@ -1233,8 +1224,7 @@ void xemu_input_bind(int index, ControllerState *state, int save)
 
     // Unbind existing controller
     if (bound_controllers[index]) {
-        // A Chihiro pad is bound without a USB device of its own, so there is
-        // nothing to unplug: its input reaches the game through JVS.
+        // A Chihiro pad has no USB device of its own: nothing to unplug.
         if (bound_controllers[index]->device) {
             Error *err = NULL;
 
