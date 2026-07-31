@@ -63,6 +63,7 @@ typedef struct DecalShader_
     GLint time_loc;
     GLint scale_loc;
     GLint palette_loc[256];
+    GLint crt_gamma_loc;
 } DecalShader;
 
 static DecalShader *g_decal_shader,
@@ -242,6 +243,7 @@ void main() {
 #version 400 core
 uniform sampler2D tex;
 uniform uint palette[256];
+uniform float crt_gamma;
 float gamma_ch(int ch, float col)
 {
     return float(bitfieldExtract(palette[uint(col * 255.0)], ch*8, 8)) / 255.0;
@@ -249,7 +251,10 @@ float gamma_ch(int ch, float col)
 
 vec4 gamma(vec4 col)
 {
-    return vec4(gamma_ch(0, col.r), gamma_ch(1, col.g), gamma_ch(2, col.b), col.a);
+    vec4 g = vec4(gamma_ch(0, col.r), gamma_ch(1, col.g), gamma_ch(2, col.b), col.a);
+    /* Optional arcade-CRT transfer curve (1.0 = off). */
+    g.rgb = pow(max(g.rgb, 0.0), vec3(crt_gamma));
+    return g;
 }
 in  vec2 Texcoord;
 out vec4 out_Color;
@@ -318,6 +323,7 @@ void main() {
         snprintf(name, sizeof(name), "palette[%d]", i);
         s->palette_loc[i] = glGetUniformLocation(s->prog, name);
     }
+    s->crt_gamma_loc = glGetUniformLocation(s->prog, "crt_gamma");
 
     const GLfloat verts[6][4] = {
         //  x      y      s      t
@@ -974,6 +980,7 @@ void RenderFramebuffer(GLint tex, int width, int height, bool flip, float scale[
                      palette[i * 3];
         glUniform1ui(s->palette_loc[i], e);
     }
+    glUniform1f(s->crt_gamma_loc, g_config.display.crt_gamma);
 
     glClearColor(0, 0, 0, 0);
     glClear(GL_COLOR_BUFFER_BIT);

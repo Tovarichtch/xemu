@@ -241,6 +241,9 @@ display:
     type: enum
     values: [linear, nearest]
     default: linear
+  crt_gamma:
+    type: number
+    default: 1.0
   window:
     fullscreen_on_startup: bool
     fullscreen_exclusive: bool

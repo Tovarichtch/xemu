@@ -1302,6 +1302,20 @@ void MainMenuChihiroView::Draw()
 
 void MainMenuDisplayView::Draw()
 {
+    SectionTitle("Monitor simulation");
+    {
+        /* Arcade CRTs have a ~2.4 native response; sRGB panels show the
+         * same signal flatter. 1.0 = off. Calibrate against the game's own
+         * C.R.T. TEST pattern (step 1 black, step 32 white). */
+        float t = (g_config.display.crt_gamma - 1.0f) / 0.5f;
+        t = t < 0.0f ? 0.0f : t > 1.0f ? 1.0f : t;
+        char buf[64];
+        snprintf(buf, sizeof(buf), "CRT gamma %.2f (1.00 = off)",
+                 g_config.display.crt_gamma);
+        Slider("CRT gamma", &t, buf);
+        g_config.display.crt_gamma = 1.0f + t * 0.5f;
+    }
+
     SectionTitle("Renderer");
     ChevronCombo("Backend", &g_config.display.renderer,
                  "Null\0"
