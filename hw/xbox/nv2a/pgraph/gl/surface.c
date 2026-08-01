@@ -553,7 +553,14 @@ SurfaceBinding *pgraph_gl_surface_get_within(NV2AState *d, hwaddr addr)
     PGRAPHState *pg = &d->pgraph;
     PGRAPHGLState *r = pg->gl_renderer_state;
 
+    /* Bindings may overlap in memory; an exact base-address match is
+     * always the surface the scanout means. */
     SurfaceBinding *surface;
+    QTAILQ_FOREACH (surface, &r->surfaces, entry) {
+        if (addr == surface->vram_addr) {
+            return surface;
+        }
+    }
     QTAILQ_FOREACH (surface, &r->surfaces, entry) {
         if (addr >= surface->vram_addr &&
             addr < (surface->vram_addr + surface->size)) {
