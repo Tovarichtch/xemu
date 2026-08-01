@@ -37,6 +37,8 @@
 #include "block/blkmemory.h"
 #include "block/block-global-state.h"
 #include "block/block_int-global-state.h"
+#include "migration/vmstate.h"
+#include <zlib.h>
 #include "qemu/main-loop.h"
 #include "hw/usb.h"
 #include "ui/xemu-settings.h"
@@ -2232,6 +2234,157 @@ static MemoryRegion chihiro_interface_fs;
 static AddressSpace chihiro_interface_as;
 static bool chihiro_interface_ready = false;
 
+/* DIMM migration: instead of ~540 MB of raw RAM, store the netboot image
+ * identity (size + CRC32) plus the pages that differ from it; load
+ * re-reads the image and applies the delta. */
+
+#define DIMM_MIG_MAGIC   0x4344494d /* CDIM */
+#define DIMM_MIG_VERSION 1
+#define DIMM_PAGE_SIZE   4096
+
+typedef struct ChihiroDimmMig {
+    uint32_t blob_size;
+    uint8_t *blob;
+} ChihiroDimmMig;
+
+static ChihiroDimmMig chihiro_dimm_mig;
+
+static uint8_t *chihiro_dimm_read_image(uint64_t buf_size,
+                                        uint64_t *file_size, uint32_t *crc)
+{
+    const char *path = g_config.sys.files.dvd_path;
+    FILE *f = (path && path[0]) ? fopen(path, "rb") : NULL;
+    if (!f) {
+        return NULL;
+    }
+    uint8_t *buf = g_malloc0(buf_size);
+    size_t n = fread(buf, 1, buf_size, f);
+    fclose(f);
+    *file_size = n;
+    *crc = crc32(0, buf, n);
+    return buf;
+}
+
+static int chihiro_dimm_pre_save(void *opaque)
+{
+    ChihiroDimmMig *m = opaque;
+    uint32_t fs_size;
+    uint8_t *fs = chihiro_fatx_get_buffer(&fs_size);
+    uint64_t file_size;
+    uint32_t crc;
+    uint8_t *ref = fs ? chihiro_dimm_read_image(fs_size, &file_size, &crc)
+                      : NULL;
+    if (!ref) {
+        error_report("chihiro: cannot read the game image to delta against");
+        return -EINVAL;
+    }
+
+    uint32_t hdr[7] = { DIMM_MIG_MAGIC, DIMM_MIG_VERSION,
+                        (uint32_t)file_size, (uint32_t)(file_size >> 32),
+                        crc, DIMM_PAGE_SIZE, 0 /* npages */ };
+    GByteArray *blob = g_byte_array_new();
+    g_byte_array_append(blob, (uint8_t *)hdr, sizeof(hdr));
+
+    uint32_t npages = 0;
+    for (uint32_t pg = 0; pg < fs_size / DIMM_PAGE_SIZE; pg++) {
+        const uint8_t *cur = fs + (size_t)pg * DIMM_PAGE_SIZE;
+        if (!memcmp(cur, ref + (size_t)pg * DIMM_PAGE_SIZE, DIMM_PAGE_SIZE)) {
+            continue;
+        }
+        g_byte_array_append(blob, (uint8_t *)&pg, 4);
+        g_byte_array_append(blob, cur, DIMM_PAGE_SIZE);
+        npages++;
+    }
+    memcpy(blob->data + 24, &npages, 4);
+    g_free(ref);
+
+    m->blob_size = blob->len;
+    g_free(m->blob);
+    m->blob = g_byte_array_free(blob, FALSE);
+
+    printf("Chihiro DIMM migration: %u changed pages, %u byte blob\n",
+           npages, m->blob_size);
+    return 0;
+}
+
+static int chihiro_dimm_post_save(void *opaque)
+{
+    ChihiroDimmMig *m = opaque;
+    g_free(m->blob);
+    m->blob = NULL;
+    m->blob_size = 0;
+    return 0;
+}
+
+static int chihiro_dimm_post_load(void *opaque, int version_id)
+{
+    ChihiroDimmMig *m = opaque;
+    int ret = -EINVAL;
+    uint32_t fs_size;
+    uint8_t *fs = chihiro_fatx_get_buffer(&fs_size);
+    const uint8_t *p = m->blob;
+    uint32_t hdr[7];
+    uint64_t cur_size;
+    uint32_t cur_crc;
+    uint8_t *ref = NULL;
+
+    if (!fs || !m->blob || m->blob_size < sizeof(hdr)) {
+        goto out;
+    }
+    memcpy(hdr, p, sizeof(hdr));
+    p += sizeof(hdr);
+    if (hdr[0] != DIMM_MIG_MAGIC || hdr[1] != DIMM_MIG_VERSION ||
+        hdr[5] != DIMM_PAGE_SIZE) {
+        goto out;
+    }
+
+    ref = chihiro_dimm_read_image(fs_size, &cur_size, &cur_crc);
+    if (!ref || cur_size != (hdr[2] | (uint64_t)hdr[3] << 32) ||
+        cur_crc != hdr[4]) {
+        error_report("chihiro: mounted game image does not match this "
+                     "snapshot");
+        goto out;
+    }
+    memcpy(fs, ref, fs_size);
+
+    for (uint32_t i = 0; i < hdr[6]; i++) {
+        uint32_t pg;
+        if ((uint64_t)(p - m->blob) + 4 + DIMM_PAGE_SIZE > m->blob_size) {
+            goto out;
+        }
+        memcpy(&pg, p, 4);
+        p += 4;
+        if ((uint64_t)pg * DIMM_PAGE_SIZE + DIMM_PAGE_SIZE > fs_size) {
+            goto out;
+        }
+        memcpy(fs + (size_t)pg * DIMM_PAGE_SIZE, p, DIMM_PAGE_SIZE);
+        p += DIMM_PAGE_SIZE;
+    }
+    ret = 0;
+
+out:
+    g_free(ref);
+    g_free(m->blob);
+    m->blob = NULL;
+    m->blob_size = 0;
+    return ret;
+}
+
+static const VMStateDescription vmstate_chihiro_dimm = {
+    .name = "chihiro-dimm",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .pre_save = chihiro_dimm_pre_save,
+    .post_save = chihiro_dimm_post_save,
+    .post_load = chihiro_dimm_post_load,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT32(blob_size, ChihiroDimmMig),
+        VMSTATE_VBUFFER_ALLOC_UINT32(blob, ChihiroDimmMig, 1, NULL,
+                                     blob_size),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
 void chihiro_ide_interface_init(void)
 {
     printf("Chihiro: IDE interface init START (fs=%llu)\n",
@@ -2241,9 +2394,11 @@ void chihiro_ide_interface_init(void)
     memory_region_init(&chihiro_interface_container, NULL,
                        "chihiro.interface", CHIHIRO_FS_SIZE);
 
-    memory_region_init_ram(&chihiro_interface_fs, NULL,
-                           "chihiro.interface.filesystem",
-                           CHIHIRO_FS_SIZE, &error_fatal);
+    /* Serialized by chihiro-dimm as a delta, not by the RAM stream. */
+    memory_region_init_ram_nomigrate(&chihiro_interface_fs, NULL,
+                                     "chihiro.interface.filesystem",
+                                     CHIHIRO_FS_SIZE, &error_fatal);
+    vmstate_register(NULL, 0, &vmstate_chihiro_dimm, &chihiro_dimm_mig);
 
     memory_region_add_subregion(&chihiro_interface_container,
                                 0, &chihiro_interface_fs);

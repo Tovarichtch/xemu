@@ -602,6 +602,21 @@ static void check_interrupts(AN2131State *s)
 
 /* ── Public API ───────────────────────────────────────────────────── */
 
+/* Re-attach pointers/callbacks after a migration load; an in-flight i2c
+ * transaction (µs-scale) is dropped back to idle. */
+void an2131_relink(AN2131State *s)
+{
+    s->cpu.code = s->ram;
+    s->cpu.code_size = AN2131_RAM_SIZE;
+    s->cpu.xdata_read = an2131_xdata_read;
+    s->cpu.xdata_write = an2131_xdata_write;
+    s->cpu.sfr_read_cb = an2131_sfr_read;
+    s->cpu.sfr_write_cb = an2131_sfr_write;
+    s->cpu.opaque = s;
+    s->i2c.phase = I2C_IDLE;
+    s->i2c.eeprom = NULL;
+}
+
 void an2131_init(AN2131State *s)
 {
     memset(s, 0, sizeof(*s));

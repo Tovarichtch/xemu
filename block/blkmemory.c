@@ -28,6 +28,7 @@
 #include "block/block-io.h"
 #include "system/memory.h"
 #include "qemu/memalign.h"
+#include "qobject/qdict.h"
 #include "block/block_int.h"
 #include "qemu/iov.h"
 
@@ -117,6 +118,8 @@ static int coroutine_fn memory_co_pwritev(BlockDriverState *bs, int64_t offset,
 static BlockDriver bdrv_memory = {
     .format_name        = "memory",
     .instance_size      = sizeof(BDRVMemoryState),
+    /* The backing MemoryRegion is part of migrated guest RAM. */
+    .snapshots_covered_by_vmstate = true,
     .bdrv_open          = memory_open,
     .bdrv_close         = memory_close,
     .bdrv_co_getlength  = memory_co_getlength,
@@ -136,6 +139,10 @@ int bdrv_memory_open(BlockDriverState *bs, AddressSpace *as, uint64_t size)
     pstrcpy(bs->filename, sizeof(bs->filename), "<mem>");
 
     bs->drv = &bdrv_memory;
+    /* A hand-opened BDS skips bdrv_open_inherit: block queries walk these
+     * dicts unconditionally and crash on NULL. */
+    bs->options = qdict_new();
+    bs->explicit_options = qdict_new();
     bs->open_flags |= BDRV_O_RDWR;
     bs->bl.request_alignment = 512;
     bs->total_sectors = size / BDRV_SECTOR_SIZE;

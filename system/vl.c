@@ -662,7 +662,8 @@ static int drive_init_func(void *opaque, QemuOpts *opts, Error **errp)
 {
     BlockInterfaceType *block_default_type = opaque;
     const char *file_path = qemu_opt_get(opts, "file");
-    bool is_cdrom_with_file = !strcmp(qemu_opt_get(opts, "media"), "cdrom") && strlen(file_path) > 0;
+    bool is_cdrom_with_file = !g_strcmp0(qemu_opt_get(opts, "media"), "cdrom") &&
+        file_path && strlen(file_path) > 0;
 
     Error *error_warn = NULL;
     bool failed = drive_new(opts, *block_default_type, is_cdrom_with_file ? &error_warn : errp) == NULL;
@@ -3084,6 +3085,16 @@ void qemu_init(int argc, char **argv)
             char *msg = g_strdup_printf("Failed to open hard disk image file '%s'. Please check machine settings.", hdd_path);
             xemu_queue_error_message(msg);
             g_free(msg);
+        } else if (mem > 64) {
+            /* Chihiro has no IDE hard disk: attach the image off-bus as the
+             * VM snapshot store. if=none keeps it invisible to the guest but
+             * still reachable by savevm (unlike a -blockdev node). */
+            fake_argv[fake_argc++] = strdup("-drive");
+            char *escaped_hdd_path = strdup_double_commas(hdd_path);
+            fake_argv[fake_argc++] = g_strdup_printf(
+                "if=none,id=snapshots,format=qcow2,file=%s",
+                escaped_hdd_path);
+            free(escaped_hdd_path);
         } else {
             fake_argv[fake_argc++] = strdup("-drive");
             char *escaped_hdd_path = strdup_double_commas(hdd_path);

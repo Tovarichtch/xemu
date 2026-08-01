@@ -72,8 +72,12 @@ void SnapshotManager::LoadSnapshotChecked(const char *name)
         return;
     }
 
+    /* Chihiro has no DVD drive: disc switching would clear dvd_path. */
+    bool chihiro = (int)g_config.sys.mem_limit >= 1;
+
     char *current_disc_path = xemu_get_currently_loaded_disc_path();
-    if (data->disc_path && (!current_disc_path || strcmp(current_disc_path, data->disc_path))) {
+    if (!chihiro && data->disc_path &&
+        (!current_disc_path || strcmp(current_disc_path, data->disc_path))) {
         if (current_disc_path) {
             m_current_disc_path = current_disc_path;
         } else {
@@ -83,7 +87,7 @@ void SnapshotManager::LoadSnapshotChecked(const char *name)
         m_pending_load_name = name;
         m_open_pending = true;
     } else {
-        if (!data->disc_path) {
+        if (!chihiro && !data->disc_path) {
             xemu_eject_disc(NULL);
         }
         LoadSnapshot(name);

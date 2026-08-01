@@ -308,6 +308,7 @@ typedef struct AN2131State {
 /* ── Public API ──────────────────────────────────────────────────────── */
 
 void an2131_init(AN2131State *s);
+void an2131_relink(AN2131State *s);
 void an2131_reset(AN2131State *s);
 void an2131_b2_boot(AN2131State *s, const uint8_t *eeprom, int eeprom_size);
 

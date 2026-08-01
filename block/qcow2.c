@@ -5479,6 +5479,23 @@ qcow2_co_save_vmstate(BlockDriverState *bs, QEMUIOVector *qiov, int64_t pos)
         return offset;
     }
 
+    if (pos == 0) {
+        BDRVQcow2State *s = bs->opaque;
+        uint64_t vmstate_base = qcow2_vm_state_offset(s);
+        uint64_t l1_coverage = (uint64_t)s->l1_size * s->l2_size *
+                               s->cluster_size;
+
+        /* A snapshot goto re-maps the stored VM state into the active L1;
+         * drop it so a new state allocates instead of COWing every cluster. */
+        if (l1_coverage > vmstate_base) {
+            qemu_co_mutex_lock(&s->lock);
+            qcow2_cluster_discard(bs, vmstate_base,
+                                  l1_coverage - vmstate_base,
+                                  QCOW2_DISCARD_NEVER, false);
+            qemu_co_mutex_unlock(&s->lock);
+        }
+    }
+
     BLKDBG_CO_EVENT(bs->file, BLKDBG_VMSTATE_SAVE);
     return bs->drv->bdrv_co_pwritev_part(bs, offset, qiov->size, qiov, 0, 0);
 }

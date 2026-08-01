@@ -242,7 +242,10 @@ void xemu_snapshots_load(const char *vm_name, Error **err)
 {
     bool vm_running = runstate_is_running();
     vm_stop(RUN_STATE_RESTORE_VM);
-    if (load_snapshot(vm_name, NULL, false, NULL, err) && vm_running) {
+    load_snapshot(vm_name, NULL, false, NULL, err);
+    /* A load refused by validation leaves the machine untouched: resume
+     * instead of staying paused forever. */
+    if (vm_running) {
         vm_start();
     }
 }

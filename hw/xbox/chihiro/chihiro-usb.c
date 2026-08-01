@@ -28,6 +28,7 @@
 #include "chihiro.h"
 #include "chihiro-jvs.h"
 #include "chihiro-an2131.h"
+#include "migration/vmstate.h"
 #define TS_MS ((long long)(qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL)))
 extern bool chihiro_game_running;
 extern bool lpc_log_verbose;
@@ -722,10 +723,170 @@ static void chihiro_an2131qc_unrealize(USBDevice *dev)
     timer_free(s->lle_tick_timer);
 }
 
+/* ── Migration state ─────────────────────────────────────────────────
+ * Plain data only: every pointer and callback is re-attached in
+ * post_load, mirroring what realize wires up. */
+static const VMStateDescription vmstate_cpu8051 = {
+    .name = "chihiro-usb/cpu8051",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT16(pc, Cpu8051State),
+        VMSTATE_UINT8(sp, Cpu8051State),
+        VMSTATE_UINT8(acc, Cpu8051State),
+        VMSTATE_UINT8(b, Cpu8051State),
+        VMSTATE_UINT16(dptr, Cpu8051State),
+        VMSTATE_UINT16(dptr_alt, Cpu8051State),
+        VMSTATE_UINT8(psw, Cpu8051State),
+        VMSTATE_UINT8_ARRAY(iram, Cpu8051State, 256),
+        VMSTATE_UINT8_ARRAY(sfr, Cpu8051State, 128),
+        VMSTATE_UINT8_ARRAY(xram, Cpu8051State, 8192),
+        VMSTATE_BOOL(halted, Cpu8051State),
+        VMSTATE_BOOL(in_interrupt, Cpu8051State),
+        VMSTATE_UINT64(cycles, Cpu8051State),
+        VMSTATE_UINT8(timer0_prescale, Cpu8051State),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
+static const VMStateDescription vmstate_an2131 = {
+    .name = "chihiro-usb/an2131",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_STRUCT(cpu, AN2131State, 1, vmstate_cpu8051, Cpu8051State),
+        VMSTATE_UINT8_ARRAY(ram, AN2131State, AN2131_RAM_SIZE),
+        /* ep[] and the non-pointer half of i2c are plain scalars; raw
+         * bytes are fine for same-build save/load (our only use case).
+         * i2c pointers are dropped to idle in an2131_relink. */
+        VMSTATE_BUFFER_UNSAFE(ep, AN2131State, 1,
+                              sizeof(((AN2131State *)0)->ep)),
+        VMSTATE_UINT8(ep0cs, AN2131State),
+        VMSTATE_UINT8(ivec, AN2131State),
+        VMSTATE_UINT8(in07irq, AN2131State),
+        VMSTATE_UINT8(out07irq, AN2131State),
+        VMSTATE_UINT8(usbirq, AN2131State),
+        VMSTATE_UINT8(in07ien, AN2131State),
+        VMSTATE_UINT8(out07ien, AN2131State),
+        VMSTATE_UINT8(usbien, AN2131State),
+        VMSTATE_UINT8(usbbav, AN2131State),
+        VMSTATE_UINT8(i2cs, AN2131State),
+        VMSTATE_UINT8(i2dat, AN2131State),
+        VMSTATE_BOOL(i2c_irq_pending, AN2131State),
+        VMSTATE_BOOL(i2c_lastrd, AN2131State),
+        VMSTATE_UINT8_ARRAY(rtc_regs, AN2131State, 16),
+        VMSTATE_UINT16(sbfy_pay_off, AN2131State),
+        VMSTATE_UINT16(sbfy_pay_end, AN2131State),
+        VMSTATE_UINT16(sbfy_chk_off, AN2131State),
+        VMSTATE_BOOL(sbfy_reading, AN2131State),
+        VMSTATE_UINT8(cpucs, AN2131State),
+        VMSTATE_UINT8(usbcs, AN2131State),
+        VMSTATE_UINT8(fnaddr, AN2131State),
+        VMSTATE_UINT8(togctl, AN2131State),
+        VMSTATE_UINT8(usbpair, AN2131State),
+        VMSTATE_UINT8(in07val, AN2131State),
+        VMSTATE_UINT8(out07val, AN2131State),
+        VMSTATE_UINT16(sudptr, AN2131State),
+        VMSTATE_UINT8(fastxfr, AN2131State),
+        VMSTATE_UINT16(autoptr, AN2131State),
+        VMSTATE_UINT8_ARRAY(setupdat, AN2131State, 8),
+        VMSTATE_UINT8(outa, AN2131State),
+        VMSTATE_UINT8(outb, AN2131State),
+        VMSTATE_UINT8(outc, AN2131State),
+        VMSTATE_UINT8(pinsa, AN2131State),
+        VMSTATE_UINT8(pinsb, AN2131State),
+        VMSTATE_UINT8(pinsc, AN2131State),
+        VMSTATE_UINT8(oea, AN2131State),
+        VMSTATE_UINT8(oeb, AN2131State),
+        VMSTATE_UINT8(oec, AN2131State),
+        VMSTATE_UINT8(portacfg, AN2131State),
+        VMSTATE_UINT8(portbcfg, AN2131State),
+        VMSTATE_UINT8(portccfg, AN2131State),
+        VMSTATE_UINT8(exif, AN2131State),
+        VMSTATE_UINT8(eie, AN2131State),
+        VMSTATE_UINT8(eip, AN2131State),
+        VMSTATE_UINT8(mpage, AN2131State),
+        VMSTATE_UINT8(dps, AN2131State),
+        VMSTATE_UINT8_ARRAY(jvs_tx_buf, AN2131State, 256),
+        VMSTATE_INT32(jvs_tx_len, AN2131State),
+        VMSTATE_INT32(jvs_tx_expected, AN2131State),
+        VMSTATE_BOOL(jvs_tx_escape, AN2131State),
+        VMSTATE_UINT8_ARRAY(jvs_rx_buf, AN2131State, 512),
+        VMSTATE_INT32(jvs_rx_len, AN2131State),
+        VMSTATE_INT32(jvs_rx_pos, AN2131State),
+        VMSTATE_BOOL(cpu_running, AN2131State),
+        VMSTATE_BOOL(jvs_response_ready, AN2131State),
+        VMSTATE_BOOL(jvs_rx_pending, AN2131State),
+        VMSTATE_UINT64(total_cycles, AN2131State),
+        VMSTATE_UINT64(jvs_response_set_cycles, AN2131State),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
+static const VMStateDescription vmstate_chihiro_jvs = {
+    .name = "chihiro-usb/jvs",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT8(device_id, ChihiroJVSState),
+        VMSTATE_UINT8(sense, ChihiroJVSState),
+        VMSTATE_UINT16_ARRAY(coin_count, ChihiroJVSState, JVS_MAX_COINS),
+        VMSTATE_UINT8(reset_count, ChihiroJVSState),
+        VMSTATE_UINT8(system_switches, ChihiroJVSState),
+        VMSTATE_UINT8_2DARRAY(player_switches, ChihiroJVSState,
+                              JVS_MAX_PLAYERS, 2),
+        VMSTATE_UINT16_ARRAY(analog, ChihiroJVSState, JVS_MAX_ANALOG),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
+static int chihiro_usb_post_load(void *opaque, int version_id)
+{
+    ChihiroUSBState *s = opaque;
+
+    an2131_relink(&s->an2131);
+    s->an2131.ic10_eeprom = s->eeprom;
+    s->an2131.ic10_size = sizeof(s->eeprom);
+    s->an2131.ic11_eeprom = s->ic11;
+    s->an2131.ic11_size = 256;
+    s->an2131.extmem = s->extmem;
+    s->an2131.extmem_size = sizeof(s->extmem);
+    s->an2131.usb_dev = s;
+
+    if (s->use_lle && s->an2131.cpu_running) {
+        timer_mod(s->lle_tick_timer,
+                  qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 1);
+    }
+    return 0;
+}
+
+static const VMStateDescription vmstate_chihiro_usb = {
+    .name = "chihiro-usb",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .post_load = chihiro_usb_post_load,
+    .fields = (const VMStateField[]) {
+        VMSTATE_USB_DEVICE(dev, ChihiroUSBState),
+        VMSTATE_UINT8_ARRAY(eeprom, ChihiroUSBState, 8192),
+        VMSTATE_UINT32(fw_bytes_written, ChihiroUSBState),
+        VMSTATE_BOOL(fw_cpu_held, ChihiroUSBState),
+        VMSTATE_BOOL(fw_loaded, ChihiroUSBState),
+        VMSTATE_BOOL(eeprom_reloaded, ChihiroUSBState),
+        VMSTATE_UINT8_ARRAY(ic11, ChihiroUSBState, 512),
+        VMSTATE_UINT8_ARRAY(extmem, ChihiroUSBState, 65536),
+        VMSTATE_STRUCT(jvs, ChihiroUSBState, 1,
+                       vmstate_chihiro_jvs, ChihiroJVSState),
+        VMSTATE_STRUCT(an2131, ChihiroUSBState, 1,
+                       vmstate_an2131, AN2131State),
+        VMSTATE_BOOL(use_lle, ChihiroUSBState),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
 static void chihiro_an2131qc_class_init(ObjectClass *klass, const void *data)
 {
-    // DeviceClass *dc = DEVICE_CLASS(klass);
     USBDeviceClass *uc = USB_DEVICE_CLASS(klass);
+    DeviceClass *dc = DEVICE_CLASS(klass);
 
     uc->realize        = chihiro_an2131qc_realize;
     uc->unrealize      = chihiro_an2131qc_unrealize;
@@ -737,7 +898,7 @@ static void chihiro_an2131qc_class_init(ObjectClass *klass, const void *data)
     uc->handle_data    = handle_data;
     uc->handle_attach  = usb_desc_attach;
 
-    //dc->vmsd = &vmstate_usb_kbd;
+    dc->vmsd = &vmstate_chihiro_usb;
 }
 
 static const TypeInfo chihiro_an2131qc_info = {
@@ -826,8 +987,8 @@ static void chihiro_an2131sc_unrealize(USBDevice *dev)
 
 static void chihiro_an2131sc_class_init(ObjectClass *klass, const void *data)
 {
-    // DeviceClass *dc = DEVICE_CLASS(klass);
     USBDeviceClass *uc = USB_DEVICE_CLASS(klass);
+    DeviceClass *dc = DEVICE_CLASS(klass);
 
     uc->realize        = chihiro_an2131sc_realize;
     uc->unrealize      = chihiro_an2131sc_unrealize;
@@ -839,7 +1000,7 @@ static void chihiro_an2131sc_class_init(ObjectClass *klass, const void *data)
     uc->handle_data    = handle_data;
     uc->handle_attach  = usb_desc_attach;
 
-    //dc->vmsd = &vmstate_usb_kbd;
+    dc->vmsd = &vmstate_chihiro_usb;
 }
 
 static const TypeInfo chihiro_an2131sc_info = {
