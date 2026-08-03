@@ -1120,10 +1120,22 @@ static MString* psh_convert(struct PixelShader *ps)
                                 "vec4 t%d = texture(texSamp%d, remap2DToCube(%s(pT%d.xyw)));\n",
                                 i, i, tex_remap, i);
                         } else {
+                            /* The projective divide saturates for q <= 0
+                             * on hardware — no finite mirror image, no
+                             * null sample. The saturated coordinates then
+                             * resolve through the sampler's address mode:
+                             * border yields the (transparent) border (CT
+                             * headlight/shadow pools), repeat folds the
+                             * pattern (VC3 fog sheet), clamp yields the
+                             * edge (VC3 decor lightmaps). Clamping the
+                             * divisor to a positive minimum reproduces
+                             * exactly that. */
                             mstring_append_fmt(
                                 vars,
-                                "vec4 t%d = textureProj(texSamp%d, %s(pT%d.xyw));\n",
-                                i, i, tex_remap, i);
+                                "vec3 tp%d = %s(pT%d.xyw);\n"
+                                "vec4 t%d = texture(texSamp%d,"
+                                " tp%d.xy / max(tp%d.z, 1e-15));\n",
+                                i, tex_remap, i, i, i, i, i);
                         }
                     } else if (ps->state->dim_tex[i] == 3) {
                         mstring_append_fmt(vars, "vec4 t%d = textureProj(texSamp%d, vec4(pT%d.xy, 0.0, pT%d.w));\n",
