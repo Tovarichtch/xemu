@@ -528,6 +528,7 @@ static SurfaceBinding *surface_put(NV2AState *d, hwaddr addr,
     register_cpu_access_callback(d, surface_out);
 
     QTAILQ_INSERT_TAIL(&r->surfaces, surface_out, entry);
+    qatomic_set(&r->have_surfaces, true);
 
     return surface_out;
 }
@@ -584,6 +585,7 @@ void pgraph_gl_surface_invalidate(NV2AState *d, SurfaceBinding *surface)
     glDeleteTextures(1, &surface->gl_buffer);
 
     QTAILQ_REMOVE(&r->surfaces, surface, entry);
+    qatomic_set(&r->have_surfaces, !QTAILQ_EMPTY(&r->surfaces));
     g_free(surface);
 }
 

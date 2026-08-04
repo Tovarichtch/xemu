@@ -386,11 +386,15 @@ void pgraph_gl_sync(NV2AState *d)
     VGADisplayParams vga_display_params;
     d->vga.get_params(&d->vga, &vga_display_params);
 
+    PGRAPHGLState *r_sync = d->pgraph.gl_renderer_state;
     SurfaceBinding *surface = pgraph_gl_surface_get_within(d, d->pcrtc.start + vga_display_params.line_offset);
     if (surface == NULL || !surface->color || !surface->width || !surface->height) {
+        qatomic_set(&r_sync->scanout_found, false);
         qemu_event_set(&d->pgraph.sync_complete);
         return;
     }
+    qatomic_set(&r_sync->scanout_found, true);
+    surface->frame_time = d->pgraph.frame_time;
 
     /* FIXME: Sanity check surface dimensions */
 
@@ -417,33 +421,22 @@ int pgraph_gl_get_framebuffer_surface(NV2AState *d)
     PGRAPHState *pg = &d->pgraph;
     PGRAPHGLState *r = pg->gl_renderer_state;
 
-    qemu_mutex_lock(&d->pfifo.lock);
-    // FIXME: Possible race condition with pgraph, consider lock
-
-    VGADisplayParams vga_display_params;
-    d->vga.get_params(&d->vga, &vga_display_params);
-
-    SurfaceBinding *surface = pgraph_gl_surface_get_within(
-        d, d->pcrtc.start + vga_display_params.line_offset);
-    if (surface == NULL || !surface->color) {
-        qemu_mutex_unlock(&d->pfifo.lock);
+    /* The surface list belongs to the render thread; walking it here
+     * raced against insertions and evictions. Only consult the atomic
+     * emptiness hint — pgraph_gl_sync resolves the actual scanout on its
+     * own thread and publishes whether it found one. An empty list
+     * (early boot, VGA text) keeps the no-kick behaviour, so this never
+     * waits on a renderer with nothing to say. */
+    if (!qatomic_read(&r->have_surfaces)) {
         return 0;
     }
 
-    assert(surface->color);
-    assert(surface->fmt.gl_attachment == GL_COLOR_ATTACHMENT0);
-    assert(surface->fmt.gl_format == GL_RGBA
-        || surface->fmt.gl_format == GL_RGB
-        || surface->fmt.gl_format == GL_BGR
-        || surface->fmt.gl_format == GL_BGRA
-        );
-
-    surface->frame_time = pg->frame_time;
+    qemu_mutex_lock(&d->pfifo.lock);
     qemu_event_reset(&d->pgraph.sync_complete);
     qatomic_set(&pg->sync_pending, true);
     pfifo_kick(d);
     qemu_mutex_unlock(&d->pfifo.lock);
     qemu_event_wait(&d->pgraph.sync_complete);
 
-    return r->gl_display_buffer;
+    return qatomic_read(&r->scanout_found) ? r->gl_display_buffer : 0;
 }

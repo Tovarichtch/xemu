@@ -169,6 +169,13 @@ typedef struct QueryReport {
 
 typedef struct PGRAPHGLState {
     GLuint gl_framebuffer;
+    /* Display-thread coordination for the scanout. The surface list is
+     * owned by the render thread; walking it from the display thread
+     * raced against insertions and evictions. have_surfaces is
+     * maintained at every list mutation, scanout_found is published by
+     * pgraph_gl_sync after resolving the scanout on its own thread. */
+    bool have_surfaces;
+    bool scanout_found;
     GLuint gl_display_buffer;
     GLint gl_display_buffer_internal_format;
     GLsizei gl_display_buffer_width;
