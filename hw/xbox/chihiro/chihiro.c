@@ -2062,10 +2062,77 @@ static void chihiro_lpc_realize(DeviceState *dev, Error **errp)
 
 }
 
+/* The whole mediaboard protocol state: without it a snapshot restored
+ * into a fresh boot leaves the LPC at reset under a guest mid-protocol,
+ * and the game kernel panics within a second. The globals ride along in
+ * a migration shim (they are machine-wide latches, not device fields). */
+static struct {
+    bool game_running;
+    bool quickreboot_pending;
+    bool active;
+} chihiro_lpc_mig;
+
+static int chihiro_lpc_pre_save(void *opaque)
+{
+    chihiro_lpc_mig.game_running = chihiro_game_running;
+    chihiro_lpc_mig.quickreboot_pending = chihiro_quickreboot_pending;
+    chihiro_lpc_mig.active = chihiro_active;
+    return 0;
+}
+
+static int chihiro_lpc_post_load(void *opaque, int version_id)
+{
+    chihiro_game_running = chihiro_lpc_mig.game_running;
+    chihiro_quickreboot_pending = chihiro_lpc_mig.quickreboot_pending;
+    chihiro_active = chihiro_lpc_mig.active;
+    return 0;
+}
+
+static const VMStateDescription vmstate_chihiro_lpc = {
+    .name = "chihiro-lpc",
+    .version_id = 2,
+    .minimum_version_id = 1,
+    .pre_save = chihiro_lpc_pre_save,
+    .post_load = chihiro_lpc_post_load,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT8_ARRAY(mbcom_read_buffer, ChihiroLPCState, 32),
+        VMSTATE_UINT8_ARRAY(mbcom_write_buffer, ChihiroLPCState, 32),
+        VMSTATE_BOOL(host_seen, ChihiroLPCState),
+        VMSTATE_UINT32(lpc_reg_addr, ChihiroLPCState),
+        VMSTATE_UINT32(lpc_reg_data, ChihiroLPCState),
+        VMSTATE_BOOL(diag_armed, ChihiroLPCState),
+        VMSTATE_UINT32(lpc_401e_reads, ChihiroLPCState),
+        VMSTATE_UINT32(last_bootstate, ChihiroLPCState),
+        VMSTATE_UINT16(lpc_scratch_4026, ChihiroLPCState),
+        VMSTATE_UINT8(mbcom_e0_status, ChihiroLPCState),
+        VMSTATE_BOOL(mbcom_resp_ready, ChihiroLPCState),
+        VMSTATE_UINT32(bb_reg_addr, ChihiroLPCState),
+        VMSTATE_UINT32(bb_reg_status, ChihiroLPCState),
+        VMSTATE_BOOL(bb_dma_active, ChihiroLPCState),
+        VMSTATE_UINT32(bb_dma_count, ChihiroLPCState),
+        VMSTATE_BOOL(bb_event_pending, ChihiroLPCState),
+        VMSTATE_UINT32(asic_cpu_ctrl, ChihiroLPCState),
+        VMSTATE_UINT32_ARRAY(dimm_cmd, ChihiroLPCState, 8),
+        VMSTATE_UINT32_ARRAY(dimm_resp, ChihiroLPCState, 8),
+        VMSTATE_UINT32(dimm_cmd_idx, ChihiroLPCState),
+        VMSTATE_BOOL(dimm_resp_ready, ChihiroLPCState),
+        VMSTATE_UINT32(dimm_cmd_count, ChihiroLPCState),
+        VMSTATE_UINT16(dimm_next_seq, ChihiroLPCState),
+        /* Protocol one-shot timers: a snapshot taken with a mediaboard
+         * transaction in flight owes the guest a response — without the
+         * timer the reply never comes and the game hangs on its next
+         * mediaboard poll. */
+        VMSTATE_TIMER_PTR_V(irq10_timer, ChihiroLPCState, 2),
+        VMSTATE_TIMER_PTR_V(dimm_resp_timer, ChihiroLPCState, 2),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
 static void chihiro_lpc_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
     dc->realize = chihiro_lpc_realize;
+    dc->vmsd = &vmstate_chihiro_lpc;
     dc->desc = "Chihiro Mediaboard LPC I/O";
 }
 
