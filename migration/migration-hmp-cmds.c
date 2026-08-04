@@ -466,9 +466,10 @@ void hmp_loadvm(Monitor *mon, const QDict *qdict)
 
     vm_stop(RUN_STATE_RESTORE_VM);
 
-    if (load_snapshot(name, NULL, false, NULL, &err)) {
-        load_snapshot_resume(saved_state);
-    }
+    load_snapshot(name, NULL, false, NULL, &err);
+    /* A refused load leaves the machine untouched: resume it rather than
+     * staying paused in restore-vm forever (the frozen-window trap). */
+    load_snapshot_resume(saved_state);
 
     hmp_handle_error(mon, err);
 }
