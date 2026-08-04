@@ -434,8 +434,9 @@ static void nv2a_vm_state_change(void *opaque, bool running, RunState state)
     if (!running) {
         timer_del(d->vblank_timer);
     } else {
-        timer_mod(d->vblank_timer,
-                  qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 16);
+        d->vblank_deadline = qemu_clock_get_ns(QEMU_CLOCK_REALTIME) +
+                             NV2A_VBLANK_INTERVAL_NS;
+        timer_mod_ns(d->vblank_timer, d->vblank_deadline);
     }
     if (state == RUN_STATE_SAVE_VM) {
         nv2a_lock_fifo(d);
