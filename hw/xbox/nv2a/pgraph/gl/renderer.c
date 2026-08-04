@@ -132,6 +132,12 @@ static void pgraph_gl_process_pending(NV2AState *d)
             pgraph_gl_process_pending_downloads(d);
         }
         if (qatomic_read(&r->download_dirty_surfaces_pending)) {
+            /* pre-savevm: close any open visibility-test interval and
+             * drain queued reports so every GET_REPORT result reaches
+             * guest RAM before it is serialized — a report left in
+             * flight would never complete after loadvm and the game's
+             * visibility-test state machine derails (halo scenes). */
+            pgraph_gl_process_pending_reports(d);
             pgraph_gl_download_dirty_surfaces(d);
         }
         if (qatomic_read(&d->pgraph.sync_pending)) {

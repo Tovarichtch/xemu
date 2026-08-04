@@ -412,6 +412,21 @@ static void nv2a_reset_hold(Object *obj, ResetType type)
 static void nv2a_vm_state_change(void *opaque, bool running, RunState state)
 {
     NV2AState *d = opaque;
+    /* The vblank timer runs on the REALTIME clock, which does not pause
+     * with the VM. Left armed, it keeps firing during savevm/loadvm:
+     * a phantom VBLANK is latched into the saved pending_interrupts and
+     * the timer fires again right after resume, delivering back-to-back
+     * vblanks. Real hardware never spaces two vblanks closer than the
+     * refresh period, and game vblank callbacks are not reentrant —
+     * snapshots taken mid-action then crash the guest on load. Stop the
+     * timer while the VM is not running and restart it on a clean period
+     * boundary. */
+    if (!running) {
+        timer_del(d->vblank_timer);
+    } else {
+        timer_mod(d->vblank_timer,
+                  qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 16);
+    }
     if (state == RUN_STATE_SAVE_VM) {
         nv2a_lock_fifo(d);
         qatomic_set(&d->pfifo.halt, true);
@@ -473,7 +488,7 @@ const VMStateDescription vmstate_nv2a_pgraph_vertex_attributes = {
 
 static const VMStateDescription vmstate_nv2a = {
     .name = "nv2a",
-    .version_id = 3,
+    .version_id = 4,
     .minimum_version_id = 1,
     .post_save = nv2a_post_save,
     .post_load = nv2a_post_load,
@@ -593,6 +608,7 @@ static const VMStateDescription vmstate_nv2a = {
         VMSTATE_BOOL(pgraph.waiting_for_nop, NV2AState),
         VMSTATE_UNUSED(1),
         VMSTATE_BOOL(pgraph.waiting_for_context_switch, NV2AState),
+        VMSTATE_BOOL_V(pgraph.zpass_pixel_count_enable, NV2AState, 4),
         VMSTATE_END_OF_LIST()
     },
 };
