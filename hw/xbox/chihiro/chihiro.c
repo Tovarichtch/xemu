@@ -181,6 +181,15 @@ typedef struct ChihiroLPCState {
 
     int64_t    last_lpc_activity_ms; /* timestamp of last LPC read/write */
 
+    /* Migration shim for the machine-wide latches (chihiro_game_running &
+     * co.): pre_save copies the globals here so they are serialized with
+     * the device; post_load restores them. Without this a load into a
+     * fresh session leaves game_running=false and the SEGABOOT IRQ10
+     * poll keeps firing into a running game — harmless while the
+     * mediaboard is idle, fatal while it is streaming (cinematics). */
+    bool mig_game_running;
+    bool mig_quickreboot_pending;
+    bool mig_active;
 } ChihiroLPCState;
 
 #define CHIHIRO_LPC_DEVICE(obj) \
@@ -2065,32 +2074,31 @@ static void chihiro_lpc_realize(DeviceState *dev, Error **errp)
 /* The whole mediaboard protocol state: without it a snapshot restored
  * into a fresh boot leaves the LPC at reset under a guest mid-protocol,
  * and the game kernel panics within a second. The globals ride along in
- * a migration shim (they are machine-wide latches, not device fields). */
-static struct {
-    bool game_running;
-    bool quickreboot_pending;
-    bool active;
-} chihiro_lpc_mig;
+ * the device state (mig_* fields) so they are actually serialized. */
 
 static int chihiro_lpc_pre_save(void *opaque)
 {
-    chihiro_lpc_mig.game_running = chihiro_game_running;
-    chihiro_lpc_mig.quickreboot_pending = chihiro_quickreboot_pending;
-    chihiro_lpc_mig.active = chihiro_active;
+    ChihiroLPCState *s = opaque;
+    s->mig_game_running = chihiro_game_running;
+    s->mig_quickreboot_pending = chihiro_quickreboot_pending;
+    s->mig_active = chihiro_active;
     return 0;
 }
 
 static int chihiro_lpc_post_load(void *opaque, int version_id)
 {
-    chihiro_game_running = chihiro_lpc_mig.game_running;
-    chihiro_quickreboot_pending = chihiro_lpc_mig.quickreboot_pending;
-    chihiro_active = chihiro_lpc_mig.active;
+    ChihiroLPCState *s = opaque;
+    if (version_id >= 3) {
+        chihiro_game_running = s->mig_game_running;
+        chihiro_quickreboot_pending = s->mig_quickreboot_pending;
+        chihiro_active = s->mig_active;
+    }
     return 0;
 }
 
 static const VMStateDescription vmstate_chihiro_lpc = {
     .name = "chihiro-lpc",
-    .version_id = 2,
+    .version_id = 3,
     .minimum_version_id = 1,
     .pre_save = chihiro_lpc_pre_save,
     .post_load = chihiro_lpc_post_load,
@@ -2124,6 +2132,9 @@ static const VMStateDescription vmstate_chihiro_lpc = {
          * mediaboard poll. */
         VMSTATE_TIMER_PTR_V(irq10_timer, ChihiroLPCState, 2),
         VMSTATE_TIMER_PTR_V(dimm_resp_timer, ChihiroLPCState, 2),
+        VMSTATE_BOOL_V(mig_game_running, ChihiroLPCState, 3),
+        VMSTATE_BOOL_V(mig_quickreboot_pending, ChihiroLPCState, 3),
+        VMSTATE_BOOL_V(mig_active, ChihiroLPCState, 3),
         VMSTATE_END_OF_LIST()
     }
 };
