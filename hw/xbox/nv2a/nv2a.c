@@ -198,6 +198,8 @@ uint32_t perf_pcrtc_enabled = 0;
 
 #include <time.h>
 
+#define NV2A_VBLANK_INTERVAL_NS 16666666LL
+
 /* PCRTC VBlank driven by REALTIME wall clock at ~60Hz.
  * Decoupled from guest CPU speed — fires regardless of TCG load. */
 static void nv2a_realtime_vblank_cb(void *opaque)
@@ -210,8 +212,15 @@ static void nv2a_realtime_vblank_cb(void *opaque)
 
     nv2a_update_irq(d);
 
-    timer_mod(d->vblank_timer,
-              qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 16);
+    /* Absolute deadline: a late callback must not push the next vblank back,
+     * or the guest, which counts time in vblanks, runs slow. */
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+
+    d->vblank_deadline += NV2A_VBLANK_INTERVAL_NS;
+    if (d->vblank_deadline < now) {
+        d->vblank_deadline = now + NV2A_VBLANK_INTERVAL_NS;
+    }
+    timer_mod_ns(d->vblank_timer, d->vblank_deadline);
 }
 
 /* Legacy entry point — no longer called from OHCI */
@@ -274,10 +283,11 @@ static void nv2a_init_vga(NV2AState *d)
     vga->con = graphic_console_init(DEVICE(d), 0, &d->hw_ops, vga);
 
     /* PCRTC VBlank: REALTIME wall-clock timer at ~60Hz */
-    d->vblank_timer = timer_new_ms(QEMU_CLOCK_REALTIME,
+    d->vblank_timer = timer_new_ns(QEMU_CLOCK_REALTIME,
                                     nv2a_realtime_vblank_cb, d);
-    timer_mod(d->vblank_timer,
-              qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 16);
+    d->vblank_deadline = qemu_clock_get_ns(QEMU_CLOCK_REALTIME) +
+                         NV2A_VBLANK_INTERVAL_NS;
+    timer_mod_ns(d->vblank_timer, d->vblank_deadline);
 
     /* PCRTC vblank: generated from OHCI frame boundary at ~60Hz.
      * See nv2a_pcrtc_vblank_tick() called from hcd-ohci.c. */
