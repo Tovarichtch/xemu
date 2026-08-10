@@ -347,19 +347,23 @@ GLSL_DEFINE(materialEmissionColor, GLSL_LTCTXA(NV_IGRAPH_XF_LTCTXA_CM_COL) ".xyz
                 break;
             case LIGHT_SPOT:
                 /* https://docs.microsoft.com/en-us/windows/win32/direct3d9/attenuation-and-spotlight-factor#spotlight-factor */
+                /* Consume the cooked spot vector directly:
+                 * ramp = dot(spt.xyz, VPhat) + spt.w, clamped to [0,1].
+                 * The D3D8 runtime cooks spt.xyz = normalize(view*(-dir)) * S
+                 * and spt.w = -cos(phi/2) * S with
+                 * S = 1/(cos(theta/2)-cos(phi/2)) through a sign-preserving
+                 * fast-rsqrt reciprocal: a hard-edged cone (theta == phi)
+                 * legitimately yields a large finite S (~2e19). The previous
+                 * angle reconstruction via 1/length(spt.xyz) overflowed
+                 * float32 (dot = 9e38 > FLT_MAX) to inf and zeroed every
+                 * such spotlight. The cooked ramp already is the D3D8
+                 * spotlight factor with its division precooked.
+                 * FIXME: D3DLIGHT8.Falloff power curve still unmodeled
+                 * (no effect on hard cones: the ramp zone has zero width). */
                 mstring_append_fmt(body,
                     "    vec4 spotDir = lightSpotDirection(%d);\n"
-                    "    float invScale = 1/length(spotDir.xyz);\n"
-                    "    float cosHalfPhi = -invScale*spotDir.w;\n"
-                    "    float cosHalfTheta = invScale + cosHalfPhi;\n"
-                    "    float spotDirDotVP = dot(spotDir.xyz, VP);\n"
-                    "    float rho = invScale*spotDirDotVP;\n"
-                    "    if (rho > cosHalfTheta) {\n"
-                    "    } else if (rho <= cosHalfPhi) {\n"
-                    "      attenuation = 0.0;\n"
-                    "    } else {\n"
-                    "      attenuation *= spotDirDotVP + spotDir.w;\n" /* FIXME: lightSpotFalloff */
-                    "    }\n",
+                    "    attenuation *=\n"
+                    "        clamp(dot(spotDir.xyz, VP) + spotDir.w, 0.0, 1.0);\n",
                     i);
                 break;
             default:
