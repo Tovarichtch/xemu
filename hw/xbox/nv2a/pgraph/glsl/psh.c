@@ -1095,7 +1095,10 @@ static MString* psh_convert(struct PixelShader *ps)
 
         assert(ps->dot_map[i] < 8);
         const char *dotmap_func = dotmap_funcs[ps->dot_map[i]];
-        if (ps->dot_map[i] > 3) {
+        /* 4 (dotmap_hilo_1) is fully implemented above; only the three
+         * hemisphere variants are stubs returning col.rgb. Warning from 4
+         * flagged a working path as missing. */
+        if (ps->dot_map[i] > 4) {
             NV2A_UNIMPLEMENTED("Dot Mapping mode %s", dotmap_func);
         }
 
