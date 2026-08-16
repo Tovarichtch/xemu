@@ -2888,8 +2888,12 @@ DEF_METHOD(NV097, SET_ZMIN_MAX_CONTROL)
                  NV_PGRAPH_ZCOMPRESSOCCLUDE_ZCLAMP_EN_CLAMP);
         break;
     default:
-        /* FIXME: Should raise NV_PGRAPH_NSOURCE_DATA_ERROR_PENDING */
-        assert(!"Invalid zclamp value");
+        /* ZCLAMP_EN is a 4-bit field (0xF0) and only two values are defined,
+         * so 14 of 16 land here. The runtime writes D3DRS_DEPTHCLIPCONTROL
+         * into this register bit for bit with no validation, so the value is
+         * guest controlled: aborting turns a bad render state into a dead
+         * emulator. Hardware would raise NV_PGRAPH_NSOURCE_DATA_ERROR_PENDING,
+         * which is not implemented; discard, as SET_SHADE_MODE does. */
         break;
     }
 }
