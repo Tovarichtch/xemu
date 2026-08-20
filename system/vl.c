@@ -3137,14 +3137,27 @@ void qemu_init(int argc, char **argv)
             format_suffix = ",format=raw";
         }
 
-        /* Chihiro: if dvd_path is a directory, XBE, or FATX .bin, skip the
+        /* Chihiro: if dvd_path is a directory, XBE, or FATX image, skip the
          * -drive for index=1. The IDE slave is registered programmatically
-         * by chihiro_ide_interface_init() with a MemoryRegion-backed device. */
+         * by chihiro_ide_interface_init() with a MemoryRegion-backed device.
+         * Sniff the FATX magic instead of trusting the extension: a renamed
+         * image (.bin_dec etc.) used to fall through here and add a second
+         * drive on index=1, colliding with the registered IDE slave and
+         * crashing at startup. Content decides, not the name. */
+        bool dvd_is_fatx = false;
+        FILE *df = fopen(dvd_path, "rb");
+        if (df) {
+            uint8_t dm[4];
+            dvd_is_fatx = fread(dm, 1, 4, df) == 4 &&
+                          memcmp(dm, "FATX", 4) == 0;
+            fclose(df);
+        }
         struct stat dvd_st;
         if (stat(dvd_path, &dvd_st) == 0 &&
             (S_ISDIR(dvd_st.st_mode) ||
              g_ascii_strcasecmp(ext, ".xbe") == 0 ||
-             g_ascii_strcasecmp(ext, ".bin") == 0)) {
+             g_ascii_strcasecmp(ext, ".bin") == 0 ||
+             dvd_is_fatx)) {
             free(escaped_dvd_path);
             escaped_dvd_path = NULL;
         }
