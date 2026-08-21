@@ -1376,7 +1376,19 @@ int main(int argc, char **argv)
     qemu_sem_post(&display_shutdown_sem);
     qemu_thread_join(&thread);
     display_finalize();
-    return exit_status;
+    /* The NVIDIA EGL DSO destructors -- registered when SDL created the
+     * GL context, i.e. AFTER our atexit above, so they run FIRST in the
+     * LIFO exit chain -- segfault inside the driver teardown on every UI
+     * quit (measured: repeating core dumps at libnvidia-eglcore+0xabe401,
+     * OpenGL and Vulkan alike, present in dumps back to 14/08), taking
+     * the queued config save down with them and stalling the quit for
+     * the seconds the 400 MB core dump takes to write. Everything useful
+     * is already down at this point (guest state via qemu_cleanup, GL
+     * context, window, SDL): write the config ourselves, flush, and skip
+     * the doomed handler chain. */
+    xemu_settings_save();
+    fflush(NULL);
+    _exit(exit_status);
 }
 
 void xemu_eject_disc(Error **errp)
