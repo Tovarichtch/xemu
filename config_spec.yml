@@ -595,6 +595,12 @@ chihiro:
     ffb_strength:
       type: integer
       default: 100
+    # Flip force-feedback direction. Off is correct on Linux and the standard case;
+    # enable if the wheel is driven away from center instead of toward it (some
+    # wheels/drivers on Windows or macOS invert the FFB polarity).
+    ffb_invert:
+      type: bool
+      default: false
     show_crosshair:
       type: bool
       default: true

@@ -1162,9 +1162,12 @@ void xemu_input_jvs_txn_hook(ChihiroJVSState *jvs)
 // (what consumer-wheel arcade FFB plugins do, since an SDL SPRING doesn't bite a G29).
 #define CHIHIRO_FFB_CENTER_GAIN  100  // force per wheel displacement (100 = full force at full lock;
                                       // higher = firmer near center but risks 60 Hz hunting/oscillation)
-#define CHIHIRO_FFB_CENTER_SIGN  (1)  // +wheel returns to center on this G29 (its constant-force axis
-                                      // is inverted vs its position axis). Confirmed by feel-test:
-                                      // -1 drove the wheel to the lock, +1 centers it.
+#define CHIHIRO_FFB_CENTER_SIGN  (1)  // Universal, NOT per-wheel. SDL_HAPTIC_STEERING_AXIS keeps force
+                                      // and position polarity consistent across wheels -- the same
+                                      // mechanism that lets PCSX2 center every wheel with one fixed
+                                      // sign and zero invert option. +1 counters displacement toward
+                                      // center (feel-confirmed on the G29; the convention is the wheel-
+                                      // agnostic Linux evdev FF direction standard, not a G29 quirk).
 #define CHIHIRO_FFB_TORQUE_LEVEL 240  // per torque force unit
 #define CHIHIRO_FFB_DAMPER_COEFF 18   // per damper unit (mild; too high fights the spring & slows the return)
 #define CHIHIRO_FFB_ROAD_MAG     40   // continuous road buzz (0x8B) -- DISABLED (see sine block):
@@ -1420,6 +1423,12 @@ static void chihiro_ffb_update(ControllerState *c)
                 lvl += CHIHIRO_FFB_CENTER_SIGN * wheel *
                        CHIHIRO_FFB_CENTER_GAIN / 100 * scale / 100;
             }
+            // Cross-platform FFB polarity safety net. On Linux the sign is the universal
+            // SDL STEERING_AXIS convention; Windows (DirectInput) and macOS (IOKit) can
+            // invert a wheel's physical direction. This user toggle flips the whole
+            // directional (constant) force -- default off = correct on Linux and the
+            // standard case. Sine (buzz) and damper are direction-agnostic, so unaffected.
+            if (g_config.chihiro.settings.ffb_invert) lvl = -lvl;
             lvl = chihiro_ffb_clamp(lvl);
             if (lvl != c->haptic_constant_lv) {
                 c->haptic_constant_lv = lvl;

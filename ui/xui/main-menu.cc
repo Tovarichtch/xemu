@@ -1211,6 +1211,9 @@ void MainMenuChihiroView::Draw()
             ImGui::SliderInt("FFB Strength",
                              &g_config.chihiro.settings.ffb_strength, 0, 200,
                              "%d%%");
+            Toggle("Invert Force Feedback",
+                   &g_config.chihiro.settings.ffb_invert,
+                   "Enable if the wheel pulls away from center instead of toward it");
         }
         ImGui::Separator();
         Toggle("Card Reader", &g_config.chihiro.card_reader.enable,
