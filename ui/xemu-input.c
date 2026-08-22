@@ -389,7 +389,7 @@ void xemu_input_init(void)
         SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
     }
 
-    if (!SDL_Init(SDL_INIT_GAMEPAD)) {
+    if (!SDL_Init(SDL_INIT_GAMEPAD | SDL_INIT_JOYSTICK)) {
         fprintf(stderr, "Failed to initialize SDL gamepad subsystem: %s\n", SDL_GetError());
         exit(1);
     }
@@ -447,7 +447,8 @@ int xemu_input_get_controller_default_bind_port(ControllerState *state,
                                                 int start)
 {
     char guid[35] = { 0 };
-    if (state->type == INPUT_DEVICE_SDL_GAMEPAD) {
+    if (state->type == INPUT_DEVICE_SDL_GAMEPAD ||
+        state->type == INPUT_DEVICE_SDL_JOYSTICK) {
         SDL_GUIDToString(state->sdl_joystick_guid, guid, sizeof(guid));
     } else if (state->type == INPUT_DEVICE_SDL_KEYBOARD) {
         snprintf(guid, sizeof(guid), "keyboard");
@@ -480,6 +481,64 @@ void xemu_save_peripheral_settings(int player_index, int peripheral_index,
         peripheral_parameter == NULL ? "" : peripheral_parameter);
 }
 
+// Finish setting up a freshly-created controller (gamepad or raw joystick):
+// open its haptic, list it, and auto-bind it to a port (restoring a saved
+// binding by GUID when possible). Shared by the gamepad and joystick add paths.
+static void xemu_input_register_controller(ControllerState *new_con)
+{
+    chihiro_ffb_open(new_con);
+
+    char guid_buf[35] = { 0 };
+    SDL_GUIDToString(new_con->sdl_joystick_guid, guid_buf, sizeof(guid_buf));
+    DPRINTF("Opened %s (%s)\n", new_con->name, guid_buf);
+
+    QTAILQ_INSERT_TAIL(&available_controllers, new_con, entry);
+    // The gamepad remap (controller_map) is a gamepad-only concept; a raw
+    // joystick has none (it is mapped per game in the Chihiro tab).
+    if (new_con->type == INPUT_DEVICE_SDL_GAMEPAD) {
+        xemu_input_bindings_reload_map(new_con);
+    }
+
+    // Do not replace binding for a currently bound device. If the same GUID is
+    // specified on multiple ports, allow any available port to be bound (e.g.
+    // an X360 wireless receiver hands every pad the same GUID).
+
+    // Attempt to re-bind to a port previously bound to this GUID
+    int port = 0;
+    bool did_bind = false;
+    while (!did_bind) {
+        port = xemu_input_get_controller_default_bind_port(new_con, port);
+        if (port < 0) {
+            break; // No (additional) default mappings
+        } else if (!xemu_input_get_bound(port)) {
+            xemu_input_bind(port, new_con, 0);
+            did_bind = true;
+            break;
+        } else {
+            port++; // Try again for another port
+        }
+    }
+
+    // Otherwise bind to any open port, and remember the binding
+    if (!did_bind && g_config.input.auto_bind) {
+        for (port = 0; port < 4; port++) {
+            if (!xemu_input_get_bound(port)) {
+                xemu_input_bind(port, new_con, 1);
+                did_bind = true;
+                break;
+            }
+        }
+    }
+
+    if (did_bind) {
+        char buf[128];
+        snprintf(buf, sizeof(buf), "Connected '%s' to port %d",
+                 new_con->name, port + 1);
+        xemu_queue_notification(buf);
+        xemu_input_rebind_xmu(port);
+    }
+}
+
 void xemu_input_process_sdl_events(const SDL_Event *event)
 {
     if (event->type == SDL_EVENT_GAMEPAD_ADDED) {
@@ -510,72 +569,52 @@ void xemu_input_process_sdl_events(const SDL_Event *event)
         new_con->lg.scaleX = 1.0f;
         new_con->lg.scaleY = 1.0f;
 
-        chihiro_ffb_open(new_con);
-
-        char guid_buf[35] = { 0 };
-        SDL_GUIDToString(new_con->sdl_joystick_guid, guid_buf, sizeof(guid_buf));
-        DPRINTF("Opened %s (%s)\n", new_con->name, guid_buf);
-
-        QTAILQ_INSERT_TAIL(&available_controllers, new_con, entry);
-        xemu_input_bindings_reload_map(new_con);
-
-        // Do not replace binding for a currently bound device. In the case that
-        // the same GUID is specified multiple times, on different ports, allow
-        // any available port to be bound.
-        //
-        // This can happen naturally with X360 wireless receiver, in which each
-        // controller gets the same GUID (go figure). We cannot remember which
-        // controller is which in this case, but we can try to tolerate this
-        // situation by binding to any previously bound port with this GUID. The
-        // upside in this case is that a person can use the same GUID on all
-        // ports and just needs to bind to the receiver and never needs to hit
-        // this dialog.
-
-
-        // Attempt to re-bind to port previously bound to
-        int port = 0;
-        bool did_bind = false;
-        while (!did_bind) {
-            port = xemu_input_get_controller_default_bind_port(new_con, port);
-            if (port < 0) {
-                // No (additional) default mappings
-                break;
-            } else if (!xemu_input_get_bound(port)) {
-                xemu_input_bind(port, new_con, 0);
-                did_bind = true;
-                break;
-            } else {
-                // Try again for another port
-                port++;
-            }
+        xemu_input_register_controller(new_con);
+    } else if (event->type == SDL_EVENT_JOYSTICK_ADDED) {
+        // Gamepads also raise SDL_EVENT_GAMEPAD_ADDED (handled above) and must
+        // not be added twice; here we only take joysticks SDL does NOT map as a
+        // gamepad -- steering wheels, flight sticks, etc.
+        SDL_JoystickID which = event->jdevice.which;
+        if (SDL_IsGamepad(which)) {
+            return;
+        }
+        SDL_Joystick *sdl_joy = SDL_OpenJoystick(which);
+        if (sdl_joy == NULL) {
+            DPRINTF("Could not open joystick %d\n", which);
+            return;
         }
 
-        // Try to bind to any open port, and if so remember the binding
-        if (!did_bind && g_config.input.auto_bind) {
-            for (port = 0; port < 4; port++) {
-                if (!xemu_input_get_bound(port)) {
-                    xemu_input_bind(port, new_con, 1);
-                    did_bind = true;
-                    break;
-                }
-            }
-        }
+        ControllerState *new_con = malloc(sizeof(ControllerState));
+        memset(new_con, 0, sizeof(ControllerState));
+        new_con->type              = INPUT_DEVICE_SDL_JOYSTICK;
+        new_con->name              = SDL_GetJoystickName(sdl_joy);
+        new_con->sdl_gamepad       = NULL;
+        new_con->sdl_joystick      = sdl_joy;
+        new_con->sdl_joystick_id   = SDL_GetJoystickID(sdl_joy);
+        new_con->sdl_joystick_guid = SDL_GetJoystickGUID(sdl_joy);
+        new_con->bound             = -1;
+        new_con->peripheral_types[0] = PERIPHERAL_NONE;
+        new_con->peripheral_types[1] = PERIPHERAL_NONE;
+        new_con->peripherals[0] = NULL;
+        new_con->peripherals[1] = NULL;
+        new_con->lg.scaleX = 1.0f;
+        new_con->lg.scaleY = 1.0f;
 
-        if (did_bind) {
-            char buf[128];
-            snprintf(buf, sizeof(buf), "Connected '%s' to port %d", 
-                     new_con->name, port+1);
-            xemu_queue_notification(buf);
-            xemu_input_rebind_xmu(port);
-        }
-    } else if (event->type == SDL_EVENT_GAMEPAD_REMOVED) {
-        DPRINTF("Controller Removed: %d\n", event->gdevice.which);
+        xemu_input_register_controller(new_con);
+    } else if (event->type == SDL_EVENT_GAMEPAD_REMOVED ||
+               event->type == SDL_EVENT_JOYSTICK_REMOVED) {
+        // A removed gamepad raises both GAMEPAD_REMOVED and JOYSTICK_REMOVED;
+        // whichever fires first removes it, the other simply finds nothing.
+        SDL_JoystickID which = (event->type == SDL_EVENT_GAMEPAD_REMOVED)
+                                   ? event->gdevice.which
+                                   : event->jdevice.which;
+        DPRINTF("Controller Removed: %d\n", which);
         int handled = 0;
         ControllerState *iter, *next;
         QTAILQ_FOREACH_SAFE(iter, &available_controllers, entry, next) {
-            if (iter->type != INPUT_DEVICE_SDL_GAMEPAD) continue;
+            if (iter->type == INPUT_DEVICE_SDL_KEYBOARD) continue;
 
-            if (iter->sdl_joystick_id == event->gdevice.which) {
+            if (iter->sdl_joystick_id == which) {
                 DPRINTF("Device removed: %s\n", iter->name);
 
                 // Disconnect
@@ -600,6 +639,8 @@ void xemu_input_process_sdl_events(const SDL_Event *event)
                 chihiro_ffb_close(iter);
                 if (iter->sdl_gamepad) {
                     SDL_CloseGamepad(iter->sdl_gamepad);
+                } else if (iter->sdl_joystick) {
+                    SDL_CloseJoystick(iter->sdl_joystick);
                 }
 
                 for (int i = 0; i < 2; i++) {
@@ -651,21 +692,56 @@ static uint16_t jvs_axis_smooth(uint16_t pos, bool neg, bool posv)
 
 static float chihiro_axis_travel(int binding)
 {
-    if (!CHIHIRO_BINDING_IS_AXIS(binding))
-        return 0.0f;
-
     ControllerState *pad = bound_controllers[0];
-    if (!pad || !pad->sdl_gamepad)
+    if (!pad)
         return 0.0f;
 
-    int16_t raw = SDL_GetGamepadAxis(
-        pad->sdl_gamepad, (SDL_GamepadAxis)CHIHIRO_BINDING_AXIS(binding));
-    float v = raw / 32767.0f;
-    if (!CHIHIRO_BINDING_AXIS_POSITIVE(binding))
-        v = -v;
-    if (v < 0.12f)
-        return 0.0f;
-    return v > 1.0f ? 1.0f : v;
+    /* Gamepad axis: one half, with a deadzone (sticks/triggers are noisy). */
+    if (CHIHIRO_BINDING_IS_AXIS(binding)) {
+        if (!pad->sdl_gamepad)
+            return 0.0f;
+        int16_t raw = SDL_GetGamepadAxis(
+            pad->sdl_gamepad, (SDL_GamepadAxis)CHIHIRO_BINDING_AXIS(binding));
+        float v = raw / 32767.0f;
+        if (!CHIHIRO_BINDING_AXIS_POSITIVE(binding))
+            v = -v;
+        if (v < 0.12f)
+            return 0.0f;
+        return v > 1.0f ? 1.0f : v;
+    }
+
+    /* Raw wheel steering: a half-axis passed through with only a tiny centre
+     * deadzone (keeps analog[0] pinned to 0x8000 for the drive-board centring
+     * check). travel(right)-travel(left) reproduces the signed axis; the game's
+     * test menu calibrates the full lock range. */
+    if (CHIHIRO_BINDING_IS_JOY_HALFAXIS(binding)) {
+        if (!pad->sdl_joystick)
+            return 0.0f;
+        int16_t raw = SDL_GetJoystickAxis(pad->sdl_joystick,
+                                          CHIHIRO_JOY_HALFAXIS(binding));
+        float v = raw / 32767.0f;
+        if (!CHIHIRO_JOY_HALFAXIS_POSITIVE(binding))
+            v = -v;
+        if (v < 0.02f)
+            return 0.0f;
+        return v > 1.0f ? 1.0f : v;
+    }
+
+    /* Raw wheel pedal: full axis oriented so "pressed" (captured at bind) runs
+     * toward 1. No calibration here -- the game's test menu learns the actual
+     * released/pressed range (handles pedals that rest at either extreme). */
+    if (CHIHIRO_BINDING_IS_JOY_PEDAL(binding)) {
+        if (!pad->sdl_joystick)
+            return 0.0f;
+        int raw = SDL_GetJoystickAxis(pad->sdl_joystick,
+                                      CHIHIRO_JOY_PEDAL_AXIS(binding));
+        if (!CHIHIRO_JOY_PEDAL_PRESS_POSITIVE(binding))
+            raw = -raw;
+        float v = (raw + 32768) / 65535.0f; /* released extreme -> ~0 */
+        return v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
+    }
+
+    return 0.0f;
 }
 
 static bool chihiro_check_input(int binding, const bool *kbd, uint32_t mouseBtn);
@@ -674,17 +750,26 @@ static bool chihiro_check_input(int binding, const bool *kbd, uint32_t mouseBtn)
 static float chihiro_input_travel(int binding, const bool *kbd,
                                   uint32_t mouseBtn)
 {
-    if (CHIHIRO_BINDING_IS_AXIS(binding))
+    if (CHIHIRO_BINDING_IS_PROGRESSIVE(binding))
         return chihiro_axis_travel(binding);
     return chihiro_check_input(binding, kbd, mouseBtn) ? 1.0f : 0.0f;
 }
 
 static bool chihiro_check_input(int binding, const bool *kbd, uint32_t mouseBtn)
 {
-    if (CHIHIRO_BINDING_IS_AXIS(binding))
+    if (CHIHIRO_BINDING_IS_PROGRESSIVE(binding))
         return chihiro_axis_travel(binding) > 0.5f;
 
-    if (binding >= CHIHIRO_GAMEPAD_BUTTON_BASE) {
+    if (CHIHIRO_BINDING_IS_JOY_BUTTON(binding)) {
+        ControllerState *pad = bound_controllers[0];
+        if (pad && pad->sdl_joystick) {
+            return SDL_GetJoystickButton(pad->sdl_joystick,
+                                         CHIHIRO_JOY_BUTTON(binding));
+        }
+        return false;
+    }
+    if (binding >= CHIHIRO_GAMEPAD_BUTTON_BASE &&
+        binding < CHIHIRO_JOYSTICK_BUTTON_BASE) {
         ControllerState *pad = bound_controllers[0];
         if (pad && pad->sdl_gamepad) {
             return SDL_GetGamepadButton(pad->sdl_gamepad,
@@ -866,7 +951,7 @@ static void xemu_input_update_jvs(void)
         {
             /* Keys ramp to full lock; an axis is already progressive. */
             uint16_t steer_val;
-            if (CHIHIRO_BINDING_IS_AXIS(b_sl) || CHIHIRO_BINDING_IS_AXIS(b_sr)) {
+            if (CHIHIRO_BINDING_IS_PROGRESSIVE(b_sl) || CHIHIRO_BINDING_IS_PROGRESSIVE(b_sr)) {
                 float a = chihiro_input_travel(b_sr, kbd, mouseBtn) -
                           chihiro_input_travel(b_sl, kbd, mouseBtn);
                 steer_val = (uint16_t)(0x8000 + (int)(a * 32767.0f));
@@ -909,7 +994,7 @@ static void xemu_input_update_jvs(void)
             int b_sr = g_config.chihiro.jvs.ok.swing_right;
             /* The board reads left above centre and right below it. */
             uint16_t swing_val;
-            if (CHIHIRO_BINDING_IS_AXIS(b_sl) || CHIHIRO_BINDING_IS_AXIS(b_sr)) {
+            if (CHIHIRO_BINDING_IS_PROGRESSIVE(b_sl) || CHIHIRO_BINDING_IS_PROGRESSIVE(b_sr)) {
                 float a = chihiro_input_travel(b_sl, kbd, mouseBtn) -
                           chihiro_input_travel(b_sr, kbd, mouseBtn);
                 swing_val = (uint16_t)(0x8000 + (int)(a * 32767.0f));
@@ -1070,10 +1155,26 @@ void xemu_input_jvs_txn_hook(ChihiroJVSState *jvs)
 // ---------------------------------------------------------------------------
 
 #define CHIHIRO_FFB_SPRING_SAT   500  // per spring magnitude unit (0-127)
-#define CHIHIRO_FFB_SPRING_COEFF 250
+#define CHIHIRO_FFB_SPRING_COEFF 340  // SDL SPRING condition effect -- WEAK/ineffective on the G29's
+                                      // geared motor (Logitech condition springs barely register), so
+                                      // real centering is done by CONSTANT force below, not this.
+// Host-computed centering: a CONSTANT force toward center from the live wheel position
+// (what consumer-wheel arcade FFB plugins do, since an SDL SPRING doesn't bite a G29).
+#define CHIHIRO_FFB_CENTER_GAIN  100  // force per wheel displacement (100 = full force at full lock;
+                                      // higher = firmer near center but risks 60 Hz hunting/oscillation)
+#define CHIHIRO_FFB_CENTER_SIGN  (1)  // +wheel returns to center on this G29 (its constant-force axis
+                                      // is inverted vs its position axis). Confirmed by feel-test:
+                                      // -1 drove the wheel to the lock, +1 centers it.
 #define CHIHIRO_FFB_TORQUE_LEVEL 240  // per torque force unit
-#define CHIHIRO_FFB_DAMPER_COEFF 220  // per damper level unit
-#define CHIHIRO_FFB_SINE_MAG     260  // per vibration power unit
+#define CHIHIRO_FFB_DAMPER_COEFF 18   // per damper unit (mild; too high fights the spring & slows the return)
+#define CHIHIRO_FFB_ROAD_MAG     40   // continuous road buzz (0x8B) -- DISABLED (see sine block):
+                                      // the G29's geared motor renders a low continuous sine as a
+                                      // notchy "catching", not a rumble. Kept for reference/re-enable.
+#define CHIHIRO_FFB_EVENT_MAG    180  // package jolt (0xFB) -- punchy discrete kerb/wall/sand hits
+// SINE period (ms) for the discrete package jolts. A geared G29 renders a low-frequency
+// periodic as a notchy step; a higher frequency reads as a cleaner tap. 10 ms = 100 Hz,
+// the documented sweet spot for arcade FFB on consumer wheels (BackForceFeeder).
+#define CHIHIRO_FFB_SINE_PERIOD  10
 
 static int16_t chihiro_ffb_clamp(int v)
 {
@@ -1088,7 +1189,11 @@ static int16_t chihiro_ffb_clamp(int v)
 static int chihiro_ffb_make(ControllerState *c, SDL_HapticEffect *e, uint32_t feature)
 {
     if (!(c->haptic_features & feature)) return -1;
-    return SDL_CreateHapticEffect(c->haptic, e);
+    int id = SDL_CreateHapticEffect(c->haptic, e);
+    if (id < 0)
+        fprintf(stderr, "Chihiro FFB: create effect (feature 0x%x) FAILED: %s\n",
+                (unsigned)feature, SDL_GetError());
+    return id;
 }
 
 // Start/stop all created effects together. Stopping releases FFB control back
@@ -1098,15 +1203,26 @@ static void chihiro_ffb_set_running(ControllerState *c, bool run)
     if (c->haptic_running == run) {
         return;
     }
+    fprintf(stderr, "Chihiro FFB: %s effects\n", run ? "RUN" : "STOP");
+    // Taking over: disable the wheel's built-in autocentre so our SPRING is the
+    // only centring force (otherwise the weak default autocentre is all you feel).
+    if (run) {
+        if (!SDL_SetHapticAutocenter(c->haptic, 0))
+            fprintf(stderr, "  SetHapticAutocenter(0) FAILED: %s\n", SDL_GetError());
+        // Re-apply every effect on the next update after (re)engaging.
+        c->haptic_spring_lv = c->haptic_damper_lv =
+            c->haptic_constant_lv = c->haptic_sine_lv = -999999;
+    }
     const int ids[] = { c->haptic_spring, c->haptic_damper,
                         c->haptic_constant, c->haptic_sine };
+    static const char *nm[] = { "spring", "damper", "constant", "sine" };
     for (int i = 0; i < 4; i++) {
         if (ids[i] < 0) continue;
-        if (run) {
-            SDL_RunHapticEffect(c->haptic, ids[i], SDL_HAPTIC_INFINITY);
-        } else {
-            SDL_StopHapticEffect(c->haptic, ids[i]);
-        }
+        bool ok = run ? SDL_RunHapticEffect(c->haptic, ids[i], SDL_HAPTIC_INFINITY)
+                      : SDL_StopHapticEffect(c->haptic, ids[i]);
+        if (!ok)
+            fprintf(stderr, "  %s %s FAILED: %s\n", run ? "run" : "stop", nm[i],
+                    SDL_GetError());
     }
     c->haptic_running = run;
 }
@@ -1116,6 +1232,8 @@ static void chihiro_ffb_open(ControllerState *c)
     c->haptic = NULL;
     c->haptic_features = 0;
     c->haptic_spring = c->haptic_constant = c->haptic_sine = c->haptic_damper = -1;
+    c->haptic_spring_lv = c->haptic_damper_lv =
+        c->haptic_constant_lv = c->haptic_sine_lv = -999999;
 
     if (!c->sdl_joystick || !SDL_IsJoystickHaptic(c->sdl_joystick)) {
         return;
@@ -1125,30 +1243,44 @@ static void chihiro_ffb_open(ControllerState *c)
         return;
     }
     c->haptic_features = SDL_GetHapticFeatures(c->haptic);
+    fprintf(stderr, "Chihiro FFB: '%s' features=0x%x [spring=%d damper=%d constant=%d "
+            "sine=%d autocenter=%d]\n", c->name ? c->name : "?",
+            (unsigned)c->haptic_features,
+            !!(c->haptic_features & SDL_HAPTIC_SPRING),
+            !!(c->haptic_features & SDL_HAPTIC_DAMPER),
+            !!(c->haptic_features & SDL_HAPTIC_CONSTANT),
+            !!(c->haptic_features & SDL_HAPTIC_SINE),
+            !!(c->haptic_features & SDL_HAPTIC_AUTOCENTER));
 
+    // All effects target the wheel's steering axis. This is REQUIRED for a real
+    // wheel: SDL_HAPTIC_POLAR aims condition effects at a nonexistent second axis
+    // so spring/damper produce no felt centring (only the wheel's own weak
+    // autocentre survives). SDL_HAPTIC_STEERING_AXIS binds them to the wheel.
     SDL_HapticEffect e;
 
     memset(&e, 0, sizeof(e));
     e.condition.type = SDL_HAPTIC_SPRING;
+    e.condition.direction.type = SDL_HAPTIC_STEERING_AXIS;
     e.condition.length = SDL_HAPTIC_INFINITY;
     c->haptic_spring = chihiro_ffb_make(c, &e, SDL_HAPTIC_SPRING);
 
     memset(&e, 0, sizeof(e));
     e.condition.type = SDL_HAPTIC_DAMPER;
+    e.condition.direction.type = SDL_HAPTIC_STEERING_AXIS;
     e.condition.length = SDL_HAPTIC_INFINITY;
     c->haptic_damper = chihiro_ffb_make(c, &e, SDL_HAPTIC_DAMPER);
 
     memset(&e, 0, sizeof(e));
     e.constant.type = SDL_HAPTIC_CONSTANT;
-    e.constant.direction.type = SDL_HAPTIC_POLAR;
+    e.constant.direction.type = SDL_HAPTIC_STEERING_AXIS;
     e.constant.length = SDL_HAPTIC_INFINITY;
     c->haptic_constant = chihiro_ffb_make(c, &e, SDL_HAPTIC_CONSTANT);
 
     memset(&e, 0, sizeof(e));
     e.periodic.type = SDL_HAPTIC_SINE;
-    e.periodic.direction.type = SDL_HAPTIC_POLAR;
+    e.periodic.direction.type = SDL_HAPTIC_STEERING_AXIS;
     e.periodic.length = SDL_HAPTIC_INFINITY;
-    e.periodic.period = 20;
+    e.periodic.period = CHIHIRO_FFB_SINE_PERIOD;
     c->haptic_sine = chihiro_ffb_make(c, &e, SDL_HAPTIC_SINE);
 
     if (c->haptic_spring >= 0 || c->haptic_constant >= 0) {
@@ -1201,64 +1333,126 @@ static void chihiro_ffb_update(ControllerState *c)
         // FFB power (0x83; 0x60 = 100%, 0 = unset -> full).
         int str = g_config.chihiro.settings.ffb_strength;
         if (str < 0) str = 0;
-        int gp = ffb.global_power ? ffb.global_power : 0x60;
+        // Global power (0x83). Per the OR2 manual, MOTOR POWER is 60/80/90/100%
+        // with 80% (=0x40) the shipping default, so fall back to 0x40 when the
+        // game has not set it (0x60 = 100% would over-drive the servo).
+        int gp = ffb.global_power ? ffb.global_power : 0x40;
         int scale = str * gp / 0x60;
+
+        /* TEMP trace (strip before commit): the WHOLE picture -- live wheel axis
+         * position, running state, the road(0x8B)-vs-jolt(0xFB) split feeding the
+         * sine, all drive-board inputs, and the effect magnitudes (0x7FFF=100%)
+         * actually sent. Lets us SEE what force each channel produces. */
+        {
+            static int n;
+            if ((n++ % 30) == 0) {
+                DriveBoardState *db = chihiro_driveboard_global;
+                int wheel = c->sdl_joystick ?
+                    SDL_GetJoystickAxis(c->sdl_joystick, 0) : 0;
+                int sp = chihiro_ffb_clamp(
+                    ffb.centering_power * CHIHIRO_FFB_SPRING_COEFF * scale / 100);
+                int dp = chihiro_ffb_clamp(
+                    ffb.friction_power * CHIHIRO_FFB_DAMPER_COEFF * scale / 100);
+                int si = chihiro_ffb_clamp(ffb.event * CHIHIRO_FFB_EVENT_MAG * scale / 100);
+                int cl = chihiro_ffb_clamp((ffb.movement_dir ? -1 : 1) *
+                    ffb.movement_power * CHIHIRO_FFB_TORQUE_LEVEL * scale / 100);
+                fprintf(stderr, "DRVWHEEL wheel=%6d run=%d | road=%3u ev=%3u pkg=%d"
+                        " | cen=%u fric=%u mov=%u/%u vib=%u -> spring=%d damper=%d"
+                        " const=%d sine=%d | gp=%d scale=%d\n",
+                        wheel, c->haptic_running, db->road_power, db->event_pulse,
+                        db->play_pkg, ffb.centering_power, ffb.friction_power,
+                        ffb.movement_dir, ffb.movement_power, ffb.vibration,
+                        sp, dp, cl, si, gp, scale);
+            }
+        }
 
         SDL_HapticEffect e;
 
-        // CENTERING (0x8B) -> spring: the drive board's dominant, always-on
-        // auto-centering force. This is what a wheel should mostly feel.
+        // CENTERING (0x87 SPRING) -> spring on the steering axis, the drive
+        // board's dominant force. Re-upload ONLY when it changes: re-applying a
+        // condition effect every frame glitches new-lg4ff and is exactly what
+        // makes the wheel feel stuck instead of centring.
         if (c->haptic_spring >= 0) {
-            memset(&e, 0, sizeof(e));
-            e.condition.type = SDL_HAPTIC_SPRING;
-            e.condition.length = SDL_HAPTIC_INFINITY;
-            uint16_t sat = (uint16_t)chihiro_ffb_clamp(
-                ffb.centering_power * CHIHIRO_FFB_SPRING_SAT * scale / 100);
-            int16_t coeff = chihiro_ffb_clamp(
+            int coeff = chihiro_ffb_clamp(
                 ffb.centering_power * CHIHIRO_FFB_SPRING_COEFF * scale / 100);
-            for (int i = 0; i < 3; i++) {
-                e.condition.right_sat[i] = e.condition.left_sat[i] = sat;
-                e.condition.right_coeff[i] = e.condition.left_coeff[i] = coeff;
+            if (coeff != c->haptic_spring_lv) {
+                c->haptic_spring_lv = coeff;
+                uint16_t sat = (uint16_t)chihiro_ffb_clamp(
+                    ffb.centering_power * CHIHIRO_FFB_SPRING_SAT * scale / 100);
+                memset(&e, 0, sizeof(e));
+                e.condition.type = SDL_HAPTIC_SPRING;
+                e.condition.direction.type = SDL_HAPTIC_STEERING_AXIS;
+                e.condition.length = SDL_HAPTIC_INFINITY;
+                e.condition.right_sat[0] = e.condition.left_sat[0] = sat;
+                e.condition.right_coeff[0] = e.condition.left_coeff[0] = (Sint16)coeff;
+                if (!SDL_UpdateHapticEffect(c->haptic, c->haptic_spring, &e))
+                    fprintf(stderr, "DRVWHEEL: SPRING update FAILED (coeff=%d): %s\n",
+                            coeff, SDL_GetError());
             }
-            SDL_UpdateHapticEffect(c->haptic, c->haptic_spring, &e);
         }
-        // FRICTION (0x86) -> damper. SUD friction is inverted: a LOWER value
-        // means stronger opposing force, so (0x80 - value) is the strength.
+        // DAMPER (0x86 torque + 0x88 damper) -> a MILD resistance. Too strong and
+        // it fights the spring so the wheel cannot return to centre.
         if (c->haptic_damper >= 0) {
-            memset(&e, 0, sizeof(e));
-            e.condition.type = SDL_HAPTIC_DAMPER;
-            e.condition.length = SDL_HAPTIC_INFINITY;
-            int fr = ffb.friction_power ? (0x80 - ffb.friction_power) : 0;
-            int16_t coeff = chihiro_ffb_clamp(
-                fr * CHIHIRO_FFB_DAMPER_COEFF * scale / 100);
-            for (int i = 0; i < 3; i++) {
-                e.condition.right_coeff[i] = e.condition.left_coeff[i] = coeff;
-                e.condition.right_sat[i] = e.condition.left_sat[i] = 0x7FFF;
+            int coeff = chihiro_ffb_clamp(
+                ffb.friction_power * CHIHIRO_FFB_DAMPER_COEFF * scale / 100);
+            if (coeff != c->haptic_damper_lv) {
+                c->haptic_damper_lv = coeff;
+                memset(&e, 0, sizeof(e));
+                e.condition.type = SDL_HAPTIC_DAMPER;
+                e.condition.direction.type = SDL_HAPTIC_STEERING_AXIS;
+                e.condition.length = SDL_HAPTIC_INFINITY;
+                e.condition.right_coeff[0] = e.condition.left_coeff[0] = (Sint16)coeff;
+                e.condition.right_sat[0] = e.condition.left_sat[0] = 0x7FFF;
+                if (!SDL_UpdateHapticEffect(c->haptic, c->haptic_damper, &e))
+                    fprintf(stderr, "DRVWHEEL: DAMPER update FAILED (coeff=%d): %s\n",
+                            coeff, SDL_GetError());
             }
-            SDL_UpdateHapticEffect(c->haptic, c->haptic_damper, &e);
         }
-        // MOVEMENT (0x84) -> directional constant push.
+        // CONSTANT force on the steering axis = MOVEMENT push (0x84, ~0 in OR2) PLUS the
+        // real CENTERING. The SDL SPRING above does not bite the G29's geared motor, so
+        // centering is synthesised here as a constant force toward center, proportional to
+        // the live wheel displacement and gated on the game engaging centering (0x87).
         if (c->haptic_constant >= 0) {
-            memset(&e, 0, sizeof(e));
-            e.constant.type = SDL_HAPTIC_CONSTANT;
-            e.constant.direction.type = SDL_HAPTIC_POLAR;
-            // 9000 = push right, 27000 = push left (polar, hundredths of a degree).
-            e.constant.direction.dir[0] = ffb.movement_dir ? 27000 : 9000;
-            e.constant.length = SDL_HAPTIC_INFINITY;
-            e.constant.level = chihiro_ffb_clamp(
-                ffb.movement_power * CHIHIRO_FFB_TORQUE_LEVEL * scale / 100);
-            SDL_UpdateHapticEffect(c->haptic, c->haptic_constant, &e);
+            int lvl = ffb.movement_power * CHIHIRO_FFB_TORQUE_LEVEL * scale / 100;
+            if (ffb.movement_dir) lvl = -lvl;
+            if (ffb.centering_power > 0 && c->sdl_joystick) {
+                int wheel = SDL_GetJoystickAxis(c->sdl_joystick, 0); // 0 = center
+                lvl += CHIHIRO_FFB_CENTER_SIGN * wheel *
+                       CHIHIRO_FFB_CENTER_GAIN / 100 * scale / 100;
+            }
+            lvl = chihiro_ffb_clamp(lvl);
+            if (lvl != c->haptic_constant_lv) {
+                c->haptic_constant_lv = lvl;
+                memset(&e, 0, sizeof(e));
+                e.constant.type = SDL_HAPTIC_CONSTANT;
+                e.constant.direction.type = SDL_HAPTIC_STEERING_AXIS;
+                e.constant.length = SDL_HAPTIC_INFINITY;
+                e.constant.level = (Sint16)lvl;
+                if (!SDL_UpdateHapticEffect(c->haptic, c->haptic_constant, &e))
+                    fprintf(stderr, "DRVWHEEL: CONSTANT update FAILED (lvl=%d): %s\n",
+                            lvl, SDL_GetError());
+            }
         }
-        // VIBRATION / playback events (0x85 / 0xFB) -> transient sine buzz.
+        // Package jolts (0xFB) -> sine on the steering axis: discrete kerb/wall/sand hits.
         if (c->haptic_sine >= 0) {
-            memset(&e, 0, sizeof(e));
-            e.periodic.type = SDL_HAPTIC_SINE;
-            e.periodic.direction.type = SDL_HAPTIC_POLAR;
-            e.periodic.length = SDL_HAPTIC_INFINITY;
-            e.periodic.period = 20;
-            e.periodic.magnitude = chihiro_ffb_clamp(
-                ffb.vibration * CHIHIRO_FFB_SINE_MAG * scale / 100);
-            SDL_UpdateHapticEffect(c->haptic, c->haptic_sine, &e);
+            // The continuous road/engine vibration (ffb.vibration, 0x8B) is intentionally
+            // NOT rendered: its idle level (0x20 = the [4,15] floor) is near-imperceptible on
+            // the real heavy 500W servo, and the G29's geared motor turns a low continuous
+            // sine into a notchy "catching" feel, not a rumble (OutRun2-on-wheel plugins
+            // likewise render only discrete events). Only the punchy package jolts play.
+            int mag = chihiro_ffb_clamp(ffb.event * CHIHIRO_FFB_EVENT_MAG * scale / 100);
+            if (mag != c->haptic_sine_lv) {
+                c->haptic_sine_lv = mag;
+                memset(&e, 0, sizeof(e));
+                e.periodic.type = SDL_HAPTIC_SINE;
+                e.periodic.direction.type = SDL_HAPTIC_STEERING_AXIS;
+                e.periodic.length = SDL_HAPTIC_INFINITY;
+                e.periodic.period = CHIHIRO_FFB_SINE_PERIOD;
+                e.periodic.magnitude = (Sint16)mag;
+                if (!SDL_UpdateHapticEffect(c->haptic, c->haptic_sine, &e))
+                    fprintf(stderr, "DRVWHEEL: SINE update FAILED (mag=%d): %s\n",
+                            mag, SDL_GetError());
+            }
         }
         return;
     }

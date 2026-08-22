@@ -14,17 +14,24 @@ typedef struct DriveBoardState {
     int     resp_head;
     int     resp_tail;
 
-    /* Sega Universal Drive (SUD) effect state, per A.Geezer's protocol notes.
-     * Centering and friction are PERSISTENT forces held until changed; the
-     * playback pulse is a one-shot transient. (Command byte = wire & 0x7F, e.g.
-     * wire 0x8B centering -> 0x0B, wire 0xFB playback -> 0x7B.) */
-    bool    motor_active;
-    uint8_t global_power;      /* 0x83 P1: overall strength (0x32=60%..0x60=100%) */
-    uint8_t centering_power;   /* 0x8B P1: auto-centering strength (persistent) */
-    uint8_t friction_power;    /* 0x86 P1: friction (persistent) */
-    uint8_t vibration_power;   /* 0x85 P2: explicit vibration power (0-0x3F) */
+    /* Sega drive-board FFB state. Command byte = wire & 0x7F (e.g. wire 0x87
+     * SPRING -> 0x07, wire 0x8B VIBRATION -> 0x0B, wire 0xFB playback -> 0x7B).
+     * Mapping is from docs/chihiro-force-feedback.md, re-confirmed by register-
+     * level disassembly of outrun2.xbe (db_dispatch_effects / db_dispatch_mode).
+     * SPRING, damper and torque are PERSISTENT (held until changed); vibration
+     * and the package pulse are transients. */
+    bool    motor_active;      /* 0x80: 00 00 = off, else on */
+    uint8_t global_power;      /* 0x83 P1: overall strength (0x40=80%..0x60=100%) */
+    bool    spring_active;     /* 0x87 SPRING seen: wheel auto-centering engaged */
+    uint8_t damper_level;      /* 0x88 P2: speed-dependent damper (0x08 slow/0x04 fast) */
+    uint8_t friction_power;    /* 0x86 P2: constant torque / road-resistance FORCE
+                                * (DAT_002fd0dd, base ~0x02, halved at idle). P1 is a
+                                * fixed 0x2F range constant, NOT the force. */
+    uint8_t road_power;        /* 0x8B P1: road/engine vibration power (0x20-0x78, rises with speed) */
+    uint8_t road_freq;         /* 0x8B P2: vibration frequency (freq*2) */
+    uint8_t vibration_power;   /* 0x85 P2: explicit vibration power (OR2 never sends 0x85) */
     uint8_t vibration_speed;   /* 0x85 P1: vibration speed */
-    uint8_t movement_dir;      /* 0x84 P1: 1 = left, 0 = right */
+    uint8_t movement_dir;      /* 0x84 P1: 1 = left, 0 = right (recenter/cancel) */
     uint8_t movement_power;    /* 0x84 P2: directional movement power */
 
     /* SUD effect packages (uploaded via 0x9D/0x9E): 16 packages x 16 movements,
@@ -50,12 +57,13 @@ typedef struct DriveBoardState {
  * wheel; only the transient vibration channel is felt on a gamepad. */
 typedef struct DriveBoardFFB {
     bool    active;            /* motor enabled */
-    uint8_t global_power;      /* 0x83: game's FFB strength %, 0 = unset (full) */
-    uint8_t centering_power;   /* wheel auto-centering spring */
-    uint8_t friction_power;    /* wheel friction/damper */
+    uint8_t global_power;      /* game FFB strength (0x83), 0 = unset -> full */
+    uint8_t centering_power;   /* SPRING (0x87): normalized auto-centering strength */
+    uint8_t friction_power;    /* DAMPER (0x86 torque + 0x88 damper): resistance, pre-normalized (higher = stronger) */
     uint8_t movement_dir;      /* 0 = right, 1 = left */
-    uint8_t movement_power;    /* wheel directional constant force */
-    uint8_t vibration;         /* transient buzz (vibration + playback events) */
+    uint8_t movement_power;    /* CONSTANT (0x84): directional push */
+    uint8_t vibration;         /* SINE continuous: road/engine buzz (0x8B, 0x85) */
+    uint8_t event;             /* SINE transient: package jolt this frame (0xFB) */
 } DriveBoardFFB;
 
 void     driveboard_init(DriveBoardState *db);

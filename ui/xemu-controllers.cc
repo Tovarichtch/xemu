@@ -122,6 +122,23 @@ ControllerGamepadRebindingMap::HandleAxisEvent(SDL_GamepadAxisEvent *event)
     return RebindEventResult::Complete;
 }
 
+ChihiroRebindingMap::ChihiroRebindingMap(int table_row, int *scancode)
+    : RebindingMap(table_row), m_scancode(scancode), m_joy_id(0),
+      m_joy_num_axes(0)
+{
+    // Snapshot the bound wheel's axes at rest, so a pedal that idles at an
+    // extreme can still be captured by movement (see the header note).
+    ControllerState *pad = bound_controllers[0];
+    if (pad && pad->type == INPUT_DEVICE_SDL_JOYSTICK && pad->sdl_joystick) {
+        m_joy_id = pad->sdl_joystick_id;
+        int n = SDL_GetNumJoystickAxes(pad->sdl_joystick);
+        int cap = (int)(sizeof(m_joy_baseline) / sizeof(m_joy_baseline[0]));
+        m_joy_num_axes = n < cap ? n : cap;
+        for (int i = 0; i < m_joy_num_axes; i++)
+            m_joy_baseline[i] = SDL_GetJoystickAxis(pad->sdl_joystick, i);
+    }
+}
+
 RebindEventResult
 ChihiroRebindingMap::ConsumeRebindEvent(SDL_Event *event)
 {
@@ -143,6 +160,29 @@ ChihiroRebindingMap::ConsumeRebindEvent(SDL_Event *event)
         *m_scancode = CHIHIRO_AXIS_BINDING(event->gaxis.axis,
                                            event->gaxis.value > 0);
         return RebindEventResult::Complete;
+    }
+    /* Raw wheel button. */
+    if (event->type == SDL_EVENT_JOYSTICK_BUTTON_UP && m_joy_id &&
+        event->jbutton.which == m_joy_id) {
+        *m_scancode = CHIHIRO_JOY_BUTTON_BINDING(event->jbutton.button);
+        return RebindEventResult::Complete;
+    }
+    /* Raw wheel axis: capture by movement from the rest snapshot, then classify
+     * centre-rest (steering half-axis) vs extreme-rest (pedal, keeping the
+     * pressed direction). Works for any wheel regardless of pedal wiring. */
+    if (event->type == SDL_EVENT_JOYSTICK_AXIS_MOTION && m_joy_id &&
+        event->jaxis.which == m_joy_id && event->jaxis.axis < m_joy_num_axes) {
+        int axis = event->jaxis.axis;
+        int delta = (int)event->jaxis.value - (int)m_joy_baseline[axis];
+        if (abs(delta) > 12000) {
+            bool moved_positive = delta > 0;
+            if (abs(m_joy_baseline[axis]) < 8000) {
+                *m_scancode = CHIHIRO_JOY_HALFAXIS_BINDING(axis, moved_positive);
+            } else {
+                *m_scancode = CHIHIRO_JOY_PEDAL_BINDING(axis, moved_positive);
+            }
+            return RebindEventResult::Complete;
+        }
     }
     return RebindEventResult::Ignore;
 }

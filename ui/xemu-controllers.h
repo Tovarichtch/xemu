@@ -73,10 +73,15 @@ struct ChihiroRebindingMap : public virtual RebindingMap {
     /* The binding itself: the row number is not its index in its group. */
     int *m_scancode;
 
-    ChihiroRebindingMap(int table_row, int *scancode)
-        : RebindingMap(table_row), m_scancode(scancode)
-    {
-    }
+    /* Raw-wheel capture: a wheel pedal rests at an extreme, so axes are captured
+     * by MOVEMENT from a rest snapshot (taken here) rather than by an absolute
+     * threshold, and the moved axis is classified centre-rest (steering) vs
+     * extreme-rest (pedal). Only the wheel bound to port 1 is listened to. */
+    SDL_JoystickID m_joy_id;       /* bound wheel joystick id, 0 = none */
+    int            m_joy_num_axes;
+    Sint16         m_joy_baseline[24];
+
+    ChihiroRebindingMap(int table_row, int *scancode);
     RebindEventResult ConsumeRebindEvent(SDL_Event *event) override;
 };
 
