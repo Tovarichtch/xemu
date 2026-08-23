@@ -522,11 +522,24 @@ static void xemu_input_register_controller(ControllerState *new_con)
     // Otherwise bind to any open port, and remember the binding
     if (!did_bind && g_config.input.auto_bind) {
         for (port = 0; port < 4; port++) {
-            if (!xemu_input_get_bound(port)) {
-                xemu_input_bind(port, new_con, 1);
-                did_bind = true;
-                break;
+            if (xemu_input_get_bound(port))
+                continue;
+            // A raw joystick (steering wheel) must not greedily seize a port the
+            // user saved for another device -- that owner may just be unplugged
+            // now. Without this, a wheel grabs port 1 at boot and, now that its
+            // GUID is persisted, keeps displacing a saved gamepad every launch.
+            if (new_con->type == INPUT_DEVICE_SDL_JOYSTICK) {
+                const char *saved = *port_index_to_settings_key_map[port];
+                if (saved && saved[0] != '\0') {
+                    char guid[35] = { 0 };
+                    SDL_GUIDToString(new_con->sdl_joystick_guid, guid, sizeof(guid));
+                    if (strcmp(saved, guid) != 0)
+                        continue;
+                }
             }
+            xemu_input_bind(port, new_con, 1);
+            did_bind = true;
+            break;
         }
     }
 
@@ -1691,7 +1704,8 @@ void xemu_input_bind(int index, ControllerState *state, int save)
     if (save) {
         char guid_buf[35] = { 0 };
         if (state) {
-            if (state->type == INPUT_DEVICE_SDL_GAMEPAD) {
+            if (state->type == INPUT_DEVICE_SDL_GAMEPAD ||
+                state->type == INPUT_DEVICE_SDL_JOYSTICK) {
                 SDL_GUIDToString(state->sdl_joystick_guid, guid_buf, sizeof(guid_buf));
             } else if (state->type == INPUT_DEVICE_SDL_KEYBOARD) {
                 snprintf(guid_buf, sizeof(guid_buf), "keyboard");
