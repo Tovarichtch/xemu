@@ -590,6 +590,11 @@ chihiro:
     force_feedback:
       type: bool
       default: false
+    # Drive-board force-feedback strength, percent. Scales both gamepad rumble
+    # and steering-wheel haptic effects (OutRun 2). 0 = off.
+    ffb_strength:
+      type: integer
+      default: 100
     show_crosshair:
       type: bool
       default: true

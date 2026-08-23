@@ -13,6 +13,7 @@
 #include "qemu/timer.h"
 #include "chihiro-an2131.h"
 #include "chihiro-jvs.h"
+#include "chihiro-driveboard.h"
 #include <string.h>
 #include <stdio.h>
 #include <time.h>
@@ -21,6 +22,7 @@
 
 static inline int min_int(int a, int b) { return a < b ? a : b; }
 static void jvs_rx_deliver(AN2131State *s);
+static void midi_rx_deliver(AN2131State *s);
 
 static inline uint16_t canon(uint16_t addr)
 {
@@ -348,7 +350,6 @@ static void an2131_xdata_write(Cpu8051State *cpu, uint16_t addr, uint8_t val)
                 s->ep[n].bc_in = val;
                 s->ep[n].in_armed = true;
                 s->ep[n].cs_in |= EPCS_BSY;
-                if (n == 4) s->diag_ep4_arms++;
             } else {
                 s->ep[n].cs_in = val;
             }
@@ -431,12 +432,24 @@ static void an2131_sfr_write(Cpu8051State *cpu, uint8_t addr, uint8_t val)
         }
         return;
     }
-    case 0xC1: /* SBUF1 — serial TX (channel 1, JVS) */
+    case 0xC1: /* SBUF1 — serial TX (channel 1) */
     {
-        s->diag_sbuf1_writes++;
         cpu->sfr[0xC0 - 0x80] |= 0x02;  /* set TI1 — byte "sent" */
 
-        /* RS-485 unescape: firmware escapes 0xE0→{0xD0,0xDF}, 0xD0→{0xD0,0xCF} */
+        if (!s->is_qc) {
+            /* SC: plain MIDI to drive board */
+            if (chihiro_driveboard_global) {
+                driveboard_receive_byte(chihiro_driveboard_global, val);
+                if (!s->midi_response_ready &&
+                    driveboard_has_response(chihiro_driveboard_global)) {
+                    s->midi_response_ready = true;
+                    s->midi_response_set_cycles = s->total_cycles;
+                }
+            }
+            return;
+        }
+
+        /* QC: RS-485 unescape: firmware escapes 0xE0→{0xD0,0xDF}, 0xD0→{0xD0,0xCF} */
         if (val == 0xE0) {
             if (s->jvs_tx_len > 0) {
                 s->jvs_tx_len = 0;
@@ -462,7 +475,6 @@ static void an2131_sfr_write(Cpu8051State *cpu, uint8_t addr, uint8_t val)
         }
 
         if (s->jvs_tx_expected > 0 && s->jvs_tx_len >= s->jvs_tx_expected) {
-            s->diag_jvs_tx++;
 
             if (chihiro_jvs_global) {
                 uint8_t raw_resp[256];
@@ -483,7 +495,6 @@ static void an2131_sfr_write(Cpu8051State *cpu, uint8_t addr, uint8_t val)
                     }
                     s->jvs_rx_len = epos;
                     s->jvs_rx_pos = 0;
-                    s->diag_jvs_rx++;
                     s->jvs_response_ready = true;
                     s->jvs_response_set_cycles = s->total_cycles;
                 }
@@ -545,7 +556,6 @@ static void check_interrupts(AN2131State *s)
     if ((cpu->sfr[SFR_IE - 0x80] & 0x02) &&
         (cpu->sfr[SFR_TCON - 0x80] & 0x20)) {
         cpu->sfr[SFR_TCON - 0x80] &= ~0x20;  /* clear TF0 */
-        s->diag_t0_overflows++;
         cpu8051_interrupt(cpu, 0x000B);
         return;
     }
@@ -554,7 +564,6 @@ static void check_interrupts(AN2131State *s)
     if ((cpu->sfr[SFR_IE - 0x80] & 0x08) &&
         (cpu->sfr[SFR_TCON - 0x80] & 0x80)) {
         cpu->sfr[SFR_TCON - 0x80] &= ~0x80;  /* clear TF1 */
-        s->diag_t1_overflows++;
         cpu8051_interrupt(cpu, 0x001B);
         return;
     }
@@ -562,7 +571,6 @@ static void check_interrupts(AN2131State *s)
     /* Serial interrupt (RI|TI in SCON), enabled by IE.4 (ES) */
     if ((cpu->sfr[SFR_IE - 0x80] & 0x10) &&
         (cpu->sfr[SFR_SCON - 0x80] & 0x03)) {
-        s->diag_serial0_irqs++;
         cpu8051_interrupt(cpu, 0x0023);
         return;
     }
@@ -570,7 +578,6 @@ static void check_interrupts(AN2131State *s)
     /* Second serial channel (SFR 0xC0 bits 0-1), enabled by IE.6 */
     if ((cpu->sfr[SFR_IE - 0x80] & 0x40) &&
         (cpu->sfr[0xC0 - 0x80] & 0x03)) {
-        s->diag_serial1_irqs++;
         cpu8051_interrupt(cpu, 0x003B);
         return;
     }
@@ -585,7 +592,6 @@ static void check_interrupts(AN2131State *s)
                 s->ram[0x0045] = avec;
             }
             s->exif |= 0x10;
-            s->diag_usb_irqs++;
             cpu8051_interrupt(cpu, INT2_VECTOR);
             return;
         }
@@ -595,7 +601,6 @@ static void check_interrupts(AN2131State *s)
     if ((s->eie & 0x02) && s->i2c_irq_pending) {
         s->i2c_irq_pending = false;
         s->exif |= 0x20;
-        s->diag_i2c_irqs++;
         cpu8051_interrupt(cpu, INT3_VECTOR);
     }
 }
@@ -804,7 +809,6 @@ int an2131_setup_packet(AN2131State *s, const uint8_t setup[8],
 {
     if (!s->cpu_running) return -1;
 
-    s->diag_setup_calls++;
 
     /* v0x18 SBFY: recalculate checksum then freeze payload for consistent
      * EP3 IN transfer. v0x19/v0x20 interleave — only v0x18/v0x1F touch flag. */
@@ -850,12 +854,14 @@ int an2131_setup_packet(AN2131State *s, const uint8_t setup[8],
 
     while (cycles < limit) {
         jvs_rx_deliver(s);
+        midi_rx_deliver(s);
         check_interrupts(s);
         int c = cpu8051_step(&s->cpu);
         if (c <= 0) {
             s->total_cycles++;
             if (usb_irq_pending(s) || s->i2c_irq_pending ||
-                s->jvs_response_ready || s->jvs_rx_pending) {
+                s->jvs_response_ready || s->jvs_rx_pending ||
+                s->midi_response_ready) {
                 s->cpu.halted = false;
                 continue;
             }
@@ -1014,6 +1020,30 @@ static void jvs_rx_deliver(AN2131State *s)
     }
 }
 
+static void midi_rx_deliver(AN2131State *s)
+{
+    if (s->is_qc || !s->midi_response_ready) return;
+    if (!chihiro_driveboard_global) return;
+
+    Cpu8051State *cpu = &s->cpu;
+    if (cpu->in_interrupt) return;
+    if (cpu->sfr[0xC0 - 0x80] & 0x01) return;  /* RI1 still set */
+
+    if (s->total_cycles - s->midi_response_set_cycles < 5000) return;
+
+    uint8_t byte = driveboard_get_response(chihiro_driveboard_global);
+    cpu->sfr[0xC1 - 0x80] = byte;
+    cpu->sfr[0xC0 - 0x80] |= 0x01;  /* set RI1 */
+    fprintf(stderr, "DRV: MIDI_RX deliver 0x%02X (cyc=%llu)\n",
+            byte, (unsigned long long)s->total_cycles);
+
+    if (driveboard_has_response(chihiro_driveboard_global)) {
+        s->midi_response_set_cycles = s->total_cycles;
+    } else {
+        s->midi_response_ready = false;
+    }
+}
+
 int an2131_run(AN2131State *s, int max_cycles)
 {
     if (!s->cpu_running) return 0;
@@ -1021,12 +1051,14 @@ int an2131_run(AN2131State *s, int max_cycles)
     int total = 0;
     while (total < max_cycles) {
         jvs_rx_deliver(s);
+        midi_rx_deliver(s);
         check_interrupts(s);
         int c = cpu8051_step(&s->cpu);
         if (c <= 0) {
             s->total_cycles++;
             if (usb_irq_pending(s) || s->i2c_irq_pending ||
-                s->jvs_response_ready || s->jvs_rx_pending) {
+                s->jvs_response_ready || s->jvs_rx_pending ||
+                s->midi_response_ready) {
                 s->cpu.halted = false;
                 continue;
             }

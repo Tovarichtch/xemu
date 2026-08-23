@@ -124,6 +124,16 @@ typedef struct ControllerState {
     SDL_JoystickID      sdl_joystick_id;
     SDL_GUID            sdl_joystick_guid;
 
+    // Chihiro drive-board force feedback on an FFB steering wheel (OutRun 2).
+    // haptic is NULL for pads with only rumble motors.
+    SDL_Haptic         *haptic;
+    uint32_t            haptic_features;
+    int                 haptic_spring;   // effect ids, -1 when unavailable
+    int                 haptic_constant;
+    int                 haptic_sine;
+    int                 haptic_damper;
+    bool                haptic_running;  // effects currently engaged (running)
+
     enum peripheral_type peripheral_types[2];
     void *peripherals[2];
 

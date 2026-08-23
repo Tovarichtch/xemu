@@ -40,6 +40,10 @@ extern ChihiroJVSState *chihiro_jvs_global;
 
 void chihiro_jvs_init(ChihiroJVSState *s);
 
+/* Per-poll JVS tape record/replay hook (ui/xemu-input.c). Called at the game's
+ * switch poll so a drive can be captured and replayed frame-for-frame. */
+void xemu_input_jvs_txn_hook(ChihiroJVSState *s);
+
 /*
  * Process a raw JVS frame (starting with 0xE0 sync).
  * Returns the number of bytes written to out[], or 0 if no response

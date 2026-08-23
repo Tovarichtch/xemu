@@ -27,6 +27,7 @@
 #include "qemu/timer.h"
 #include "chihiro.h"
 #include "chihiro-jvs.h"
+#include "chihiro-driveboard.h"
 #include "chihiro-an2131.h"
 #include "migration/vmstate.h"
 #define TS_MS ((long long)(qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL)))
@@ -66,22 +67,6 @@ typedef struct ChihiroUSBState {
     AN2131State an2131;
     bool use_lle;  /* true after firmware loaded and AN2131 CPU running */
     QEMUTimer *lle_tick_timer;
-
-    /* JVS watchdog diagnostic */
-    int64_t last_jvs_send_ms;
-    int64_t last_jvs_recv_ms;
-    bool jvs_watchdog_fired;
-
-    /* ── DIAG: event-driven listeners (no behavior change) ──── */
-    int64_t diag_last_report_ms;
-    uint64_t diag_tick_count;
-    uint64_t diag_cycles_total;
-    /* state snapshot for transition detection */
-    bool diag_prev_tr0;
-    bool diag_prev_ep4_armed;
-    bool diag_prev_halted;
-    bool diag_prev_cpu_running;
-    int  diag_zero_cycle_streak;
 
     /* Runtime copy of USB descriptor — populated from EEPROM B2 header
      * (VID/PID/bcdDevice) at realize instead of hardcoded constants */
@@ -411,12 +396,9 @@ static void handle_control(USBDevice *dev, USBPacket *p,
             p->actual_length = length;
         }
 
-        if (s->is_qc && bRequest == 0x20) {
-            s->last_jvs_send_ms = TS_MS;
-        }
-
+        /* 0x18 excluded: logging in that path freezes the game at INITIALIZING */
         if (lpc_log_verbose && (bRequest == 0x1C || bRequest == 0x24 || bRequest == 0x15
-                                || bRequest == 0x17 || bRequest == 0x18 || bRequest == 0x16)) {
+                                || bRequest == 0x17 || bRequest == 0x16)) {
             fprintf(stderr, "[%07lld] LLE [%s] v0x%02X val=0x%04X idx=0x%04X resp_len=%d ctrl={",
                     TS_MS, id, bRequest, value, index, resp_len);
             int show = resp_len > 0 ? MIN(resp_len, 16) : MIN(length, 16);
@@ -552,16 +534,6 @@ static void handle_data(USBDevice *dev, USBPacket *p)
     ChihiroUSBState *s = (ChihiroUSBState *)dev;
     int ep = p->ep->nr;
 
-    if (s->is_qc && ep == 4) {
-        static int ep4_data_log = 0;
-        if (ep4_data_log < 50) {
-            fprintf(stderr, "[%07lld] handle_data EP4 pid=%s armed=%d bc=%d\n",
-                    TS_MS, p->pid == USB_TOKEN_IN ? "IN" : "OUT",
-                    s->an2131.ep[4].in_armed, s->an2131.ep[4].bc_in);
-            ep4_data_log++;
-        }
-    }
-
     /* LLE path: route bulk transfers through AN2131 firmware */
     if (s->use_lle) {
         if (p->pid == USB_TOKEN_IN) {
@@ -584,19 +556,7 @@ static void handle_data(USBDevice *dev, USBPacket *p)
                             fprintf(stderr, " %02X", buf[i]);
                         fprintf(stderr, "\n");
                     }
-                    if (ep == 4 && s->is_qc) {
-                        static int ep4in_data_log = 0;
-                        if (ep4in_data_log < 50) {
-                            fprintf(stderr, "[%07lld] EP4_IN_DATA: %d bytes:", TS_MS, got);
-                            for (int i = 0; i < got && i < 16; i++)
-                                fprintf(stderr, " %02X", buf[i]);
-                            fprintf(stderr, "\n");
-                            ep4in_data_log++;
-                        }
-                    }
                     usb_packet_copy(p, buf, got);
-                    if (ep == 4 && s->is_qc)
-                        s->last_jvs_recv_ms = TS_MS;
                 }
             } else {
                 p->status = USB_RET_NAK;
@@ -606,16 +566,6 @@ static void handle_data(USBDevice *dev, USBPacket *p)
             uint8_t buf[64];
             int chunk = MIN(len, (int)sizeof(buf));
             usb_packet_copy(p, buf, chunk);
-            {
-                static int bulk_out_log = 0;
-                if (bulk_out_log < 200) {
-                    fprintf(stderr, "[%07lld] BULK_OUT ep=%d len=%d", TS_MS, ep, chunk);
-                    for (int i = 0; i < 8 && i < chunk; i++)
-                        fprintf(stderr, " %02X", buf[i]);
-                    fprintf(stderr, "\n");
-                    bulk_out_log++;
-                }
-            }
             an2131_ep_out_write(&s->an2131, ep, buf, chunk);
             an2131_run(&s->an2131, 2000);
 
@@ -687,6 +637,7 @@ static void chihiro_an2131qc_realize(USBDevice *dev, Error **errp)
 
     /* AN2131 LLE: init 8051 CPU + register layer, wire EEPROMs + extmem */
     an2131_init(&s->an2131);
+    s->an2131.is_qc = true;
     s->an2131.ic10_eeprom = s->eeprom;
     s->an2131.ic10_size = sizeof(s->eeprom);
     s->an2131.ic11_eeprom = s->ic11;
@@ -950,8 +901,13 @@ static void chihiro_an2131sc_realize(USBDevice *dev, Error **errp)
 
     chihiro_jvs_init(&s->jvs);
 
+    static DriveBoardState driveboard_instance;
+    driveboard_init(&driveboard_instance);
+    chihiro_driveboard_global = &driveboard_instance;
+
     /* AN2131 LLE: init 8051 CPU + register layer, wire EEPROMs + extmem */
     an2131_init(&s->an2131);
+    s->an2131.is_qc = false;
     s->an2131.ic10_eeprom = s->eeprom;
     s->an2131.ic10_size = sizeof(s->eeprom);
     s->an2131.ic11_eeprom = s->ic11;

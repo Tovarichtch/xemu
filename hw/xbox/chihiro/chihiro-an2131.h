@@ -282,6 +282,13 @@ typedef struct AN2131State {
     int     jvs_rx_len;
     int     jvs_rx_pos;        /* next byte to feed back via SBUF1 RX */
 
+    /* ── QC/SC identity ────────────────────────────────────────── */
+    bool is_qc;             /* true = JVS/RS-485, false = MIDI/drive board */
+
+    /* ── MIDI RX (drive board response injection) ─────────────── */
+    bool     midi_response_ready;
+    uint64_t midi_response_set_cycles;
+
     /* ── Runtime state ──────────────────────────────────────────── */
     bool cpu_running;       /* true after CPUCS release */
     void *usb_dev;          /* Back-pointer to ChihiroUSBState */
@@ -291,18 +298,6 @@ typedef struct AN2131State {
     uint64_t jvs_response_set_cycles;  /* total_cycles when JVS response was generated */
 
 
-    /* ── DIAG event counters (incremented in an2131, read in chihiro-usb) ── */
-    uint64_t diag_t0_overflows;
-    uint64_t diag_t1_overflows;
-    uint64_t diag_serial0_irqs;
-    uint64_t diag_serial1_irqs;
-    uint64_t diag_usb_irqs;
-    uint64_t diag_i2c_irqs;
-    uint64_t diag_jvs_tx;
-    uint64_t diag_jvs_rx;
-    uint64_t diag_sbuf1_writes;
-    uint64_t diag_ep4_arms;
-    uint64_t diag_setup_calls;
 } AN2131State;
 
 /* ── Public API ──────────────────────────────────────────────────────── */

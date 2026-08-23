@@ -37,6 +37,7 @@
 #include "system/blockdev.h"
 #include "hw/xbox/chihiro/chihiro-jvs.h"
 #include "hw/xbox/chihiro/chihiro.h"
+#include "hw/xbox/chihiro/chihiro-driveboard.h"
 
 extern SDL_Window *m_window;
 extern int viewport_coords[4];
@@ -96,6 +97,12 @@ ControllerState *bound_controllers[4] = { NULL, NULL, NULL, NULL };
 const char *bound_drivers[4] = { DRIVER_DUKE, DRIVER_DUKE, DRIVER_DUKE,
                                  DRIVER_DUKE };
 int test_mode;
+
+// Chihiro drive-board force feedback (defined below, used in the SDL device
+// add/remove handlers and the per-frame update).
+static void chihiro_ffb_open(ControllerState *c);
+static void chihiro_ffb_close(ControllerState *c);
+static void chihiro_ffb_update(ControllerState *c);
 
 static float m_mouseX;
 static float m_mouseY;
@@ -387,6 +394,13 @@ void xemu_input_init(void)
         exit(1);
     }
 
+    // Haptic is optional: needed only for steering-wheel force feedback.
+    // A failure here just means wheels fall back to rumble (or nothing).
+    if (!SDL_InitSubSystem(SDL_INIT_HAPTIC)) {
+        fprintf(stderr, "SDL haptic subsystem unavailable (wheel FFB disabled): %s\n",
+                SDL_GetError());
+    }
+
     // Create the keyboard input (always first)
     ControllerState *new_con = malloc(sizeof(ControllerState));
     memset(new_con, 0, sizeof(ControllerState));
@@ -496,6 +510,8 @@ void xemu_input_process_sdl_events(const SDL_Event *event)
         new_con->lg.scaleX = 1.0f;
         new_con->lg.scaleY = 1.0f;
 
+        chihiro_ffb_open(new_con);
+
         char guid_buf[35] = { 0 };
         SDL_GUIDToString(new_con->sdl_joystick_guid, guid_buf, sizeof(guid_buf));
         DPRINTF("Opened %s (%s)\n", new_con->name, guid_buf);
@@ -581,6 +597,7 @@ void xemu_input_process_sdl_events(const SDL_Event *event)
                 QTAILQ_REMOVE (&available_controllers, iter, entry);
 
                 // Deallocate
+                chihiro_ffb_close(iter);
                 if (iter->sdl_gamepad) {
                     SDL_CloseGamepad(iter->sdl_gamepad);
                 }
@@ -934,12 +951,343 @@ static void xemu_input_update_jvs(void)
     coin_prev = coin_key;
 }
 
+// ---------------------------------------------------------------------------
+// JVS tape record / replay (XEMU_JVS_RECORD / XEMU_JVS_REPLAY)
+//
+// The whole JVS input state is a few dozen bytes per frame. Captured/played one
+// frame per game switch-poll (v2 magic XJVSTAP2) so loading-time differences
+// between runs cannot shift the inputs against the game. Used here to reproduce
+// a real drive (steering + gas that can't be injected via keyboard) so drive-
+// board force feedback can be measured and tuned against real gameplay.
+// ---------------------------------------------------------------------------
+typedef struct {
+    uint8_t  system_switches;
+    uint8_t  player_switches[JVS_MAX_PLAYERS][2];
+    uint16_t analog[JVS_MAX_ANALOG];
+    uint16_t coin_count[JVS_MAX_COINS];
+} JVSFrame;
+
+#define JVS_TAPE_MAGIC "XJVSTAP2"
+
+bool xemu_jvs_snap_loaded;   /* set by the LPC post-load hook (loadvm), if any */
+
+static FILE *jvs_tape;
+static bool  jvs_tape_v2;
+static bool  jvs_replaying;
+static unsigned long jvs_tape_frames;
+
+static void jvs_tape_init(void)
+{
+    static int done;
+    if (done) return;
+    done = 1;
+
+    const char *rep = getenv("XEMU_JVS_REPLAY");
+    const char *rec = getenv("XEMU_JVS_RECORD");
+    if (rep) {
+        jvs_tape = fopen(rep, "rb");
+        if (jvs_tape) {
+            char magic[8];
+            if (fread(magic, 1, 8, jvs_tape) == 8 &&
+                !memcmp(magic, JVS_TAPE_MAGIC, 8)) {
+                jvs_tape_v2 = true;
+            } else {
+                fseek(jvs_tape, 0, SEEK_SET);
+            }
+            jvs_replaying = true;
+        }
+        fprintf(stderr, "JVS replay: %s%s\n", jvs_tape ? rep : "FAILED",
+                jvs_tape_v2 ? " (per-frame)" : " (legacy)");
+    } else if (rec) {
+        jvs_tape = fopen(rec, "wb");
+        if (jvs_tape) {
+            fwrite(JVS_TAPE_MAGIC, 1, 8, jvs_tape);
+        }
+        fprintf(stderr, "JVS record: %s\n", jvs_tape ? rec : "FAILED");
+    }
+}
+
+void xemu_input_jvs_txn_hook(ChihiroJVSState *jvs)
+{
+    JVSFrame f;
+
+    jvs_tape_init();
+    if (!jvs_tape) {
+        return;
+    }
+
+    /* XEMU_JVS_ON_LOAD=1: start only at the first loadvm (snapshot-aligned). */
+    static int on_load = -1;
+    if (on_load < 0) {
+        on_load = getenv("XEMU_JVS_ON_LOAD") ? 1 : 0;
+    }
+    if (on_load && !xemu_jvs_snap_loaded) {
+        return;
+    }
+
+    if (jvs_replaying) {
+        if (!jvs_tape_v2) {
+            return;
+        }
+        if (fread(&f, sizeof(f), 1, jvs_tape) != 1) {
+            fprintf(stderr, "JVS replay: end of tape (%lu frames)\n",
+                    jvs_tape_frames);
+            fclose(jvs_tape);
+            jvs_tape = NULL;
+            jvs_replaying = false;
+            return;
+        }
+        jvs_tape_frames++;
+        jvs->system_switches = f.system_switches;
+        memcpy(jvs->player_switches, f.player_switches, sizeof(f.player_switches));
+        memcpy(jvs->analog, f.analog, sizeof(f.analog));
+        memcpy(jvs->coin_count, f.coin_count, sizeof(f.coin_count));
+        return;
+    }
+
+    /* Record what the game is about to read. */
+    f.system_switches = jvs->system_switches;
+    memcpy(f.player_switches, jvs->player_switches, sizeof(f.player_switches));
+    memcpy(f.analog, jvs->analog, sizeof(f.analog));
+    memcpy(f.coin_count, jvs->coin_count, sizeof(f.coin_count));
+    fwrite(&f, sizeof(f), 1, jvs_tape);
+    fflush(jvs_tape);   /* per-frame flush: the tape survives the fast quit path */
+    jvs_tape_frames++;
+}
+
+// ---------------------------------------------------------------------------
+// Chihiro drive-board force feedback -> host haptics (OutRun 2)
+//
+// OutRun 2 drives the 838-13683 drive board with SPRING / TORQUE / DAMPER /
+// VIBRATION commands (decoded in chihiro-driveboard.c). We translate the live
+// effect state onto the bound player-1 device: a real force-feedback wheel gets
+// proportional SDL_Haptic condition/constant/periodic effects; a plain gamepad
+// gets rumble from the vibration channel.
+//
+// The arcade board itself runs a fixed-PWM binary motor; these proportional
+// mappings realise the game's *computed* FFB intent on modern hardware. The
+// scaling constants are host tuning knobs (feel), not emulated values.
+// ---------------------------------------------------------------------------
+
+#define CHIHIRO_FFB_SPRING_SAT   500  // per spring magnitude unit (0-127)
+#define CHIHIRO_FFB_SPRING_COEFF 250
+#define CHIHIRO_FFB_TORQUE_LEVEL 240  // per torque force unit
+#define CHIHIRO_FFB_DAMPER_COEFF 220  // per damper level unit
+#define CHIHIRO_FFB_SINE_MAG     260  // per vibration power unit
+
+static int16_t chihiro_ffb_clamp(int v)
+{
+    if (v > 0x7FFF)  return 0x7FFF;
+    if (v < -0x7FFF) return -0x7FFF;
+    return (int16_t)v;
+}
+
+// Create a zero-force effect but do NOT start it: running effects seize FFB
+// control and would suppress the wheel's own auto-centering while idle. Effects
+// are started only when the game's FFB actually engages (chihiro_ffb_update).
+static int chihiro_ffb_make(ControllerState *c, SDL_HapticEffect *e, uint32_t feature)
+{
+    if (!(c->haptic_features & feature)) return -1;
+    return SDL_CreateHapticEffect(c->haptic, e);
+}
+
+// Start/stop all created effects together. Stopping releases FFB control back
+// to the wheel (restoring its default behaviour) when the game isn't driving it.
+static void chihiro_ffb_set_running(ControllerState *c, bool run)
+{
+    if (c->haptic_running == run) {
+        return;
+    }
+    const int ids[] = { c->haptic_spring, c->haptic_damper,
+                        c->haptic_constant, c->haptic_sine };
+    for (int i = 0; i < 4; i++) {
+        if (ids[i] < 0) continue;
+        if (run) {
+            SDL_RunHapticEffect(c->haptic, ids[i], SDL_HAPTIC_INFINITY);
+        } else {
+            SDL_StopHapticEffect(c->haptic, ids[i]);
+        }
+    }
+    c->haptic_running = run;
+}
+
+static void chihiro_ffb_open(ControllerState *c)
+{
+    c->haptic = NULL;
+    c->haptic_features = 0;
+    c->haptic_spring = c->haptic_constant = c->haptic_sine = c->haptic_damper = -1;
+
+    if (!c->sdl_joystick || !SDL_IsJoystickHaptic(c->sdl_joystick)) {
+        return;
+    }
+    c->haptic = SDL_OpenHapticFromJoystick(c->sdl_joystick);
+    if (!c->haptic) {
+        return;
+    }
+    c->haptic_features = SDL_GetHapticFeatures(c->haptic);
+
+    SDL_HapticEffect e;
+
+    memset(&e, 0, sizeof(e));
+    e.condition.type = SDL_HAPTIC_SPRING;
+    e.condition.length = SDL_HAPTIC_INFINITY;
+    c->haptic_spring = chihiro_ffb_make(c, &e, SDL_HAPTIC_SPRING);
+
+    memset(&e, 0, sizeof(e));
+    e.condition.type = SDL_HAPTIC_DAMPER;
+    e.condition.length = SDL_HAPTIC_INFINITY;
+    c->haptic_damper = chihiro_ffb_make(c, &e, SDL_HAPTIC_DAMPER);
+
+    memset(&e, 0, sizeof(e));
+    e.constant.type = SDL_HAPTIC_CONSTANT;
+    e.constant.direction.type = SDL_HAPTIC_POLAR;
+    e.constant.length = SDL_HAPTIC_INFINITY;
+    c->haptic_constant = chihiro_ffb_make(c, &e, SDL_HAPTIC_CONSTANT);
+
+    memset(&e, 0, sizeof(e));
+    e.periodic.type = SDL_HAPTIC_SINE;
+    e.periodic.direction.type = SDL_HAPTIC_POLAR;
+    e.periodic.length = SDL_HAPTIC_INFINITY;
+    e.periodic.period = 20;
+    c->haptic_sine = chihiro_ffb_make(c, &e, SDL_HAPTIC_SINE);
+
+    if (c->haptic_spring >= 0 || c->haptic_constant >= 0) {
+        fprintf(stderr, "Chihiro FFB: wheel '%s' ready "
+                "(spring=%d constant=%d sine=%d damper=%d)\n",
+                c->name ? c->name : "?", c->haptic_spring,
+                c->haptic_constant, c->haptic_sine, c->haptic_damper);
+    }
+}
+
+static void chihiro_ffb_close(ControllerState *c)
+{
+    if (!c->haptic) {
+        return;
+    }
+    SDL_CloseHaptic(c->haptic);  // destroys created effects as well
+    c->haptic = NULL;
+    c->haptic_spring = c->haptic_constant = c->haptic_sine = c->haptic_damper = -1;
+}
+
+static void chihiro_ffb_update(ControllerState *c)
+{
+    if (!c || !chihiro_driveboard_global) {
+        return;
+    }
+
+    // Master switch: Chihiro > Force Feedback. When off, release any running
+    // wheel effects and silence pad rumble; the drive board keeps responding
+    // regardless, so OutRun 2 still boots past its drive-board init.
+    if (!g_config.chihiro.settings.force_feedback) {
+        chihiro_ffb_set_running(c, false);
+        c->gp.rumble_l = c->gp.rumble_r = 0;
+        return;
+    }
+
+    DriveBoardFFB ffb;
+    driveboard_get_ffb(chihiro_driveboard_global, &ffb);
+
+    // Path 1: a real force-feedback wheel (supports condition/constant force).
+    if (c->haptic && (c->haptic_spring >= 0 || c->haptic_constant >= 0)) {
+        // Engage effects only while the game is actually driving FFB; stopping
+        // them hands control back to the wheel's own centering when idle.
+        bool engage = ffb.active;
+        chihiro_ffb_set_running(c, engage);
+        if (!engage) {
+            return;
+        }
+
+        // Combined power scaling: user slider (percent) x the game's in-game
+        // FFB power (0x83; 0x60 = 100%, 0 = unset -> full).
+        int str = g_config.chihiro.settings.ffb_strength;
+        if (str < 0) str = 0;
+        int gp = ffb.global_power ? ffb.global_power : 0x60;
+        int scale = str * gp / 0x60;
+
+        SDL_HapticEffect e;
+
+        // CENTERING (0x8B) -> spring: the drive board's dominant, always-on
+        // auto-centering force. This is what a wheel should mostly feel.
+        if (c->haptic_spring >= 0) {
+            memset(&e, 0, sizeof(e));
+            e.condition.type = SDL_HAPTIC_SPRING;
+            e.condition.length = SDL_HAPTIC_INFINITY;
+            uint16_t sat = (uint16_t)chihiro_ffb_clamp(
+                ffb.centering_power * CHIHIRO_FFB_SPRING_SAT * scale / 100);
+            int16_t coeff = chihiro_ffb_clamp(
+                ffb.centering_power * CHIHIRO_FFB_SPRING_COEFF * scale / 100);
+            for (int i = 0; i < 3; i++) {
+                e.condition.right_sat[i] = e.condition.left_sat[i] = sat;
+                e.condition.right_coeff[i] = e.condition.left_coeff[i] = coeff;
+            }
+            SDL_UpdateHapticEffect(c->haptic, c->haptic_spring, &e);
+        }
+        // FRICTION (0x86) -> damper. SUD friction is inverted: a LOWER value
+        // means stronger opposing force, so (0x80 - value) is the strength.
+        if (c->haptic_damper >= 0) {
+            memset(&e, 0, sizeof(e));
+            e.condition.type = SDL_HAPTIC_DAMPER;
+            e.condition.length = SDL_HAPTIC_INFINITY;
+            int fr = ffb.friction_power ? (0x80 - ffb.friction_power) : 0;
+            int16_t coeff = chihiro_ffb_clamp(
+                fr * CHIHIRO_FFB_DAMPER_COEFF * scale / 100);
+            for (int i = 0; i < 3; i++) {
+                e.condition.right_coeff[i] = e.condition.left_coeff[i] = coeff;
+                e.condition.right_sat[i] = e.condition.left_sat[i] = 0x7FFF;
+            }
+            SDL_UpdateHapticEffect(c->haptic, c->haptic_damper, &e);
+        }
+        // MOVEMENT (0x84) -> directional constant push.
+        if (c->haptic_constant >= 0) {
+            memset(&e, 0, sizeof(e));
+            e.constant.type = SDL_HAPTIC_CONSTANT;
+            e.constant.direction.type = SDL_HAPTIC_POLAR;
+            // 9000 = push right, 27000 = push left (polar, hundredths of a degree).
+            e.constant.direction.dir[0] = ffb.movement_dir ? 27000 : 9000;
+            e.constant.length = SDL_HAPTIC_INFINITY;
+            e.constant.level = chihiro_ffb_clamp(
+                ffb.movement_power * CHIHIRO_FFB_TORQUE_LEVEL * scale / 100);
+            SDL_UpdateHapticEffect(c->haptic, c->haptic_constant, &e);
+        }
+        // VIBRATION / playback events (0x85 / 0xFB) -> transient sine buzz.
+        if (c->haptic_sine >= 0) {
+            memset(&e, 0, sizeof(e));
+            e.periodic.type = SDL_HAPTIC_SINE;
+            e.periodic.direction.type = SDL_HAPTIC_POLAR;
+            e.periodic.length = SDL_HAPTIC_INFINITY;
+            e.periodic.period = 20;
+            e.periodic.magnitude = chihiro_ffb_clamp(
+                ffb.vibration * CHIHIRO_FFB_SINE_MAG * scale / 100);
+            SDL_UpdateHapticEffect(c->haptic, c->haptic_sine, &e);
+        }
+        return;
+    }
+
+    // Path 2: plain gamepad -> rumble motors from the vibration/event channel.
+    // (The rumble sender already gates on enable_rumble; setting 0 when
+    // disabled keeps the state clean.)
+    if (c->type == INPUT_DEVICE_SDL_GAMEPAD) {
+        int str = g_config.chihiro.settings.ffb_strength;
+        if (str < 0) str = 0;
+        uint32_t raw = driveboard_get_rumble(chihiro_driveboard_global);
+        raw = raw * (uint32_t)str / 100;
+        uint16_t r = raw > 0xFFFF ? 0xFFFF : (uint16_t)raw;
+        c->gp.rumble_l = r;
+        c->gp.rumble_r = r;
+    }
+}
+
 void xemu_input_update_controllers(void)
 {
     ControllerState *iter;
     QTAILQ_FOREACH (iter, &available_controllers, entry) {
         xemu_input_update_controller(iter);
     }
+
+    // Chihiro drive-board force feedback -> bound player 1 (steering-wheel
+    // haptics if available, otherwise gamepad rumble). See chihiro_ffb_update().
+    chihiro_ffb_update(bound_controllers[0]);
+
     QTAILQ_FOREACH (iter, &available_controllers, entry) {
         xemu_input_update_rumble(iter);
     }

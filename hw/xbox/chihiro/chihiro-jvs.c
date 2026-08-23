@@ -129,6 +129,8 @@ static int jvs_handle_command(ChihiroJVSState *s,
 
     case 0x20: { /* Read Switch Inputs */
         if (cmd_len < 3) return 1;
+        /* JVS tape record/replay: capture or inject the input the game reads. */
+        xemu_input_jvs_txn_hook(s);
         int players = cmd[1];
         int bytes_per = cmd[2];
         PUT(JVS_REPORT_OK);
