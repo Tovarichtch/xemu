@@ -982,10 +982,9 @@ static void xemu_input_update_jvs(void)
             if (chihiro_check_input(g_config.chihiro.jvs.ctx.jump, kbd, mouseBtn))
                 sw0 |= 0x02;
         } else {
-            if (chihiro_check_input(g_config.chihiro.jvs.or2.gear_up, kbd, mouseBtn))
-                sw1 |= 0x20;
-            if (chihiro_check_input(g_config.chihiro.jvs.or2.gear_down, kbd, mouseBtn))
-                sw1 |= 0x10;
+            /* OR2: view change is player-1 sw0 bit 4. The sequential shifter is
+             * NOT on player 1 -- it is wired to the SECOND player's up/down pins,
+             * applied after the P2 update below (see there). */
             if (chihiro_check_input(g_config.chihiro.jvs.or2.view_change, kbd, mouseBtn))
                 sw0 |= 0x10;
         }
@@ -1033,6 +1032,17 @@ static void xemu_input_update_jvs(void)
     jvs->player_switches[0][1] = sw1;
 
     chihiro_update_jvs_p2(jvs, kbd, mouseBtn, profile);
+
+    // OR2's sequential shifter is wired to the SECOND player's UP/DOWN switch
+    // pins: JVS sw0 bits 5/4 of player 2. Testmode.xbe (and the game) read gear
+    // from that player-2 word, not from player 1 -- verified by decompiling the
+    // input-test display. Applied after the P2 update so it is not cleared.
+    if (profile == CONFIG_CHIHIRO_JVS_PROFILE_OR2) {
+        if (chihiro_check_input(g_config.chihiro.jvs.or2.gear_up, kbd, mouseBtn))
+            jvs->player_switches[1][0] |= 0x20;
+        if (chihiro_check_input(g_config.chihiro.jvs.or2.gear_down, kbd, mouseBtn))
+            jvs->player_switches[1][0] |= 0x10;
+    }
 
     jvs->system_switches = chihiro_check_input(g_config.chihiro.jvs.test, kbd, mouseBtn) ? 0x80 : 0x00;
 
