@@ -741,8 +741,9 @@ static float chihiro_axis_travel(int binding)
             v = -v;
         if (v < 0.02f)
             return 0.0f;
-        // Range scaling: 270 deg of the physical wheel reaches full lock (arcade),
-        // unless "Full range" (scale 1.0) maps the whole wheel to full lock.
+        // Range scaling: `wheel_rotation` degrees of the physical wheel reach full
+        // lock (default 270, arcade); "Full range" (scale 1.0) maps the whole
+        // wheel onto the game's axis.
         v *= g_wheel_steering_scale;
         return v > 1.0f ? 1.0f : v;
     }
@@ -1146,22 +1147,24 @@ static void chihiro_ffb_set_running(ControllerState *c, bool run)
     c->haptic_running = run;
 }
 
-// Steering rotation range. The setting is the player's PHYSICAL wheel range in
-// degrees; the game (the OutRun 2 cabinet) is 270 deg lock-to-lock. We software-
-// scale the steering so that turning 270 deg of the wheel reaches full in-game
-// lock -- arcade feel -- on a larger wheel, while a smaller wheel still reaches
-// full lock at its own extreme (scale never drops below 1). 0 means "Full range":
-// the whole wheel maps to full lock, no scaling. Pure math with no OS wheel API,
-// so it behaves identically on Linux, Windows and macOS.
-static void chihiro_apply_wheel_rotation(int wheel_degrees)
+// Steering rotation range. The setting is how many degrees of the physical
+// wheel (lock-to-lock) reach full in-game lock -- the Sega Rally Model 2
+// wrapper convention: 270 (default) = turning 270 deg of the wheel already
+// reaches the game's full steering range (OutRun 2 cabinet), 540 = 540 deg,
+// and 0 = "Full range" = the whole wheel maps 1:1 onto the game's axis. The
+// steering is software-scaled by wheel_range / setting, assuming the common
+// 900 deg sim wheel (G29/G920/T300...). Pure math with no OS wheel API, so it
+// behaves identically on Linux, Windows and macOS; the scale never drops below
+// 1 (a setting at or above the wheel's range is simply the full range).
+static void chihiro_apply_wheel_rotation(int lock_degrees)
 {
-    const float game_degrees = 270.0f; // OutRun 2 cabinet, lock-to-lock
-    if (wheel_degrees <= 0) {          // "Full range": use the whole wheel
+    const float wheel_range = 900.0f;  // assumed physical lock-to-lock range
+    if (lock_degrees <= 0) {           // "Full range": use the whole wheel
         g_wheel_steering_scale = 1.0f;
         return;
     }
-    if (wheel_degrees < 150) wheel_degrees = 150;
-    float s = (float)wheel_degrees / game_degrees;
+    if (lock_degrees < 150) lock_degrees = 150;
+    float s = wheel_range / (float)lock_degrees;  // 900/270 = 3.33x
     g_wheel_steering_scale = s < 1.0f ? 1.0f : s;
 }
 

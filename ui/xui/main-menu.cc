@@ -1214,10 +1214,10 @@ void MainMenuChihiroView::Draw()
 
     if (ImGui::CollapsingHeader("Steering Wheel")) {
         // Wheel Rotation is independent of force feedback -- always shown.
-        // It is the player's physical wheel rotation: steering is scaled so 270 deg
-        // reaches full in-game lock (OutRun 2 cabinet). Wheels of 270 deg or less
-        // already play 1:1, so they use "Full range" (0); the larger entries squeeze
-        // a big sim wheel down to the arcade 270 deg. Common real rotations only.
+        // Sega Rally Model 2 wrapper convention: the value is how many degrees of
+        // the physical wheel reach full in-game lock -- 270 (default, OutRun 2
+        // cabinet) means a 270 deg turn already covers the game's whole steering
+        // range; "Full range" maps the whole wheel 1:1. Common real values only.
         static const int rot_vals[] = { 0, 270, 360, 540, 900, 1080 };
         static const char *rot_lbls[] = {
             "Full range", "270\xc2\xb0 (default)", "360\xc2\xb0", "540\xc2\xb0",
@@ -1231,9 +1231,9 @@ void MainMenuChihiroView::Draw()
             }
         if (ImGui::Combo("Wheel Rotation", &idx, rot_lbls, n_rot))
             g_config.chihiro.settings.wheel_rotation = rot_vals[idx];
-        ImGui::SetItemTooltip("Your steering wheel's rotation range. The game "
-                              "reaches full lock at 270\xc2\xb0 (OutRun 2 "
-                              "cabinet); \"Full range\" uses the whole wheel.");
+        ImGui::SetItemTooltip("Degrees of wheel rotation that reach full in-game "
+                              "lock. 270\xc2\xb0 matches the OutRun 2 cabinet; "
+                              "\"Full range\" maps the whole wheel 1:1.");
 
         // Force feedback and its sub-settings depend on the master FFB switch.
         Toggle("Force Feedback", &g_config.chihiro.settings.force_feedback,

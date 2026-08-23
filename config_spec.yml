@@ -601,9 +601,10 @@ chihiro:
     ffb_invert:
       type: bool
       default: false
-    # Player's physical steering-wheel rotation range in degrees. Steering is
-    # scaled so 270 deg reaches full in-game lock (OutRun 2 cabinet). 0 = "Full
-    # range": use the whole wheel, no scaling. Default 270.
+    # Degrees of physical wheel rotation that reach full in-game lock (Sega Rally
+    # Model 2 wrapper convention). Default 270 = a 270 deg turn covers the game's
+    # whole steering range (OutRun 2 cabinet). 0 = "Full range": the whole wheel
+    # maps 1:1. Software scaling assuming a 900 deg wheel.
     wheel_rotation:
       type: integer
       default: 270
