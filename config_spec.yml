@@ -590,6 +590,23 @@ chihiro:
     force_feedback:
       type: bool
       default: false
+    # Drive-board force-feedback strength, percent. Scales both gamepad rumble
+    # and steering-wheel haptic effects (OutRun 2). 0 = off.
+    ffb_strength:
+      type: integer
+      default: 100
+    # Flip force-feedback direction. Off is correct on Linux and the standard case;
+    # enable if the wheel is driven away from center instead of toward it (some
+    # wheels/drivers on Windows or macOS invert the FFB polarity).
+    ffb_invert:
+      type: bool
+      default: false
+    # Player's physical steering-wheel rotation range in degrees. Steering is
+    # scaled so 270 deg reaches full in-game lock (OutRun 2 cabinet). 0 = "Full
+    # range": use the whole wheel, no scaling. Default 270.
+    wheel_rotation:
+      type: integer
+      default: 270
     show_crosshair:
       type: bool
       default: true

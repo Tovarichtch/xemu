@@ -540,7 +540,15 @@ void MainMenuInputView::Draw()
         tc.w = 0.0f;
         ImGui::PushStyleColor(ImGuiCol_Header, tc);
 
-        if (ImGui::CollapsingHeader("Input Mapping")) {
+        if (bound_state->type == INPUT_DEVICE_SDL_JOYSTICK) {
+            // A raw wheel/joystick has no Xbox-gamepad remap; it is mapped per
+            // game in the Chihiro tab, and its range/pedals calibrate in the
+            // game's TEST MENU.
+            ImGui::TextWrapped(
+                "Steering wheel / raw joystick. Bind its axes and buttons in "
+                "the Chihiro tab (Arcade Settings). Wheel rotation range and "
+                "pedals are calibrated in each game's TEST MENU.");
+        } else if (ImGui::CollapsingHeader("Input Mapping")) {
             float p = ImGui::GetFrameHeight() * 0.3;
             ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, ImVec2(p, p));
             if (ImGui::BeginTable("input_remap_tbl", 2,
@@ -855,11 +863,29 @@ static const char *chihiro_gamepad_axis_name(int value)
     return buf;
 }
 
+static const char *chihiro_joystick_name(int value)
+{
+    static char buf[32];
+    if (CHIHIRO_BINDING_IS_JOY_BUTTON(value))
+        snprintf(buf, sizeof(buf), "Wheel Btn %d", CHIHIRO_JOY_BUTTON(value));
+    else if (CHIHIRO_BINDING_IS_JOY_HALFAXIS(value))
+        snprintf(buf, sizeof(buf), "Wheel Axis %d %c", CHIHIRO_JOY_HALFAXIS(value),
+                 CHIHIRO_JOY_HALFAXIS_POSITIVE(value) ? '+' : '-');
+    else
+        snprintf(buf, sizeof(buf), "Wheel Pedal %d", CHIHIRO_JOY_PEDAL_AXIS(value));
+    return buf;
+}
+
 static const char *chihiro_binding_name(int value)
 {
     if (CHIHIRO_BINDING_IS_AXIS(value))
         return chihiro_gamepad_axis_name(value);
-    if (value >= CHIHIRO_GAMEPAD_BUTTON_BASE)
+    if (CHIHIRO_BINDING_IS_JOY_BUTTON(value) ||
+        CHIHIRO_BINDING_IS_JOY_HALFAXIS(value) ||
+        CHIHIRO_BINDING_IS_JOY_PEDAL(value))
+        return chihiro_joystick_name(value);
+    if (value >= CHIHIRO_GAMEPAD_BUTTON_BASE &&
+        value < CHIHIRO_JOYSTICK_BUTTON_BASE)
         return chihiro_gamepad_button_name(value - CHIHIRO_GAMEPAD_BUTTON_BASE);
     switch (value) {
     case 1001: return "Left Click";
@@ -1137,6 +1163,24 @@ void MainMenuChihiroView::Draw()
     ImGui::PopFont();
 
     if (ImGui::CollapsingHeader("Arcade Settings")) {
+        Toggle("Freeplay", &g_config.chihiro.settings.freeplay,
+               "Disable coin requirement (applies on reset)");
+        chihiro_freeplay_setting = g_config.chihiro.settings.freeplay;
+        ChevronCombo("Region", &g_config.chihiro.settings.region,
+                     "Japan\0USA\0Export\0",
+                     "Arcade region setting (applies on reset)");
+        chihiro_region_setting = g_config.chihiro.settings.region;
+        ImGui::BeginDisabled();
+        int board_dummy = 0;
+        ChevronCombo("Board Type", &board_dummy,
+                     "Type-1 (FPGA)\0",
+                     "Type-3 (ASIC) support coming soon");
+        ImGui::EndDisabled();
+        Toggle("Card Reader", &g_config.chihiro.card_reader.enable,
+               "CRP-1231 IC card reader emulation (Ghost Squad, Gundam)");
+    }
+
+    if (ImGui::CollapsingHeader("Light Gun")) {
         Toggle("Light Gun Mode", &g_config.chihiro.settings.lightgun_mode,
                "Hides system cursor and prevents mouse from triggering menus. Toggle with F3.");
         Toggle("Show Crosshair", &g_config.chihiro.settings.show_crosshair,
@@ -1166,24 +1210,42 @@ void MainMenuChihiroView::Draw()
                              &g_config.chihiro.settings.sinden_border_size,
                              2, 30, "%d px");
         }
-        Toggle("Freeplay", &g_config.chihiro.settings.freeplay,
-               "Disable coin requirement (applies on reset)");
-        chihiro_freeplay_setting = g_config.chihiro.settings.freeplay;
-        ChevronCombo("Region", &g_config.chihiro.settings.region,
-                     "Japan\0USA\0Export\0",
-                     "Arcade region setting (applies on reset)");
-        chihiro_region_setting = g_config.chihiro.settings.region;
-        ImGui::BeginDisabled();
-        int board_dummy = 0;
-        ChevronCombo("Board Type", &board_dummy,
-                     "Type-1 (FPGA)\0",
-                     "Type-3 (ASIC) support coming soon");
-        ImGui::EndDisabled();
+    }
+
+    if (ImGui::CollapsingHeader("Steering Wheel")) {
+        // Wheel Rotation is independent of force feedback -- always shown.
+        // It is the player's physical wheel rotation: steering is scaled so 270 deg
+        // reaches full in-game lock (OutRun 2 cabinet). Wheels of 270 deg or less
+        // already play 1:1, so they use "Full range" (0); the larger entries squeeze
+        // a big sim wheel down to the arcade 270 deg. Common real rotations only.
+        static const int rot_vals[] = { 0, 270, 360, 540, 900, 1080 };
+        static const char *rot_lbls[] = {
+            "Full range", "270\xc2\xb0 (default)", "360\xc2\xb0", "540\xc2\xb0",
+            "900\xc2\xb0", "1080\xc2\xb0" };
+        const int n_rot = (int)(sizeof(rot_vals) / sizeof(rot_vals[0]));
+        int idx = 1;  // default 270 (OutRun 2 cabinet)
+        for (int i = 0; i < n_rot; i++)
+            if (rot_vals[i] == g_config.chihiro.settings.wheel_rotation) {
+                idx = i;
+                break;
+            }
+        if (ImGui::Combo("Wheel Rotation", &idx, rot_lbls, n_rot))
+            g_config.chihiro.settings.wheel_rotation = rot_vals[idx];
+        ImGui::SetItemTooltip("Your steering wheel's rotation range. The game "
+                              "reaches full lock at 270\xc2\xb0 (OutRun 2 "
+                              "cabinet); \"Full range\" uses the whole wheel.");
+
+        // Force feedback and its sub-settings depend on the master FFB switch.
         Toggle("Force Feedback", &g_config.chihiro.settings.force_feedback,
                "Enable force feedback for driving games (OutRun 2)");
-        ImGui::Separator();
-        Toggle("Card Reader", &g_config.chihiro.card_reader.enable,
-               "CRP-1231 IC card reader emulation (Ghost Squad, Gundam)");
+        if (g_config.chihiro.settings.force_feedback) {
+            ImGui::SliderInt("FFB Strength",
+                             &g_config.chihiro.settings.ffb_strength, 0, 200,
+                             "%d%%");
+            Toggle("Invert Force Feedback",
+                   &g_config.chihiro.settings.ffb_invert,
+                   "Enable if the wheel pulls away from center instead of toward it");
+        }
     }
 
     if (ImGui::CollapsingHeader("Files")) {

@@ -73,6 +73,7 @@ enum controller_state_axis_index {
 enum controller_input_device_type {
     INPUT_DEVICE_SDL_KEYBOARD,
     INPUT_DEVICE_SDL_GAMEPAD,
+    INPUT_DEVICE_SDL_JOYSTICK, // raw joystick (steering wheel etc.), not a mapped gamepad
 };
 
 enum peripheral_type { PERIPHERAL_NONE, PERIPHERAL_XMU, PERIPHERAL_TYPE_COUNT };
@@ -124,6 +125,21 @@ typedef struct ControllerState {
     SDL_JoystickID      sdl_joystick_id;
     SDL_GUID            sdl_joystick_guid;
 
+    // Chihiro drive-board force feedback on an FFB steering wheel (OutRun 2).
+    // haptic is NULL for pads with only rumble motors.
+    SDL_Haptic         *haptic;
+    uint32_t            haptic_features;
+    int                 haptic_spring;   // effect ids, -1 when unavailable
+    int                 haptic_constant;
+    int                 haptic_sine;
+    int                 haptic_damper;
+    bool                haptic_running;  // effects currently engaged (running)
+    // Last value uploaded to each effect. Re-uploading an unchanged condition
+    // effect every frame glitches new-lg4ff (wheel feels stuck), so only update
+    // on change. -999999 = "force next update".
+    int                 haptic_spring_lv, haptic_damper_lv;
+    int                 haptic_constant_lv, haptic_sine_lv;
+
     enum peripheral_type peripheral_types[2];
     void *peripherals[2];
 
@@ -149,9 +165,53 @@ extern "C" {
 #define CHIHIRO_GAMEPAD_AXIS_BASE 3001
 #define CHIHIRO_AXIS_BINDING(axis, positive) \
     (CHIHIRO_GAMEPAD_AXIS_BASE + (axis) * 2 + ((positive) ? 1 : 0))
-#define CHIHIRO_BINDING_IS_AXIS(b) ((b) >= CHIHIRO_GAMEPAD_AXIS_BASE)
 #define CHIHIRO_BINDING_AXIS(b) (((b) - CHIHIRO_GAMEPAD_AXIS_BASE) / 2)
 #define CHIHIRO_BINDING_AXIS_POSITIVE(b) ((((b) - CHIHIRO_GAMEPAD_AXIS_BASE) & 1) != 0)
+
+/*
+ * Raw SDL_Joystick bindings (steering wheels etc.) live in namespaces above the
+ * gamepad ones: a wheel exposes more axes/buttons than the fixed Xbox layout,
+ * and the read side must use the SDL_Joystick API, not SDL_Gamepad. Steering is
+ * a half-axis (centred at 0, like a stick); a pedal is a full-axis whose
+ * "pressed" direction is captured at bind time, then the raw value is fed
+ * straight to the JVS analog so the GAME's test-menu calibrates range/direction
+ * (exactly as an operator calibrates the pots on a real cabinet).
+ */
+#define CHIHIRO_JOYSTICK_BUTTON_BASE   4001 /* + button index */
+#define CHIHIRO_JOYSTICK_HALFAXIS_BASE 5001 /* + axis*2 + positive       (steering) */
+#define CHIHIRO_JOYSTICK_PEDAL_BASE    6001 /* + axis*2 + press_positive  (pedals) */
+#define CHIHIRO_JOYSTICK_PEDAL_END     8000
+
+#define CHIHIRO_JOY_BUTTON_BINDING(btn) (CHIHIRO_JOYSTICK_BUTTON_BASE + (btn))
+#define CHIHIRO_JOY_HALFAXIS_BINDING(axis, positive) \
+    (CHIHIRO_JOYSTICK_HALFAXIS_BASE + (axis) * 2 + ((positive) ? 1 : 0))
+#define CHIHIRO_JOY_PEDAL_BINDING(axis, press_positive) \
+    (CHIHIRO_JOYSTICK_PEDAL_BASE + (axis) * 2 + ((press_positive) ? 1 : 0))
+
+/* gamepad axis: 3001..4000 */
+#define CHIHIRO_BINDING_IS_AXIS(b) \
+    ((b) >= CHIHIRO_GAMEPAD_AXIS_BASE && (b) < CHIHIRO_JOYSTICK_BUTTON_BASE)
+/* raw joystick button: 4001..5000 */
+#define CHIHIRO_BINDING_IS_JOY_BUTTON(b) \
+    ((b) >= CHIHIRO_JOYSTICK_BUTTON_BASE && (b) < CHIHIRO_JOYSTICK_HALFAXIS_BASE)
+#define CHIHIRO_JOY_BUTTON(b) ((b) - CHIHIRO_JOYSTICK_BUTTON_BASE)
+/* raw joystick half-axis (steering): 5001..6000 */
+#define CHIHIRO_BINDING_IS_JOY_HALFAXIS(b) \
+    ((b) >= CHIHIRO_JOYSTICK_HALFAXIS_BASE && (b) < CHIHIRO_JOYSTICK_PEDAL_BASE)
+#define CHIHIRO_JOY_HALFAXIS(b) (((b) - CHIHIRO_JOYSTICK_HALFAXIS_BASE) / 2)
+#define CHIHIRO_JOY_HALFAXIS_POSITIVE(b) \
+    ((((b) - CHIHIRO_JOYSTICK_HALFAXIS_BASE) & 1) != 0)
+/* raw joystick full-axis pedal: 6001..7999 */
+#define CHIHIRO_BINDING_IS_JOY_PEDAL(b) \
+    ((b) >= CHIHIRO_JOYSTICK_PEDAL_BASE && (b) < CHIHIRO_JOYSTICK_PEDAL_END)
+#define CHIHIRO_JOY_PEDAL_AXIS(b) (((b) - CHIHIRO_JOYSTICK_PEDAL_BASE) / 2)
+#define CHIHIRO_JOY_PEDAL_PRESS_POSITIVE(b) \
+    ((((b) - CHIHIRO_JOYSTICK_PEDAL_BASE) & 1) != 0)
+
+/* "Progressive" = any analog travel input (vs a digital button/key). */
+#define CHIHIRO_BINDING_IS_PROGRESSIVE(b) \
+    (CHIHIRO_BINDING_IS_AXIS(b) || CHIHIRO_BINDING_IS_JOY_HALFAXIS(b) || \
+     CHIHIRO_BINDING_IS_JOY_PEDAL(b))
 
 extern int *g_keyboard_scancode_map[25];
 extern int *g_chihiro_universal_map[4];
