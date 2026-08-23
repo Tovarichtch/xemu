@@ -1235,6 +1235,10 @@ void MainMenuChihiroView::Draw()
                               "lock. 270\xc2\xb0 matches the OutRun 2 cabinet; "
                               "\"Full range\" maps the whole wheel 1:1.");
 
+        Toggle("Wheel Auto-Center (Experimental)",
+               &g_config.chihiro.settings.wheel_autocenter,
+               "Spring the wheel back to center when no game force feedback is active");
+
         // Force feedback and its sub-settings depend on the master FFB switch.
         Toggle("Force Feedback", &g_config.chihiro.settings.force_feedback,
                "Enable force feedback for driving games (OutRun 2)");

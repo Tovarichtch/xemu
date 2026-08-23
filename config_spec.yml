@@ -608,6 +608,12 @@ chihiro:
     wheel_rotation:
       type: integer
       default: 270
+    # Spring the wheel back to centre while the game is not driving force
+    # feedback. Arcade wheel cabs centre mechanically (Crazy Taxi HR has no FFB
+    # hardware at all), so a limp FFB wheel is less faithful than this.
+    wheel_autocenter:
+      type: bool
+      default: true
     show_crosshair:
       type: bool
       default: true

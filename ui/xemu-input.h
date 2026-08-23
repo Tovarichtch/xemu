@@ -139,6 +139,7 @@ typedef struct ControllerState {
     // on change. -999999 = "force next update".
     int                 haptic_spring_lv, haptic_damper_lv;
     int                 haptic_constant_lv, haptic_sine_lv;
+    int                 haptic_autocenter_lv; // built-in autocentre %, -1 = unknown
 
     enum peripheral_type peripheral_types[2];
     void *peripherals[2];

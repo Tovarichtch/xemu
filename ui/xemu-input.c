@@ -1105,6 +1105,13 @@ static void xemu_input_update_jvs(void)
 // periodic as a notchy step; a higher frequency reads as a cleaner tap. 10 ms = 100 Hz,
 // the documented sweet spot for arcade FFB on consumer wheels (BackForceFeeder).
 #define CHIHIRO_FFB_SINE_PERIOD  10
+// Idle wheel liveliness: every Chihiro wheel cab centres MECHANICALLY (spring --
+// Crazy Taxi HR has no drive board at all, and OutRun 2's servo only acts once
+// the game engages). A modern FFB wheel has no spring, so while no drive-board
+// effect is running we arm the wheel's BUILT-IN autocentre (firmware spring;
+// smooth on Logitech, no host update loop, no hunting). Host feel emulation of
+// the cab's mechanical return -- strength is a host tuning knob, 0-100.
+#define CHIHIRO_FFB_AUTOCENTER   50
 
 static int16_t chihiro_ffb_clamp(int v)
 {
@@ -1133,6 +1140,7 @@ static void chihiro_ffb_set_running(ControllerState *c, bool run)
     // only centring force (otherwise the weak default autocentre is all you feel).
     if (run) {
         SDL_SetHapticAutocenter(c->haptic, 0);
+        c->haptic_autocenter_lv = 0;
         // Re-apply every effect on the next update after (re)engaging.
         c->haptic_spring_lv = c->haptic_damper_lv =
             c->haptic_constant_lv = c->haptic_sine_lv = -999999;
@@ -1175,6 +1183,7 @@ static void chihiro_ffb_open(ControllerState *c)
     c->haptic_spring = c->haptic_constant = c->haptic_sine = c->haptic_damper = -1;
     c->haptic_spring_lv = c->haptic_damper_lv =
         c->haptic_constant_lv = c->haptic_sine_lv = -999999;
+    c->haptic_autocenter_lv = -1;
 
     if (!c->sdl_joystick || !SDL_IsJoystickHaptic(c->sdl_joystick)) {
         return;
@@ -1225,6 +1234,7 @@ static void chihiro_ffb_close(ControllerState *c)
     SDL_CloseHaptic(c->haptic);  // destroys created effects as well
     c->haptic = NULL;
     c->haptic_spring = c->haptic_constant = c->haptic_sine = c->haptic_damper = -1;
+    c->haptic_autocenter_lv = -1;
 }
 
 static void chihiro_ffb_update(ControllerState *c)
@@ -1241,6 +1251,21 @@ static void chihiro_ffb_update(ControllerState *c)
         if (deg != applied_rotation) {
             applied_rotation = deg;
             chihiro_apply_wheel_rotation(deg);
+        }
+    }
+
+    // Wheel auto-centre (see CHIHIRO_FFB_AUTOCENTER): armed whenever no
+    // drive-board effect is running, released as soon as the game's FFB takes
+    // over (chihiro_ffb_set_running(true) zeroes it). Independent of the FFB
+    // master switch -- it stands in for the cab's mechanical spring, which is
+    // there even on cabs with no FFB hardware (Crazy Taxi HR).
+    if (c->haptic && c->sdl_joystick) {
+        int want = (!c->haptic_running &&
+                    g_config.chihiro.settings.wheel_autocenter)
+                       ? CHIHIRO_FFB_AUTOCENTER : 0;
+        if (want != c->haptic_autocenter_lv) {
+            SDL_SetHapticAutocenter(c->haptic, want);
+            c->haptic_autocenter_lv = want;
         }
     }
 
