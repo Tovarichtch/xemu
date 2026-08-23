@@ -1034,8 +1034,6 @@ static void midi_rx_deliver(AN2131State *s)
     uint8_t byte = driveboard_get_response(chihiro_driveboard_global);
     cpu->sfr[0xC1 - 0x80] = byte;
     cpu->sfr[0xC0 - 0x80] |= 0x01;  /* set RI1 */
-    fprintf(stderr, "DRV: MIDI_RX deliver 0x%02X (cyc=%llu)\n",
-            byte, (unsigned long long)s->total_cycles);
 
     if (driveboard_has_response(chihiro_driveboard_global)) {
         s->midi_response_set_cycles = s->total_cycles;

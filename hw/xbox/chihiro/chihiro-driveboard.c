@@ -4,21 +4,14 @@
 
 DriveBoardState *chihiro_driveboard_global = NULL;
 
-static int driveboard_buf_count(DriveBoardState *db)
-{
-    return (db->resp_tail - db->resp_head + DRIVEBOARD_RESP_SIZE) % DRIVEBOARD_RESP_SIZE;
-}
-
 static void driveboard_push_response(DriveBoardState *db, uint8_t val)
 {
     int next = (db->resp_tail + 1) % DRIVEBOARD_RESP_SIZE;
     if (next == db->resp_head) {
-        fprintf(stderr, "DRV: RESP DROP 0x%02X (buf full=%d)\n", val, driveboard_buf_count(db));
-        return;
+        return;  // response FIFO full, drop
     }
     db->resp_buf[db->resp_tail] = val;
     db->resp_tail = next;
-    fprintf(stderr, "DRV: RESP PUSH 0x%02X (buf=%d)\n", val, driveboard_buf_count(db));
 }
 
 void driveboard_init(DriveBoardState *db)
@@ -39,8 +32,6 @@ void driveboard_receive_byte(DriveBoardState *db, uint8_t byte)
     uint8_t cmd = db->tx_buf[0] & 0x7F;
     uint8_t p1  = db->tx_buf[1];
     uint8_t p2  = db->tx_buf[2];
-
-    fprintf(stderr, "DRV: CMD 0x%02X p1=0x%02X p2=0x%02X\n", cmd, p1, p2);
 
     switch (cmd) {
     /* --- init / handshake (responses kept as the game's init SM expects) --- */
@@ -174,17 +165,6 @@ uint16_t driveboard_get_rumble(DriveBoardState *db)
     uint32_t rumble = mag * 780;                       /* power ~0x54 -> full */
     if (rumble > 0xFFFF) rumble = 0xFFFF;
 
-    /* TEMP trace (strip before final commit): confirm each event plays its own
-     * package (jolt vs buzz) and that road buzz (0x8B) stays out of the pad. */
-    {
-        static int n; static uint16_t prev = 0xAAAA;
-        if ((uint16_t)rumble != prev || (n++ % 120) == 0) {
-            prev = (uint16_t)rumble;
-            fprintf(stderr, "DRVFFB: pkg=%d pos=%u road=%u fric=%u ev=%u -> rumble=%u\n",
-                    db->play_pkg, db->play_pos, db->road_power,
-                    db->friction_power, db->event_pulse, (unsigned)rumble);
-        }
-    }
     return (uint16_t)rumble;
 }
 

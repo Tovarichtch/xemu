@@ -690,6 +690,10 @@ static uint16_t jvs_axis_smooth(uint16_t pos, bool neg, bool posv)
     return target;
 }
 
+// Steering scale from the wheel-rotation setting: `desired` degrees of physical
+// rotation map to full in-game lock. Set by chihiro_apply_wheel_rotation().
+static float g_wheel_steering_scale = 1.0f;
+
 static float chihiro_axis_travel(int binding)
 {
     ControllerState *pad = bound_controllers[0];
@@ -724,6 +728,9 @@ static float chihiro_axis_travel(int binding)
             v = -v;
         if (v < 0.02f)
             return 0.0f;
+        // Range scaling: 270 deg of the physical wheel reaches full lock (arcade),
+        // unless "Full range" (scale 1.0) maps the whole wheel to full lock.
+        v *= g_wheel_steering_scale;
         return v > 1.0f ? 1.0f : v;
     }
 
@@ -1192,11 +1199,7 @@ static int16_t chihiro_ffb_clamp(int v)
 static int chihiro_ffb_make(ControllerState *c, SDL_HapticEffect *e, uint32_t feature)
 {
     if (!(c->haptic_features & feature)) return -1;
-    int id = SDL_CreateHapticEffect(c->haptic, e);
-    if (id < 0)
-        fprintf(stderr, "Chihiro FFB: create effect (feature 0x%x) FAILED: %s\n",
-                (unsigned)feature, SDL_GetError());
-    return id;
+    return SDL_CreateHapticEffect(c->haptic, e);
 }
 
 // Start/stop all created effects together. Stopping releases FFB control back
@@ -1206,28 +1209,41 @@ static void chihiro_ffb_set_running(ControllerState *c, bool run)
     if (c->haptic_running == run) {
         return;
     }
-    fprintf(stderr, "Chihiro FFB: %s effects\n", run ? "RUN" : "STOP");
     // Taking over: disable the wheel's built-in autocentre so our SPRING is the
     // only centring force (otherwise the weak default autocentre is all you feel).
     if (run) {
-        if (!SDL_SetHapticAutocenter(c->haptic, 0))
-            fprintf(stderr, "  SetHapticAutocenter(0) FAILED: %s\n", SDL_GetError());
+        SDL_SetHapticAutocenter(c->haptic, 0);
         // Re-apply every effect on the next update after (re)engaging.
         c->haptic_spring_lv = c->haptic_damper_lv =
             c->haptic_constant_lv = c->haptic_sine_lv = -999999;
     }
     const int ids[] = { c->haptic_spring, c->haptic_damper,
                         c->haptic_constant, c->haptic_sine };
-    static const char *nm[] = { "spring", "damper", "constant", "sine" };
     for (int i = 0; i < 4; i++) {
         if (ids[i] < 0) continue;
-        bool ok = run ? SDL_RunHapticEffect(c->haptic, ids[i], SDL_HAPTIC_INFINITY)
-                      : SDL_StopHapticEffect(c->haptic, ids[i]);
-        if (!ok)
-            fprintf(stderr, "  %s %s FAILED: %s\n", run ? "run" : "stop", nm[i],
-                    SDL_GetError());
+        if (run) SDL_RunHapticEffect(c->haptic, ids[i], SDL_HAPTIC_INFINITY);
+        else     SDL_StopHapticEffect(c->haptic, ids[i]);
     }
     c->haptic_running = run;
+}
+
+// Steering rotation range. The setting is the player's PHYSICAL wheel range in
+// degrees; the game (the OutRun 2 cabinet) is 270 deg lock-to-lock. We software-
+// scale the steering so that turning 270 deg of the wheel reaches full in-game
+// lock -- arcade feel -- on a larger wheel, while a smaller wheel still reaches
+// full lock at its own extreme (scale never drops below 1). 0 means "Full range":
+// the whole wheel maps to full lock, no scaling. Pure math with no OS wheel API,
+// so it behaves identically on Linux, Windows and macOS.
+static void chihiro_apply_wheel_rotation(int wheel_degrees)
+{
+    const float game_degrees = 270.0f; // OutRun 2 cabinet, lock-to-lock
+    if (wheel_degrees <= 0) {          // "Full range": use the whole wheel
+        g_wheel_steering_scale = 1.0f;
+        return;
+    }
+    if (wheel_degrees < 150) wheel_degrees = 150;
+    float s = (float)wheel_degrees / game_degrees;
+    g_wheel_steering_scale = s < 1.0f ? 1.0f : s;
 }
 
 static void chihiro_ffb_open(ControllerState *c)
@@ -1246,14 +1262,6 @@ static void chihiro_ffb_open(ControllerState *c)
         return;
     }
     c->haptic_features = SDL_GetHapticFeatures(c->haptic);
-    fprintf(stderr, "Chihiro FFB: '%s' features=0x%x [spring=%d damper=%d constant=%d "
-            "sine=%d autocenter=%d]\n", c->name ? c->name : "?",
-            (unsigned)c->haptic_features,
-            !!(c->haptic_features & SDL_HAPTIC_SPRING),
-            !!(c->haptic_features & SDL_HAPTIC_DAMPER),
-            !!(c->haptic_features & SDL_HAPTIC_CONSTANT),
-            !!(c->haptic_features & SDL_HAPTIC_SINE),
-            !!(c->haptic_features & SDL_HAPTIC_AUTOCENTER));
 
     // All effects target the wheel's steering axis. This is REQUIRED for a real
     // wheel: SDL_HAPTIC_POLAR aims condition effects at a nonexistent second axis
@@ -1285,13 +1293,6 @@ static void chihiro_ffb_open(ControllerState *c)
     e.periodic.length = SDL_HAPTIC_INFINITY;
     e.periodic.period = CHIHIRO_FFB_SINE_PERIOD;
     c->haptic_sine = chihiro_ffb_make(c, &e, SDL_HAPTIC_SINE);
-
-    if (c->haptic_spring >= 0 || c->haptic_constant >= 0) {
-        fprintf(stderr, "Chihiro FFB: wheel '%s' ready "
-                "(spring=%d constant=%d sine=%d damper=%d)\n",
-                c->name ? c->name : "?", c->haptic_spring,
-                c->haptic_constant, c->haptic_sine, c->haptic_damper);
-    }
 }
 
 static void chihiro_ffb_close(ControllerState *c)
@@ -1308,6 +1309,17 @@ static void chihiro_ffb_update(ControllerState *c)
 {
     if (!c || !chihiro_driveboard_global) {
         return;
+    }
+
+    // Wheel rotation range: recompute the steering scale when the setting changes.
+    // Pure software (see chihiro_apply_wheel_rotation), independent of the FFB switch.
+    if (c->sdl_joystick) {
+        static int applied_rotation = -1;
+        int deg = g_config.chihiro.settings.wheel_rotation;
+        if (deg != applied_rotation) {
+            applied_rotation = deg;
+            chihiro_apply_wheel_rotation(deg);
+        }
     }
 
     // Master switch: Chihiro > Force Feedback. When off, release any running
@@ -1342,33 +1354,6 @@ static void chihiro_ffb_update(ControllerState *c)
         int gp = ffb.global_power ? ffb.global_power : 0x40;
         int scale = str * gp / 0x60;
 
-        /* TEMP trace (strip before commit): the WHOLE picture -- live wheel axis
-         * position, running state, the road(0x8B)-vs-jolt(0xFB) split feeding the
-         * sine, all drive-board inputs, and the effect magnitudes (0x7FFF=100%)
-         * actually sent. Lets us SEE what force each channel produces. */
-        {
-            static int n;
-            if ((n++ % 30) == 0) {
-                DriveBoardState *db = chihiro_driveboard_global;
-                int wheel = c->sdl_joystick ?
-                    SDL_GetJoystickAxis(c->sdl_joystick, 0) : 0;
-                int sp = chihiro_ffb_clamp(
-                    ffb.centering_power * CHIHIRO_FFB_SPRING_COEFF * scale / 100);
-                int dp = chihiro_ffb_clamp(
-                    ffb.friction_power * CHIHIRO_FFB_DAMPER_COEFF * scale / 100);
-                int si = chihiro_ffb_clamp(ffb.event * CHIHIRO_FFB_EVENT_MAG * scale / 100);
-                int cl = chihiro_ffb_clamp((ffb.movement_dir ? -1 : 1) *
-                    ffb.movement_power * CHIHIRO_FFB_TORQUE_LEVEL * scale / 100);
-                fprintf(stderr, "DRVWHEEL wheel=%6d run=%d | road=%3u ev=%3u pkg=%d"
-                        " | cen=%u fric=%u mov=%u/%u vib=%u -> spring=%d damper=%d"
-                        " const=%d sine=%d | gp=%d scale=%d\n",
-                        wheel, c->haptic_running, db->road_power, db->event_pulse,
-                        db->play_pkg, ffb.centering_power, ffb.friction_power,
-                        ffb.movement_dir, ffb.movement_power, ffb.vibration,
-                        sp, dp, cl, si, gp, scale);
-            }
-        }
-
         SDL_HapticEffect e;
 
         // CENTERING (0x87 SPRING) -> spring on the steering axis, the drive
@@ -1388,9 +1373,7 @@ static void chihiro_ffb_update(ControllerState *c)
                 e.condition.length = SDL_HAPTIC_INFINITY;
                 e.condition.right_sat[0] = e.condition.left_sat[0] = sat;
                 e.condition.right_coeff[0] = e.condition.left_coeff[0] = (Sint16)coeff;
-                if (!SDL_UpdateHapticEffect(c->haptic, c->haptic_spring, &e))
-                    fprintf(stderr, "DRVWHEEL: SPRING update FAILED (coeff=%d): %s\n",
-                            coeff, SDL_GetError());
+                SDL_UpdateHapticEffect(c->haptic, c->haptic_spring, &e);
             }
         }
         // DAMPER (0x86 torque + 0x88 damper) -> a MILD resistance. Too strong and
@@ -1406,9 +1389,7 @@ static void chihiro_ffb_update(ControllerState *c)
                 e.condition.length = SDL_HAPTIC_INFINITY;
                 e.condition.right_coeff[0] = e.condition.left_coeff[0] = (Sint16)coeff;
                 e.condition.right_sat[0] = e.condition.left_sat[0] = 0x7FFF;
-                if (!SDL_UpdateHapticEffect(c->haptic, c->haptic_damper, &e))
-                    fprintf(stderr, "DRVWHEEL: DAMPER update FAILED (coeff=%d): %s\n",
-                            coeff, SDL_GetError());
+                SDL_UpdateHapticEffect(c->haptic, c->haptic_damper, &e);
             }
         }
         // CONSTANT force on the steering axis = MOVEMENT push (0x84, ~0 in OR2) PLUS the
@@ -1437,9 +1418,7 @@ static void chihiro_ffb_update(ControllerState *c)
                 e.constant.direction.type = SDL_HAPTIC_STEERING_AXIS;
                 e.constant.length = SDL_HAPTIC_INFINITY;
                 e.constant.level = (Sint16)lvl;
-                if (!SDL_UpdateHapticEffect(c->haptic, c->haptic_constant, &e))
-                    fprintf(stderr, "DRVWHEEL: CONSTANT update FAILED (lvl=%d): %s\n",
-                            lvl, SDL_GetError());
+                SDL_UpdateHapticEffect(c->haptic, c->haptic_constant, &e);
             }
         }
         // Package jolts (0xFB) -> sine on the steering axis: discrete kerb/wall/sand hits.
@@ -1458,9 +1437,7 @@ static void chihiro_ffb_update(ControllerState *c)
                 e.periodic.length = SDL_HAPTIC_INFINITY;
                 e.periodic.period = CHIHIRO_FFB_SINE_PERIOD;
                 e.periodic.magnitude = (Sint16)mag;
-                if (!SDL_UpdateHapticEffect(c->haptic, c->haptic_sine, &e))
-                    fprintf(stderr, "DRVWHEEL: SINE update FAILED (mag=%d): %s\n",
-                            mag, SDL_GetError());
+                SDL_UpdateHapticEffect(c->haptic, c->haptic_sine, &e);
             }
         }
         return;

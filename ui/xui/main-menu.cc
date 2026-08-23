@@ -1163,6 +1163,24 @@ void MainMenuChihiroView::Draw()
     ImGui::PopFont();
 
     if (ImGui::CollapsingHeader("Arcade Settings")) {
+        Toggle("Freeplay", &g_config.chihiro.settings.freeplay,
+               "Disable coin requirement (applies on reset)");
+        chihiro_freeplay_setting = g_config.chihiro.settings.freeplay;
+        ChevronCombo("Region", &g_config.chihiro.settings.region,
+                     "Japan\0USA\0Export\0",
+                     "Arcade region setting (applies on reset)");
+        chihiro_region_setting = g_config.chihiro.settings.region;
+        ImGui::BeginDisabled();
+        int board_dummy = 0;
+        ChevronCombo("Board Type", &board_dummy,
+                     "Type-1 (FPGA)\0",
+                     "Type-3 (ASIC) support coming soon");
+        ImGui::EndDisabled();
+        Toggle("Card Reader", &g_config.chihiro.card_reader.enable,
+               "CRP-1231 IC card reader emulation (Ghost Squad, Gundam)");
+    }
+
+    if (ImGui::CollapsingHeader("Light Gun")) {
         Toggle("Light Gun Mode", &g_config.chihiro.settings.lightgun_mode,
                "Hides system cursor and prevents mouse from triggering menus. Toggle with F3.");
         Toggle("Show Crosshair", &g_config.chihiro.settings.show_crosshair,
@@ -1192,19 +1210,32 @@ void MainMenuChihiroView::Draw()
                              &g_config.chihiro.settings.sinden_border_size,
                              2, 30, "%d px");
         }
-        Toggle("Freeplay", &g_config.chihiro.settings.freeplay,
-               "Disable coin requirement (applies on reset)");
-        chihiro_freeplay_setting = g_config.chihiro.settings.freeplay;
-        ChevronCombo("Region", &g_config.chihiro.settings.region,
-                     "Japan\0USA\0Export\0",
-                     "Arcade region setting (applies on reset)");
-        chihiro_region_setting = g_config.chihiro.settings.region;
-        ImGui::BeginDisabled();
-        int board_dummy = 0;
-        ChevronCombo("Board Type", &board_dummy,
-                     "Type-1 (FPGA)\0",
-                     "Type-3 (ASIC) support coming soon");
-        ImGui::EndDisabled();
+    }
+
+    if (ImGui::CollapsingHeader("Steering Wheel")) {
+        // Wheel Rotation is independent of force feedback -- always shown.
+        // It is the player's physical wheel rotation: steering is scaled so 270 deg
+        // reaches full in-game lock (OutRun 2 cabinet). Wheels of 270 deg or less
+        // already play 1:1, so they use "Full range" (0); the larger entries squeeze
+        // a big sim wheel down to the arcade 270 deg. Common real rotations only.
+        static const int rot_vals[] = { 0, 270, 360, 540, 900, 1080 };
+        static const char *rot_lbls[] = {
+            "Full range", "270\xc2\xb0 (default)", "360\xc2\xb0", "540\xc2\xb0",
+            "900\xc2\xb0", "1080\xc2\xb0" };
+        const int n_rot = (int)(sizeof(rot_vals) / sizeof(rot_vals[0]));
+        int idx = 1;  // default 270 (OutRun 2 cabinet)
+        for (int i = 0; i < n_rot; i++)
+            if (rot_vals[i] == g_config.chihiro.settings.wheel_rotation) {
+                idx = i;
+                break;
+            }
+        if (ImGui::Combo("Wheel Rotation", &idx, rot_lbls, n_rot))
+            g_config.chihiro.settings.wheel_rotation = rot_vals[idx];
+        ImGui::SetItemTooltip("Your steering wheel's rotation range. The game "
+                              "reaches full lock at 270\xc2\xb0 (OutRun 2 "
+                              "cabinet); \"Full range\" uses the whole wheel.");
+
+        // Force feedback and its sub-settings depend on the master FFB switch.
         Toggle("Force Feedback", &g_config.chihiro.settings.force_feedback,
                "Enable force feedback for driving games (OutRun 2)");
         if (g_config.chihiro.settings.force_feedback) {
@@ -1215,9 +1246,6 @@ void MainMenuChihiroView::Draw()
                    &g_config.chihiro.settings.ffb_invert,
                    "Enable if the wheel pulls away from center instead of toward it");
         }
-        ImGui::Separator();
-        Toggle("Card Reader", &g_config.chihiro.card_reader.enable,
-               "CRP-1231 IC card reader emulation (Ghost Squad, Gundam)");
     }
 
     if (ImGui::CollapsingHeader("Files")) {

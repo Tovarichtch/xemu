@@ -601,6 +601,12 @@ chihiro:
     ffb_invert:
       type: bool
       default: false
+    # Player's physical steering-wheel rotation range in degrees. Steering is
+    # scaled so 270 deg reaches full in-game lock (OutRun 2 cabinet). 0 = "Full
+    # range": use the whole wheel, no scaling. Default 270.
+    wheel_rotation:
+      type: integer
+      default: 270
     show_crosshair:
       type: bool
       default: true
