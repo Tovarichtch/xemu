@@ -39,7 +39,8 @@ bool Toggle(const char *str_id, bool *v, const char *description = nullptr);
 void Slider(const char *str_id, float *v, const char *description = nullptr);
 void FilePicker(const char *str_id, const char *current_path,
                 const SDL_DialogFileFilter *filters, int nfilters, bool dir,
-                std::function<void(const char *new_path)> on_select);
+                std::function<void(const char *new_path)> on_select,
+                bool save = false);
 void DrawComboChevron();
 void PrepareComboTitleDescription(const char *label, const char *description,
                                   float combo_size_ratio);

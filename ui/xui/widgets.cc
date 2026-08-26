@@ -300,7 +300,7 @@ void Slider(const char *str_id, float *v, const char *description)
 
 void FilePicker(const char *str_id, const char *current_path,
                 const SDL_DialogFileFilter *filters, int nfilters, bool dir,
-                std::function<void(const char *new_path)> on_select)
+                std::function<void(const char *new_path)> on_select, bool save)
 {
     ImGui::PushStyleColor(ImGuiCol_Button, IM_COL32_BLACK_TRANS);
     ImGuiStyle &style = ImGui::GetStyle();
@@ -317,6 +317,10 @@ void FilePicker(const char *str_id, const char *current_path,
     if (status) {
         if (dir) {
             ShowOpenFolderDialog(current_path, on_select);
+        } else if (save) {
+            /* Save mode: the user may type a NEW filename that does not
+             * exist yet (e.g. a fresh card image the device will create). */
+            ShowSaveFileDialog(filters, nfilters, current_path, on_select);
         } else {
             ShowOpenFileDialog(filters, nfilters, current_path, on_select);
         }
