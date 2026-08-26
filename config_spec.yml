@@ -637,6 +637,12 @@ chihiro:
     enable:
       type: bool
       default: true
+    card1_path:
+      type: string
+      default: ""
+    card2_path:
+      type: string
+      default: ""
   roms:
     bios_path:
       type: string

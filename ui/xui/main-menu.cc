@@ -1178,6 +1178,24 @@ void MainMenuChihiroView::Draw()
         ImGui::EndDisabled();
         Toggle("Card Reader", &g_config.chihiro.card_reader.enable,
                "CRP-1231 IC card reader emulation (Ghost Squad, Gundam)");
+        if (g_config.chihiro.card_reader.enable) {
+            static const SDL_DialogFileFilter card_filters[] = {
+                { "Card Images", "bin" },
+                { "All Files", "*" }
+            };
+            FilePicker("Player 1 Card",
+                       g_config.chihiro.card_reader.card1_path, card_filters, 2,
+                       false, [](const char *path) {
+                           xemu_settings_set_string(
+                               &g_config.chihiro.card_reader.card1_path, path);
+                       }, true);
+            FilePicker("Player 2 Card",
+                       g_config.chihiro.card_reader.card2_path, card_filters, 2,
+                       false, [](const char *path) {
+                           xemu_settings_set_string(
+                               &g_config.chihiro.card_reader.card2_path, path);
+                       }, true);
+        }
     }
 
     if (ImGui::CollapsingHeader("Light Gun")) {
