@@ -1,17 +1,7 @@
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include "chihiro-card-reader.h"
-
-static uint32_t card_crc32(const uint8_t *data, int len)
-{
-    uint32_t crc = 0xFFFFFFFF;
-    for (int i = 0; i < len; i++) {
-        crc ^= data[i];
-        for (int j = 0; j < 8; j++)
-            crc = (crc >> 1) ^ (0xEDB88320 & -(crc & 1));
-    }
-    return crc;
-}
 
 static uint8_t compute_checksum(const uint8_t *buf, int len)
 {
@@ -136,47 +126,11 @@ void card_reader_insert(CardReaderState *s, const char *path)
         }
     }
 
+    /* Assigned file missing or short: insert a BLANK card (all zeroes) and
+     * create the file. The game reads an unformatted card and offers to
+     * format/register it, exactly like a fresh physical card — no synthetic
+     * pre-filled card is fabricated. */
     memset(s->card_data, 0, CARD_TOTAL_SIZE);
-
-    /* Card byte layout (81 blocks × 8 bytes = 648 bytes read by game):
-     *   [0x00-0x1F]  blocks 0-3: Mifare overhead (block 3 skipped)
-     *   [0x20-0x3F]  blocks 4-7: card metadata (FUN_0002b8b0 validates)
-     *   [0x40-0x13F] blocks 8-39: SBHU slot 0 (256 bytes, FUN_0002b940)
-     *   [0x140-0x23F] blocks 40-71: SBHU slot 1 (mirror)
-     */
-
-    /* Blocks 4-7: card metadata, read big-endian by FUN_0002b8b0 */
-    s->card_data[32] = 0x95;
-    s->card_data[33] = 0x71;
-    s->card_data[34] = 0x36;
-    s->card_data[35] = 0x40;
-    /* bytes 36-39 = 0 (required for version ≥ 1000 pass) */
-    s->card_data[52] = 0x00;
-    s->card_data[53] = 0x00;
-    s->card_data[54] = 0x03;
-    s->card_data[55] = 0xF2;
-
-    /* Blocks 8+: SBHU structure at offset 64 (FUN_0002b740 layout) */
-    uint32_t *d = (uint32_t *)(s->card_data + 64);
-    d[0]    = 0x55484253;  /* "SBHU" magic */
-    d[1]    = 0x000003F2;  /* format version (1010) */
-    d[2]    = 0x4754584E;  /* "NXTG" game ID */
-    d[3]    = 0x00000100;  /* data length (256) */
-    d[4]    = 0x00010001;  /* card ID 1 */
-    d[5]    = 0x00020002;  /* card ID 2 */
-    d[9]    = 100;         /* initial credits/rank */
-    d[0x1d] = 2;           /* costume default */
-    d[0x1e] = 0x11;        /* costume count */
-    d[0x34] = 2;           /* weapon default */
-    d[0x35] = 0x11;        /* weapon count */
-    s->card_data[64 + 0x6d] = 0xFF;  /* name marker */
-
-    /* CRC-32 over SBHU slot 0 (252 bytes at offset 64), stored at offset 64+0xFC */
-    uint32_t crc = card_crc32(s->card_data + 64, 0xFC);
-    memcpy(s->card_data + 64 + 0xFC, &crc, 4);
-    /* Slot 1 = mirror of slot 0 */
-    memcpy(s->card_data + 64 + 0x100, s->card_data + 64, 0x100);
-
     s->card_present = true;
     s->dirty = true;
     card_reader_flush(s);
@@ -195,7 +149,6 @@ void card_reader_remove(CardReaderState *s)
 
 void card_reader_write_byte(CardReaderState *s, uint8_t byte)
 {
-    if (s->ignore_usb) return;
     card_reader_tap_byte(s, byte);
 }
 
@@ -223,12 +176,6 @@ void card_reader_tap_byte(CardReaderState *s, uint8_t byte)
 
     if (s->rx_pos >= 5 && s->rx_pos == s->rx_expected) {
         build_response(s, s->rx_buf[1]);
-
-        if (s->tx_len > 0 && s->tx_len <= (int)sizeof(s->inject_buf)) {
-            memcpy(s->inject_buf, s->tx_buf, s->tx_len);
-            s->inject_len = s->tx_len;
-            s->inject_pending = true;
-        }
 
         s->rx_pos = 0;
         s->rx_expected = 0;

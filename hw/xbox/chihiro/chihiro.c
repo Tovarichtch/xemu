@@ -429,47 +429,25 @@ uint32_t chihiro_va_to_pa(uint32_t va)
     return (pte & 0xFFFFF000) | (va & 0xFFF);
 }
 
-/* Card reader state: 2 players, ring buffer tap/injection */
+/* Card reader state: one CRP-1231 per player, driven by the SC 8051 UARTs */
 static CardReaderState card_state[2];
 static bool card_reader_initialized;
 
-bool chihiro_card_reader_present(int player)
-{
-    if (player < 0 || player > 1) return false;
-    return card_state[player].card_present;
-}
-
-bool chihiro_get_card_inject(int player, uint8_t *buf, int *len)
-{
-    if (player < 0 || player > 1) return false;
-    CardReaderState *s = &card_state[player];
-    if (!s->inject_pending) return false;
-    memcpy(buf, s->inject_buf, s->inject_len);
-    *len = s->inject_len;
-    s->inject_pending = false;
-    return true;
-}
-
-void chihiro_card_tap_byte(int player, uint8_t byte)
-{
-    if (player < 0 || player > 1) return;
-    card_reader_tap_byte(&card_state[player], byte);
-}
-
-void chihiro_card_set_ignore_usb(int player, bool val)
-{
-    if (player < 0 || player > 1) return;
-    card_state[player].ignore_usb = val;
-}
+/* Exposed to the SC (AN2131) layer so the 8051 UART drives the readers
+ * directly. [0] = MIDI/UART1 reader, [1] = RS-232C/UART0 reader. */
+CardReaderState *chihiro_card_reader_global = card_state;
+/* A card game owns the SC MIDI (UART1) channel: the OutRun 2 drive board must
+ * not intercept it (only OR2 uses the drive board, and it has no card reader).
+ * Before this the FFB drive board answered on MIDI for every game and its
+ * bytes corrupted player 1's card channel. */
+bool chihiro_card_reader_enabled;
 
 /*
- * Card reader plumbing — WORKAROUND, not LLE.
- *
- * The game talks to the CRP-1231 over the baseboard serial link, but the
- * Xbox USBD stack never completes the bulk IRPs that would carry it (root
- * cause still open). Until that is fixed we tap the game's TX ring buffer
- * and inject responses into its RX ring buffer from this timer, and force
- * the operator settings the card screen gates on.
+ * Card reader support. The serial data path is fully LLE: the game's USB
+ * vendor requests reach the real SC 8051 firmware, which talks to the
+ * CRP-1231 readers over its two UARTs (chihiro-an2131.c). This timer only
+ * manages card insertion (the UI assignment) and forces the operator
+ * settings the card screen gates on.
  */
 static void chihiro_card_force_operator_settings(void)
 {
@@ -552,108 +530,47 @@ static void chihiro_card_force_module22(int tick)
     }
 }
 
-/* Read the bytes the game wrote to its serial TX ring and feed the reader. */
-static void chihiro_card_tap_tx_rings(void)
-{
-    static uint16_t tx_tap_pos[2] = { 0xFFFF, 0xFFFF };
-
-    for (int p = 0; p < 2; p++) {
-        uint32_t rb_va = (p == 0) ? 0x4bf550 : 0x4bf584;
-        uint32_t txbp_pa = chihiro_va_to_pa(rb_va + 0x14);
-        uint32_t txcp_pa = chihiro_va_to_pa(rb_va + 0x18);
-        uint32_t txwp_pa = chihiro_va_to_pa(rb_va + 0x1A);
-        if (txbp_pa == 0xFFFFFFFF || txcp_pa == 0xFFFFFFFF ||
-            txwp_pa == 0xFFFFFFFF)
-            continue;
-
-        uint32_t tx_buf_va;
-        uint16_t tx_cap, tx_wp;
-        cpu_physical_memory_read(txbp_pa, &tx_buf_va, 4);
-        cpu_physical_memory_read(txcp_pa, &tx_cap, 2);
-        cpu_physical_memory_read(txwp_pa, &tx_wp, 2);
-
-        if (tx_cap == 0 || tx_buf_va == 0)
-            continue;
-
-        if (tx_tap_pos[p] == 0xFFFF)
-            tx_tap_pos[p] = tx_wp;
-
-        int fed = 0;
-        while (tx_tap_pos[p] != tx_wp && fed < 64) {
-            uint32_t bpa = chihiro_va_to_pa(tx_buf_va + tx_tap_pos[p]);
-            if (bpa == 0xFFFFFFFF) break;
-            uint8_t byte;
-            cpu_physical_memory_read(bpa, &byte, 1);
-            chihiro_card_tap_byte(p, byte);
-            tx_tap_pos[p] = (tx_tap_pos[p] + 1) % tx_cap;
-            fed++;
-        }
-    }
-}
-
-/* Push pending card reader responses into the game's serial RX ring. */
-static void chihiro_card_inject_rx_rings(void)
-{
-    for (int p = 0; p < 2; p++) {
-        uint8_t ibuf[256];
-        int ilen;
-        if (!chihiro_get_card_inject(p, ibuf, &ilen))
-            continue;
-
-        uint32_t rb_va = (p == 0) ? 0x4bf550 : 0x4bf584;
-        uint32_t bp_pa = chihiro_va_to_pa(rb_va + 0x20);
-        uint32_t cp_pa = chihiro_va_to_pa(rb_va + 0x24);
-        uint32_t wp_pa = chihiro_va_to_pa(rb_va + 0x26);
-        if (bp_pa == 0xFFFFFFFF || cp_pa == 0xFFFFFFFF ||
-            wp_pa == 0xFFFFFFFF)
-            continue;
-
-        uint32_t buf_va;
-        uint16_t cap, wp;
-        cpu_physical_memory_read(bp_pa, &buf_va, 4);
-        cpu_physical_memory_read(cp_pa, &cap, 2);
-        cpu_physical_memory_read(wp_pa, &wp, 2);
-
-        if (cap == 0 || buf_va == 0)
-            continue;
-
-        for (int i = 0; i < ilen; i++) {
-            uint32_t bpa = chihiro_va_to_pa(buf_va + wp);
-            if (bpa != 0xFFFFFFFF)
-                cpu_physical_memory_write(bpa, &ibuf[i], 1);
-            wp = (wp + 1) % cap;
-        }
-        cpu_physical_memory_write(wp_pa, &wp, 2);
-    }
-}
-
 static void chihiro_card_reader_tick(void)
 {
     static int card_tick;
+    static char card_last_path[2][1200];
     card_tick++;
 
     if (!card_reader_initialized) {
+        chihiro_card_reader_enabled = true;
         card_reader_init(&card_state[0]);
         card_reader_init(&card_state[1]);
         char path[1200];
         for (int p = 0; p < 2; p++) {
             chihiro_resolve_card_path(p, path, sizeof(path));
+            snprintf(card_last_path[p], sizeof(card_last_path[p]), "%s", path);
             card_reader_insert(&card_state[p], path);
         }
-        chihiro_card_set_ignore_usb(0, true);
-        chihiro_card_set_ignore_usb(1, true);
         card_reader_initialized = true;
-        fprintf(stderr, "Chihiro: card reader enabled (dir=%s)\n",
-                chihiro_game_dir);
+        fprintf(stderr, "Chihiro: card reader enabled\n");
     }
 
     chihiro_card_force_operator_settings();
     chihiro_card_force_module22(card_tick);
-    /* CARD_IN is set via JVS sw1 |= 0x20 (PUSH5) in xemu-input.c. The game's
-     * remap function (FUN_00085550) produces bit 12 in the IO struct
-     * naturally — no timer-based forcing needed. */
-    chihiro_card_tap_tx_rings();
-    chihiro_card_inject_rx_rings();
+
+    /* Inserting a card is the player's gesture: the UI assignment IS the
+     * inserted card. Changing it swaps cards (the old one is flushed and
+     * ejected first), clearing it ejects with no replacement. CARD_IN is set
+     * via JVS sw1 |= 0x20 (PUSH5) in xemu-input.c. */
+    for (int p = 0; p < 2; p++) {
+        char now_path[1200];
+        chihiro_resolve_card_path(p, now_path, sizeof(now_path));
+        if (strcmp(now_path, card_last_path[p]) != 0) {
+            snprintf(card_last_path[p], sizeof(card_last_path[p]), "%s",
+                     now_path);
+            card_reader_remove(&card_state[p]);
+            card_state[p].card_path[0] = '\0';
+            if (now_path[0])
+                card_reader_insert(&card_state[p], now_path);
+            fprintf(stderr, "Chihiro: card P%d %s\n", p + 1,
+                    now_path[0] ? "inserted" : "ejected");
+        }
+    }
 }
 
 /* Execution VAs of the SEGABOOT the board boots: the second megabyte of the
@@ -2229,33 +2146,18 @@ static bool chihiro_resolve_save_path(void)
     return true;
 }
 
-/* Cards live with the other per-game data, not next to the disc image: moving
- * a game folder used to lose them. An existing card beside the image is
- * migrated once. */
+/* ONLY an explicit per-player card file chosen in Settings > Chihiro is
+ * read. With no card assigned the reader is EMPTY: the game offers to play
+ * without a card, and no synthetic or auto-resolved card is fabricated. */
 static void chihiro_resolve_card_path(int player, char *out, size_t out_len)
 {
-    char base[64];
-    char cards_dir[1024];
-    if (!chihiro_game_base_name(base, sizeof(base)) ||
-        !chihiro_data_dir("cards", cards_dir, sizeof(cards_dir))) {
-        snprintf(out, out_len, "%s/card_p%d.bin", chihiro_game_dir, player + 1);
+    const char *cfg = (player == 0) ? g_config.chihiro.card_reader.card1_path
+                                    : g_config.chihiro.card_reader.card2_path;
+    if (cfg && cfg[0]) {
+        snprintf(out, out_len, "%s", cfg);
         return;
     }
-
-    snprintf(out, out_len, "%s/%s_p%d.bin", cards_dir, base, player + 1);
-    if (g_file_test(out, G_FILE_TEST_EXISTS)) return;
-
-    char legacy[1100];
-    snprintf(legacy, sizeof(legacy), "%s/card_p%d.bin", chihiro_game_dir,
-             player + 1);
-    char *data = NULL;
-    gsize len = 0;
-    if (g_file_get_contents(legacy, &data, &len, NULL)) {
-        if (g_file_set_contents(out, data, len, NULL)) {
-            fprintf(stderr, "Chihiro: migrated card %s -> %s\n", legacy, out);
-        }
-        g_free(data);
-    }
+    out[0] = '\0'; /* unassigned: no card in this reader */
 }
 
 static void chihiro_exit_notify(Notifier *notifier, void *data)

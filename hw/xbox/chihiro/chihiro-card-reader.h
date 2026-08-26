@@ -20,11 +20,6 @@ typedef struct {
     uint8_t card_data[CARD_TOTAL_SIZE];
     bool dirty;
     char card_path[512];
-
-    uint8_t inject_buf[256];
-    int inject_len;
-    bool inject_pending;
-    bool ignore_usb;
 } CardReaderState;
 
 void card_reader_init(CardReaderState *s);
@@ -35,5 +30,13 @@ void card_reader_tap_byte(CardReaderState *s, uint8_t byte);
 int  card_reader_read(CardReaderState *s, uint8_t *buf, int max_len);
 bool card_reader_has_response(CardReaderState *s);
 void card_reader_flush(CardReaderState *s);
+
+/* chihiro.c owns the two reader instances and exposes them to the SC (AN2131)
+ * layer, which drives them through the real 8051 UART.
+ * Index [0] = MIDI/UART1 reader, [1] = RS-232C/UART0 reader. */
+extern CardReaderState *chihiro_card_reader_global;
+/* True once a card game has enabled its readers: the SC MIDI (UART1) channel
+ * then belongs to the card reader, not the OutRun 2 drive board. */
+extern bool chihiro_card_reader_enabled;
 
 #endif
