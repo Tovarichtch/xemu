@@ -288,6 +288,7 @@ typedef struct AN2131State {
     /* ── MIDI RX (drive board response injection) ─────────────── */
     bool     midi_response_ready;
     uint64_t midi_response_set_cycles;
+    uint64_t card_resp_cycles[2];      /* card RX pacing: last byte time (0=idle) */
 
     /* ── Runtime state ──────────────────────────────────────────── */
     bool cpu_running;       /* true after CPUCS release */

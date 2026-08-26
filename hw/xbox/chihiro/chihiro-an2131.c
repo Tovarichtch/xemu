@@ -14,6 +14,7 @@
 #include "chihiro-an2131.h"
 #include "chihiro-jvs.h"
 #include "chihiro-driveboard.h"
+#include "chihiro-card-reader.h"
 #include <string.h>
 #include <stdio.h>
 #include <time.h>
@@ -23,6 +24,7 @@
 static inline int min_int(int a, int b) { return a < b ? a : b; }
 static void jvs_rx_deliver(AN2131State *s);
 static void midi_rx_deliver(AN2131State *s);
+static void card_rx_deliver(AN2131State *s);
 
 static inline uint16_t canon(uint16_t addr)
 {
@@ -419,9 +421,12 @@ static void an2131_sfr_write(Cpu8051State *cpu, uint8_t addr, uint8_t val)
     case SFR_EIP:
         s->eip = val;
         return;
-    case 0x99: /* SBUF0 — serial TX (channel 0, unused for JVS) */
+    case 0x99: /* SBUF0 — UART0 TX = RS-232C card reader (slot 1) */
         cpu->sfr[addr - 0x80] = val;
-        cpu->sfr[0x98 - 0x80] |= 0x02;  /* set TI */
+        cpu->sfr[0x98 - 0x80] |= 0x02;  /* set TI0 */
+        if (!s->is_qc && chihiro_card_reader_enabled &&
+            chihiro_card_reader_global)
+            card_reader_write_byte(&chihiro_card_reader_global[1], val);
         return;
     case 0xC0: /* SCON1 — defer next RX byte until after RETI */
     {
@@ -437,7 +442,15 @@ static void an2131_sfr_write(Cpu8051State *cpu, uint8_t addr, uint8_t val)
         cpu->sfr[0xC0 - 0x80] |= 0x02;  /* set TI1 — byte "sent" */
 
         if (!s->is_qc) {
-            /* SC: plain MIDI to drive board */
+            /* A card game owns the MIDI channel: the drive board must NOT see
+             * these bytes (only OutRun 2 uses the drive board, and it has no
+             * card reader). */
+            if (chihiro_card_reader_enabled) {
+                if (chihiro_card_reader_global)
+                    card_reader_write_byte(&chihiro_card_reader_global[0], val);
+                return;
+            }
+            /* SC: plain MIDI to drive board (OutRun 2 FFB) */
             if (chihiro_driveboard_global) {
                 driveboard_receive_byte(chihiro_driveboard_global, val);
                 if (!s->midi_response_ready &&
@@ -846,22 +859,33 @@ int an2131_setup_packet(AN2131State *s, const uint8_t setup[8],
     bool is_in = setup[0] & 0x80;
     bool need_ep4 = (setup[1] == 0x19 && is_in);
     bool need_ep2 = (setup[1] == 0x17 && is_in);
+    /* SC card-RX polls (0x1A/0x1B): draining a 64-byte chunk plus the bulk
+     * feeder hand-off can exceed the default window, so the reply would be
+     * armed only after we returned (and lost). Give them a long window like
+     * the 0x17 EEPROM read gets. */
+    bool need_card = !s->is_qc && is_in &&
+                     (setup[1] == 0x1A || setup[1] == 0x1B);
 
     int cycles = 0;
-    int limit = need_ep2 ? 30000 : 10000;
+    int limit = need_ep2 ? 30000 : (need_card ? 60000 : 10000);
     int drain = 0;
     bool mainloop_hit = false;
 
     while (cycles < limit) {
         jvs_rx_deliver(s);
         midi_rx_deliver(s);
+        card_rx_deliver(s);
         check_interrupts(s);
         int c = cpu8051_step(&s->cpu);
         if (c <= 0) {
             s->total_cycles++;
             if (usb_irq_pending(s) || s->i2c_irq_pending ||
                 s->jvs_response_ready || s->jvs_rx_pending ||
-                s->midi_response_ready) {
+                s->midi_response_ready ||
+                (!s->is_qc && chihiro_card_reader_enabled &&
+                 chihiro_card_reader_global &&
+                 (card_reader_has_response(&chihiro_card_reader_global[0]) ||
+                  card_reader_has_response(&chihiro_card_reader_global[1])))) {
                 s->cpu.halted = false;
                 continue;
             }
@@ -1023,6 +1047,7 @@ static void jvs_rx_deliver(AN2131State *s)
 static void midi_rx_deliver(AN2131State *s)
 {
     if (s->is_qc || !s->midi_response_ready) return;
+    if (chihiro_card_reader_enabled) return;  /* MIDI belongs to the card reader */
     if (!chihiro_driveboard_global) return;
 
     Cpu8051State *cpu = &s->cpu;
@@ -1042,6 +1067,56 @@ static void midi_rx_deliver(AN2131State *s)
     }
 }
 
+/* Deliver one pending card-response byte into a SC UART RX register: wait a
+ * reader round-trip before the first byte, then pace at a real serial byte
+ * rate (back-to-back delivery starves the firmware's SUDAV dispatch during
+ * long responses), and gate on RI so the UART ISR consumes each byte before
+ * the next is posted. The UARTs run in 9-bit mode: the firmware checks the
+ * 9th bit (RB8, SCON bit 2) as even parity of each byte and reports a channel
+ * error the game rejects on mismatch. */
+static void card_rx_deliver_ch(AN2131State *s, int slot,
+                               uint8_t sbuf, uint8_t scon, int idx)
+{
+    Cpu8051State *cpu = &s->cpu;
+    CardReaderState *c = &chihiro_card_reader_global[slot];
+
+    if (!card_reader_has_response(c)) {
+        s->card_resp_cycles[idx] = 0;               /* nothing pending */
+        return;
+    }
+    if (s->card_resp_cycles[idx] == 0)
+        s->card_resp_cycles[idx] = s->total_cycles; /* response just became ready */
+    {
+        uint64_t need = (c->tx_pos == 0) ? 15000 : 1500;
+        if (s->total_cycles - s->card_resp_cycles[idx] < need)
+            return;
+    }
+    if (cpu->sfr[scon - 0x80] & 0x01)
+        return;                                     /* RI set: previous byte unread */
+
+    uint8_t b;
+    if (card_reader_read(c, &b, 1) == 1) {
+        s->card_resp_cycles[idx] = s->total_cycles; /* pace the next byte */
+        cpu->sfr[sbuf - 0x80] = b;
+        uint8_t par = b;
+        par ^= par >> 4; par ^= par >> 2; par ^= par >> 1;
+        if (par & 1)
+            cpu->sfr[scon - 0x80] |= 0x04;          /* RB8 = even parity */
+        else
+            cpu->sfr[scon - 0x80] &= ~0x04;
+        cpu->sfr[scon - 0x80] |= 0x01;              /* set RI */
+    }
+}
+
+static void card_rx_deliver(AN2131State *s)
+{
+    if (s->is_qc || !chihiro_card_reader_enabled || !chihiro_card_reader_global)
+        return;
+    if (s->cpu.in_interrupt) return;
+    card_rx_deliver_ch(s, 1, 0x99, 0x98, 0);   /* RS-232C: SBUF0/SCON0 */
+    card_rx_deliver_ch(s, 0, 0xC1, 0xC0, 1);   /* MIDI:    SBUF1/SCON1 */
+}
+
 int an2131_run(AN2131State *s, int max_cycles)
 {
     if (!s->cpu_running) return 0;
@@ -1050,13 +1125,28 @@ int an2131_run(AN2131State *s, int max_cycles)
     while (total < max_cycles) {
         jvs_rx_deliver(s);
         midi_rx_deliver(s);
+        card_rx_deliver(s);
         check_interrupts(s);
+        /* If the firmware arms an EP0-IN reply after the setup window already
+         * returned (e.g. a vendor dispatch delayed by serial ISR load), it
+         * spins on the EP0CS busy bit waiting for a host read that will never
+         * come through that window. On silicon the host always drains EP0 —
+         * model that here so the late (already-missed) reply is consumed and
+         * the firmware returns to its main loop. */
+        if (s->ep[0].in_armed && (s->ep0cs & EP0CS_INBSY)) {
+            s->ep0cs &= ~EP0CS_INBSY;
+            s->ep[0].in_armed = false;
+        }
         int c = cpu8051_step(&s->cpu);
         if (c <= 0) {
             s->total_cycles++;
             if (usb_irq_pending(s) || s->i2c_irq_pending ||
                 s->jvs_response_ready || s->jvs_rx_pending ||
-                s->midi_response_ready) {
+                s->midi_response_ready ||
+                (!s->is_qc && chihiro_card_reader_enabled &&
+                 chihiro_card_reader_global &&
+                 (card_reader_has_response(&chihiro_card_reader_global[0]) ||
+                  card_reader_has_response(&chihiro_card_reader_global[1])))) {
                 s->cpu.halted = false;
                 continue;
             }
