@@ -2188,6 +2188,14 @@ static void chihiro_exit_notify(Notifier *notifier, void *data)
 }
 
 static Notifier chihiro_exit_notifier = { .notify = chihiro_exit_notify };
+/* Flush the arcade backup (game save) immediately. The UI quit path skips
+ * the doomed driver atexit chain with _exit(), which also skips the exit
+ * notifier below — it must flush explicitly before leaving. */
+void chihiro_flush_save_now(void)
+{
+    chihiro_exit_notify(NULL, NULL);
+}
+
 static bool chihiro_exit_notifier_registered = false;
 
 void chihiro_save_init(void)

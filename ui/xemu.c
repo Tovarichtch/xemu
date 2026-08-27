@@ -1386,6 +1386,13 @@ int main(int argc, char **argv)
      * is already down at this point (guest state via qemu_cleanup, GL
      * context, window, SDL): write the config ourselves, flush, and skip
      * the doomed handler chain. */
+    {
+        /* The Chihiro arcade backup (coin bank, operator settings, scores)
+         * normally flushes from an exit notifier — skipped by the _exit
+         * below. Write it here, like the config. */
+        void chihiro_flush_save_now(void);
+        chihiro_flush_save_now();
+    }
     xemu_settings_save();
     fflush(NULL);
     _exit(exit_status);
