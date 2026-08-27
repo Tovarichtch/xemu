@@ -423,10 +423,17 @@ static void an2131_sfr_write(Cpu8051State *cpu, uint8_t addr, uint8_t val)
         return;
     case 0x99: /* SBUF0 — UART0 TX = RS-232C card reader (slot 1) */
         cpu->sfr[addr - 0x80] = val;
-        cpu->sfr[0x98 - 0x80] |= 0x02;  /* set TI0 */
         if (!s->is_qc && chihiro_card_reader_enabled &&
-            chihiro_card_reader_global)
+            chihiro_card_reader_global) {
             card_reader_write_byte(&chihiro_card_reader_global[1], val);
+            /* Real UART: TI rises when the byte finishes shifting out.
+             * Raising it instantly re-enters the TX interrupt one time too
+             * many at end-of-frame and the firmware's byte counter
+             * underflows — the pump then retransmits forever. */
+            s->card_ti_cycles[0] = s->total_cycles | 1;
+            return;
+        }
+        cpu->sfr[0x98 - 0x80] |= 0x02;  /* set TI0 */
         return;
     case 0xC0: /* SCON1 — defer next RX byte until after RETI */
     {
@@ -439,17 +446,18 @@ static void an2131_sfr_write(Cpu8051State *cpu, uint8_t addr, uint8_t val)
     }
     case 0xC1: /* SBUF1 — serial TX (channel 1) */
     {
+        if (!s->is_qc && chihiro_card_reader_enabled) {
+            /* A card game owns the MIDI channel: the drive board must NOT see
+             * these bytes (only OutRun 2 uses the drive board, and it has no
+             * card reader). TI deferred — see the SBUF0 case. */
+            if (chihiro_card_reader_global)
+                card_reader_write_byte(&chihiro_card_reader_global[0], val);
+            s->card_ti_cycles[1] = s->total_cycles | 1;
+            return;
+        }
         cpu->sfr[0xC0 - 0x80] |= 0x02;  /* set TI1 — byte "sent" */
 
         if (!s->is_qc) {
-            /* A card game owns the MIDI channel: the drive board must NOT see
-             * these bytes (only OutRun 2 uses the drive board, and it has no
-             * card reader). */
-            if (chihiro_card_reader_enabled) {
-                if (chihiro_card_reader_global)
-                    card_reader_write_byte(&chihiro_card_reader_global[0], val);
-                return;
-            }
             /* SC: plain MIDI to drive board (OutRun 2 FFB) */
             if (chihiro_driveboard_global) {
                 driveboard_receive_byte(chihiro_driveboard_global, val);
@@ -855,6 +863,9 @@ int an2131_setup_packet(AN2131State *s, const uint8_t setup[8],
 
     s->usbirq |= USBIRQ_SUDAV;
     s->ep[0].in_armed = false;
+    /* Hold card RX delivery only while a card drain (0x1A/0x1B) runs. */
+    s->in_setup = !s->is_qc && (setup[0] & 0x80) &&
+                  (setup[1] == 0x1A || setup[1] == 0x1B);
 
     bool is_in = setup[0] & 0x80;
     bool need_ep4 = (setup[1] == 0x19 && is_in);
@@ -863,8 +874,12 @@ int an2131_setup_packet(AN2131State *s, const uint8_t setup[8],
      * feeder hand-off can exceed the default window, so the reply would be
      * armed only after we returned (and lost). Give them a long window like
      * the 0x17 EEPROM read gets. */
-    bool need_card = !s->is_qc && is_in &&
-                     (setup[1] == 0x1A || setup[1] == 0x1B);
+    bool need_card = !s->is_qc &&
+                     (((setup[1] == 0x1A || setup[1] == 0x1B) && is_in) ||
+                      /* card SENDs too: ingesting a long write command
+                       * exceeds the default window and the unanswered setup
+                       * is fake-completed, wedging the exchange */
+                      setup[1] == 0x22 || setup[1] == 0x23);
 
     int cycles = 0;
     int limit = need_ep2 ? 30000 : (need_card ? 60000 : 10000);
@@ -911,6 +926,7 @@ int an2131_setup_packet(AN2131State *s, const uint8_t setup[8],
         if (drain && mainloop_hit && (cycles - drain) > 2000) break;
         if (drain && (cycles - drain) > 20000) break;
     }
+    s->in_setup = false;
 
     if (is_in && s->ep[0].in_armed) {
         int bc = s->ep[0].bc_in;
@@ -1082,12 +1098,22 @@ static void card_rx_deliver_ch(AN2131State *s, int slot,
 
     if (!card_reader_has_response(c)) {
         s->card_resp_cycles[idx] = 0;               /* nothing pending */
+        s->card_delivering[idx] = false;
         return;
     }
     if (s->card_resp_cycles[idx] == 0)
         s->card_resp_cycles[idx] = s->total_cycles; /* response just became ready */
+    if (c->tx_pos == 0 && s->card_delivering[idx]) {
+        /* A repeated command replaced the response we were delivering (the
+         * firmware retransmits frames): restart the turnaround delay so the
+         * duplicates settle into one clean reply instead of piling up ACKs
+         * until the channel FIFO overflows. */
+        s->card_resp_cycles[idx] = s->total_cycles;
+        s->card_delivering[idx] = false;
+    }
     {
-        uint64_t need = (c->tx_pos == 0) ? 15000 : 1500;
+        /* Real CRP-1231 command turnaround is tens of ms (magnetic I/O). */
+        uint64_t need = (c->tx_pos == 0) ? 60000 : 1500;
         if (s->total_cycles - s->card_resp_cycles[idx] < need)
             return;
     }
@@ -1097,6 +1123,7 @@ static void card_rx_deliver_ch(AN2131State *s, int slot,
     uint8_t b;
     if (card_reader_read(c, &b, 1) == 1) {
         s->card_resp_cycles[idx] = s->total_cycles; /* pace the next byte */
+        s->card_delivering[idx] = true;
         cpu->sfr[sbuf - 0x80] = b;
         uint8_t par = b;
         par ^= par >> 4; par ^= par >> 2; par ^= par >> 1;
@@ -1112,6 +1139,20 @@ static void card_rx_deliver(AN2131State *s)
 {
     if (s->is_qc || !chihiro_card_reader_enabled || !chihiro_card_reader_global)
         return;
+    /* Deferred TX-complete: raise TI one UART byte-time after the SBUF
+     * write, as the silicon does. */
+    for (int i = 0; i < 2; i++) {
+        if (s->card_ti_cycles[i] &&
+            s->total_cycles - s->card_ti_cycles[i] >= 200) {
+            s->cpu.sfr[(i == 0 ? 0x98 : 0xC0) - 0x80] |= 0x02;
+            s->card_ti_cycles[i] = 0;
+        }
+    }
+    /* Hold delivery while a card-drain vendor request (0x1A/0x1B) is still
+     * being serviced (reply not yet armed): a serial RX interrupt in the
+     * middle of the drain/feeder copy clobbers shared firmware work
+     * pointers and the game receives zeros. */
+    if (s->in_setup && !s->ep[0].in_armed) return;
     if (s->cpu.in_interrupt) return;
     card_rx_deliver_ch(s, 1, 0x99, 0x98, 0);   /* RS-232C: SBUF0/SCON0 */
     card_rx_deliver_ch(s, 0, 0xC1, 0xC0, 1);   /* MIDI:    SBUF1/SCON1 */

@@ -289,6 +289,9 @@ typedef struct AN2131State {
     bool     midi_response_ready;
     uint64_t midi_response_set_cycles;
     uint64_t card_resp_cycles[2];      /* card RX pacing: last byte time (0=idle) */
+    bool     card_delivering[2];       /* a response byte has been delivered */
+    uint64_t card_ti_cycles[2];        /* pending TX-complete: SBUF write time (0=none) */
+    bool     in_setup;                 /* inside an2131_setup_packet's window */
 
     /* ── Runtime state ──────────────────────────────────────────── */
     bool cpu_running;       /* true after CPUCS release */

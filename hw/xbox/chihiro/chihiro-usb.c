@@ -565,6 +565,14 @@ static void handle_data(USBDevice *dev, USBPacket *p)
             int len = p->iov.size;
             uint8_t buf[64];
             int chunk = MIN(len, (int)sizeof(buf));
+            /* Silicon back-pressure: the OUT endpoint NAKs while the firmware
+             * has not consumed the previous packet (it re-arms by writing
+             * OUTnBC). Overwriting the buffer instead corrupts multi-chunk
+             * frames — the card WRITE command in particular. */
+            if (s->an2131.ep[ep].cs_out & EPCS_BSY) {
+                p->status = USB_RET_NAK;
+                return;
+            }
             usb_packet_copy(p, buf, chunk);
             an2131_ep_out_write(&s->an2131, ep, buf, chunk);
             an2131_run(&s->an2131, 2000);
