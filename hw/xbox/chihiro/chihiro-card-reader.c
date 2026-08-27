@@ -126,11 +126,19 @@ void card_reader_insert(CardReaderState *s, const char *path)
         }
     }
 
-    /* Assigned file missing or short: insert a BLANK card (all zeroes) and
-     * create the file. The game reads an unformatted card and offers to
-     * format/register it, exactly like a fresh physical card — no synthetic
-     * pre-filled card is fabricated. */
+    /* Assigned file missing or short: insert a fresh card and create the
+     * file. A fresh card from the reader's stock carries the factory
+     * metadata header (blocks 4-7, big-endian) with an empty game-data
+     * area: the game validates that header first, then finds no game
+     * structure and treats the card as NEW, offering registration. An
+     * all-zero card would fail the header check and be rejected. */
     memset(s->card_data, 0, CARD_TOTAL_SIZE);
+    s->card_data[32] = 0x95;
+    s->card_data[33] = 0x71;
+    s->card_data[34] = 0x36;
+    s->card_data[35] = 0x40;
+    s->card_data[54] = 0x03;
+    s->card_data[55] = 0xF2;
     s->card_present = true;
     s->dirty = true;
     card_reader_flush(s);
