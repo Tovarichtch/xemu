@@ -8,7 +8,10 @@
 #define CARD_TOTAL_SIZE 2048
 
 typedef struct {
-    uint8_t rx_buf[256];
+    /* A full-card WRITE command is 10 header bytes + 2048 data + checksum;
+     * a short buffer silently truncates it, corrupts the card, and the
+     * game's verify pass reports Write Failure / NG. */
+    uint8_t rx_buf[CARD_TOTAL_SIZE + 32];
     int rx_pos;
     int rx_expected;
 
