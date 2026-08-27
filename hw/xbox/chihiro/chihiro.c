@@ -442,6 +442,13 @@ CardReaderState *chihiro_card_reader_global = card_state;
  * bytes corrupted player 1's card channel. */
 bool chihiro_card_reader_enabled;
 
+/* Physical card-insertion microswitch state for the JVS input path. */
+bool chihiro_card_reader_present(int player)
+{
+    if (player < 0 || player > 1) return false;
+    return card_state[player].card_present;
+}
+
 /*
  * Card reader support. The serial data path is fully LLE: the game's USB
  * vendor requests reach the real SC 8051 firmware, which talks to the

@@ -847,10 +847,16 @@ static void chihiro_update_jvs_p2(ChihiroJVSState *jvs, const bool *kbd,
     if (chihiro_check_input(g_config.chihiro.jvs_p2.service, kbd, mouseBtn))
         sw0 |= 0x40;
 
-    /* The second reader reports its card the same way the first one does. */
-    if (profile == CONFIG_CHIHIRO_JVS_PROFILE_GS &&
-        g_config.chihiro.card_reader.enable)
-        sw1 |= 0x20;
+    /* The second reader's physical insertion microswitch: it follows the
+     * assigned card, not the reader toggle — with no card in the slot the
+     * game must see the switch released, or it retries reads forever. */
+    {
+        bool chihiro_card_reader_present(int player);
+        if (profile == CONFIG_CHIHIRO_JVS_PROFILE_GS &&
+            g_config.chihiro.card_reader.enable &&
+            chihiro_card_reader_present(1))
+            sw1 |= 0x20;
+    }
 
     jvs->player_switches[1][0] = sw0;
     jvs->player_switches[1][1] = sw1;
@@ -945,8 +951,14 @@ static void xemu_input_update_jvs(void)
         if (profile == CONFIG_CHIHIRO_JVS_PROFILE_GS) {
             if (chihiro_check_input(g_config.chihiro.jvs.gs.change, kbd, mouseBtn))
                 sw1 |= 0x40;
-            if (g_config.chihiro.card_reader.enable)
-                sw1 |= 0x20;
+            {
+                /* Physical insertion microswitch: follows the assigned
+                 * card, not the reader toggle. */
+                bool chihiro_card_reader_present(int player);
+                if (g_config.chihiro.card_reader.enable &&
+                    chihiro_card_reader_present(0))
+                    sw1 |= 0x20;
+            }
         }
         break;
     }
