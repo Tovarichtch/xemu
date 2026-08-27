@@ -874,7 +874,7 @@ int an2131_setup_packet(AN2131State *s, const uint8_t setup[8],
      * feeder hand-off can exceed the default window, so the reply would be
      * armed only after we returned (and lost). Give them a long window like
      * the 0x17 EEPROM read gets. */
-    bool need_card = !s->is_qc &&
+    bool need_card = !s->is_qc && chihiro_card_reader_enabled &&
                      (((setup[1] == 0x1A || setup[1] == 0x1B) && is_in) ||
                       /* card SENDs too: ingesting a long write command
                        * exceeds the default window and the unanswered setup
@@ -924,6 +924,11 @@ int an2131_setup_packet(AN2131State *s, const uint8_t setup[8],
         }
         if (drain && mainloop_hit && setup[1] == 0x20) break;
         if (drain && mainloop_hit && (cycles - drain) > 2000) break;
+        /* Card requests: once the reply is armed the critical work is done
+         * (the bulk feeder keeps running from an2131_run) — leaving the
+         * window open to the 20000-cycle drain tail on every poll makes the
+         * whole machine boot and run visibly slower. */
+        if (drain && need_card && (cycles - drain) > 2000) break;
         if (drain && (cycles - drain) > 20000) break;
     }
     s->in_setup = false;
