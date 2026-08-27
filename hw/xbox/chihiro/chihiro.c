@@ -544,7 +544,6 @@ static void chihiro_card_reader_tick(void)
     card_tick++;
 
     if (!card_reader_initialized) {
-        chihiro_card_reader_enabled = true;
         card_reader_init(&card_state[0]);
         card_reader_init(&card_state[1]);
         char path[1200];
@@ -578,6 +577,12 @@ static void chihiro_card_reader_tick(void)
                     now_path[0] ? "inserted" : "ejected");
         }
     }
+}
+
+/* Only the OutRun 2 family (outrun2.xbe, OR2SP) talks to a drive board. */
+static bool chihiro_cabinet_has_driveboard(void)
+{
+    return strncasecmp(chihiro_game_filename, "outrun2", 7) == 0;
 }
 
 /* Execution VAs of the SEGABOOT the board boots: the second megabyte of the
@@ -813,7 +818,13 @@ static void chihiro_diag_timer_cb(void *opaque)
     ChihiroLPCState *s = (ChihiroLPCState *)opaque;
 
     if (chihiro_game_running) {
-        if (g_config.chihiro.card_reader.enable)
+        /* Cabinet wiring: the OutRun 2 cabinets hang the FFB drive board off
+         * SC UART1 and have no card readers; the card cabinets wire a
+         * CRP-1231 there instead — never both. Re-evaluated every tick so the
+         * UI toggle takes effect live and hands MIDI back. */
+        chihiro_card_reader_enabled = g_config.chihiro.card_reader.enable &&
+                                      !chihiro_cabinet_has_driveboard();
+        if (chihiro_card_reader_enabled)
             chihiro_card_reader_tick();
         timer_mod(s->diag_timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 16);
         return;
