@@ -383,7 +383,7 @@ void DebugVideoWindow::Draw()
         static float t = 0;
         if (runstate_is_running()) {
             t += ImGui::GetIO().DeltaTime;
-            fps.AddPoint(t, g_nv2a_stats.increment_fps);
+            fps.AddPoint(t, g_nv2a_stats.display_fps);
         }
         x_start = t - 10.0;
         x_end = t;
@@ -400,7 +400,7 @@ void DebugVideoWindow::Draw()
                 ImPlot::PlotShaded("##fps", &fps.Data[0].x, &fps.Data[0].y, fps.Data.size(), 0, 0, fps.Offset, 2 * sizeof(float));
                 ImPlot::PlotLine("##fps", &fps.Data[0].x, &fps.Data[0].y, fps.Data.size(), 0, fps.Offset, 2 * sizeof(float));
             }
-            ImPlot::Annotation(x_start, 65, ImPlot::GetLastItemColor(), ImVec2(0,0), true, "FPS: %d", g_nv2a_stats.increment_fps);
+            ImPlot::Annotation(x_start, 65, ImPlot::GetLastItemColor(), ImVec2(0,0), true, "FPS: %d", g_nv2a_stats.display_fps);
             ImPlot::EndPlot();
         }
 

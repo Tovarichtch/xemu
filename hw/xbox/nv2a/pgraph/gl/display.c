@@ -281,6 +281,8 @@ static void render_display(NV2AState *d, SurfaceBinding *surface)
     struct PGRAPHState *pg = &d->pgraph;
     PGRAPHGLState *r = pg->gl_renderer_state;
 
+    g_nv2a_stats.presented_frame_id = surface->draw_time;
+
     unsigned int width, height;
     VGADisplayParams vga_display_params;
     d->vga.get_resolution(&d->vga, (int*)&width, (int*)&height);
