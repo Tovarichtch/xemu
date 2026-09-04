@@ -754,6 +754,18 @@ static void psh_append_shadowmap(const struct PixelShader *ps, int i, bool compa
 
 // Adjust the s, t coordinates in the given VAR to account for the 4 texel
 // border supported by the hardware.
+static void psh_append_depth_range_test(const struct PixelShader *ps,
+                                        MString *out)
+{
+    if (ps->state->depth_clipping) {
+        mstring_append(out, "if (zvalue < clipRange.z || clipRange.w < zvalue) {\n"
+                            "  discard;\n"
+                            "}\n");
+    } else {
+        mstring_append(out, "zvalue = clamp(zvalue, clipRange.z, clipRange.w);\n");
+    }
+}
+
 static void apply_border_adjustment(const struct PixelShader *ps, MString *vars, int tex_index, const char *var_template)
 {
     int i = tex_index;
@@ -1049,15 +1061,15 @@ static MString* psh_convert(struct PixelShader *ps)
             "zvalue += depthFactor*triMZ;\n");
     }
 
-    /* Depth clipping */
-    if (ps->state->depth_clipping) {
-        mstring_append(
-            clip, "if (zvalue < clipRange.z || clipRange.w < zvalue) {\n"
-                  "  discard;\n"
-                  "}\n");
-    } else {
-        mstring_append(
-            clip, "zvalue = clamp(zvalue, clipRange.z, clipRange.w);\n");
+    /* Depth clipping. A DOT_ZW stage replaces the depth later (NV_texture_shader
+     * 3.8.13.1.21: the range test applies to the replaced value), so the test
+     * is emitted after that stage instead. */
+    bool depth_replace = false;
+    for (int i = 2; i < 4; i++) {
+        depth_replace |= ps->tex_modes[i] == PS_TEXTUREMODES_DOT_ZW;
+    }
+    if (!depth_replace) {
+        psh_append_depth_range_test(ps, clip);
     }
 
     MString *vars = mstring_new();
@@ -1263,8 +1275,16 @@ static MString* psh_convert(struct PixelShader *ps)
             mstring_append_fmt(vars, "/* PS_TEXTUREMODES_DOT_ZW */\n");
             mstring_append_fmt(vars, "float dot%d = dot(pT%d.xyz, %s(t%d));\n",
                 i, i, dotmap_func, ps->input_tex[i]);
+            /* Depth replace (NV_texture_shader 3.8.13.1.21): the window-space
+             * depth becomes dotP / dotC, previous-stage dot product over this
+             * one; polygon offset is lost; a zero divisor lands beyond the far
+             * plane. Units are the rasterizer's window z (see zvalue). */
+            mstring_append_fmt(vars,
+                "zvalue = (dot%d != 0.0) ? dot%d / dot%d"
+                " : uintBitsToFloat(0x7F7FFFFFu);\n",
+                i, i - 1, i);
+            psh_append_depth_range_test(ps, vars);
             mstring_append_fmt(vars, "vec4 t%d = vec4(0.0);\n", i);
-            // FIXME: mstring_append_fmt(vars, "gl_FragDepth = t%d.x;\n", i);
             break;
         case PS_TEXTUREMODES_DOT_RFLCT_DIFF:
             assert(i == 2);
