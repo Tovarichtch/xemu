@@ -60,6 +60,15 @@ typedef struct VertexAttribute {
     bool inline_buffer_populated;
 } VertexAttribute;
 
+/* Inline-array footprint of one attribute: the NV2A packs every attribute of
+ * an inline vertex into whole dwords (PROVEN: the XDK's CDevice_SetStateUP
+ * pushes (count * size + 3) >> 2 dwords per attribute). DMA arrays keep their
+ * own offsets and strides. */
+static inline unsigned int pgraph_inline_attr_size(const VertexAttribute *attr)
+{
+    return (attr->size * attr->count + 3) & ~3u;
+}
+
 typedef struct Surface {
     bool draw_dirty;
     bool buffer_dirty;
