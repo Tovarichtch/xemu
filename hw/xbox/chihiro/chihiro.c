@@ -580,9 +580,11 @@ static void chihiro_card_reader_tick(void)
 }
 
 /* Only the OutRun 2 family (outrun2.xbe, OR2SP) talks to a drive board. */
-static bool chihiro_cabinet_has_driveboard(void)
+/* Only the Ghost Squad cabinet carries CRP-1231 card readers; the others
+ * have nothing on that port and must not get cards created for them. */
+static bool chihiro_cabinet_has_card_reader(void)
 {
-    return strncasecmp(chihiro_game_filename, "outrun2", 7) == 0;
+    return strncasecmp(chihiro_game_filename, "vsg", 3) == 0;
 }
 
 /* Execution VAs of the SEGABOOT the board boots: the second megabyte of the
@@ -832,11 +834,11 @@ static void chihiro_diag_timer_cb(void *opaque)
 
     if (chihiro_game_running) {
         /* Cabinet wiring: the OutRun 2 cabinets hang the FFB drive board off
-         * SC UART1 and have no card readers; the card cabinets wire a
-         * CRP-1231 there instead — never both. Re-evaluated every tick so the
-         * UI toggle takes effect live and hands MIDI back. */
+         * SC UART1; the Ghost Squad cabinet wires two CRP-1231 there
+         * instead. Re-evaluated every tick so the UI toggle takes effect
+         * live and hands MIDI back. */
         chihiro_card_reader_enabled = g_config.chihiro.card_reader.enable &&
-                                      !chihiro_cabinet_has_driveboard();
+                                      chihiro_cabinet_has_card_reader();
         if (chihiro_card_reader_enabled)
             chihiro_card_reader_tick();
         timer_mod(s->diag_timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 16);
