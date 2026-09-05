@@ -56,7 +56,6 @@
 #include "update.hh"
 #endif
 #include <stb_image.h>
-#include "crosshair_default.png.h"
 
 bool g_screenshot_pending;
 const char *g_snapshot_pending_load_name;
@@ -76,45 +75,39 @@ static GLuint g_tex;
 static bool g_flip_req;
 
 
-static GLuint g_crosshair_tex = 0;
-static int g_crosshair_w = 0, g_crosshair_h = 0;
-static std::string g_crosshair_loaded_path;
+/* One player's crosshair image (chihiro.jvs*.crosshair_path). */
+struct Crosshair {
+    GLuint tex = 0;
+    int w = 0, h = 0;
+    std::string path;
+};
+static Crosshair g_crosshair[2];
 
-static void LoadCrosshairTexture(void)
+static void LoadCrosshair(Crosshair &c, const char *want_c)
 {
-    const char *custom = g_config.chihiro.settings.crosshair_path;
-    std::string want = custom ? custom : "";
+    std::string want = want_c ? want_c : "";
+    if (c.path == want) return;
 
-    if (g_crosshair_tex && g_crosshair_loaded_path == want)
-        return;
-
-    if (g_crosshair_tex) {
-        glDeleteTextures(1, &g_crosshair_tex);
-        g_crosshair_tex = 0;
+    if (c.tex) {
+        glDeleteTextures(1, &c.tex);
+        c.tex = 0;
     }
+    c.path = want;
+    if (want.empty()) return;
 
     int w, h, ch;
-    unsigned char *data = NULL;
     stbi_set_flip_vertically_on_load(0);
-
-    if (!want.empty()) {
-        data = stbi_load(want.c_str(), &w, &h, &ch, 4);
-    }
-    if (!data) {
-        data = stbi_load_from_memory(crosshair_default_data,
-                                     crosshair_default_size, &w, &h, &ch, 4);
-    }
+    unsigned char *data = stbi_load(want.c_str(), &w, &h, &ch, 4);
     if (!data) return;
 
-    glGenTextures(1, &g_crosshair_tex);
-    glBindTexture(GL_TEXTURE_2D, g_crosshair_tex);
+    glGenTextures(1, &c.tex);
+    glBindTexture(GL_TEXTURE_2D, c.tex);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA,
                  GL_UNSIGNED_BYTE, data);
-    g_crosshair_w = w;
-    g_crosshair_h = h;
-    g_crosshair_loaded_path = want;
+    c.w = w;
+    c.h = h;
     stbi_image_free(data);
 }
 
@@ -187,46 +180,30 @@ static void RenderLightGunOverlays(void)
 
     RenderSindenBorder(vx, vy, vw, vh, winW, winH);
 
-    if (!g_config.chihiro.settings.show_crosshair)
+    if (!chihiro_jvs_global)
         return;
 
-    LoadCrosshairTexture();
-    if (!g_crosshair_tex) return;
+    /* Each player's crosshair follows the aim the game receives; 0,0 means
+     * off the picture, so nothing is drawn. */
+    for (int p = 0; p < 2; p++) {
+        Crosshair &c = g_crosshair[p];
+        LoadCrosshair(c, p ? g_config.chihiro.jvs_p2.crosshair_path
+                           : g_config.chihiro.jvs.crosshair_path);
+        if (!c.tex) continue;
+        uint16_t jx = chihiro_jvs_global->analog[p * 2];
+        uint16_t jy = chihiro_jvs_global->analog[p * 2 + 1];
+        if (!jx && !jy) continue;
 
-    float scale = g_config.chihiro.settings.crosshair_scale / 100.0f;
-    float half_w = (g_crosshair_w * scale) / 2.0f;
-    float half_h = (g_crosshair_h * scale) / 2.0f;
-
-    auto draw_at = [&](float nx, float ny, int player) {
-        float cx = vx + nx * vw;
-        float cy = vy + ny * vh;
-        ImU32 tint = (player == 0) ? IM_COL32(255, 255, 255, 220)
-                                   : IM_COL32(100, 150, 255, 220);
+        int pct = p ? g_config.chihiro.jvs_p2.crosshair_scale
+                    : g_config.chihiro.jvs.crosshair_scale;
+        float half_w = c.w * pct / 200.0f;
+        float half_h = c.h * pct / 200.0f;
+        float cx = vx + jx / 65535.0f * vw;
+        float cy = vy + jy / 65535.0f * vh;
         ImGui::GetForegroundDrawList()->AddImage(
-            (ImTextureID)(intptr_t)g_crosshair_tex,
+            (ImTextureID)(intptr_t)c.tex,
             ImVec2(cx - half_w, cy - half_h),
-            ImVec2(cx + half_w, cy + half_h),
-            ImVec2(0, 0), ImVec2(1, 1), tint);
-    };
-
-    bool drawn = false;
-    for (int i = 0; i < 4; i++) {
-        int16_t ax, ay;
-        if (!xemu_input_get_lightgun_pos(i, &ax, &ay))
-            continue;
-        draw_at((ax + 32768.0f) / 65535.0f,
-                1.0f - (ay + 32768.0f) / 65535.0f, i);
-        drawn = true;
-    }
-    if (drawn || !chihiro_jvs_global)
-        return;
-
-    /* No light gun device bound: JVS aims with the mouse, so follow the very
-     * position the game receives (0,0 means offscreen — draw nothing). */
-    uint16_t jx = chihiro_jvs_global->analog[0];
-    uint16_t jy = chihiro_jvs_global->analog[1];
-    if (jx || jy) {
-        draw_at(jx / 65535.0f, jy / 65535.0f, 0);
+            ImVec2(cx + half_w, cy + half_h));
     }
 }
 

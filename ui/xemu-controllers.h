@@ -81,8 +81,14 @@ struct ChihiroRebindingMap : public virtual RebindingMap {
     int            m_joy_num_axes;
     Sint16         m_joy_baseline[24];
 
-    ChihiroRebindingMap(int table_row, int *scancode);
+    /* The player whose row is bound: its pointer device has no SDL events,
+     * so its buttons are polled (PollPointer) while the row waits. */
+    int      m_player;
+    uint32_t m_pointer_seen;
+
+    ChihiroRebindingMap(int table_row, int *scancode, int player);
     RebindEventResult ConsumeRebindEvent(SDL_Event *event) override;
+    bool PollPointer();
 };
 
 #endif // XEMU_CONTROLLERS_H

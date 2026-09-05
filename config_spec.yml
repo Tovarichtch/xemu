@@ -380,6 +380,18 @@ chihiro:
       type: enum
       values: [hotd3, vc3, gs, ctx, or2, ok]
       default: hotd3
+    # Gun aim: "mouse" = system cursor, "" = none, else the identity of a
+    # pointer device (chihiro.settings.pointer_devices)
+    pointer_device:
+      type: string
+      default: mouse
+    crosshair_path:
+      type: string
+      default: ""
+    crosshair_scale:
+      type: integer
+      default: 100
+    # System keys, shared by every game
     start:
       type: integer
       default: 40
@@ -392,6 +404,19 @@ chihiro:
     test:
       type: integer
       default: 39
+    # Driving keys, shared by Crazy Taxi and OutRun 2 (a wheel or a pad)
+    steer_left:
+      type: integer
+      default: 80
+    steer_right:
+      type: integer
+      default: 79
+    gas:
+      type: integer
+      default: 82
+    brake:
+      type: integer
+      default: 81
     hotd3:
       trigger:
         type: integer
@@ -420,18 +445,6 @@ chihiro:
         type: integer
         default: 44
     ctx:
-      steer_left:
-        type: integer
-        default: 80
-      steer_right:
-        type: integer
-        default: 79
-      gas:
-        type: integer
-        default: 82
-      brake:
-        type: integer
-        default: 81
       drive_gear:
         type: integer
         default: 225
@@ -442,18 +455,6 @@ chihiro:
         type: integer
         default: 44
     or2:
-      steer_left:
-        type: integer
-        default: 80
-      steer_right:
-        type: integer
-        default: 79
-      gas:
-        type: integer
-        default: 82
-      brake:
-        type: integer
-        default: 81
       gear_up:
         type: integer
         default: 29
@@ -483,16 +484,19 @@ chihiro:
         type: integer
         default: 27
   jvs_p2:
+    pointer_device:
+      type: string
+      default: ""
+    crosshair_path:
+      type: string
+      default: ""
+    crosshair_scale:
+      type: integer
+      default: 100
     start:
       type: integer
       default: 0
-    service:
-      type: integer
-      default: 0
     coin:
-      type: integer
-      default: 0
-    test:
       type: integer
       default: 0
     hotd3_trigger:
@@ -517,66 +521,6 @@ chihiro:
       type: integer
       default: 0
     gs_change:
-      type: integer
-      default: 0
-    ctx_steer_left:
-      type: integer
-      default: 0
-    ctx_steer_right:
-      type: integer
-      default: 0
-    ctx_gas:
-      type: integer
-      default: 0
-    ctx_brake:
-      type: integer
-      default: 0
-    ctx_drive_gear:
-      type: integer
-      default: 0
-    ctx_reverse:
-      type: integer
-      default: 0
-    ctx_jump:
-      type: integer
-      default: 0
-    or2_steer_left:
-      type: integer
-      default: 0
-    or2_steer_right:
-      type: integer
-      default: 0
-    or2_gas:
-      type: integer
-      default: 0
-    or2_brake:
-      type: integer
-      default: 0
-    or2_gear_up:
-      type: integer
-      default: 0
-    or2_gear_down:
-      type: integer
-      default: 0
-    or2_view_change:
-      type: integer
-      default: 0
-    ok_swing_left:
-      type: integer
-      default: 0
-    ok_swing_right:
-      type: integer
-      default: 0
-    ok_board_front:
-      type: integer
-      default: 0
-    ok_board_rear:
-      type: integer
-      default: 0
-    ok_left_grab:
-      type: integer
-      default: 0
-    ok_right_grab:
       type: integer
       default: 0
   settings:
@@ -617,15 +561,15 @@ chihiro:
     wheel_autocenter:
       type: bool
       default: true
-    show_crosshair:
+    # Read each mouse or light gun on its own (evdev on Linux) so two players
+    # can aim with their own device. Off: the system cursor aims.
+    pointer_devices:
+      type: bool
+      default: false
+    # Exclusive grab of the devices aimed with while playing (Linux)
+    pointer_grab:
       type: bool
       default: true
-    crosshair_scale:
-      type: integer
-      default: 100
-    crosshair_path:
-      type: string
-      default: ""
     sinden_border:
       type: bool
       default: false

@@ -67,7 +67,7 @@ public:
 class MainMenuChihiroView : public virtual MainMenuTabView
 {
 public:
-    std::unique_ptr<RebindingMap> m_rebinding;
+    std::unique_ptr<ChihiroRebindingMap> m_rebinding;
 
     MainMenuChihiroView() : m_rebinding{ nullptr }
     {
@@ -75,6 +75,7 @@ public:
     bool ConsumeRebindEvent(SDL_Event *event);
     bool IsInputRebinding();
     void Draw() override;
+    void DrawGameTab();
     void Hide() override;
 };
 

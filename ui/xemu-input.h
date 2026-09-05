@@ -159,7 +159,11 @@ extern const char *bound_drivers[4];
 extern "C" {
 #endif
 
+/* 1001..1013: buttons of the device the player aims with (the system mouse
+ * or its own pointer device), SDL layout: left, middle, right, x1, x2, then
+ * the 8 extra buttons some light guns carry. */
 #define CHIHIRO_MOUSE_BUTTON_BASE 1001
+#define CHIHIRO_POINTER_BUTTONS 13
 #define CHIHIRO_GAMEPAD_BUTTON_BASE 2001
 
 /* A JVS input may also be bound to one half of a gamepad axis. */
@@ -219,16 +223,14 @@ extern int *g_chihiro_universal_map[4];
 extern int *g_chihiro_hotd3_map[2];
 extern int *g_chihiro_vc3_map[3];
 extern int *g_chihiro_gs_map[3];
-extern int *g_chihiro_ctx_map[7];
-extern int *g_chihiro_or2_map[7];
+extern int *g_chihiro_drive_map[4];
+extern int *g_chihiro_ctx_map[3];
+extern int *g_chihiro_or2_map[3];
 extern int *g_chihiro_ok_map[6];
-extern int *g_chihiro_p2_universal_map[4];
+extern int *g_chihiro_p2_universal_map[2];
 extern int *g_chihiro_p2_hotd3_map[2];
 extern int *g_chihiro_p2_vc3_map[3];
 extern int *g_chihiro_p2_gs_map[3];
-extern int *g_chihiro_p2_ctx_map[7];
-extern int *g_chihiro_p2_or2_map[7];
-extern int *g_chihiro_p2_ok_map[6];
 
 void xemu_input_init(void);
 void xemu_input_process_sdl_events(const SDL_Event *event); // SDL_EVENT_GAMEPAD_ADDED, SDL_EVENT_GAMEPAD_REMOVED
@@ -254,7 +256,8 @@ void xemu_input_set_test_mode(int enabled);
 int xemu_input_get_test_mode(void);
 void xemu_input_reset_input_mapping(ControllerState *state);
 int xemu_input_lightgun_active(void);
-int xemu_input_get_lightgun_pos(int player_index, int16_t *x, int16_t *y);
+/* Buttons of the player's pointer device (0 when it aims otherwise). */
+uint32_t xemu_input_pointer_device_buttons(int player);
 
 #ifdef __cplusplus
 }

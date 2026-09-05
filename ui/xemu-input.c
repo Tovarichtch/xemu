@@ -17,7 +17,6 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-
 #include "qemu/osdep.h"
 #include "hw/qdev-core.h"
 #include "hw/qdev-properties.h"
@@ -30,7 +29,9 @@
 
 #include "xemu-input.h"
 #include "xemu-notifications.h"
+#include "xemu-pointer.h"
 #include "xemu-settings.h"
+#include "xui/xemu-hud.h"
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -41,6 +42,10 @@
 
 extern SDL_Window *m_window;
 extern int viewport_coords[4];
+
+/* Card reader (chihiro-cardreader.c): a slot's insertion microswitch. */
+bool chihiro_card_reader_present(int player);
+extern bool chihiro_card_reader_enabled;
 
 // #define DEBUG_INPUT
 
@@ -195,21 +200,21 @@ int *g_chihiro_gs_map[3] = {
     &g_config.chihiro.jvs.gs.change,
 };
 
-int *g_chihiro_ctx_map[7] = {
-    &g_config.chihiro.jvs.ctx.steer_left,
-    &g_config.chihiro.jvs.ctx.steer_right,
-    &g_config.chihiro.jvs.ctx.gas,
-    &g_config.chihiro.jvs.ctx.brake,
+/* Steering and pedals are shared by the driving games (g_chihiro_drive_map). */
+int *g_chihiro_drive_map[4] = {
+    &g_config.chihiro.jvs.steer_left,
+    &g_config.chihiro.jvs.steer_right,
+    &g_config.chihiro.jvs.gas,
+    &g_config.chihiro.jvs.brake,
+};
+
+int *g_chihiro_ctx_map[3] = {
     &g_config.chihiro.jvs.ctx.drive_gear,
     &g_config.chihiro.jvs.ctx.reverse,
     &g_config.chihiro.jvs.ctx.jump,
 };
 
-int *g_chihiro_or2_map[7] = {
-    &g_config.chihiro.jvs.or2.steer_left,
-    &g_config.chihiro.jvs.or2.steer_right,
-    &g_config.chihiro.jvs.or2.gas,
-    &g_config.chihiro.jvs.or2.brake,
+int *g_chihiro_or2_map[3] = {
     &g_config.chihiro.jvs.or2.gear_up,
     &g_config.chihiro.jvs.or2.gear_down,
     &g_config.chihiro.jvs.or2.view_change,
@@ -224,11 +229,10 @@ int *g_chihiro_ok_map[6] = {
     &g_config.chihiro.jvs.ok.right_grab,
 };
 
-int *g_chihiro_p2_universal_map[4] = {
+/* Player 2: start and coin only. */
+int *g_chihiro_p2_universal_map[2] = {
     &g_config.chihiro.jvs_p2.start,
-    &g_config.chihiro.jvs_p2.service,
     &g_config.chihiro.jvs_p2.coin,
-    &g_config.chihiro.jvs_p2.test,
 };
 
 int *g_chihiro_p2_hotd3_map[2] = {
@@ -246,35 +250,6 @@ int *g_chihiro_p2_gs_map[3] = {
     &g_config.chihiro.jvs_p2.gs_trigger,
     &g_config.chihiro.jvs_p2.gs_body_button,
     &g_config.chihiro.jvs_p2.gs_change,
-};
-
-int *g_chihiro_p2_ctx_map[7] = {
-    &g_config.chihiro.jvs_p2.ctx_steer_left,
-    &g_config.chihiro.jvs_p2.ctx_steer_right,
-    &g_config.chihiro.jvs_p2.ctx_gas,
-    &g_config.chihiro.jvs_p2.ctx_brake,
-    &g_config.chihiro.jvs_p2.ctx_drive_gear,
-    &g_config.chihiro.jvs_p2.ctx_reverse,
-    &g_config.chihiro.jvs_p2.ctx_jump,
-};
-
-int *g_chihiro_p2_or2_map[7] = {
-    &g_config.chihiro.jvs_p2.or2_steer_left,
-    &g_config.chihiro.jvs_p2.or2_steer_right,
-    &g_config.chihiro.jvs_p2.or2_gas,
-    &g_config.chihiro.jvs_p2.or2_brake,
-    &g_config.chihiro.jvs_p2.or2_gear_up,
-    &g_config.chihiro.jvs_p2.or2_gear_down,
-    &g_config.chihiro.jvs_p2.or2_view_change,
-};
-
-int *g_chihiro_p2_ok_map[6] = {
-    &g_config.chihiro.jvs_p2.ok_swing_left,
-    &g_config.chihiro.jvs_p2.ok_swing_right,
-    &g_config.chihiro.jvs_p2.ok_board_front,
-    &g_config.chihiro.jvs_p2.ok_board_rear,
-    &g_config.chihiro.jvs_p2.ok_left_grab,
-    &g_config.chihiro.jvs_p2.ok_right_grab,
 };
 
 static void check_and_reset_in_range(int *btn, int min, int max,
@@ -441,6 +416,8 @@ void xemu_input_init(void)
     }
 
     QTAILQ_INSERT_TAIL(&available_controllers, new_con, entry);
+
+    xemu_pointer_init();
 }
 
 int xemu_input_get_controller_default_bind_port(ControllerState *state, 
@@ -798,18 +775,135 @@ static bool chihiro_check_input(int binding, const bool *kbd, uint32_t mouseBtn)
         }
         return false;
     }
-    if (binding >= CHIHIRO_MOUSE_BUTTON_BASE) {
-        int btn = binding - CHIHIRO_MOUSE_BUTTON_BASE + 1;
-        return (mouseBtn & SDL_BUTTON_MASK(btn)) != 0;
+    if (binding >= CHIHIRO_MOUSE_BUTTON_BASE &&
+        binding < CHIHIRO_MOUSE_BUTTON_BASE + CHIHIRO_POINTER_BUTTONS) {
+        return (mouseBtn & (1u << (binding - CHIHIRO_MOUSE_BUTTON_BASE))) != 0;
     }
     return (binding > 0 && kbd[binding]);
 }
 
+/* Where a player's gun aims: the system cursor, one pointer device, or
+ * nothing (a second player with no device). */
+enum { AIM_NONE, AIM_MOUSE, AIM_DEVICE };
+
+static int chihiro_aim_source(int player, const char **identity)
+{
+    const char *sel = player ? g_config.chihiro.jvs_p2.pointer_device
+                             : g_config.chihiro.jvs.pointer_device;
+    *identity = NULL;
+    if (!sel || !sel[0]) {
+        return AIM_NONE;
+    }
+    if (strcmp(sel, "mouse") == 0) {
+        return AIM_MOUSE;
+    }
+    if (!g_config.chihiro.settings.pointer_devices) {
+        return AIM_NONE;
+    }
+    *identity = sel;
+    return AIM_DEVICE;
+}
+
+/* Buttons behind a player's 1001+ bindings: those of the device it aims
+ * with. Outside the gun games the system mouse serves everyone. */
+static uint32_t chihiro_pointer_buttons(int player, bool gun,
+                                        uint32_t sdl_mouse)
+{
+    const char *id;
+    if (!gun) {
+        return sdl_mouse;
+    }
+    switch (chihiro_aim_source(player, &id)) {
+    case AIM_MOUSE:
+        return sdl_mouse;
+    case AIM_DEVICE:
+        return xemu_pointer_buttons(id);
+    default:
+        return 0;
+    }
+}
+
+uint32_t xemu_input_pointer_device_buttons(int player)
+{
+    const char *id;
+    if (chihiro_aim_source(player, &id) != AIM_DEVICE) {
+        return 0;
+    }
+    return xemu_pointer_buttons(id);
+}
+
+/* One gun player's aim into its JVS analog pair (P1: 0/1, P2: 2/3), in
+ * window pixels mapped onto the game picture. Returns false without an aim
+ * source; *offscreen is set when the aim leaves the picture (or the device
+ * is unplugged), which is how the games see a reload. */
+static bool chihiro_gun_aim(ChihiroJVSState *jvs, int player, bool *offscreen)
+{
+    const char *id;
+    float px = 0, py = 0;
+    bool have = false;
+    int drawW, drawH;
+
+    SDL_GetWindowSizeInPixels(m_window, &drawW, &drawH);
+    switch (chihiro_aim_source(player, &id)) {
+    case AIM_MOUSE: {
+        float fx, fy;
+        int winW, winH;
+        SDL_GetMouseState(&fx, &fy);
+        SDL_GetWindowSize(m_window, &winW, &winH);
+        px = fx * (winW > 0 ? (float)drawW / winW : 1.0f);
+        py = fy * (winH > 0 ? (float)drawH / winH : 1.0f);
+        have = true;
+        break;
+    }
+    case AIM_DEVICE:
+        have = xemu_pointer_position(id, &px, &py);
+        break;
+    default:
+        return false;
+    }
+
+    float nx = 0, ny = 0;
+    if (have) {
+        float vx = 0, vy = 0, vw = drawW, vh = drawH;
+        if (viewport_coords[2] > 0 && viewport_coords[3] > 0) {
+            vx = viewport_coords[0];
+            vy = viewport_coords[1];
+            vw = viewport_coords[2];
+            vh = viewport_coords[3];
+        }
+        nx = (px - vx) / vw;
+        ny = (py - vy) / vh;
+    }
+    const float safe = 0.01f;
+    *offscreen = !have || nx < safe || nx > 1.0f - safe || ny < safe ||
+                 ny > 1.0f - safe;
+    if (*offscreen) {
+        jvs->analog[player * 2] = 0;
+        jvs->analog[player * 2 + 1] = 0;
+    } else {
+        jvs->analog[player * 2] = (uint16_t)(nx * 0xFFFF);
+        jvs->analog[player * 2 + 1] = (uint16_t)(ny * 0xFFFF);
+    }
+    return true;
+}
+
+/* The SCREEN switch: raised when the gun points off the picture (HOTD3, GS)
+ * or fires off the picture (VC3). */
+static uint8_t chihiro_gun_screen_bit(int profile, bool aim, bool offscreen,
+                                      bool trigger)
+{
+    if (!aim || !offscreen) {
+        return 0;
+    }
+    if (profile == CONFIG_CHIHIRO_JVS_PROFILE_VC3) {
+        return trigger ? 0x01 : 0;
+    }
+    return 0x01;
+}
+
 /*
- * Player 2 switches. Only the light gun games have a second player; the
- * driving and skating cabinets have a single set of controls. Aiming for P2
- * would need a second pointing device, so only the buttons and CARD_IN are
- * wired here.
+ * Player 2: only the light gun games have a second player. Aim comes from
+ * the second player's own pointer device, if one is selected.
  */
 static void chihiro_update_jvs_p2(ChihiroJVSState *jvs, const bool *kbd,
                                   uint32_t mouseBtn, int profile)
@@ -838,26 +932,24 @@ static void chihiro_update_jvs_p2(ChihiroJVSState *jvs, const bool *kbd,
         return;
     }
 
-    if (chihiro_check_input(tkey, kbd, mouseBtn)) sw0 |= 0x02;
+    bool offscreen = false;
+    bool aim = chihiro_gun_aim(jvs, 1, &offscreen);
+    bool trigger = chihiro_check_input(tkey, kbd, mouseBtn);
+
+    if (trigger) sw0 |= 0x02;
     if (chihiro_check_input(bkey, kbd, mouseBtn)) sw1 |= 0x80;
     if (chihiro_check_input(xkey, kbd, mouseBtn)) sw1 |= 0x40;
+    sw0 |= chihiro_gun_screen_bit(profile, aim, offscreen, trigger);
 
     if (chihiro_check_input(g_config.chihiro.jvs_p2.start, kbd, mouseBtn))
         sw0 |= 0x80;
-    if (chihiro_check_input(g_config.chihiro.jvs_p2.service, kbd, mouseBtn))
-        sw0 |= 0x40;
 
     /* The second reader's physical insertion microswitch: it follows the
-     * assigned card, not the reader toggle — with no card in the slot the
+     * assigned card, not the reader toggle -- with no card in the slot the
      * game must see the switch released, or it retries reads forever. */
-    {
-        bool chihiro_card_reader_present(int player);
-        extern bool chihiro_card_reader_enabled;
-        if (profile == CONFIG_CHIHIRO_JVS_PROFILE_GS &&
-            chihiro_card_reader_enabled &&
-            chihiro_card_reader_present(1))
-            sw1 |= 0x20;
-    }
+    if (profile == CONFIG_CHIHIRO_JVS_PROFILE_GS &&
+        chihiro_card_reader_enabled && chihiro_card_reader_present(1))
+        sw1 |= 0x20;
 
     jvs->player_switches[1][0] = sw0;
     jvs->player_switches[1][1] = sw1;
@@ -876,49 +968,23 @@ static void xemu_input_update_jvs(void)
     ChihiroJVSState *jvs = chihiro_jvs_global;
 
     const bool *kbd = SDL_GetKeyboardState(NULL);
-    float fmx, fmy;
-    uint32_t mouseBtn = SDL_GetMouseState(&fmx, &fmy);
+    uint32_t sdlBtn = SDL_GetMouseState(NULL, NULL);
     uint8_t sw0 = 0;
     uint8_t sw1 = 0;
 
     int profile = chihiro_detected_game_profile();
     if (profile < 0) profile = g_config.chihiro.jvs.profile;
+    bool gun = profile == CONFIG_CHIHIRO_JVS_PROFILE_HOTD3 ||
+               profile == CONFIG_CHIHIRO_JVS_PROFILE_VC3 ||
+               profile == CONFIG_CHIHIRO_JVS_PROFILE_GS;
+    uint32_t mouseBtn = chihiro_pointer_buttons(0, gun, sdlBtn);
 
     switch (profile) {
     case CONFIG_CHIHIRO_JVS_PROFILE_HOTD3:
     case CONFIG_CHIHIRO_JVS_PROFILE_VC3:
     case CONFIG_CHIHIRO_JVS_PROFILE_GS: {
-        int32_t winW, winH;
-        SDL_GetWindowSize(m_window, &winW, &winH);
-        float mx = fmx, my = fmy;
-        if (viewport_coords[2] > 0 && viewport_coords[3] > 0) {
-            int32_t drawW, drawH;
-            SDL_GetWindowSizeInPixels(m_window, &drawW, &drawH);
-            float scaleW = (float)winW / (float)drawW;
-            float scaleH = (float)winH / (float)drawH;
-            mx -= viewport_coords[0] * scaleW;
-            my -= viewport_coords[1] * scaleH;
-            winW = (int)(viewport_coords[2] * scaleW);
-            winH = (int)(viewport_coords[3] * scaleH);
-        }
-
-        float safe = 0.01f;
-        bool offscreen = (mx < safe * winW || mx > (1.0f - safe) * winW ||
-                          my < safe * winH || my > (1.0f - safe) * winH);
-
-        if (offscreen) {
-            jvs->analog[0] = 0;
-            jvs->analog[1] = 0;
-        } else {
-            float nx = mx / winW;
-            float ny = my / winH;
-            if (nx < 0) nx = 0;
-            if (nx > 1) nx = 1;
-            if (ny < 0) ny = 0;
-            if (ny > 1) ny = 1;
-            jvs->analog[0] = (uint16_t)(nx * 0xFFFF);
-            jvs->analog[1] = (uint16_t)(ny * 0xFFFF);
-        }
+        bool offscreen = false;
+        bool aim = chihiro_gun_aim(jvs, 0, &offscreen);
 
         int tkey, bkey;
         if (profile == CONFIG_CHIHIRO_JVS_PROFILE_HOTD3) {
@@ -937,13 +1003,7 @@ static void xemu_input_update_jvs(void)
 
         if (trigger) sw0 |= 0x02;
         if (body)    sw1 |= 0x80;
-
-        if (profile == CONFIG_CHIHIRO_JVS_PROFILE_HOTD3 ||
-            profile == CONFIG_CHIHIRO_JVS_PROFILE_GS) {
-            if (offscreen) sw0 |= 0x01;
-        } else if (profile == CONFIG_CHIHIRO_JVS_PROFILE_VC3) {
-            if (offscreen && trigger) sw0 |= 0x01;
-        }
+        sw0 |= chihiro_gun_screen_bit(profile, aim, offscreen, trigger);
 
         if (profile == CONFIG_CHIHIRO_JVS_PROFILE_VC3) {
             if (chihiro_check_input(g_config.chihiro.jvs.vc3.pedal, kbd, mouseBtn))
@@ -952,32 +1012,19 @@ static void xemu_input_update_jvs(void)
         if (profile == CONFIG_CHIHIRO_JVS_PROFILE_GS) {
             if (chihiro_check_input(g_config.chihiro.jvs.gs.change, kbd, mouseBtn))
                 sw1 |= 0x40;
-            {
-                /* Physical insertion microswitch: follows the assigned
-                 * card, not the reader toggle. */
-                bool chihiro_card_reader_present(int player);
-                extern bool chihiro_card_reader_enabled;
-                if (chihiro_card_reader_enabled &&
-                    chihiro_card_reader_present(0))
-                    sw1 |= 0x20;
-            }
+            /* Physical insertion microswitch: follows the assigned card,
+             * not the reader toggle. */
+            if (chihiro_card_reader_enabled && chihiro_card_reader_present(0))
+                sw1 |= 0x20;
         }
         break;
     }
     case CONFIG_CHIHIRO_JVS_PROFILE_CTX:
     case CONFIG_CHIHIRO_JVS_PROFILE_OR2: {
-        int b_sl, b_sr, b_gas, b_brk;
-        if (profile == CONFIG_CHIHIRO_JVS_PROFILE_CTX) {
-            b_sl  = g_config.chihiro.jvs.ctx.steer_left;
-            b_sr  = g_config.chihiro.jvs.ctx.steer_right;
-            b_gas = g_config.chihiro.jvs.ctx.gas;
-            b_brk = g_config.chihiro.jvs.ctx.brake;
-        } else {
-            b_sl  = g_config.chihiro.jvs.or2.steer_left;
-            b_sr  = g_config.chihiro.jvs.or2.steer_right;
-            b_gas = g_config.chihiro.jvs.or2.gas;
-            b_brk = g_config.chihiro.jvs.or2.brake;
-        }
+        int b_sl  = g_config.chihiro.jvs.steer_left;
+        int b_sr  = g_config.chihiro.jvs.steer_right;
+        int b_gas = g_config.chihiro.jvs.gas;
+        int b_brk = g_config.chihiro.jvs.brake;
 
         bool sl = chihiro_check_input(b_sl, kbd, mouseBtn);
         bool sr = chihiro_check_input(b_sr, kbd, mouseBtn);
@@ -1059,7 +1106,8 @@ static void xemu_input_update_jvs(void)
     jvs->player_switches[0][0] = sw0;
     jvs->player_switches[0][1] = sw1;
 
-    chihiro_update_jvs_p2(jvs, kbd, mouseBtn, profile);
+    chihiro_update_jvs_p2(jvs, kbd, chihiro_pointer_buttons(1, gun, sdlBtn),
+                          profile);
 
     // OR2's sequential shifter is wired to the SECOND player's UP/DOWN switch
     // pins: JVS sw0 bits 5/4 of player 2. Testmode.xbe (and the game) read gear
@@ -1079,6 +1127,21 @@ static void xemu_input_update_jvs(void)
     if (coin_key && !coin_prev)
         jvs->coin_count[0]++;
     coin_prev = coin_key;
+
+    /* Hold the guns exclusively while playing so they stop moving the
+     * desktop cursor; let go whenever the menu wants the mouse. */
+    {
+        const char *id1 = NULL, *id2 = NULL;
+        int hud_kbd = 0, hud_mouse = 0;
+        xemu_hud_should_capture_kbd_mouse(&hud_kbd, &hud_mouse);
+        if (gun) {
+            chihiro_aim_source(0, &id1);
+            chihiro_aim_source(1, &id2);
+        }
+        xemu_pointer_set_grab(gun && g_config.chihiro.settings.pointer_grab &&
+                                  !hud_mouse,
+                              id1, id2);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1420,6 +1483,8 @@ static void chihiro_ffb_update(ControllerState *c)
 
 void xemu_input_update_controllers(void)
 {
+    xemu_pointer_poll();
+
     ControllerState *iter;
     QTAILQ_FOREACH (iter, &available_controllers, entry) {
         xemu_input_update_controller(iter);
@@ -2028,17 +2093,4 @@ int xemu_input_lightgun_active(void)
         }
     }
     return 0;
-}
-
-int xemu_input_get_lightgun_pos(int player_index, int16_t *x, int16_t *y)
-{
-    if (player_index < 0 || player_index >= 4) return 0;
-    if (!bound_drivers[player_index] ||
-        strcmp(bound_drivers[player_index], DRIVER_LIGHT_GUN) != 0)
-        return 0;
-    ControllerState *s = bound_controllers[player_index];
-    if (!s || s->lg.status != 0x20) return 0;
-    *x = s->lg.axis[0];
-    *y = s->lg.axis[1];
-    return 1;
 }

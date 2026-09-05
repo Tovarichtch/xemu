@@ -122,9 +122,10 @@ ControllerGamepadRebindingMap::HandleAxisEvent(SDL_GamepadAxisEvent *event)
     return RebindEventResult::Complete;
 }
 
-ChihiroRebindingMap::ChihiroRebindingMap(int table_row, int *scancode)
+ChihiroRebindingMap::ChihiroRebindingMap(int table_row, int *scancode,
+                                         int player)
     : RebindingMap(table_row), m_scancode(scancode), m_joy_id(0),
-      m_joy_num_axes(0)
+      m_joy_num_axes(0), m_player(player), m_pointer_seen(0)
 {
     // Snapshot the bound wheel's axes at rest, so a pedal that idles at an
     // extreme can still be captured by movement (see the header note).
@@ -185,6 +186,19 @@ ChihiroRebindingMap::ConsumeRebindEvent(SDL_Event *event)
         }
     }
     return RebindEventResult::Ignore;
+}
+
+/* A button of the player's pointer device, captured on release. */
+bool ChihiroRebindingMap::PollPointer()
+{
+    uint32_t now = xemu_input_pointer_device_buttons(m_player);
+    uint32_t released = m_pointer_seen & ~now;
+    m_pointer_seen |= now;
+    if (released) {
+        *m_scancode = CHIHIRO_MOUSE_BUTTON_BASE + __builtin_ctz(released);
+        return true;
+    }
+    return false;
 }
 
 RebindEventResult
