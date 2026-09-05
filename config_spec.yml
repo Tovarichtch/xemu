@@ -5,7 +5,7 @@ general:
   updates:
     check:
       type: bool
-      default: true
+      default: false
   screenshot_dir: string
   games_dir: string
   skip_boot_anim: bool
