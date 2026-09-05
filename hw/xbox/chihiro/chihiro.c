@@ -2414,6 +2414,18 @@ void chihiro_ide_interface_init(void)
     fflush(stdout);
 }
 
+/* memmem is missing from some C libraries (mingw). */
+static const uint8_t *chihiro_mem_find(const uint8_t *hay, size_t hay_len,
+                                       const char *needle)
+{
+    size_t n = strlen(needle);
+    for (size_t i = 0; n && i + n <= hay_len; i++) {
+        if (hay[i] == (uint8_t)needle[0] && memcmp(hay + i, needle, n) == 0)
+            return hay + i;
+    }
+    return NULL;
+}
+
 static void chihiro_segaboot_identify(void)
 {
     if (chihiro_flash_rom_size < 0x200000)
@@ -2421,7 +2433,7 @@ static void chihiro_segaboot_identify(void)
 
     const uint8_t *half = chihiro_flash_rom + 0x100000;
     const char *tag = "SegaBoot Ver.";
-    const uint8_t *p = memmem(half, 0x100000, tag, strlen(tag));
+    const uint8_t *p = chihiro_mem_find(half, 0x100000, tag);
     if (!p) {
         printf("Chihiro: no SEGABOOT in this flash dump\n");
         return;
