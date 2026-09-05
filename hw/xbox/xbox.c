@@ -443,25 +443,14 @@ void xbox_init_common(MachineState *machine,
                                    (long long)(g_get_monotonic_time() - t0)
                                    / 1000);
 
-                            /* Extract game filename from boot.id */
-                            for (uint32_t off = 0; off + 480 <= file_size;
-                                 off++) {
+                            /* The game executable, from the image's boot.id */
+                            for (uint32_t off = 0;
+                                 off + CHIHIRO_BOOTID_LEN <= file_size; off++) {
+                                char name[64];
                                 if (memcmp(fs_buf + off, "BTID", 4) == 0 &&
-                                    memcmp(fs_buf + off + 0x20,
-                                           "XBAM", 4) == 0) {
-                                    char name_buf[32];
-                                    memcpy(name_buf,
-                                           fs_buf + off + 0xA0, 31);
-                                    name_buf[31] = '\0';
-                                    char *n = name_buf;
-                                    while (*n == '\\' || *n == '/') n++;
-                                    if (*n) {
-                                        strncpy(chihiro_game_filename,
-                                                n, 63);
-                                        chihiro_game_filename[63] = '\0';
-                                        printf("Chihiro: game → '%s'\n",
-                                               chihiro_game_filename);
-                                    }
+                                    chihiro_bootid_executable(fs_buf + off, name,
+                                                              sizeof(name))) {
+                                    chihiro_set_game_executable(name);
                                     break;
                                 }
                             }

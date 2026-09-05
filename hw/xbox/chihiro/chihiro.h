@@ -36,6 +36,10 @@ extern uint32_t chihiro_pc20_size;
 /* Game state */
 extern char chihiro_game_dir[1024];
 extern char chihiro_game_filename[64];
+/* Sega netboot boot.id: the bytes every source of the game name parses. */
+#define CHIHIRO_BOOTID_LEN 0xC0
+bool chihiro_bootid_executable(const uint8_t *bid, char *out, size_t out_len);
+void chihiro_set_game_executable(const char *name);
 extern bool chihiro_board_type3;
 extern int chihiro_region_setting;
 extern bool chihiro_freeplay_setting;

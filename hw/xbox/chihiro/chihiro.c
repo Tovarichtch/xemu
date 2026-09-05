@@ -735,56 +735,69 @@ static void chihiro_segaboot_poll(void)
  * with magic "BTID", "XBAM" at +0x20 and the executable at +0xA0
  * (e.g. "\hod3xb.xbe"). Fall back to scanning SEGABOOT data for ".xbe".
  */
+/* Sega netboot boot.id: "BTID" at 0, "XBAM" at 0x20, game executable at
+ * 0xA0 (31 chars, backslash-prefixed). The one parser for every source. */
+bool chihiro_bootid_executable(const uint8_t *bid, char *out, size_t out_len)
+{
+    if (memcmp(bid, "BTID", 4) != 0 || memcmp(bid + 0x20, "XBAM", 4) != 0) {
+        return false;
+    }
+    char exec[32];
+    memcpy(exec, bid + 0xA0, 31);
+    exec[31] = 0;
+    const char *name = exec;
+    while (*name == '\\' || *name == '/') name++;
+    if (!*name) {
+        return false;
+    }
+    g_strlcpy(out, name, out_len);
+    return true;
+}
+
+/* The single writer of the game executable name; every consumer (save
+ * file, JVS profile, drive board) reads chihiro_game_filename. */
+void chihiro_set_game_executable(const char *name)
+{
+    if (strcmp(chihiro_game_filename, name) == 0) {
+        return;
+    }
+    g_strlcpy(chihiro_game_filename, name, sizeof(chihiro_game_filename));
+    printf("Chihiro: game → '%s'\n", chihiro_game_filename);
+}
+
+/* A game launched from a directory carries its boot.id as a file. */
+static void chihiro_capture_game_filename_from_dir(void)
+{
+    if (chihiro_game_filename[0] || !chihiro_game_dir[0]) {
+        return;
+    }
+    char bootid_path[1100];
+    snprintf(bootid_path, sizeof(bootid_path), "%s/boot.id", chihiro_game_dir);
+    FILE *f = fopen(bootid_path, "rb");
+    if (!f) {
+        return;
+    }
+    uint8_t bid[CHIHIRO_BOOTID_LEN];
+    char name[64];
+    if (fread(bid, 1, sizeof(bid), f) == sizeof(bid) &&
+        chihiro_bootid_executable(bid, name, sizeof(name))) {
+        chihiro_set_game_executable(name);
+    }
+    fclose(f);
+}
+
+/* SEGABOOT loads boot.id at PA 0x4F000 before it reaches boot=3: the
+ * fallback when the image was not parsed on the host. */
 static void chihiro_capture_game_filename(void)
 {
-    chihiro_game_filename[0] = 0;
-
-    uint8_t btid[4];
-    cpu_physical_memory_read(0x4F000, btid, 4);
-    if (memcmp(btid, "BTID", 4) == 0) {
-        uint8_t xbam[4];
-        cpu_physical_memory_read(0x4F020, xbam, 4);
-        if (memcmp(xbam, "XBAM", 4) == 0) {
-            uint8_t game_exec[32] = {0};
-            cpu_physical_memory_read(0x4F0A0, game_exec, 31);
-            char *name = (char *)game_exec;
-            while (*name == '\\' || *name == '/') name++;
-            if (name[0] && strlen(name) < 60) {
-                strncpy(chihiro_game_filename, name, 63);
-                chihiro_game_filename[63] = 0;
-            }
-        }
-    }
-
-    if (chihiro_game_filename[0])
+    if (chihiro_game_filename[0]) {
         return;
-
-    for (uint32_t pa = 0x50000; pa < 0x56000; pa++) {
-        uint8_t buf[4];
-        cpu_physical_memory_read(pa, buf, 4);
-        if (memcmp(buf, ".xbe", 4) != 0 && memcmp(buf, ".XBE", 4) != 0)
-            continue;
-
-        int start = 0;
-        uint8_t fname[64];
-        for (int back = 1; back <= 42; back++) {
-            uint8_t c;
-            cpu_physical_memory_read(pa - back, &c, 1);
-            if (c < 0x20 || c >= 0x7F || c == '\\' || c == '/' || c == ':') {
-                start = back - 1;
-                break;
-            }
-            start = back;
-        }
-        if (start > 0) {
-            cpu_physical_memory_read(pa - start, fname, start + 4);
-            fname[start + 4] = 0;
-            int len = start + 4;
-            if (len > 4 && len < 60) {
-                memcpy(chihiro_game_filename, fname, len + 1);
-                break;
-            }
-        }
+    }
+    uint8_t bid[CHIHIRO_BOOTID_LEN];
+    char name[64];
+    cpu_physical_memory_read(0x4F000, bid, sizeof(bid));
+    if (chihiro_bootid_executable(bid, name, sizeof(name))) {
+        chihiro_set_game_executable(name);
     }
 }
 
@@ -1031,28 +1044,7 @@ void chihiro_on_quickreboot_signal(void)
         return;
     }
 
-    /* Read boot.id from game directory to get game executable name */
-    if (chihiro_game_dir[0] && !chihiro_game_filename[0]) {
-        char bootid_path[1100];
-        snprintf(bootid_path, sizeof(bootid_path), "%s/boot.id", chihiro_game_dir);
-        FILE *f = fopen(bootid_path, "rb");
-        if (f) {
-            uint8_t bid[480];
-            if (fread(bid, 1, 480, f) >= 0xC0) {
-                /* gameExecutable at offset 0xA0, 32 bytes, backslash-prefixed */
-                char *exec = (char *)&bid[0xA0];
-                exec[31] = 0;
-                /* Skip leading backslash */
-                char *name = exec;
-                while (*name == '\\' || *name == '/') name++;
-                if (*name) {
-                    strncpy(chihiro_game_filename, name, 63);
-                    chihiro_game_filename[63] = 0;
-                }
-            }
-            fclose(f);
-        }
-    }
+    chihiro_capture_game_filename_from_dir();
 
     chihiro_quickreboot_pending = true;
     chihiro_game_running = false;
@@ -2121,27 +2113,7 @@ static bool chihiro_game_base_name(char *base, size_t base_len)
 {
     if (!chihiro_game_dir[0]) return false;
 
-    /* Resolve game filename from boot.id if not already known */
-    if (!chihiro_game_filename[0]) {
-        char bootid_path[1100];
-        snprintf(bootid_path, sizeof(bootid_path), "%s/boot.id", chihiro_game_dir);
-        FILE *f = fopen(bootid_path, "rb");
-        if (f) {
-            uint8_t bid[480];
-            if (fread(bid, 1, 480, f) >= 0xC0) {
-                char *exec = (char *)&bid[0xA0];
-                exec[31] = 0;
-                char *name = exec;
-                while (*name == '\\' || *name == '/') name++;
-                if (*name) {
-                    strncpy(chihiro_game_filename, name, 63);
-                    chihiro_game_filename[63] = 0;
-                }
-            }
-            fclose(f);
-        }
-    }
-
+    chihiro_capture_game_filename_from_dir();
     if (!chihiro_game_filename[0]) return false;
 
     strncpy(base, chihiro_game_filename, base_len - 1);
