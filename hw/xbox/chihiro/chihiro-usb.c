@@ -867,6 +867,39 @@ static const TypeInfo chihiro_an2131qc_info = {
     .class_init    = chihiro_an2131qc_class_init,
 };
 
+/* The game uploads its SUD effect packages once at boot; without this
+ * section a loaded snapshot plays every impact as silence. */
+static const VMStateDescription vmstate_chihiro_driveboard = {
+    .name = "chihiro-driveboard",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT8_ARRAY(tx_buf, DriveBoardState, 4),
+        VMSTATE_INT32(tx_pos, DriveBoardState),
+        VMSTATE_UINT8_ARRAY(resp_buf, DriveBoardState, DRIVEBOARD_RESP_SIZE),
+        VMSTATE_INT32(resp_head, DriveBoardState),
+        VMSTATE_INT32(resp_tail, DriveBoardState),
+        VMSTATE_BOOL(motor_active, DriveBoardState),
+        VMSTATE_UINT8(global_power, DriveBoardState),
+        VMSTATE_BOOL(spring_active, DriveBoardState),
+        VMSTATE_UINT8(damper_level, DriveBoardState),
+        VMSTATE_UINT8(friction_power, DriveBoardState),
+        VMSTATE_UINT8(road_power, DriveBoardState),
+        VMSTATE_UINT8(road_freq, DriveBoardState),
+        VMSTATE_UINT8(vibration_power, DriveBoardState),
+        VMSTATE_UINT8(vibration_speed, DriveBoardState),
+        VMSTATE_UINT8(movement_dir, DriveBoardState),
+        VMSTATE_UINT8(movement_power, DriveBoardState),
+        VMSTATE_UINT8_2DARRAY(sud_pkg, DriveBoardState, 16, 16),
+        VMSTATE_UINT8(sud_up_pkg, DriveBoardState),
+        VMSTATE_UINT8(sud_up_idx, DriveBoardState),
+        VMSTATE_INT8(play_pkg, DriveBoardState),
+        VMSTATE_UINT8(play_pos, DriveBoardState),
+        VMSTATE_UINT8(play_sub, DriveBoardState),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
 static void chihiro_an2131sc_realize(USBDevice *dev, Error **errp)
 {
     ChihiroUSBState *s = (ChihiroUSBState *)dev;
@@ -912,6 +945,7 @@ static void chihiro_an2131sc_realize(USBDevice *dev, Error **errp)
     static DriveBoardState driveboard_instance;
     driveboard_init(&driveboard_instance);
     chihiro_driveboard_global = &driveboard_instance;
+    vmstate_register(NULL, 0, &vmstate_chihiro_driveboard, &driveboard_instance);
 
     /* AN2131 LLE: init 8051 CPU + register layer, wire EEPROMs + extmem */
     an2131_init(&s->an2131);
