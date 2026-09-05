@@ -375,8 +375,15 @@ void xbox_init_common(MachineState *machine,
         /* TODO: Wire g_config.chihiro.roms.* paths here instead of
          * auto-discovery from the Xbox BIOS directory. Then remove
          * chihiro_load_flash_rom/chihiro_load_eeproms auto-discovery. */
-        chihiro_load_flash_rom(g_config.sys.files.flashrom_path);
-        chihiro_load_eeproms(g_config.sys.files.flashrom_path);
+        /* The ROM folder is the one holding the BIOS actually booted: the
+         * Xbox flash when configured, else the Chihiro BIOS (see vl.c). */
+        const char *rom_ref = g_config.sys.files.flashrom_path;
+        if ((!rom_ref || !rom_ref[0]) && g_config.chihiro.roms.bios_path &&
+            g_config.chihiro.roms.bios_path[0]) {
+            rom_ref = g_config.chihiro.roms.bios_path;
+        }
+        chihiro_load_flash_rom(rom_ref);
+        chihiro_load_eeproms(rom_ref);
 
         chihiro_region_setting = g_config.chihiro.settings.region;
         chihiro_freeplay_setting = g_config.chihiro.settings.freeplay;

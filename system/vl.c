@@ -3056,9 +3056,14 @@ void qemu_init(int argc, char **argv)
     }
 
     const char *flashrom_path = g_config.sys.files.flashrom_path;
-    /* Chihiro: an explicit BIOS from Settings > Chihiro > Files wins. */
-    if ((int)g_config.sys.mem_limit >= 1 && g_config.chihiro.roms.bios_path &&
-        g_config.chihiro.roms.bios_path[0]) {
+    /* Chihiro: an explicit BIOS from Settings > Chihiro > Files wins in
+     * Chihiro mode (128M), and also fills in whenever no Xbox flash is
+     * configured at all -- either BIOS satisfies the requirement, a
+     * first-time Chihiro setup must not insist on an Xbox flash image. */
+    if (g_config.chihiro.roms.bios_path && g_config.chihiro.roms.bios_path[0] &&
+        ((int)g_config.sys.mem_limit >= 1 ||
+         !g_config.sys.files.flashrom_path ||
+         !g_config.sys.files.flashrom_path[0])) {
         flashrom_path = g_config.chihiro.roms.bios_path;
     }
     if (g_config.general.show_welcome) {
