@@ -3662,7 +3662,13 @@ endif
 
 tomlplusplus = dependency('tomlplusplus', fallback: ['tomlplusplus', 'tomlplusplus_dep'], default_options: ['default_library=static'])
 
-xxhash = dependency('libxxhash', fallback: ['xxhash', 'xxhash_dep'], default_options: ['default_library=static'])
+# The wrap's 'cpu-little-endian' feature is 'auto', which this project's
+# auto_features turns into disabled: xxhash then byte-swaps every read and
+# its digests differ from every other build of the same input. State the
+# host's endianness explicitly so digests agree across platforms.
+xxhash = dependency('libxxhash', fallback: ['xxhash', 'xxhash_dep'],
+                    default_options: ['default_library=static',
+                                      'cpu-little-endian=' + (host_machine.endian() == 'little' ? 'enabled' : 'disabled')])
 
 #####################
 # Generated sources #
