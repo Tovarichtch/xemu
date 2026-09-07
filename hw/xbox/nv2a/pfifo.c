@@ -302,7 +302,16 @@ static void pfifo_run_pusher(NV2AState *d)
             break;
         }
 
-        size_t num_words_available = dma_put_v - dma_get_v;
+        /* Words the pusher may read from GET: up to PUT, or, once PUT has
+         * wrapped to the start of the ring, up to the end of the DMA
+         * object, limit + 1 (the jump word there brings GET back). The unsigned
+         * PUT - GET was a huge count on a wrapped ring, and the
+         * DRAW_ARRAYS lookahead then took the previous lap's words past
+         * the jump for more draws: GET left the object (Crazy Taxi at
+         * 10x, the pusher a lap behind while the city loads). */
+        uint32_t dma_end = (uint32_t)((dma_len + 1) & ~(hwaddr)3);
+        size_t num_words_available =
+            (dma_put_v >= dma_get_v ? dma_put_v : dma_end) - dma_get_v;
         assert(num_words_available % 4 == 0);
         num_words_available /= 4;
 
