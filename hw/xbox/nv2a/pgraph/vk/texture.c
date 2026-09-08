@@ -649,7 +649,12 @@ static void copy_zeta_surface_to_texture(PGRAPHState *pg, SurfaceBinding *surfac
             ROUND_UP(scaled_width * scaled_height * 4,
                      r->device_props.limits.minStorageBufferOffsetAlignment);
         stencil_buffer_size = scaled_width * scaled_height;
-        copied_image_size += stencil_buffer_size;
+        /* The depth plane copies as 32-bit texels whatever the image texel
+         * size (8 bytes for D32_SFLOAT_S8_UINT, the AMD fallback): the
+         * copy ends with the stencil plane. Summing the image texel size
+         * and the stencil plane claimed 9 bytes a pixel against a buffer
+         * sized for 8 (House of the Dead 3 on AMD Windows, assertion). */
+        copied_image_size = stencil_buffer_offset + stencil_buffer_size;
 
         regions[num_regions++] = (VkBufferImageCopy){
             .bufferOffset = stencil_buffer_offset,
