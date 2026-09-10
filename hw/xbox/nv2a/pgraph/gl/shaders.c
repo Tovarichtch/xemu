@@ -511,6 +511,18 @@ static void shader_cache_entry_post_evict(Lru *lru, LruNode *node)
 {
     ShaderBinding *binding = container_of(node, ShaderBinding, node);
 
+    /* The evicted entry may be the one the renderer still points at: its
+     * program and pipeline are deleted right below, and a later restore
+     * (the off-frame texture touch rebinds the live program) would then
+     * name a deleted object -- GL_INVALID_OPERATION, reported by AMD's
+     * driver as "GL error 0x502 at touch fresh textures". The next draw
+     * looks the binding up again, so dropping it here costs nothing. */
+    PGRAPHGLState *r = container_of(lru, PGRAPHGLState, shader_cache);
+    if (r->shader_binding == binding) {
+        r->shader_binding = NULL;
+    }
+    binding->initialized = false;
+
     if (binding->save_thread) {
         qemu_thread_join(binding->save_thread);
         g_free(binding->save_thread);
