@@ -287,10 +287,27 @@ static void set_full_screen(struct xemu_console *scon, bool set)
 
     if (gui_fullscreen) {
         const SDL_DisplayMode *mode = NULL;
+        SDL_DisplayMode closest;
         SDL_DisplayMode **modes = NULL;
         if (g_config.display.window.fullscreen_exclusive) {
             SDL_DisplayID display = SDL_GetDisplayForWindow(scon->real_window);
-            if (display) {
+            /* The mode the player is already running, not the largest the
+             * screen will accept. A display that advertises 4096x2160 (a
+             * TV, or a panel with a DCI mode) had the game composited at
+             * 4K on a laptop iGPU while the desktop was far smaller:
+             * Crazy Taxi fell from 60 to a median of 54 on a Radeon Vega 7
+             * the moment exclusive fullscreen was switched on (measured,
+             * 10/09). Ask for the mode closest to the desktop instead. */
+            const SDL_DisplayMode *desktop =
+                display ? SDL_GetDesktopDisplayMode(display) : NULL;
+            if (desktop &&
+                SDL_GetClosestFullscreenDisplayMode(display, desktop->w,
+                                                    desktop->h,
+                                                    desktop->refresh_rate,
+                                                    true, &closest)) {
+                mode = &closest;
+            }
+            if (!mode && display) {
                 int num_modes = 0;
                 modes = SDL_GetFullscreenDisplayModes(display, &num_modes);
                 if (modes && num_modes > 0) {
@@ -299,7 +316,7 @@ static void set_full_screen(struct xemu_console *scon, bool set)
                 }
             }
             if (mode) {
-                fprintf(stderr, "Selected exclusive fullscreen mode: %dx%d pixel_density=%f refresh_rate=%f\n", mode->w, mode->h, mode->pixel_density, mode->refresh_rate);
+                fprintf(stderr, "Selected exclusive fullscreen mode: %dx%d pixel_density=%f refresh_rate=%f (desktop %dx%d@%.0f)\n", mode->w, mode->h, mode->pixel_density, mode->refresh_rate, desktop ? desktop->w : 0, desktop ? desktop->h : 0, desktop ? desktop->refresh_rate : 0.0f);
             } else {
                 fprintf(stderr, "Failed to get fullscreen display mode: %s\n", SDL_GetError());
             }
