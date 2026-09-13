@@ -206,7 +206,15 @@ static void timer_tick(Cpu8051State *s)
         }
     }
 
-    s->sfr[SFR_TCON - 0x80] = tcon;
+    /* Written back only when a timer actually changed it. This runs once
+     * per machine cycle -- 6 million times a second per board, two boards
+     * -- and the next cycle reads the same byte straight back, so an
+     * unconditional store puts a store-to-load dependency on every cycle
+     * of the interpreter. The value written is identical; only the store
+     * is skipped. */
+    if (s->sfr[SFR_TCON - 0x80] != tcon) {
+        s->sfr[SFR_TCON - 0x80] = tcon;
+    }
 }
 
 /* ── instruction execution ─────────────────────────────────────────── */
