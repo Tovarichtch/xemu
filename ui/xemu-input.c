@@ -1237,36 +1237,18 @@ static void xemu_input_update_jvs(void)
 // ---------------------------------------------------------------------------
 
 #define CHIHIRO_FFB_SPRING_SAT   500  // per spring magnitude unit (0-127)
-#define CHIHIRO_FFB_SPRING_COEFF 340  // SDL SPRING condition effect -- WEAK/ineffective on the G29's
-                                      // geared motor (Logitech condition springs barely register), so
-                                      // real centering is done by CONSTANT force below, not this.
-// Host-computed centering: a CONSTANT force toward center from the live wheel position
-// (what consumer-wheel arcade FFB plugins do, since an SDL SPRING doesn't bite a G29).
-#define CHIHIRO_FFB_CENTER_GAIN  100  // force per wheel displacement (100 = full force at full lock;
-                                      // higher = firmer near center but risks 60 Hz hunting/oscillation)
-#define CHIHIRO_FFB_CENTER_SIGN  (1)  // Universal, NOT per-wheel. SDL_HAPTIC_STEERING_AXIS keeps force
-                                      // and position polarity consistent across wheels -- the same
-                                      // mechanism that lets PCSX2 center every wheel with one fixed
-                                      // sign and zero invert option. +1 counters displacement toward
-                                      // center (feel-confirmed on the G29; the convention is the wheel-
-                                      // agnostic Linux evdev FF direction standard, not a G29 quirk).
+#define CHIHIRO_FFB_SPRING_COEFF 340  // SDL SPRING condition effect -- weak on the G29's geared motor
+                                      // (Logitech condition springs barely register); the drive
+                                      // board's spring is rendered with the wheel's own autocentre
+                                      // (see chihiro_ffb_update), this covers drivers without one.
 #define CHIHIRO_FFB_TORQUE_LEVEL 240  // per torque force unit
 #define CHIHIRO_FFB_DAMPER_COEFF 18   // per damper unit (mild; too high fights the spring & slows the return)
-#define CHIHIRO_FFB_ROAD_MAG     40   // continuous road buzz (0x8B) -- DISABLED (see sine block):
-                                      // the G29's geared motor renders a low continuous sine as a
-                                      // notchy "catching", not a rumble. Kept for reference/re-enable.
-#define CHIHIRO_FFB_EVENT_MAG    180  // package jolt (0xFB) -- punchy discrete kerb/wall/sand hits
-// SINE period (ms) for the discrete package jolts. A geared G29 renders a low-frequency
-// periodic as a notchy step; a higher frequency reads as a cleaner tap. 10 ms = 100 Hz,
-// the documented sweet spot for arcade FFB on consumer wheels (BackForceFeeder).
-#define CHIHIRO_FFB_SINE_PERIOD  10
 // Idle wheel liveliness: every Chihiro wheel cab centres MECHANICALLY (spring --
 // Crazy Taxi HR has no drive board at all, and OutRun 2's servo only acts once
 // the game engages). A modern FFB wheel has no spring, so while no drive-board
 // effect is running we arm the wheel's BUILT-IN autocentre (firmware spring;
-// smooth on Logitech, no host update loop, no hunting). Host feel emulation of
-// the cab's mechanical return -- strength is a host tuning knob, 0-100.
-#define CHIHIRO_FFB_AUTOCENTER   50
+// smooth on Logitech, no host update loop, no hunting) at the user's
+// strength (chihiro.settings.wheel_autocenter_strength, 0-100).
 
 static int16_t chihiro_ffb_clamp(int v)
 {
@@ -1291,18 +1273,14 @@ static void chihiro_ffb_set_running(ControllerState *c, bool run)
     if (c->haptic_running == run) {
         return;
     }
-    // Taking over: disable the wheel's built-in autocentre so our SPRING is the
-    // only centring force (otherwise the weak default autocentre is all you feel).
+    // Re-apply every effect on the next update after (re)engaging.
     if (run) {
-        SDL_SetHapticAutocenter(c->haptic, 0);
-        c->haptic_autocenter_lv = 0;
-        // Re-apply every effect on the next update after (re)engaging.
         c->haptic_spring_lv = c->haptic_damper_lv =
-            c->haptic_constant_lv = c->haptic_sine_lv = -999999;
+            c->haptic_constant_lv = -999999;
     }
     const int ids[] = { c->haptic_spring, c->haptic_damper,
-                        c->haptic_constant, c->haptic_sine };
-    for (int i = 0; i < 4; i++) {
+                        c->haptic_constant };
+    for (int i = 0; i < 3; i++) {
         if (ids[i] < 0) continue;
         if (run) SDL_RunHapticEffect(c->haptic, ids[i], SDL_HAPTIC_INFINITY);
         else     SDL_StopHapticEffect(c->haptic, ids[i]);
@@ -1335,9 +1313,8 @@ static void chihiro_ffb_open(ControllerState *c)
 {
     c->haptic = NULL;
     c->haptic_features = 0;
-    c->haptic_spring = c->haptic_constant = c->haptic_sine = c->haptic_damper = -1;
-    c->haptic_spring_lv = c->haptic_damper_lv =
-        c->haptic_constant_lv = c->haptic_sine_lv = -999999;
+    c->haptic_spring = c->haptic_constant = c->haptic_damper = -1;
+    c->haptic_spring_lv = c->haptic_damper_lv = c->haptic_constant_lv = -999999;
     c->haptic_autocenter_lv = -1;
 
     if (!c->sdl_joystick || !SDL_IsJoystickHaptic(c->sdl_joystick)) {
@@ -1373,12 +1350,6 @@ static void chihiro_ffb_open(ControllerState *c)
     e.constant.length = SDL_HAPTIC_INFINITY;
     c->haptic_constant = chihiro_ffb_make(c, &e, SDL_HAPTIC_CONSTANT);
 
-    memset(&e, 0, sizeof(e));
-    e.periodic.type = SDL_HAPTIC_SINE;
-    e.periodic.direction.type = SDL_HAPTIC_STEERING_AXIS;
-    e.periodic.length = SDL_HAPTIC_INFINITY;
-    e.periodic.period = CHIHIRO_FFB_SINE_PERIOD;
-    c->haptic_sine = chihiro_ffb_make(c, &e, SDL_HAPTIC_SINE);
 }
 
 static void chihiro_ffb_close(ControllerState *c)
@@ -1388,7 +1359,7 @@ static void chihiro_ffb_close(ControllerState *c)
     }
     SDL_CloseHaptic(c->haptic);  // destroys created effects as well
     c->haptic = NULL;
-    c->haptic_spring = c->haptic_constant = c->haptic_sine = c->haptic_damper = -1;
+    c->haptic_spring = c->haptic_constant = c->haptic_damper = -1;
     c->haptic_autocenter_lv = -1;
 }
 
@@ -1409,15 +1380,13 @@ static void chihiro_ffb_update(ControllerState *c)
         }
     }
 
-    // Wheel auto-centre (see CHIHIRO_FFB_AUTOCENTER): armed whenever no
-    // drive-board effect is running, released as soon as the game's FFB takes
-    // over (chihiro_ffb_set_running(true) zeroes it). Independent of the FFB
-    // master switch -- it stands in for the cab's mechanical spring, which is
-    // there even on cabs with no FFB hardware (Crazy Taxi HR).
-    if (c->haptic && c->sdl_joystick) {
-        int want = (!c->haptic_running &&
-                    g_config.chihiro.settings.wheel_autocenter)
-                       ? CHIHIRO_FFB_AUTOCENTER : 0;
+    // Wheel auto-centre while no drive-board effect is running: the cab's
+    // mechanical spring, there even on cabs with no FFB hardware (Crazy Taxi
+    // HR), so independent of the FFB master switch. In service the game's
+    // own spring takes over below.
+    if (c->haptic && c->sdl_joystick && !c->haptic_running) {
+        int want = g_config.chihiro.settings.wheel_autocenter ?
+                       g_config.chihiro.settings.wheel_autocenter_strength : 0;
         if (want != c->haptic_autocenter_lv) {
             SDL_SetHapticAutocenter(c->haptic, want);
             c->haptic_autocenter_lv = want;
@@ -1456,12 +1425,24 @@ static void chihiro_ffb_update(ControllerState *c)
         int gp = ffb.global_power ? ffb.global_power : 0x40;
         int scale = str * gp / 0x60;
 
+        // CENTERING (0x87 SPRING): the drive board's spring is a spring, so
+        // it is the wheel's own autocentre, at the game's motor power times
+        // the user's strength; released with the effect (0 while the game
+        // holds the wheel free, e.g. its menus).
+        if (c->sdl_joystick) {
+            int want = ffb.centering_power > 0 ? (scale > 100 ? 100 : scale) : 0;
+            if (want != c->haptic_autocenter_lv) {
+                SDL_SetHapticAutocenter(c->haptic, want);
+                c->haptic_autocenter_lv = want;
+            }
+        }
+
         SDL_HapticEffect e;
 
-        // CENTERING (0x87 SPRING) -> spring on the steering axis, the drive
-        // board's dominant force. Re-upload ONLY when it changes: re-applying a
-        // condition effect every frame glitches new-lg4ff and is exactly what
-        // makes the wheel feel stuck instead of centring.
+        // The same spring as an SDL SPRING effect, for drivers without an
+        // autocentre. Re-upload ONLY when it changes: re-applying a condition
+        // effect every frame glitches new-lg4ff and is exactly what makes the
+        // wheel feel stuck instead of centring.
         if (c->haptic_spring >= 0) {
             int coeff = chihiro_ffb_clamp(
                 ffb.centering_power * CHIHIRO_FFB_SPRING_COEFF * scale / 100);
@@ -1494,17 +1475,18 @@ static void chihiro_ffb_update(ControllerState *c)
                 SDL_UpdateHapticEffect(c->haptic, c->haptic_damper, &e);
             }
         }
-        // CONSTANT force on the steering axis = MOVEMENT push (0x84, ~0 in OR2) PLUS the
-        // real CENTERING. The SDL SPRING above does not bite the G29's geared motor, so
-        // centering is synthesised here as a constant force toward center, proportional to
-        // the live wheel displacement and gated on the game engaging centering (0x87).
+        // CONSTANT force on the steering axis: the MOVEMENT push (0x84, ~0 in
+        // OR2) plus the package movement (0xFB) the board executes this frame,
+        // direction and power as the game uploaded them (0x9E): a collision
+        // is full power one way for 6-8 frames, a surface an alternation.
+        // The continuous road vibration (0x8B) is not rendered: near
+        // imperceptible on the cab's servo, a notchy catch on a geared motor.
         if (c->haptic_constant >= 0) {
             int lvl = ffb.movement_power * CHIHIRO_FFB_TORQUE_LEVEL * scale / 100;
             if (ffb.movement_dir) lvl = -lvl;
-            if (ffb.centering_power > 0 && c->sdl_joystick) {
-                int wheel = SDL_GetJoystickAxis(c->sdl_joystick, 0); // 0 = center
-                lvl += CHIHIRO_FFB_CENTER_SIGN * wheel *
-                       CHIHIRO_FFB_CENTER_GAIN / 100 * scale / 100;
+            if (ffb.event_power) {
+                int step = ffb.event_power * 32767 / 127 * scale / 100;
+                lvl += ffb.event_dir ? -step : step;
             }
             // Cross-platform FFB polarity safety net. On Linux the sign is the universal
             // SDL STEERING_AXIS convention; Windows (DirectInput) and macOS (IOKit) can
@@ -1521,25 +1503,6 @@ static void chihiro_ffb_update(ControllerState *c)
                 e.constant.length = SDL_HAPTIC_INFINITY;
                 e.constant.level = (Sint16)lvl;
                 SDL_UpdateHapticEffect(c->haptic, c->haptic_constant, &e);
-            }
-        }
-        // Package jolts (0xFB) -> sine on the steering axis: discrete kerb/wall/sand hits.
-        if (c->haptic_sine >= 0) {
-            // The continuous road/engine vibration (ffb.vibration, 0x8B) is intentionally
-            // NOT rendered: its idle level (0x20 = the [4,15] floor) is near-imperceptible on
-            // the real heavy 500W servo, and the G29's geared motor turns a low continuous
-            // sine into a notchy "catching" feel, not a rumble (OutRun2-on-wheel plugins
-            // likewise render only discrete events). Only the punchy package jolts play.
-            int mag = chihiro_ffb_clamp(ffb.event * CHIHIRO_FFB_EVENT_MAG * scale / 100);
-            if (mag != c->haptic_sine_lv) {
-                c->haptic_sine_lv = mag;
-                memset(&e, 0, sizeof(e));
-                e.periodic.type = SDL_HAPTIC_SINE;
-                e.periodic.direction.type = SDL_HAPTIC_STEERING_AXIS;
-                e.periodic.length = SDL_HAPTIC_INFINITY;
-                e.periodic.period = CHIHIRO_FFB_SINE_PERIOD;
-                e.periodic.magnitude = (Sint16)mag;
-                SDL_UpdateHapticEffect(c->haptic, c->haptic_sine, &e);
             }
         }
         return;
@@ -1568,11 +1531,17 @@ void xemu_input_update_controllers(void)
         xemu_input_update_controller(iter);
     }
 
-    // Chihiro drive-board force feedback -> bound player 1 (steering-wheel
-    // haptics if available, otherwise gamepad rumble). See chihiro_ffb_update().
-    chihiro_ffb_update(bound_controllers[0]);
-
+    // Chihiro drive-board force feedback goes to the device that steers:
+    // wheel haptics if it has them, gamepad rumble otherwise. With a drive
+    // board every other pad stays silent (rumble is re-sent each frame from
+    // gp.rumble_*); without one the rumble is the guest's own (xid).
+    ControllerState *ffb_pad = chihiro_binding_pad(g_config.chihiro.jvs.steer_left);
+    chihiro_ffb_update(ffb_pad);
     QTAILQ_FOREACH (iter, &available_controllers, entry) {
+        if (chihiro_driveboard_global && iter != ffb_pad &&
+            iter->type == INPUT_DEVICE_SDL_GAMEPAD) {
+            iter->gp.rumble_l = iter->gp.rumble_r = 0;
+        }
         xemu_input_update_rumble(iter);
     }
     xemu_input_update_jvs();

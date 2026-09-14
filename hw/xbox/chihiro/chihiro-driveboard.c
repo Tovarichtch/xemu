@@ -203,13 +203,14 @@ void driveboard_get_ffb(DriveBoardState *db, DriveBoardFFB *out)
     out->movement_dir   = db->movement_dir;
     out->movement_power = db->movement_power;
 
-    /* Advance SUD package playback: one movement every 2 host frames. The
-     * current movement's power is the event's transient magnitude; its texture
-     * (jolt vs buzz) comes from the package the game selected. This accessor is
+    /* Advance SUD package playback: one movement every 2 host frames, its
+     * direction and power as the game uploaded them (0x9E). This accessor is
      * the single per-frame tick (called unconditionally by the host). */
-    uint8_t power = 0;
+    uint8_t power = 0, dir = 0;
     if (db->play_pkg >= 0 && db->play_pkg < 16) {
-        power = db->sud_pkg[db->play_pkg][db->play_pos & 0x0F] & 0x7F;
+        uint8_t step = db->sud_pkg[db->play_pkg][db->play_pos & 0x0F];
+        power = step & 0x7F;
+        dir = step >> 7;
         if (++db->play_sub >= 2) {
             db->play_sub = 0;
             if (++db->play_pos >= 16) {
@@ -226,5 +227,6 @@ void driveboard_get_ffb(DriveBoardState *db, DriveBoardFFB *out)
     uint8_t road = db->road_power;
     if (db->vibration_power > road) road = db->vibration_power;
     out->vibration = road;   /* continuous road/engine buzz */
-    out->event     = power;  /* transient package jolt this frame */
+    out->event_power = power;  /* this frame's package movement */
+    out->event_dir = dir;
 }

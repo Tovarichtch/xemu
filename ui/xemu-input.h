@@ -131,14 +131,13 @@ typedef struct ControllerState {
     uint32_t            haptic_features;
     int                 haptic_spring;   // effect ids, -1 when unavailable
     int                 haptic_constant;
-    int                 haptic_sine;
     int                 haptic_damper;
     bool                haptic_running;  // effects currently engaged (running)
     // Last value uploaded to each effect. Re-uploading an unchanged condition
     // effect every frame glitches new-lg4ff (wheel feels stuck), so only update
     // on change. -999999 = "force next update".
     int                 haptic_spring_lv, haptic_damper_lv;
-    int                 haptic_constant_lv, haptic_sine_lv;
+    int                 haptic_constant_lv;
     int                 haptic_autocenter_lv; // built-in autocentre %, -1 = unknown
 
     enum peripheral_type peripheral_types[2];

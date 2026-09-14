@@ -1485,9 +1485,16 @@ void MainMenuChihiroView::Draw()
                               "lock. 270\xc2\xb0 matches the OutRun 2 cabinet; "
                               "\"Full range\" maps the whole wheel 1:1.");
 
-        Toggle("Wheel Auto-Center (Experimental)",
+        Toggle("Wheel Auto-Center",
                &g_config.chihiro.settings.wheel_autocenter,
-               "Spring the wheel back to center when no game force feedback is active");
+               "Spring the wheel back to center when no game force feedback is "
+               "active: the cabinet's mechanical spring (menus, attract, and "
+               "Crazy Taxi, which has no drive board)");
+        if (g_config.chihiro.settings.wheel_autocenter) {
+            ImGui::SliderInt("Auto-Center Strength",
+                             &g_config.chihiro.settings.wheel_autocenter_strength,
+                             0, 100, "%d%%");
+        }
 
         // Force feedback and its sub-settings depend on the master FFB switch.
         Toggle("Force Feedback", &g_config.chihiro.settings.force_feedback,

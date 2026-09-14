@@ -63,8 +63,9 @@ typedef struct DriveBoardFFB {
     uint8_t friction_power;    /* DAMPER (0x86 torque + 0x88 damper): resistance, pre-normalized (higher = stronger) */
     uint8_t movement_dir;      /* 0 = right, 1 = left */
     uint8_t movement_power;    /* CONSTANT (0x84): directional push */
-    uint8_t vibration;         /* SINE continuous: road/engine buzz (0x8B, 0x85) */
-    uint8_t event;             /* SINE transient: package jolt this frame (0xFB) */
+    uint8_t vibration;         /* continuous road/engine vibration (0x8B, 0x85) */
+    uint8_t event_power;       /* package playback (0xFB): this frame's movement, 0-0x7F */
+    uint8_t event_dir;         /* its direction, as 0x84: 0 = right, 1 = left */
 } DriveBoardFFB;
 
 void     driveboard_init(DriveBoardState *db);

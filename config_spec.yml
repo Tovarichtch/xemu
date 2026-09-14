@@ -573,6 +573,9 @@ chihiro:
     wheel_autocenter:
       type: bool
       default: true
+    wheel_autocenter_strength:
+      type: integer
+      default: 50
     # Read each mouse or light gun on its own (evdev on Linux) so two players
     # can aim with their own device. Off: the system cursor aims.
     pointer_devices:
