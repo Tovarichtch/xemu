@@ -157,22 +157,12 @@ static void xbox_flash_init(MachineState *ms, MemoryRegion *rom_memory)
             return;
         }
 
-        if (XBOX_MACHINE(ms)->chihiro) {
-            /* Chihiro: its BIOS carries its own boot code at the end of the
-             * image, with its own RC4 key. The retail MCPX ROM overlaid
-             * there would replace it and the 2BL would not decrypt. An Xbox
-             * BIOS of any size (many images are 1 MiB) gets the overlay. */
-            printf("Chihiro: the BIOS carries its own boot code, the MCPX ROM "
-                   "is not overlaid\n");
-        } else {
-            /* Standard Xbox BIOS: overlay retail MCPX ROM */
-            int fd = qemu_open(filename, O_RDONLY | O_BINARY, NULL);
-            assert(fd >= 0);
-            int rc = read(fd, bios_data + bios_size - bootrom_size,
-                          bootrom_size);
-            assert(rc == bootrom_size);
-            close(fd);
-        }
+        /* Read in MCPX ROM over last 512 bytes of BIOS data */
+        int fd = qemu_open(filename, O_RDONLY | O_BINARY, NULL);
+        assert(fd >= 0);
+        int rc = read(fd, bios_data + bios_size - bootrom_size, bootrom_size);
+        assert(rc == bootrom_size);
+        close(fd);
         g_free(filename);
     }
 

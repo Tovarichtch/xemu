@@ -3109,7 +3109,10 @@ void qemu_init(int argc, char **argv)
     char *bootrom_arg = NULL;
     const char *bootrom_path = g_config.sys.files.bootrom_path;
 
-    if (strlen(bootrom_path) > 0) {
+    /* CHIHIRO (not upstream): the Chihiro BIOS is an MCPX X2 image with its
+     * boot ROM built in, which xemu boots as is, like a debug BIOS. The MCPX
+     * ROM configured for the retail Xbox is not handed to that machine. */
+    if (!chihiro_machine && strlen(bootrom_path) > 0) {
         int bootrom_size = get_image_size(bootrom_path, NULL);
         if (bootrom_size < 0) {
             char *msg = g_strdup_printf("Failed to open BootROM file '%s'. "
