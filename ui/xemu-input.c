@@ -109,8 +109,6 @@ static void chihiro_ffb_open(ControllerState *c);
 static void chihiro_ffb_close(ControllerState *c);
 static void chihiro_ffb_update(ControllerState *c);
 
-static float m_mouseX;
-static float m_mouseY;
 
 static const char **port_index_to_settings_key_map[] = {
     &g_config.input.bindings.port1,
@@ -716,6 +714,10 @@ void xemu_input_process_sdl_events(const SDL_Event *event)
     }
 }
 
+static bool player_aim(int player, float *nx, float *ny);
+static uint32_t chihiro_pointer_buttons(int player, bool gun,
+                                        uint32_t sdl_mouse);
+
 void xemu_input_update_controller(ControllerState *state)
 {
     int64_t now = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
@@ -729,8 +731,42 @@ void xemu_input_update_controller(ControllerState *state)
     } else if (state->type == INPUT_DEVICE_SDL_GAMEPAD) {
         xemu_input_update_sdl_controller_state(state);
     }
+    /* LIGHTGUN (not upstream) */
+    if (state->bound >= 0 &&
+        strcmp(get_bound_driver(state->bound), DRIVER_LIGHT_GUN) == 0) {
+        xemu_input_update_light_gun(state);
+    }
 
     state->last_input_updated_ts = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+}
+
+/* LIGHTGUN (not upstream): the Xbox light gun on a port aims with the
+ * pointer device of the player seated there (port 1 = player 1, port 2 =
+ * player 2), whatever controller is bound to the port for the other
+ * buttons. The pointer's left and right buttons are the trigger and B; the
+ * light is seen on the picture only. */
+void xemu_input_update_light_gun(ControllerState *state)
+{
+    int player = state->bound == 1 ? 1 : 0;
+    float nx, ny;
+    if (player_aim(player, &nx, &ny) && nx >= 0.0f && nx <= 1.0f &&
+        ny >= 0.0f && ny <= 1.0f) {
+        int x = (int)((nx - 0.5f) * 65535.0f);
+        int y = (int)((0.5f - ny) * 65535.0f);
+        state->lg.axis[0] = (int16_t)MIN(MAX(x, -32768), 32767);
+        state->lg.axis[1] = (int16_t)MIN(MAX(y, -32768), 32767);
+        state->lg.status = 0x20;
+    } else {
+        state->lg.status = 0;
+    }
+    uint32_t btn = chihiro_pointer_buttons(player, true,
+                                           SDL_GetMouseState(NULL, NULL));
+    if (btn & SDL_BUTTON_MASK(SDL_BUTTON_LEFT)) {
+        state->lg.buttons |= CONTROLLER_BUTTON_A;
+    }
+    if (btn & SDL_BUTTON_MASK(SDL_BUTTON_RIGHT)) {
+        state->lg.buttons |= CONTROLLER_BUTTON_B;
+    }
 }
 
 static uint16_t jvs_axis_smooth(uint16_t pos, bool neg, bool posv)
@@ -857,6 +893,14 @@ static bool chihiro_check_input(int binding, const bool *kbd, uint32_t mouseBtn)
     return (binding > 0 && kbd[binding]);
 }
 
+/* The Chihiro games played with a gun. */
+static bool chihiro_gun_profile(int profile)
+{
+    return profile == CONFIG_CHIHIRO_JVS_PROFILE_HOTD3 ||
+           profile == CONFIG_CHIHIRO_JVS_PROFILE_VC3 ||
+           profile == CONFIG_CHIHIRO_JVS_PROFILE_GS;
+}
+
 /* Where a player's gun aims: the system cursor, one pointer device, or
  * nothing (a second player with no device). */
 enum { AIM_NONE, AIM_MOUSE, AIM_DEVICE };
@@ -907,15 +951,14 @@ uint32_t xemu_input_pointer_device_buttons(int player)
     return xemu_pointer_buttons(id);
 }
 
-/* One gun player's aim into its JVS analog pair (P1: 0/1, P2: 2/3), in
- * window pixels mapped onto the game picture. Returns false without an aim
- * source; *offscreen is set when the aim leaves the picture (or the device
- * is unplugged), which is how the games see a reload. */
-static bool chihiro_gun_aim(ChihiroJVSState *jvs, int player, bool *offscreen)
+/* CHIHIRO + LIGHTGUN (not upstream): a player's aim as a fraction of the
+ * game picture (0..1 across the viewport, beyond that off the picture);
+ * false without an aim source, or while the device has not reported a
+ * position. Shared by the Chihiro guns and the Xbox light gun. */
+static bool player_aim(int player, float *nx, float *ny)
 {
     const char *id;
-    float px = 0, py = 0;
-    bool have = false;
+    float px, py;
     int drawW, drawH;
 
     SDL_GetWindowSizeInPixels(m_window, &drawW, &drawH);
@@ -927,28 +970,40 @@ static bool chihiro_gun_aim(ChihiroJVSState *jvs, int player, bool *offscreen)
         SDL_GetWindowSize(m_window, &winW, &winH);
         px = fx * (winW > 0 ? (float)drawW / winW : 1.0f);
         py = fy * (winH > 0 ? (float)drawH / winH : 1.0f);
-        have = true;
         break;
     }
     case AIM_DEVICE:
-        have = xemu_pointer_position(id, &px, &py);
+        if (!xemu_pointer_position(id, &px, &py)) {
+            return false;
+        }
         break;
     default:
         return false;
     }
-
-    float nx = 0, ny = 0;
-    if (have) {
-        float vx = 0, vy = 0, vw = drawW, vh = drawH;
-        if (viewport_coords[2] > 0 && viewport_coords[3] > 0) {
-            vx = viewport_coords[0];
-            vy = viewport_coords[1];
-            vw = viewport_coords[2];
-            vh = viewport_coords[3];
-        }
-        nx = (px - vx) / vw;
-        ny = (py - vy) / vh;
+    float vx = 0, vy = 0, vw = drawW, vh = drawH;
+    if (viewport_coords[2] > 0 && viewport_coords[3] > 0) {
+        vx = viewport_coords[0];
+        vy = viewport_coords[1];
+        vw = viewport_coords[2];
+        vh = viewport_coords[3];
     }
+    *nx = (px - vx) / vw;
+    *ny = (py - vy) / vh;
+    return true;
+}
+
+/* One gun player's aim into its JVS analog pair (P1: 0/1, P2: 2/3), in
+ * window pixels mapped onto the game picture. Returns false without an aim
+ * source; *offscreen is set when the aim leaves the picture (or the device
+ * is unplugged), which is how the games see a reload. */
+static bool chihiro_gun_aim(ChihiroJVSState *jvs, int player, bool *offscreen)
+{
+    const char *id;
+    if (chihiro_aim_source(player, &id) == AIM_NONE) {
+        return false;
+    }
+    float nx = 0, ny = 0;
+    bool have = player_aim(player, &nx, &ny);
     const float safe = 0.01f;
     *offscreen = !have || nx < safe || nx > 1.0f - safe || ny < safe ||
                  ny > 1.0f - safe;
@@ -1040,9 +1095,7 @@ static void xemu_input_update_jvs(void)
 
     int profile = chihiro_detected_game_profile();
     if (profile < 0) profile = g_config.chihiro.jvs.profile;
-    bool gun = profile == CONFIG_CHIHIRO_JVS_PROFILE_HOTD3 ||
-               profile == CONFIG_CHIHIRO_JVS_PROFILE_VC3 ||
-               profile == CONFIG_CHIHIRO_JVS_PROFILE_GS;
+    bool gun = chihiro_gun_profile(profile);
     uint32_t mouseBtn = chihiro_pointer_buttons(0, gun, sdlBtn);
 
     switch (profile) {
@@ -1205,21 +1258,36 @@ static void xemu_input_update_jvs(void)
     if (coin_key && !coin_prev)
         jvs->coin_count[0]++;
     coin_prev = coin_key;
+}
 
-    /* Hold the guns exclusively while playing so they stop moving the
-     * desktop cursor; let go whenever the menu wants the mouse. */
-    {
-        const char *id1 = NULL, *id2 = NULL;
-        int hud_kbd = 0, hud_mouse = 0;
-        xemu_hud_should_capture_kbd_mouse(&hud_kbd, &hud_mouse);
-        if (gun) {
-            chihiro_aim_source(0, &id1);
-            chihiro_aim_source(1, &id2);
+/* CHIHIRO + LIGHTGUN (not upstream): guns in play, a Chihiro gun game or an
+ * Xbox light gun on a port. Their pointer devices are then held exclusively
+ * while playing, so they stop moving the desktop cursor; let go whenever
+ * the menu wants the mouse. */
+static void xemu_input_grab_pointers(void)
+{
+    bool gun = false;
+    for (int i = 0; i < 4; i++) {
+        if (bound_controllers[i] &&
+            strcmp(get_bound_driver(i), DRIVER_LIGHT_GUN) == 0) {
+            gun = true;
         }
-        xemu_pointer_set_grab(gun && g_config.chihiro.settings.pointer_grab &&
-                                  !hud_mouse,
-                              id1, id2);
     }
+    if (!gun && chihiro_jvs_global) {
+        int profile = chihiro_detected_game_profile();
+        if (profile < 0) profile = g_config.chihiro.jvs.profile;
+        gun = chihiro_gun_profile(profile);
+    }
+    const char *id1 = NULL, *id2 = NULL;
+    int hud_kbd = 0, hud_mouse = 0;
+    xemu_hud_should_capture_kbd_mouse(&hud_kbd, &hud_mouse);
+    if (gun) {
+        chihiro_aim_source(0, &id1);
+        chihiro_aim_source(1, &id2);
+    }
+    xemu_pointer_set_grab(gun && g_config.chihiro.settings.pointer_grab &&
+                              !hud_mouse,
+                          id1, id2);
 }
 
 // ---------------------------------------------------------------------------
@@ -1545,7 +1613,7 @@ void xemu_input_update_controllers(void)
         xemu_input_update_rumble(iter);
     }
     xemu_input_update_jvs();
-
+    xemu_input_grab_pointers(); /* CHIHIRO + LIGHTGUN (not upstream) */
 }
 
 void xemu_input_update_sdl_kbd_controller_state(ControllerState *state)
@@ -1562,61 +1630,6 @@ void xemu_input_update_sdl_kbd_controller_state(ControllerState *state)
 
     const char *bound_driver = get_bound_driver(state->bound);
     if (strcmp(bound_driver, DRIVER_LIGHT_GUN) == 0) {
-        uint32_t mouseBtn = SDL_GetMouseState(&m_mouseX, &m_mouseY);
-
-        int32_t windowWidth, windowHeight;
-        // Use SDL_GetWindowSize to match SDL_GetMouseState coordinate space
-        // (both return logical/window coordinates, not physical/drawable pixels)
-        SDL_GetWindowSize(m_window, &windowWidth, &windowHeight);
-
-        DPRINTF("[Lightgun] Window Coordinates: %.0f, %.0f\n", m_mouseX, m_mouseY);
-
-        // Adjust to viewport coordinates if available
-        if (viewport_coords[2] > 0 && viewport_coords[3] > 0) {
-            // viewport_coords are in drawable (pixel) space.
-            // Scale them to window (logical) space for HiDPI compat.
-            int32_t drawW, drawH;
-            SDL_GetWindowSizeInPixels(m_window, &drawW, &drawH);
-            float scaleW = (float)windowWidth / (float)drawW;
-            float scaleH = (float)windowHeight / (float)drawH;
-
-            // Switch from Window coordinates to Viewport Coordinates
-            m_mouseX -= viewport_coords[0] * scaleW;
-            m_mouseY -= viewport_coords[1] * scaleH;
-            windowWidth = (int)(viewport_coords[2] * scaleW);
-            windowHeight = (int)(viewport_coords[3] * scaleH);
-        }
-
-        // Check bounds AFTER viewport adjustment — mouse must be inside
-        // the actual game viewport, not just the window
-        if (m_mouseX >= 0 && m_mouseX <= windowWidth &&
-            m_mouseY >= 0 && m_mouseY <= windowHeight) {
-
-            DPRINTF("[Lightgun] Viewport Coordinates: %.0f, %.0f\n", m_mouseX, m_mouseY);
-            // Direct linear mapping - no scale/offset correction needed.
-            // Emulated gun provides pixel-perfect coordinates.
-            int32_t x = (int32_t)((m_mouseX - (windowWidth / 2)) *
-                                  65535 / windowWidth);
-            int32_t y = (int32_t)(((windowHeight / 2) - m_mouseY) *
-                                  65535 / windowHeight);
-
-            state->lg.axis[0] = (int16_t)MIN(MAX(x, -32768), 32767);
-            state->lg.axis[1] = (int16_t)MIN(MAX(y, -32768), 32767);
-            state->lg.status = 0x20; // Light Visible
-
-            DPRINTF("[LightGun] X: %d, Y: %d", state->lg.axis[0], state->lg.axis[1]);
-        } else {
-            state->lg.status = 0x00;
-        }
-
-        // Left mouse button is the trigger (A), right mouse button is B
-        if (mouseBtn & SDL_BUTTON_MASK(SDL_BUTTON_LEFT)) {
-            state->lg.buttons |= CONTROLLER_BUTTON_A;
-        }
-        if (mouseBtn & SDL_BUTTON_MASK(SDL_BUTTON_RIGHT)) {
-            state->lg.buttons |= CONTROLLER_BUTTON_B;
-        }
-
         if (kbd[g_config.input.keyboard_controller_scancode_map.a])
             state->lg.buttons |= CONTROLLER_BUTTON_A;
         if (kbd[g_config.input.keyboard_controller_scancode_map.b])
@@ -1691,6 +1704,7 @@ void xemu_input_update_sdl_kbd_controller_state(ControllerState *state)
 void xemu_input_update_sdl_controller_state(ControllerState *state)
 {
     state->gp.buttons = 0;
+    state->lg.buttons = 0; /* LIGHTGUN (not upstream) */
     memset(state->gp.axis, 0, sizeof(state->gp.axis));
 
     if (state->bound < 0)

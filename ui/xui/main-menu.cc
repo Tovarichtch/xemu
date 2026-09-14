@@ -108,6 +108,8 @@ bool MainMenuInputView::IsInputRebinding()
     return m_rebinding != nullptr;
 }
 
+static void ChihiroPointerCell(int player);
+
 void MainMenuInputView::Draw()
 {
     SectionTitle("Controllers");
@@ -251,6 +253,18 @@ void MainMenuInputView::Draw()
     DrawComboChevron();
 
     ImGui::NextColumn();
+
+    // LIGHTGUN (not upstream): an Xbox light gun aims with the pointer
+    // device of the player seated at this port: the system mouse, or one of
+    // the devices read separately (Chihiro tab, Light Gun section), the
+    // same choice as the Chihiro guns.
+    if (strcmp(bound_drivers[active], DRIVER_LIGHT_GUN) == 0) {
+        ImGui::Text("Aims With");
+        ImGui::SameLine(0, 0);
+        ImGui::NextColumn();
+        ChihiroPointerCell(active == 1 ? 1 : 0);
+        ImGui::NextColumn();
+    }
 
     //
     // Render input device combo
