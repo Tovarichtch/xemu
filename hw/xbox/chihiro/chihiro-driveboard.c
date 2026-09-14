@@ -34,16 +34,24 @@ void driveboard_receive_byte(DriveBoardState *db, uint8_t byte)
     uint8_t p2  = db->tx_buf[2];
 
     switch (cmd) {
-    /* --- init / handshake (responses kept as the game's init SM expects) --- */
+    /* --- init / handshake --- The reply is the board status (bits 0-2,
+     * mirrored in 4-6): 1 while it initializes, 0 in service. The init
+     * state machine needs the 1 after RESET and SET_MODE (with a 0 it
+     * re-sends SET_MODE forever); once db_runtime_pump (0x1d950) runs, a
+     * status 1 is the ENCODER ALARM fault, and the centering task ends with
+     * another SET_MODE (0x1df87). The first poll marks the board in service. */
     case 0x7F:  /* wire 0xFF: motor reset */
+        db->initializing = true;
         driveboard_push_response(db, 0x11);
         break;
-    case 0x01:  /* wire 0x81: SET_MODE (P1 = 0x30 mode, P2 = 0x7F). Not power. */
-        driveboard_push_response(db, 0x11);
+    case 0x01:  /* wire 0x81: SET_MODE (P1 = mode, P2 = 0x7F). Not power. */
+        driveboard_push_response(db, db->initializing ? 0x11 : 0x00);
         break;
     case 0x7C:  /* wire 0xFC: start motor board (game polls, ignores this) */
+        db->initializing = false;
         break;
     case 0x7D:  /* wire 0xFD: poll / watchdog */
+        db->initializing = false;
         driveboard_push_response(db, 0x00);
         break;
 

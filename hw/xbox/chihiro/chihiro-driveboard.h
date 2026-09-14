@@ -20,6 +20,7 @@ typedef struct DriveBoardState {
      * level disassembly of outrun2.xbe (db_dispatch_effects / db_dispatch_mode).
      * SPRING, damper and torque are PERSISTENT (held until changed); vibration
      * and the package pulse are transients. */
+    bool    initializing;      /* from RESET (0xFF) to the first poll (0xFD) or start (0xFC): status 1 */
     bool    motor_active;      /* 0x80: 00 00 = off, else on */
     uint8_t global_power;      /* 0x83 P1: overall strength (0x40=80%..0x60=100%) */
     bool    spring_active;     /* 0x87 SPRING seen: wheel auto-centering engaged */
