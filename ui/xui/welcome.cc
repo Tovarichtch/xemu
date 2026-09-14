@@ -54,6 +54,15 @@ void FirstBootWindow::Draw()
     ImGui::SetCursorPosX((ImGui::GetWindowWidth()-ImGui::CalcTextSize(msg).x)/2);
     ImGui::Text("%s", msg);
 
+    ImGui::Dummy(ImVec2(0,12*g_viewport_mgr.m_scale));
+
+    /* CHIHIRO (not upstream): what a first-time player should expect. */
+    ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + 380*g_viewport_mgr.m_scale);
+    ImGui::TextDisabled("xemu Chihiro is an experimental build, still under "
+                        "development. The first run of each game stutters "
+                        "while its shaders compile; the next runs are smooth.");
+    ImGui::PopTextWrapPos();
+
     ImGui::Dummy(ImVec2(0,20*g_viewport_mgr.m_scale));
 
     ImGui::SetCursorPosX((ImGui::GetWindowWidth()-120*g_viewport_mgr.m_scale)/2);
