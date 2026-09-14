@@ -500,7 +500,12 @@ void xbox_init_common(MachineState *machine,
             if (bs) usb0_bus = USB_BUS(bs);
         }
 
-        if (usb0_bus) {
+        if (usb0_bus && (!chihiro_ic10_data || !chihiro_pc20_data)) {
+            /* Their realize needs the dumps and usb_create_simple aborts on
+             * failure; the startup check has already told the user. */
+            fprintf(stderr, "Chihiro: QC/SC USB devices not created "
+                    "(ic10/pc20 EEPROM dump missing)\n");
+        } else if (usb0_bus) {
             /* Create but don't attach (auto_attach=0 in realize) */
             USBDevice *qc = usb_create_simple(usb0_bus, "chihiro-an2131qc");
             USBDevice *sc = usb_create_simple(usb0_bus, "chihiro-an2131sc");

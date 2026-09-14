@@ -1774,7 +1774,9 @@ static uint8_t *load_eeprom_configured(const char *configured, const char *dir,
 
 void chihiro_load_eeproms(const char *bios_path)
 {
-    if (chihiro_ic10_data) return;
+    static bool loaded;
+    if (loaded) return;
+    loaded = true;
 
     char dir[1024] = {0};
     const char *last_sep = strrchr(bios_path, '/');

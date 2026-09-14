@@ -148,6 +148,7 @@
 #include "ui/xemu-net.h"
 #include "ui/xemu-input.h"
 #include "hw/xbox/eeprom_generation.h"
+#include "hw/xbox/chihiro/chihiro.h"
 
 #define MAX_VIRTIO_CONSOLES 1
 
@@ -3083,6 +3084,38 @@ void qemu_init(int argc, char **argv)
     int mem = ((int)g_config.sys.mem_limit + 1) * 64;
     fake_argv[fake_argc++] = strdup("-m");
     fake_argv[fake_argc++] = g_strdup_printf("%d", mem);
+
+    /* Chihiro (128M): the QC and SC USB devices are realized from their
+     * EEPROM dumps and a missing dump aborts the whole process from inside
+     * the machine build. Load the media board files here, where a missing
+     * one becomes a message and a paused machine like a missing BIOS. */
+    if (mem > 64) {
+        chihiro_load_flash_rom(flashrom_path);
+        chihiro_load_eeproms(flashrom_path);
+        GString *missing = g_string_new(NULL);
+        if (!chihiro_flash_rom_loaded()) {
+            g_string_append(missing, "\n- media board flash (fpr21042_m29w160et.bin)");
+        }
+        if (!chihiro_ic10_data) {
+            g_string_append(missing, "\n- QC EEPROM (ic10_g24lc64.bin)");
+        }
+        if (!chihiro_pc20_data) {
+            g_string_append(missing, "\n- SC EEPROM (pc20_g24lc64.bin)");
+        }
+        if (!chihiro_ic11_data) {
+            g_string_append(missing, "\n- baseboard EEPROM (ic11_24lc024.bin)");
+        }
+        if (missing->len) {
+            char *msg = g_strdup_printf(
+                "Chihiro files not found:%s\n\nSet them in Settings > Chihiro > "
+                "Files (or put them next to the BIOS) and restart.",
+                missing->str);
+            xemu_queue_error_message(msg);
+            g_free(msg);
+            autostart = 0;
+        }
+        g_string_free(missing, TRUE);
+    }
 
     const char *hdd_path = g_config.sys.files.hdd_path;
     if (strlen(hdd_path) > 0) {
