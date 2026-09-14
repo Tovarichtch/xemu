@@ -925,7 +925,7 @@ static const char *chihiro_binding_name(int value)
     }
 }
 
-/* Backend badge next to "Gun Aim", so nobody debugs a gun the backend
+/* Backend badge next to "Pointer", so nobody debugs a gun the backend
  * never reads: EVDEV/RAWINPUT, ON in green, OFF in white. */
 static void ChihiroPointerBadge(void)
 {
@@ -946,7 +946,7 @@ static void ChihiroPointerBadge(void)
                           "section below). OFF: the system cursor aims.");
 }
 
-/* Gun Aim of one player: the system cursor, or one of the pointer devices
+/* Pointer of one player: the system cursor, or one of the pointer devices
  * read separately (chihiro.settings.pointer_devices). */
 static void ChihiroPointerCell(int player)
 {
@@ -1018,7 +1018,7 @@ static void ChihiroRebindCell(int *scancode, int row_id,
     std::string device_name;
     if (*scancode >= CHIHIRO_MOUSE_BUTTON_BASE &&
         *scancode < CHIHIRO_MOUSE_BUTTON_BASE + CHIHIRO_POINTER_BUTTONS) {
-        /* Which device: the one the player aims with (Gun Aim). */
+        /* Which device: the one the player aims with (Pointer). */
         const char *sel = player ? g_config.chihiro.jvs_p2.pointer_device
                                  : g_config.chihiro.jvs.pointer_device;
         if (!sel || !sel[0]) {
@@ -1135,7 +1135,7 @@ static void ChihiroDevicesTab(std::unique_ptr<ChihiroRebindingMap> &rebinding)
 
         ImGui::TableNextRow();
         ImGui::TableSetColumnIndex(0);
-        ImGui::Text("Gun Aim");
+        ImGui::Text("Pointer");
         ChihiroPointerBadge();
         ImGui::TableSetColumnIndex(1);
         ChihiroPointerCell(0);
@@ -1154,8 +1154,6 @@ static void ChihiroDevicesTab(std::unique_ptr<ChihiroRebindingMap> &rebinding)
         ImGui::EndTable();
     }
     ImGui::PopStyleVar();
-    ImGui::TextDisabled("Wheel or pad, shared by Crazy Taxi and OutRun 2. "
-                        "Rotation and force feedback: Steering Wheel below.");
 
     if (ImGui::Button("Reset to Default")) {
         xemu_settings_set_string(&g_config.chihiro.jvs.pointer_device, "mouse");
