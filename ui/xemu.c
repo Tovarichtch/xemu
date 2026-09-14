@@ -47,6 +47,8 @@
 #include "xemu-settings.h"
 #include "xemu-snapshots.h"
 #include "xemu-version.h"
+#include "xemu-xbe.h"
+#include "hw/xbox/chihiro/chihiro.h"
 #include "xemu-os-utils.h"
 
 #include "data/xemu_64x64.png.h"
@@ -901,6 +903,71 @@ static bool event_watch_callback(void *userdata, SDL_Event *event)
     return true; // Ignored
 }
 
+/* CHIHIRO (not upstream): the window title names the fork, the upstream
+ * release it builds on, the playtest, and the game once it is known:
+ * "xemu Chihiro 0.8.134 | Playtest #1 | Virtua Cop 3". */
+#define XEMU_BUILD_TITLE "xemu Chihiro"
+#define XEMU_BUILD_LABEL "Playtest #1"
+
+static const char *const chihiro_game_titles[] = {
+    [CONFIG_CHIHIRO_JVS_PROFILE_HOTD3] = "The House of the Dead III",
+    [CONFIG_CHIHIRO_JVS_PROFILE_VC3] = "Virtua Cop 3",
+    [CONFIG_CHIHIRO_JVS_PROFILE_GS] = "Ghost Squad",
+    [CONFIG_CHIHIRO_JVS_PROFILE_CTX] = "Crazy Taxi: High Roller",
+    [CONFIG_CHIHIRO_JVS_PROFILE_OR2] = "OutRun 2",
+    [CONFIG_CHIHIRO_JVS_PROFILE_OK] = "Ollie King",
+};
+
+static void window_title(char *title, size_t n)
+{
+    /* The upstream release only: the commit count and hash stay in the
+     * log and the About window. */
+    const char *dash = strchr(xemu_version, '-');
+    int vlen = dash ? (int)(dash - xemu_version) : (int)strlen(xemu_version);
+
+    /* A Chihiro game by its detected profile, an Xbox one by its XBE. */
+    char game[96] = "";
+    int profile = chihiro_detected_game_profile();
+    if (profile >= 0 && profile < (int)ARRAY_SIZE(chihiro_game_titles)) {
+        g_strlcpy(game, chihiro_game_titles[profile], sizeof(game));
+    } else if (!xemu_chihiro_mode()) {
+        struct xbe *xbe = xemu_get_xbe_info();
+        if (xbe && xbe->cert) {
+            char *name = g_utf16_to_utf8(xbe->cert->m_title_name, 40, NULL,
+                                         NULL, NULL);
+            if (name) {
+                g_strlcpy(game, g_strstrip(name), sizeof(game));
+                g_free(name);
+            }
+        }
+    }
+    snprintf(title, n, "%s %.*s%s | %s%s%s", XEMU_BUILD_TITLE, vlen,
+             xemu_version,
+#ifdef XEMU_DEBUG_BUILD
+             " Debug",
+#else
+             "",
+#endif
+             XEMU_BUILD_LABEL, game[0] ? " | " : "", game);
+}
+
+/* Once a second, under the lock (the XBE query reads guest memory). */
+static void update_window_title(void)
+{
+    static char last[192];
+    static int tick;
+    if (++tick < 60) {
+        return;
+    }
+    tick = 0;
+    char title[192];
+    window_title(title, sizeof(title));
+    if (strcmp(title, last) != 0) {
+        g_strlcpy(last, title, sizeof(last));
+        SDL_SetWindowTitle(m_window, title);
+    }
+}
+
 static void poll_events(struct xemu_console *scon)
 {
     SDL_Event ev1, *ev = &ev1;
@@ -960,6 +1027,7 @@ static void poll_events(struct xemu_console *scon)
 
     xemu_main_loop_lock();
     xemu_input_update_controllers();
+    update_window_title();
     xemu_main_loop_unlock();
 }
 
@@ -1003,11 +1071,8 @@ static void display_very_early_init(DisplayOptions *o)
         SDL_GL_CONTEXT_PROFILE_CORE);
     SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
 
-    char *title = g_strdup_printf("xemu | v%s"
-#ifdef XEMU_DEBUG_BUILD
-                                  " Debug"
-#endif
-                                  , xemu_version);
+    char title[192];
+    window_title(title, sizeof(title));
 
     // Decide window size
     int min_window_width = 640;
@@ -1054,7 +1119,6 @@ static void display_very_early_init(DisplayOptions *o)
         SDL_Quit();
         exit(1);
     }
-    g_free(title);
     SDL_SetWindowMinimumSize(m_window, min_window_width, min_window_height);
 
     const SDL_DisplayMode *disp_mode = SDL_GetCurrentDisplayMode(SDL_GetDisplayForWindow(m_window));
