@@ -149,6 +149,7 @@
 #include "ui/xemu-input.h"
 #include "hw/xbox/eeprom_generation.h"
 #include "hw/xbox/chihiro/chihiro.h"
+#include "block/block-global-state.h"
 
 #define MAX_VIRTIO_CONSOLES 1
 
@@ -2043,8 +2044,60 @@ static void qemu_apply_machine_options(QDict *qdict)
     }
 }
 
+static int xemu_check_file(const char *path);
+static char *strdup_double_commas(const char *input);
+
+/* Chihiro: the qcow2 that holds VM snapshots. Off-bus (if=none) so the
+ * guest never sees it, still reachable by savevm. Defaults to
+ * chihiro_snapshots.qcow2 in the data directory and is created there when
+ * missing: nothing else creates images on the user's machine. */
+static void chihiro_snapshot_store_setup(void)
+{
+    if ((int)g_config.sys.mem_limit < 1) {
+        return;
+    }
+    if (strlen(g_config.sys.files.hdd_path) == 0) {
+        char *path = g_strdup_printf("%schihiro_snapshots.qcow2",
+                                     xemu_settings_get_base_path());
+        xemu_settings_set_string(&g_config.sys.files.hdd_path, path);
+        g_free(path);
+    }
+    const char *path = g_config.sys.files.hdd_path;
+    if (qemu_access(path, F_OK) == -1) {
+        Error *err = NULL;
+        bdrv_img_create(path, "qcow2", NULL, NULL, NULL, 64 * MiB, 0, true,
+                        &err);
+        if (err) {
+            char *msg = g_strdup_printf("Failed to create the snapshot store "
+                                        "'%s': %s\n\nSnapshots are unavailable.",
+                                        path, error_get_pretty(err));
+            xemu_queue_error_message(msg);
+            g_free(msg);
+            error_free(err);
+            return;
+        }
+        printf("Chihiro: snapshot store created at '%s'\n", path);
+    } else if (xemu_check_file(path)) {
+        char *msg = g_strdup_printf("Failed to open the snapshot store '%s'. "
+                                    "Please check machine settings.", path);
+        xemu_queue_error_message(msg);
+        g_free(msg);
+        return;
+    }
+    char *escaped = strdup_double_commas(path);
+    char *spec = g_strdup_printf("if=none,id=snapshots,format=qcow2,file=%s",
+                                 escaped);
+    free(escaped);
+    if (!qemu_opts_parse_noisily(qemu_find_opts("drive"), spec, false)) {
+        xemu_queue_error_message("The snapshot store could not be attached. "
+                                 "Snapshots are unavailable.");
+    }
+    g_free(spec);
+}
+
 static void qemu_create_early_backends(void)
 {
+    chihiro_snapshot_store_setup();
     MachineClass *machine_class = MACHINE_GET_CLASS(current_machine);
 #if defined(CONFIG_SDL)
     const bool use_sdl = (dpy.type == DISPLAY_TYPE_SDL);
@@ -3118,21 +3171,15 @@ void qemu_init(int argc, char **argv)
     }
 
     const char *hdd_path = g_config.sys.files.hdd_path;
-    if (strlen(hdd_path) > 0) {
+    if (mem > 64) {
+        /* Chihiro has no IDE hard disk; the image is only the VM snapshot
+         * store, attached once the block layer is up (see
+         * chihiro_snapshot_store_setup), created there when absent. */
+    } else if (strlen(hdd_path) > 0) {
         if (xemu_check_file(hdd_path)) {
             char *msg = g_strdup_printf("Failed to open hard disk image file '%s'. Please check machine settings.", hdd_path);
             xemu_queue_error_message(msg);
             g_free(msg);
-        } else if (mem > 64) {
-            /* Chihiro has no IDE hard disk: attach the image off-bus as the
-             * VM snapshot store. if=none keeps it invisible to the guest but
-             * still reachable by savevm (unlike a -blockdev node). */
-            fake_argv[fake_argc++] = strdup("-drive");
-            char *escaped_hdd_path = strdup_double_commas(hdd_path);
-            fake_argv[fake_argc++] = g_strdup_printf(
-                "if=none,id=snapshots,format=qcow2,file=%s",
-                escaped_hdd_path);
-            free(escaped_hdd_path);
         } else {
             fake_argv[fake_argc++] = strdup("-drive");
             char *escaped_hdd_path = strdup_double_commas(hdd_path);
