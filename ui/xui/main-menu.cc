@@ -1218,18 +1218,20 @@ void MainMenuChihiroView::DrawGameTab()
         }
         case CONFIG_CHIHIRO_JVS_PROFILE_VC3: {
             static const char *labels[] = {
-                "Trigger", "Change Weapon", "Pedal (Justice Shot)"
+                "Trigger", "Change Weapon", "Pedal (Justice Shot)",
+                "(Optional) Manual reload"
             };
-            for (int i = 0; i < 3; i++)
+            for (int i = 0; i < 4; i++)
                 ChihiroRebindRow(labels[i], map_vc3[i],
                                  row++, m_rebinding, active_player);
             break;
         }
         case CONFIG_CHIHIRO_JVS_PROFILE_GS: {
             static const char *labels[] = {
-                "Trigger", "Action Button", "Change Firerate"
+                "Trigger", "Action Button", "Change Firerate",
+                "(Optional) Manual reload"
             };
-            for (int i = 0; i < 3; i++)
+            for (int i = 0; i < 4; i++)
                 ChihiroRebindRow(labels[i], map_gs[i],
                                  row++, m_rebinding, active_player);
             break;

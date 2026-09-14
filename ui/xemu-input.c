@@ -188,16 +188,18 @@ int *g_chihiro_hotd3_map[2] = {
     &g_config.chihiro.jvs.hotd3.body_button,
 };
 
-int *g_chihiro_vc3_map[3] = {
+int *g_chihiro_vc3_map[4] = {
     &g_config.chihiro.jvs.vc3.trigger,
     &g_config.chihiro.jvs.vc3.body_button,
     &g_config.chihiro.jvs.vc3.pedal,
+    &g_config.chihiro.jvs.vc3.reload,
 };
 
-int *g_chihiro_gs_map[3] = {
+int *g_chihiro_gs_map[4] = {
     &g_config.chihiro.jvs.gs.trigger,
     &g_config.chihiro.jvs.gs.body_button,
     &g_config.chihiro.jvs.gs.change,
+    &g_config.chihiro.jvs.gs.reload,
 };
 
 /* Steering and pedals are shared by the driving games (g_chihiro_drive_map). */
@@ -240,16 +242,18 @@ int *g_chihiro_p2_hotd3_map[2] = {
     &g_config.chihiro.jvs_p2.hotd3_body_button,
 };
 
-int *g_chihiro_p2_vc3_map[3] = {
+int *g_chihiro_p2_vc3_map[4] = {
     &g_config.chihiro.jvs_p2.vc3_trigger,
     &g_config.chihiro.jvs_p2.vc3_body_button,
     &g_config.chihiro.jvs_p2.vc3_pedal,
+    &g_config.chihiro.jvs_p2.vc3_reload,
 };
 
-int *g_chihiro_p2_gs_map[3] = {
+int *g_chihiro_p2_gs_map[4] = {
     &g_config.chihiro.jvs_p2.gs_trigger,
     &g_config.chihiro.jvs_p2.gs_body_button,
     &g_config.chihiro.jvs_p2.gs_change,
+    &g_config.chihiro.jvs_p2.gs_reload,
 };
 
 static void check_and_reset_in_range(int *btn, int min, int max,
@@ -887,20 +891,6 @@ static bool chihiro_gun_aim(ChihiroJVSState *jvs, int player, bool *offscreen)
     return true;
 }
 
-/* The SCREEN switch: raised when the gun points off the picture (HOTD3, GS)
- * or fires off the picture (VC3). */
-static uint8_t chihiro_gun_screen_bit(int profile, bool aim, bool offscreen,
-                                      bool trigger)
-{
-    if (!aim || !offscreen) {
-        return 0;
-    }
-    if (profile == CONFIG_CHIHIRO_JVS_PROFILE_VC3) {
-        return trigger ? 0x01 : 0;
-    }
-    return 0x01;
-}
-
 /*
  * Player 2: only the light gun games have a second player. Aim comes from
  * the second player's own pointer device, if one is selected.
@@ -909,7 +899,7 @@ static void chihiro_update_jvs_p2(ChihiroJVSState *jvs, const bool *kbd,
                                   uint32_t mouseBtn, int profile)
 {
     uint8_t sw0 = 0, sw1 = 0;
-    int tkey = 0, bkey = 0, xkey = 0;
+    int tkey = 0, bkey = 0, xkey = 0, rkey = 0;
 
     switch (profile) {
     case CONFIG_CHIHIRO_JVS_PROFILE_HOTD3:
@@ -920,11 +910,13 @@ static void chihiro_update_jvs_p2(ChihiroJVSState *jvs, const bool *kbd,
         tkey = g_config.chihiro.jvs_p2.vc3_trigger;
         bkey = g_config.chihiro.jvs_p2.vc3_body_button;
         xkey = g_config.chihiro.jvs_p2.vc3_pedal;
+        rkey = g_config.chihiro.jvs_p2.vc3_reload;
         break;
     case CONFIG_CHIHIRO_JVS_PROFILE_GS:
         tkey = g_config.chihiro.jvs_p2.gs_trigger;
         bkey = g_config.chihiro.jvs_p2.gs_body_button;
         xkey = g_config.chihiro.jvs_p2.gs_change;
+        rkey = g_config.chihiro.jvs_p2.gs_reload;
         break;
     default:
         jvs->player_switches[1][0] = 0;
@@ -934,12 +926,15 @@ static void chihiro_update_jvs_p2(ChihiroJVSState *jvs, const bool *kbd,
 
     bool offscreen = false;
     bool aim = chihiro_gun_aim(jvs, 1, &offscreen);
-    bool trigger = chihiro_check_input(tkey, kbd, mouseBtn);
+    if (chihiro_check_input(rkey, kbd, mouseBtn)) {
+        offscreen = true; /* reload key, see player 1 */
+        aim = true;
+    }
 
-    if (trigger) sw0 |= 0x02;
+    if (chihiro_check_input(tkey, kbd, mouseBtn)) sw0 |= 0x02;
     if (chihiro_check_input(bkey, kbd, mouseBtn)) sw1 |= 0x80;
     if (chihiro_check_input(xkey, kbd, mouseBtn)) sw1 |= 0x40;
-    sw0 |= chihiro_gun_screen_bit(profile, aim, offscreen, trigger);
+    if (aim && offscreen) sw0 |= 0x01;
 
     if (chihiro_check_input(g_config.chihiro.jvs_p2.start, kbd, mouseBtn))
         sw0 |= 0x80;
@@ -986,16 +981,24 @@ static void xemu_input_update_jvs(void)
         bool offscreen = false;
         bool aim = chihiro_gun_aim(jvs, 0, &offscreen);
 
-        int tkey, bkey;
+        int tkey, bkey, rkey = 0;
         if (profile == CONFIG_CHIHIRO_JVS_PROFILE_HOTD3) {
             tkey = g_config.chihiro.jvs.hotd3.trigger;
             bkey = g_config.chihiro.jvs.hotd3.body_button;
         } else if (profile == CONFIG_CHIHIRO_JVS_PROFILE_VC3) {
             tkey = g_config.chihiro.jvs.vc3.trigger;
             bkey = g_config.chihiro.jvs.vc3.body_button;
+            rkey = g_config.chihiro.jvs.vc3.reload;
         } else {
             tkey = g_config.chihiro.jvs.gs.trigger;
             bkey = g_config.chihiro.jvs.gs.body_button;
+            rkey = g_config.chihiro.jvs.gs.reload;
+        }
+        /* The reload key holds the gun off the picture; the aim keeps its
+         * place (the game stops following the gun meanwhile). */
+        if (chihiro_check_input(rkey, kbd, mouseBtn)) {
+            offscreen = true;
+            aim = true;
         }
 
         bool trigger = chihiro_check_input(tkey, kbd, mouseBtn);
@@ -1003,7 +1006,11 @@ static void xemu_input_update_jvs(void)
 
         if (trigger) sw0 |= 0x02;
         if (body)    sw1 |= 0x80;
-        sw0 |= chihiro_gun_screen_bit(profile, aim, offscreen, trigger);
+        /* SCREEN switch (player byte 0 bit 0, PUSH2): up while the gun is
+         * off the picture, in every game. Virtua Cop 3 too: vc3.xbe
+         * player_input_from_pad (0x7a160) raises OUT OF SCREEN from PUSH2
+         * held alone; the trigger (PUSH1) only fires. */
+        if (aim && offscreen) sw0 |= 0x01;
 
         if (profile == CONFIG_CHIHIRO_JVS_PROFILE_VC3) {
             if (chihiro_check_input(g_config.chihiro.jvs.vc3.pedal, kbd, mouseBtn))
