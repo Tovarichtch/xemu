@@ -3084,6 +3084,20 @@ void qemu_init(int argc, char **argv)
     fake_argv[fake_argc++] = argv[0];
     fake_argv[fake_argc++] = strdup("-machine");
 
+    /* An image given on the command line is the loaded image: it decides
+     * the machine and is remembered as the last game. */
+    for (int i = 1; i < argc; i++) {
+        if (argv[i] && strcmp(argv[i], "-dvd_path") == 0) {
+            argv[i] = NULL;
+            if (i < argc - 1 && argv[i + 1]) {
+                xemu_settings_set_string(&g_config.sys.files.dvd_path,
+                                         argv[i + 1]);
+                argv[i + 1] = NULL;
+            }
+            break;
+        }
+    }
+
     /* The machine follows the loaded image (see xemu_chihiro_mode); it is
      * remembered for a launch with no image. */
     bool chihiro_machine = xemu_chihiro_mode();
@@ -3229,17 +3243,6 @@ void qemu_init(int argc, char **argv)
     }
 
     const char *dvd_path = g_config.sys.files.dvd_path;
-    // Allow overriding the dvd path from command line
-    for (int i = 1; i < argc; i++) {
-        if (argv[i] && strcmp(argv[i], "-dvd_path") == 0) {
-            argv[i] = NULL;
-            if (i < argc - 1 && argv[i+1]) {
-                dvd_path = argv[i+1];
-                argv[i+1] = NULL;
-            }
-            break;
-        }
-    }
 
     // On a Chihiro, auto-detect media type:
     // - .iso files = DVD/CD-ROM (game disc images)
