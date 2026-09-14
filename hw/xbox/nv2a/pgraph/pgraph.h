@@ -396,6 +396,22 @@ static inline void pgraph_apply_anti_aliasing_factor(PGRAPHState *pg,
     }
 }
 
+/* A surface is never larger than the size its format declares, when it
+ * declares one (the width and height fields are left at zero for the
+ * non-power-of-two linear targets). A linear surface is otherwise sized by
+ * the clip rectangle, which a game may leave at the previous target's size
+ * while it draws into a smaller one: Silent Scope's 256x256 scope with a
+ * 640x480 clip would span its neighbouring surfaces and evict them. */
+static inline void pgraph_bound_surface_to_format(PGRAPHState *pg,
+                                                  unsigned int *width,
+                                                  unsigned int *height)
+{
+    if (pg->surface_shape.log_width && pg->surface_shape.log_height) {
+        *width = MIN(*width, 1u << pg->surface_shape.log_width);
+        *height = MIN(*height, 1u << pg->surface_shape.log_height);
+    }
+}
+
 static inline void pgraph_apply_scaling_factor(PGRAPHState *pg,
                                         unsigned int *width,
                                         unsigned int *height)

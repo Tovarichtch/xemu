@@ -1110,6 +1110,7 @@ static void populate_surface_binding_entry(NV2AState *d, bool color,
             width += pg->surface_shape.clip_x;
             height += pg->surface_shape.clip_y;
         }
+        pgraph_bound_surface_to_format(pg, &width, &height);
     } else {
         width = r->color_binding->width;
         height = r->color_binding->height;
