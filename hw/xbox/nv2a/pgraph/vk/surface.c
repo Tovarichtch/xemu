@@ -575,7 +575,17 @@ static void surface_access_callback(void *opaque, MemoryRegion *mr, hwaddr addr,
         qatomic_set(&r->downloads_pending, true);
         pfifo_kick(d);
         qemu_mutex_unlock(&d->pfifo.lock);
+        /* A DMA write from the main loop arrives here holding the BQL, which
+         * the pfifo thread may need before it can download (NO_OPERATION
+         * raises an interrupt): let go of it while waiting, as a reset does. */
+        bool bql = bql_locked();
+        if (bql) {
+            bql_unlock();
+        }
         qemu_event_wait(&r->downloads_complete);
+        if (bql) {
+            bql_lock();
+        }
     }
 }
 
