@@ -157,7 +157,7 @@ static void xbox_flash_init(MachineState *ms, MemoryRegion *rom_memory)
             return;
         }
 
-        if (ms->ram_size > 64 * 1024 * 1024) {
+        if (XBOX_MACHINE(ms)->chihiro) {
             /* Chihiro: its BIOS carries its own boot code at the end of the
              * image, with its own RC4 key. The retail MCPX ROM overlaid
              * there would replace it and the 2BL would not decrypt. An Xbox
@@ -303,7 +303,7 @@ void xbox_init_common(MachineState *machine,
                              OBJECT(pit), &error_fatal);
     isa_realize_and_unref(pcms->pcspk, isa_bus, &error_fatal);
 
-    if (machine->ram_size > 64 * 1024 * 1024) {
+    if (XBOX_MACHINE(machine)->chihiro) {
         chihiro_ide_interface_init();
     }
 
@@ -362,14 +362,12 @@ void xbox_init_common(MachineState *machine,
         *isa_bus_out = isa_bus;
     }
 
-    /* Auto-detect Chihiro mode: 128MB RAM = Chihiro baseboard present.
-     * A real Chihiro is an Xbox with add-on boards. We emulate this by
-     * adding the mediaboard LPC I/O device when 128MB is configured.
-     * This provides the XBAM identification string that SEGABOOT checks
-     * to detect the baseboard. */
-    if (machine->ram_size > 64 * 1024 * 1024) {
+    /* A real Chihiro is an Xbox with add-on boards. The machine property
+     * adds the mediaboard LPC I/O device, which provides the XBAM
+     * identification string that SEGABOOT checks to detect the baseboard. */
+    if (XBOX_MACHINE(machine)->chihiro) {
         gint64 init_t0 = g_get_monotonic_time();
-        printf("Chihiro: 128MB RAM detected, enabling mediaboard LPC\n");
+        printf("Chihiro: enabling the media board\n");
 
         /* TODO: Wire g_config.chihiro.roms.* paths here instead of
          * auto-discovery from the Xbox BIOS directory. Then remove
@@ -541,6 +539,17 @@ static void machine_set_bootrom(Object *obj, const char *value, Error **errp)
     ms->bootrom = g_strdup(value);
 }
 
+/* CHIHIRO (not upstream) */
+static bool machine_get_chihiro(Object *obj, Error **errp)
+{
+    return XBOX_MACHINE(obj)->chihiro;
+}
+
+static void machine_set_chihiro(Object *obj, bool value, Error **errp)
+{
+    XBOX_MACHINE(obj)->chihiro = value;
+}
+
 static char *machine_get_avpack(Object *obj, Error **errp)
 {
     XboxMachineState *ms = XBOX_MACHINE(obj);
@@ -647,6 +656,11 @@ static void xbox_machine_options(MachineClass *m)
     object_class_property_add_str(oc, "bootrom", machine_get_bootrom,
                                   machine_set_bootrom);
     object_class_property_set_description(oc, "bootrom", "Xbox bootrom file");
+
+    object_class_property_add_bool(oc, "chihiro", machine_get_chihiro,
+                                   machine_set_chihiro);
+    object_class_property_set_description(
+        oc, "chihiro", "Sega Chihiro: media board, baseboard and 128 MiB");
 
     object_class_property_add_str(oc, "avpack", machine_get_avpack,
                                   machine_set_avpack);

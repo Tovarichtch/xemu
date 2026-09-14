@@ -51,11 +51,6 @@ const char **g_snapshot_shortcut_index_key_map[] = {
     &g_config.general.snapshots.shortcuts.f8,
 };
 
-static bool xemu_chihiro_mode(void)
-{
-    return (int)g_config.sys.mem_limit >= 1;
-}
-
 /* The image the snapshots live in: the Chihiro store, else the Xbox disk. */
 static const char *xemu_snapshots_image_path(void)
 {

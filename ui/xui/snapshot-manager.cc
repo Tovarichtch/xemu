@@ -89,7 +89,7 @@ void SnapshotManager::LoadSnapshotChecked(const char *name)
     /* Chihiro has no DVD drive: disc switching would clear dvd_path. A
      * snapshot names the netboot image it was taken with; another image
      * cannot be swapped in, so refuse before the machine is touched. */
-    bool chihiro = (int)g_config.sys.mem_limit >= 1;
+    bool chihiro = xemu_chihiro_mode();
     if (chihiro) {
         const char *have = path_basename_ptr(g_config.sys.files.dvd_path);
         char *msg = NULL;

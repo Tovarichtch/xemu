@@ -313,11 +313,8 @@ static void smbus_smc_realize(DeviceState *dev, Error **errp)
      * On real hardware, DIP 6,7,8 ground the AV sense pins → SMC reads 0x00.
      * Chihiro games expect SCART mode; SEGABOOT reads boot.id for video
      * timing details. */
-    {
-        MachineState *ms = MACHINE(qdev_get_machine());
-        if (ms->ram_size > 64 * 1024 * 1024) {
-            smc->avpack_reg = SMC_REG_AVPACK_SCART;
-        }
+    if (object_property_get_bool(qdev_get_machine(), "chihiro", NULL)) {
+        smc->avpack_reg = SMC_REG_AVPACK_SCART;
     }
 
     smc_version = object_property_get_str(qdev_get_machine(), "smc-version", NULL);

@@ -388,9 +388,7 @@ public:
             for (const auto &file :
                  std::filesystem::directory_iterator(directory)) {
                 const auto &file_path = file.path();
-                bool is_chihiro_image =
-                    (int)g_config.sys.mem_limit >= 1 &&
-                    file_path.extension() == ".bin";
+                bool is_chihiro_image = file_path.extension() == ".bin";
                 if (std::filesystem::is_regular_file(file_path) &&
                     (file_path.extension() == ".iso" ||
                      file_path.extension() == ".xiso" || is_chihiro_image)) {

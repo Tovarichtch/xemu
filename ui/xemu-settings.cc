@@ -343,3 +343,54 @@ void xemu_settings_reset_keyboard_mapping(void)
   cnode->reset_to_defaults();
   cnode->store_to_struct(&g_config);
 }
+
+/* CHIHIRO (not upstream) */
+bool xemu_media_is_xbox_disc(const char *path)
+{
+    /* The XISO volume descriptor sits in sector 32, at the start of the
+     * game partition: offset 0 of an XISO, after the video partition of a
+     * redump image. */
+    static const char magic[] = "MICROSOFT*XBOX*MEDIA";
+    static const long partitions[] = { 0, 0x18300000 };
+    if (!path || !path[0] || g_file_test(path, G_FILE_TEST_IS_DIR)) {
+        return false;
+    }
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        return false;
+    }
+    bool disc = false;
+    for (int i = 0; i < 2 && !disc; i++) {
+        char buf[sizeof(magic) - 1];
+        disc = fseek(f, partitions[i] + 0x10000, SEEK_SET) == 0 &&
+               fread(buf, 1, sizeof(buf), f) == sizeof(buf) &&
+               memcmp(buf, magic, sizeof(buf)) == 0;
+    }
+    fclose(f);
+    return disc;
+}
+
+bool xemu_chihiro_mode(void)
+{
+    static int mode = -1;
+    if (mode < 0) {
+        const char *image = g_config.sys.files.dvd_path;
+        if (image && image[0]) {
+            mode = !xemu_media_is_xbox_disc(image);
+        } else {
+            switch (g_config.sys.default_machine) {
+            case CONFIG_SYS_DEFAULT_MACHINE_XBOX:
+                mode = 0;
+                break;
+            case CONFIG_SYS_DEFAULT_MACHINE_CHIHIRO:
+                mode = 1;
+                break;
+            default:
+                mode = g_config.sys.last_machine ==
+                       CONFIG_SYS_LAST_MACHINE_CHIHIRO;
+                break;
+            }
+        }
+    }
+    return mode;
+}

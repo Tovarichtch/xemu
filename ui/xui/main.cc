@@ -140,7 +140,7 @@ static void RenderSindenBorder(float vx, float vy, float vw, float vh,
 /* No crosshair, border or hidden pointer outside a Chihiro gun game. */
 static bool ChihiroGunGame(void)
 {
-    if ((int)g_config.sys.mem_limit < 1)
+    if (!xemu_chihiro_mode())
         return false;
 
     int profile = chihiro_detected_game_profile();

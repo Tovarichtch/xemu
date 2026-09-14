@@ -1328,18 +1328,6 @@ void MainMenuChihiroView::DrawGameTab()
 
 void MainMenuChihiroView::Draw()
 {
-    if ((int)g_config.sys.mem_limit < 1) {
-        ImGui::PushFont(g_font_mgr.m_menu_font_small);
-        ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.2f, 1.0f),
-                           "Chihiro mode is off: system memory is set to 64 MiB.");
-        if (ImGui::Button("Enable Chihiro mode (128 MiB)")) {
-            g_config.sys.mem_limit = 1;
-        }
-        ImGui::SameLine();
-        ImGui::TextDisabled("(applies on reset)");
-        ImGui::PopFont();
-    }
-
     SectionTitle("Input");
     ImGui::PushFont(g_font_mgr.m_menu_font_small);
 
@@ -1554,6 +1542,10 @@ void MainMenuChihiroView::Draw()
             { "QCOW2 Image", "qcow2" },
             { "All Files", "*" }
         };
+        FilePicker("EEPROM Xbox (debug key)", g_config.chihiro.roms.eeprom_path,
+                   rom_filters, 2, false, [](const char *path) {
+            xemu_settings_set_string(&g_config.chihiro.roms.eeprom_path, path);
+        });
         FilePicker("Snapshot Store", g_config.chihiro.roms.snapshot_store_path,
                    store_filters, 2, false, [](const char *path) {
             xemu_settings_set_string(&g_config.chihiro.roms.snapshot_store_path, path);
@@ -2375,6 +2367,14 @@ void MainMenuSystemView::Draw()
     }
 
     SectionTitle("System Configuration");
+
+    /* CHIHIRO (not upstream) */
+    if (ChevronCombo(
+            "Default Machine", &g_config.sys.default_machine,
+            "Auto\0Xbox\0Chihiro\0",
+            "Machine to boot when no image is loaded")) {
+        m_dirty = true;
+    }
 
     if (ChevronCombo(
             "System Memory", &g_config.sys.mem_limit,

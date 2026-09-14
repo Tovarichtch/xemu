@@ -28,7 +28,7 @@
 void ActionEjectDisc(void)
 {
     /* Chihiro has no tray: ejecting would only wipe the configured image. */
-    if ((int)g_config.sys.mem_limit >= 1) {
+    if (xemu_chihiro_mode()) {
         return;
     }
 
@@ -69,13 +69,14 @@ void ActionLoadDiscFile(const char *file_path)
 {
     Error *err = NULL;
 
-    /* A Chihiro netboot image is mapped into the baseboard when the machine
-     * is created, so it only takes effect on the next launch. */
-    if ((int)g_config.sys.mem_limit >= 1 &&
-        std::filesystem::path(file_path).extension() == ".bin") {
+    /* The machine follows the image: a Chihiro image is mapped into the
+     * baseboard when the machine is created, and an Xbox disc needs the
+     * Xbox, so either takes effect on the next launch unless this Xbox is
+     * already running and the file is a disc. */
+    if (xemu_chihiro_mode() || !xemu_media_is_xbox_disc(file_path)) {
         xemu_settings_set_string(&g_config.sys.files.dvd_path, file_path);
         remember_games_dir(file_path);
-        xemu_queue_notification("Chihiro image selected. Restart xemu to boot it.");
+        xemu_queue_notification("Image selected. Restart xemu to boot it.");
         return;
     }
 

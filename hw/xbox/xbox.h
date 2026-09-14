@@ -44,6 +44,7 @@ typedef struct XboxMachineState {
     /*< public >*/
     char *bootrom;
     char *avpack;
+    bool chihiro;          /* CHIHIRO (not upstream): Sega Chihiro add-on boards */
     bool short_animation;
     char *smc_version;
     char *video_encoder;
