@@ -186,32 +186,55 @@ extern "C" {
 #define CHIHIRO_JOYSTICK_HALFAXIS_BASE 5001 /* + axis*2 + positive       (steering) */
 #define CHIHIRO_JOYSTICK_PEDAL_BASE    6001 /* + axis*2 + press_positive  (pedals) */
 #define CHIHIRO_JOYSTICK_PEDAL_END     8000
+/* A raw-joystick binding also names the port its device is bound to, so a
+ * pedal set or a shifter on another port maps like the wheel: value +
+ * port * stride. Port 1 keeps the historical values. */
+#define CHIHIRO_JOY_PORT_STRIDE        10000
+#define CHIHIRO_JOY_PORTS              4
+#define CHIHIRO_JOYSTICK_END \
+    (CHIHIRO_JOYSTICK_BUTTON_BASE + CHIHIRO_JOY_PORTS * CHIHIRO_JOY_PORT_STRIDE)
 
 #define CHIHIRO_JOY_BUTTON_BINDING(btn) (CHIHIRO_JOYSTICK_BUTTON_BASE + (btn))
 #define CHIHIRO_JOY_HALFAXIS_BINDING(axis, positive) \
     (CHIHIRO_JOYSTICK_HALFAXIS_BASE + (axis) * 2 + ((positive) ? 1 : 0))
 #define CHIHIRO_JOY_PEDAL_BINDING(axis, press_positive) \
     (CHIHIRO_JOYSTICK_PEDAL_BASE + (axis) * 2 + ((press_positive) ? 1 : 0))
+#define CHIHIRO_JOY_PORTED(b, port) ((b) + (port) * CHIHIRO_JOY_PORT_STRIDE)
 
 /* gamepad axis: 3001..4000 */
 #define CHIHIRO_BINDING_IS_AXIS(b) \
     ((b) >= CHIHIRO_GAMEPAD_AXIS_BASE && (b) < CHIHIRO_JOYSTICK_BUTTON_BASE)
+/* raw joystick, any port: 4001..44000 */
+#define CHIHIRO_BINDING_IS_JOY(b) \
+    ((b) >= CHIHIRO_JOYSTICK_BUTTON_BASE && (b) < CHIHIRO_JOYSTICK_END)
+#define CHIHIRO_JOY_PORT(b) \
+    (((b) - CHIHIRO_JOYSTICK_BUTTON_BASE) / CHIHIRO_JOY_PORT_STRIDE)
+#define CHIHIRO_JOY_UNPORTED(b) \
+    ((b) - CHIHIRO_JOY_PORT(b) * CHIHIRO_JOY_PORT_STRIDE)
 /* raw joystick button: 4001..5000 */
 #define CHIHIRO_BINDING_IS_JOY_BUTTON(b) \
-    ((b) >= CHIHIRO_JOYSTICK_BUTTON_BASE && (b) < CHIHIRO_JOYSTICK_HALFAXIS_BASE)
-#define CHIHIRO_JOY_BUTTON(b) ((b) - CHIHIRO_JOYSTICK_BUTTON_BASE)
+    (CHIHIRO_BINDING_IS_JOY(b) && \
+     CHIHIRO_JOY_UNPORTED(b) < CHIHIRO_JOYSTICK_HALFAXIS_BASE)
+#define CHIHIRO_JOY_BUTTON(b) \
+    (CHIHIRO_JOY_UNPORTED(b) - CHIHIRO_JOYSTICK_BUTTON_BASE)
 /* raw joystick half-axis (steering): 5001..6000 */
 #define CHIHIRO_BINDING_IS_JOY_HALFAXIS(b) \
-    ((b) >= CHIHIRO_JOYSTICK_HALFAXIS_BASE && (b) < CHIHIRO_JOYSTICK_PEDAL_BASE)
-#define CHIHIRO_JOY_HALFAXIS(b) (((b) - CHIHIRO_JOYSTICK_HALFAXIS_BASE) / 2)
+    (CHIHIRO_BINDING_IS_JOY(b) && \
+     CHIHIRO_JOY_UNPORTED(b) >= CHIHIRO_JOYSTICK_HALFAXIS_BASE && \
+     CHIHIRO_JOY_UNPORTED(b) < CHIHIRO_JOYSTICK_PEDAL_BASE)
+#define CHIHIRO_JOY_HALFAXIS(b) \
+    ((CHIHIRO_JOY_UNPORTED(b) - CHIHIRO_JOYSTICK_HALFAXIS_BASE) / 2)
 #define CHIHIRO_JOY_HALFAXIS_POSITIVE(b) \
-    ((((b) - CHIHIRO_JOYSTICK_HALFAXIS_BASE) & 1) != 0)
+    (((CHIHIRO_JOY_UNPORTED(b) - CHIHIRO_JOYSTICK_HALFAXIS_BASE) & 1) != 0)
 /* raw joystick full-axis pedal: 6001..7999 */
 #define CHIHIRO_BINDING_IS_JOY_PEDAL(b) \
-    ((b) >= CHIHIRO_JOYSTICK_PEDAL_BASE && (b) < CHIHIRO_JOYSTICK_PEDAL_END)
-#define CHIHIRO_JOY_PEDAL_AXIS(b) (((b) - CHIHIRO_JOYSTICK_PEDAL_BASE) / 2)
+    (CHIHIRO_BINDING_IS_JOY(b) && \
+     CHIHIRO_JOY_UNPORTED(b) >= CHIHIRO_JOYSTICK_PEDAL_BASE && \
+     CHIHIRO_JOY_UNPORTED(b) < CHIHIRO_JOYSTICK_PEDAL_END)
+#define CHIHIRO_JOY_PEDAL_AXIS(b) \
+    ((CHIHIRO_JOY_UNPORTED(b) - CHIHIRO_JOYSTICK_PEDAL_BASE) / 2)
 #define CHIHIRO_JOY_PEDAL_PRESS_POSITIVE(b) \
-    ((((b) - CHIHIRO_JOYSTICK_PEDAL_BASE) & 1) != 0)
+    (((CHIHIRO_JOY_UNPORTED(b) - CHIHIRO_JOYSTICK_PEDAL_BASE) & 1) != 0)
 
 /* "Progressive" = any analog travel input (vs a digital button/key). */
 #define CHIHIRO_BINDING_IS_PROGRESSIVE(b) \

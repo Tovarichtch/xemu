@@ -124,20 +124,31 @@ ControllerGamepadRebindingMap::HandleAxisEvent(SDL_GamepadAxisEvent *event)
 
 ChihiroRebindingMap::ChihiroRebindingMap(int table_row, int *scancode,
                                          int player)
-    : RebindingMap(table_row), m_scancode(scancode), m_joy_id(0),
-      m_joy_num_axes(0), m_player(player), m_pointer_seen(0)
+    : RebindingMap(table_row), m_scancode(scancode), m_joy_id{ 0, 0, 0, 0 },
+      m_joy_num_axes{ 0, 0, 0, 0 }, m_player(player), m_pointer_seen(0)
 {
-    // Snapshot the bound wheel's axes at rest, so a pedal that idles at an
-    // extreme can still be captured by movement (see the header note).
-    ControllerState *pad = bound_controllers[0];
-    if (pad && pad->type == INPUT_DEVICE_SDL_JOYSTICK && pad->sdl_joystick) {
-        m_joy_id = pad->sdl_joystick_id;
+    // Snapshot every bound raw joystick's axes at rest, so a pedal that
+    // idles at an extreme can still be captured by movement (header note).
+    for (int port = 0; port < 4; port++) {
+        ControllerState *pad = bound_controllers[port];
+        if (!pad || pad->type != INPUT_DEVICE_SDL_JOYSTICK || !pad->sdl_joystick)
+            continue;
+        m_joy_id[port] = pad->sdl_joystick_id;
         int n = SDL_GetNumJoystickAxes(pad->sdl_joystick);
-        int cap = (int)(sizeof(m_joy_baseline) / sizeof(m_joy_baseline[0]));
-        m_joy_num_axes = n < cap ? n : cap;
-        for (int i = 0; i < m_joy_num_axes; i++)
-            m_joy_baseline[i] = SDL_GetJoystickAxis(pad->sdl_joystick, i);
+        int cap = (int)(sizeof(m_joy_baseline[0]) / sizeof(m_joy_baseline[0][0]));
+        m_joy_num_axes[port] = n < cap ? n : cap;
+        for (int i = 0; i < m_joy_num_axes[port]; i++)
+            m_joy_baseline[port][i] = SDL_GetJoystickAxis(pad->sdl_joystick, i);
     }
+}
+
+/* The port whose raw joystick raised this event, -1 if none. */
+static int joy_event_port(const SDL_JoystickID *ids, SDL_JoystickID which)
+{
+    for (int port = 0; port < 4; port++)
+        if (ids[port] && ids[port] == which)
+            return port;
+    return -1;
 }
 
 RebindEventResult
@@ -162,27 +173,32 @@ ChihiroRebindingMap::ConsumeRebindEvent(SDL_Event *event)
                                            event->gaxis.value > 0);
         return RebindEventResult::Complete;
     }
-    /* Raw wheel button. */
-    if (event->type == SDL_EVENT_JOYSTICK_BUTTON_UP && m_joy_id &&
-        event->jbutton.which == m_joy_id) {
-        *m_scancode = CHIHIRO_JOY_BUTTON_BINDING(event->jbutton.button);
-        return RebindEventResult::Complete;
-    }
-    /* Raw wheel axis: capture by movement from the rest snapshot, then classify
-     * centre-rest (steering half-axis) vs extreme-rest (pedal, keeping the
-     * pressed direction). Works for any wheel regardless of pedal wiring. */
-    if (event->type == SDL_EVENT_JOYSTICK_AXIS_MOTION && m_joy_id &&
-        event->jaxis.which == m_joy_id && event->jaxis.axis < m_joy_num_axes) {
-        int axis = event->jaxis.axis;
-        int delta = (int)event->jaxis.value - (int)m_joy_baseline[axis];
-        if (abs(delta) > 12000) {
-            bool moved_positive = delta > 0;
-            if (abs(m_joy_baseline[axis]) < 8000) {
-                *m_scancode = CHIHIRO_JOY_HALFAXIS_BINDING(axis, moved_positive);
-            } else {
-                *m_scancode = CHIHIRO_JOY_PEDAL_BINDING(axis, moved_positive);
-            }
+    /* Raw joystick button, on whichever port the device sits. */
+    if (event->type == SDL_EVENT_JOYSTICK_BUTTON_UP) {
+        int port = joy_event_port(m_joy_id, event->jbutton.which);
+        if (port >= 0) {
+            *m_scancode = CHIHIRO_JOY_PORTED(
+                CHIHIRO_JOY_BUTTON_BINDING(event->jbutton.button), port);
             return RebindEventResult::Complete;
+        }
+    }
+    /* Raw joystick axis: capture by movement from the rest snapshot, then
+     * classify centre-rest (steering half-axis) vs extreme-rest (pedal,
+     * keeping the pressed direction). Works for any wheel regardless of
+     * pedal wiring. */
+    if (event->type == SDL_EVENT_JOYSTICK_AXIS_MOTION) {
+        int port = joy_event_port(m_joy_id, event->jaxis.which);
+        int axis = event->jaxis.axis;
+        if (port >= 0 && axis < m_joy_num_axes[port]) {
+            int delta = (int)event->jaxis.value - (int)m_joy_baseline[port][axis];
+            if (abs(delta) > 12000) {
+                bool moved_positive = delta > 0;
+                int b = abs(m_joy_baseline[port][axis]) < 8000 ?
+                            CHIHIRO_JOY_HALFAXIS_BINDING(axis, moved_positive) :
+                            CHIHIRO_JOY_PEDAL_BINDING(axis, moved_positive);
+                *m_scancode = CHIHIRO_JOY_PORTED(b, port);
+                return RebindEventResult::Complete;
+            }
         }
     }
     return RebindEventResult::Ignore;

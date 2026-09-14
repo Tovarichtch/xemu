@@ -424,23 +424,80 @@ void xemu_input_init(void)
     xemu_pointer_init();
 }
 
-int xemu_input_get_controller_default_bind_port(ControllerState *state, 
+/* What names a controller in the saved port bindings: its SDL GUID (vendor,
+ * product, version), which two units of one model share, plus the serial
+ * when the device reports a real one, else the device path. */
+static void controller_identity(ControllerState *state, char *buf, size_t len)
+{
+    if (state->type == INPUT_DEVICE_SDL_KEYBOARD) {
+        snprintf(buf, len, "keyboard");
+        return;
+    }
+    char guid[35] = { 0 };
+    SDL_GUIDToString(state->sdl_joystick_guid, guid, sizeof(guid));
+    const char *serial = state->sdl_joystick ?
+                             SDL_GetJoystickSerial(state->sdl_joystick) : NULL;
+    const char *path = state->sdl_joystick ?
+                           SDL_GetJoystickPath(state->sdl_joystick) : NULL;
+    if (serial && strlen(serial) >= 8) {
+        snprintf(buf, len, "%s/%s", guid, serial);
+    } else if (path && path[0]) {
+        snprintf(buf, len, "%s#%s", guid, path);
+    } else {
+        snprintf(buf, len, "%s", guid);
+    }
+}
+
+/* Whether a saved identity is this GUID, with or without a suffix. */
+static bool identity_is_guid(const char *saved, const char *guid)
+{
+    size_t n = strlen(guid);
+    return strncmp(saved, guid, n) == 0 &&
+           (saved[n] == 0 || saved[n] == '/' || saved[n] == '#');
+}
+
+/* Another connected unit of the same model: then only the exact identity
+ * may take a saved port, or the first one enumerated would take it every
+ * launch. SDL's list is complete from the first registration on, where
+ * available_controllers fills one event at a time. */
+static bool controller_has_twin(ControllerState *state)
+{
+    int count = 0;
+    SDL_JoystickID *ids = SDL_GetJoysticks(&count);
+    bool twin = false;
+    for (int i = 0; ids && i < count && !twin; i++) {
+        if (ids[i] == state->sdl_joystick_id) {
+            continue;
+        }
+        SDL_GUID guid = SDL_GetJoystickGUIDForID(ids[i]);
+        twin = memcmp(&guid, &state->sdl_joystick_guid, sizeof(guid)) == 0;
+    }
+    SDL_free(ids);
+    return twin;
+}
+
+int xemu_input_get_controller_default_bind_port(ControllerState *state,
                                                 int start)
 {
-    char guid[35] = { 0 };
-    if (state->type == INPUT_DEVICE_SDL_GAMEPAD ||
-        state->type == INPUT_DEVICE_SDL_JOYSTICK) {
-        SDL_GUIDToString(state->sdl_joystick_guid, guid, sizeof(guid));
-    } else if (state->type == INPUT_DEVICE_SDL_KEYBOARD) {
-        snprintf(guid, sizeof(guid), "keyboard");
-    }
-
+    char id[160];
+    controller_identity(state, id, sizeof(id));
     for (int i = start; i < 4; i++) {
-        if (strcmp(guid, *port_index_to_settings_key_map[i]) == 0) {
+        if (strcmp(id, *port_index_to_settings_key_map[i]) == 0) {
             return i;
         }
     }
-
+    if (state->type == INPUT_DEVICE_SDL_KEYBOARD || controller_has_twin(state)) {
+        return -1;
+    }
+    /* Alone of its model: a binding saved before serials and paths were
+     * recorded, or a path that moved, still names this device. */
+    char guid[35] = { 0 };
+    SDL_GUIDToString(state->sdl_joystick_guid, guid, sizeof(guid));
+    for (int i = start; i < 4; i++) {
+        if (identity_is_guid(*port_index_to_settings_key_map[i], guid)) {
+            return i;
+        }
+    }
     return -1;
 }
 
@@ -512,9 +569,13 @@ static void xemu_input_register_controller(ControllerState *new_con)
             if (new_con->type == INPUT_DEVICE_SDL_JOYSTICK) {
                 const char *saved = *port_index_to_settings_key_map[port];
                 if (saved && saved[0] != '\0') {
-                    char guid[35] = { 0 };
+                    char id[160], guid[35] = { 0 };
+                    controller_identity(new_con, id, sizeof(id));
                     SDL_GUIDToString(new_con->sdl_joystick_guid, guid, sizeof(guid));
-                    if (strcmp(saved, guid) != 0)
+                    bool mine = strcmp(saved, id) == 0 ||
+                                (!controller_has_twin(new_con) &&
+                                 identity_is_guid(saved, guid));
+                    if (!mine)
                         continue;
                 }
             }
@@ -688,9 +749,19 @@ static uint16_t jvs_axis_smooth(uint16_t pos, bool neg, bool posv)
 // rotation map to full in-game lock. Set by chihiro_apply_wheel_rotation().
 static float g_wheel_steering_scale = 1.0f;
 
+/* The device a binding reads: a raw-joystick binding names its port, the
+ * others come from port 1. */
+static ControllerState *chihiro_binding_pad(int binding)
+{
+    if (CHIHIRO_BINDING_IS_JOY(binding)) {
+        return bound_controllers[CHIHIRO_JOY_PORT(binding)];
+    }
+    return bound_controllers[0];
+}
+
 static float chihiro_axis_travel(int binding)
 {
-    ControllerState *pad = bound_controllers[0];
+    ControllerState *pad = chihiro_binding_pad(binding);
     if (!pad)
         return 0.0f;
 
@@ -763,7 +834,7 @@ static bool chihiro_check_input(int binding, const bool *kbd, uint32_t mouseBtn)
         return chihiro_axis_travel(binding) > 0.5f;
 
     if (CHIHIRO_BINDING_IS_JOY_BUTTON(binding)) {
-        ControllerState *pad = bound_controllers[0];
+        ControllerState *pad = chihiro_binding_pad(binding);
         if (pad && pad->sdl_joystick) {
             return SDL_GetJoystickButton(pad->sdl_joystick,
                                          CHIHIRO_JOY_BUTTON(binding));
@@ -1814,16 +1885,11 @@ void xemu_input_bind(int index, ControllerState *state, int save)
         bound_controllers[index] = NULL;
     }
 
-    // Save this controller's GUID in settings for auto re-connect
+    // Save this controller's identity in settings for auto re-connect
     if (save) {
-        char guid_buf[35] = { 0 };
+        char guid_buf[160] = { 0 };
         if (state) {
-            if (state->type == INPUT_DEVICE_SDL_GAMEPAD ||
-                state->type == INPUT_DEVICE_SDL_JOYSTICK) {
-                SDL_GUIDToString(state->sdl_joystick_guid, guid_buf, sizeof(guid_buf));
-            } else if (state->type == INPUT_DEVICE_SDL_KEYBOARD) {
-                snprintf(guid_buf, sizeof(guid_buf), "keyboard");
-            }
+            controller_identity(state, guid_buf, sizeof(guid_buf));
         }
         xemu_settings_set_string(port_index_to_settings_key_map[index], guid_buf);
         xemu_settings_set_string(port_index_to_driver_settings_key_map[index],

@@ -547,8 +547,10 @@ void MainMenuInputView::Draw()
             // game's TEST MENU.
             ImGui::TextWrapped(
                 "Steering wheel / raw joystick. Bind its axes and buttons in "
-                "the Chihiro tab (Arcade Settings). Wheel rotation range and "
-                "pedals are calibrated in each game's TEST MENU.");
+                "the Chihiro tab (Arcade Settings); a separate pedal set or "
+                "shifter goes on another port and is bound the same way. "
+                "Wheel rotation range and pedals are calibrated in each "
+                "game's TEST MENU.");
         } else if (ImGui::CollapsingHeader("Input Mapping")) {
             float p = ImGui::GetFrameHeight() * 0.3;
             ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, ImVec2(p, p));
@@ -866,14 +868,17 @@ static const char *chihiro_gamepad_axis_name(int value)
 
 static const char *chihiro_joystick_name(int value)
 {
-    static char buf[32];
+    static char buf[40];
+    char who[12] = "Wheel";
+    if (CHIHIRO_JOY_PORT(value) > 0)
+        snprintf(who, sizeof(who), "Port %d", CHIHIRO_JOY_PORT(value) + 1);
     if (CHIHIRO_BINDING_IS_JOY_BUTTON(value))
-        snprintf(buf, sizeof(buf), "Wheel Btn %d", CHIHIRO_JOY_BUTTON(value));
+        snprintf(buf, sizeof(buf), "%s Btn %d", who, CHIHIRO_JOY_BUTTON(value));
     else if (CHIHIRO_BINDING_IS_JOY_HALFAXIS(value))
-        snprintf(buf, sizeof(buf), "Wheel Axis %d %c", CHIHIRO_JOY_HALFAXIS(value),
+        snprintf(buf, sizeof(buf), "%s Axis %d %c", who, CHIHIRO_JOY_HALFAXIS(value),
                  CHIHIRO_JOY_HALFAXIS_POSITIVE(value) ? '+' : '-');
     else
-        snprintf(buf, sizeof(buf), "Wheel Pedal %d", CHIHIRO_JOY_PEDAL_AXIS(value));
+        snprintf(buf, sizeof(buf), "%s Pedal %d", who, CHIHIRO_JOY_PEDAL_AXIS(value));
     return buf;
 }
 

@@ -73,13 +73,14 @@ struct ChihiroRebindingMap : public virtual RebindingMap {
     /* The binding itself: the row number is not its index in its group. */
     int *m_scancode;
 
-    /* Raw-wheel capture: a wheel pedal rests at an extreme, so axes are captured
-     * by MOVEMENT from a rest snapshot (taken here) rather than by an absolute
-     * threshold, and the moved axis is classified centre-rest (steering) vs
-     * extreme-rest (pedal). Only the wheel bound to port 1 is listened to. */
-    SDL_JoystickID m_joy_id;       /* bound wheel joystick id, 0 = none */
-    int            m_joy_num_axes;
-    Sint16         m_joy_baseline[24];
+    /* Raw-joystick capture: a wheel pedal rests at an extreme, so axes are
+     * captured by MOVEMENT from a rest snapshot (taken here) rather than by
+     * an absolute threshold, and the moved axis is classified centre-rest
+     * (steering) vs extreme-rest (pedal). Every raw joystick bound to a
+     * port is listened to; the binding records the port. */
+    SDL_JoystickID m_joy_id[4];       /* per port, 0 = no raw joystick */
+    int            m_joy_num_axes[4];
+    Sint16         m_joy_baseline[4][24];
 
     /* The player whose row is bound: its pointer device has no SDL events,
      * so its buttons are polled (PollPointer) while the row waits. */
