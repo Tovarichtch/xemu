@@ -153,10 +153,10 @@ void DrawSlider(float v, bool hovered, ImVec2 pos, ImVec2 size)
     draw_list->AddRectFilled(smin, smax, bg, rounding);
 
     if (circular_grab) {
-       draw_list->AddCircleFilled(pmid, radius * 0.8, ImGui::GetColorU32(ImGuiCol_SliderGrab));
+       draw_list->AddCircleFilled(pmid, radius * 0.8, ImGui::GetColorU32(ImGuiCol_Text));
     } else {
         ImVec2 offs(radius*0.8, radius*0.8);
-        draw_list->AddRectFilled(pmid - offs, pmid + offs, ImGui::GetColorU32(ImGuiCol_SliderGrab), rounding);
+        draw_list->AddRectFilled(pmid - offs, pmid + offs, ImGui::GetColorU32(ImGuiCol_Text), rounding);
     }
 }
 
@@ -178,10 +178,10 @@ void DrawToggle(bool enabled, bool hovered, ImVec2 pos, ImVec2 size)
     draw_list->AddRectFilled(smin, smax, bg, rounding);
 
     if (circular_grab) {
-        draw_list->AddCircleFilled(pmid, radius * 0.8, ImGui::GetColorU32(ImGuiCol_SliderGrab));
+        draw_list->AddCircleFilled(pmid, radius * 0.8, ImGui::GetColorU32(ImGuiCol_Text));
     } else {
         ImVec2 offs(radius*0.8, radius*0.8);
-        draw_list->AddRectFilled(pmid - offs, pmid + offs, ImGui::GetColorU32(ImGuiCol_SliderGrab), rounding);
+        draw_list->AddRectFilled(pmid - offs, pmid + offs, ImGui::GetColorU32(ImGuiCol_Text), rounding);
     }
 }
 

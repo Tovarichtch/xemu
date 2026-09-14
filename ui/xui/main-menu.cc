@@ -1489,9 +1489,7 @@ void MainMenuChihiroView::Draw()
 
         Toggle("Wheel Auto-Center",
                &g_config.chihiro.settings.wheel_autocenter,
-               "Spring the wheel back to center when no game force feedback is "
-               "active: the cabinet's mechanical spring (menus, attract, and "
-               "Crazy Taxi, which has no drive board)");
+               "Spring the wheel back to center when no game force feedback is active");
         if (g_config.chihiro.settings.wheel_autocenter) {
             ImGui::SliderInt("Auto-Center Strength",
                              &g_config.chihiro.settings.wheel_autocenter_strength,
