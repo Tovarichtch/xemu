@@ -24,6 +24,13 @@ void chihiro_usb_set_devices(USBDevice *qc, USBDevice *sc);
 void chihiro_load_flash_rom(const char *bios_path);
 bool chihiro_flash_rom_loaded(void);
 
+/* Why the last DIMM snapshot save or load failed, NULL when it did not:
+ * the vmstate hooks can only return an errno, the UI wants words. */
+const char *chihiro_dimm_last_error(void);
+/* Size and CRC32 of the mounted netboot image as the DIMM delta records
+ * them; false when the image cannot be read. */
+bool chihiro_dimm_image_identity(uint64_t *size, uint32_t *crc);
+
 /* Load baseboard EEPROMs (ic10, ic11, pc20) from BIOS directory */
 void chihiro_load_eeproms(const char *bios_path);
 extern uint8_t *chihiro_ic10_data;

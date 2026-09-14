@@ -40,6 +40,20 @@ SnapshotManager::~SnapshotManager()
     xemu_snapshots_mark_dirty();
 }
 
+/* The file name part of a path, either separator, no allocation. */
+static const char *path_basename_ptr(const char *path)
+{
+    if (!path) {
+        return "";
+    }
+    const char *sep = strrchr(path, '/');
+    const char *bsep = strrchr(path, '\\');
+    if (bsep > sep) {
+        sep = bsep;
+    }
+    return sep ? sep + 1 : path;
+}
+
 void SnapshotManager::Refresh()
 {
     Error *err = NULL;
@@ -72,8 +86,32 @@ void SnapshotManager::LoadSnapshotChecked(const char *name)
         return;
     }
 
-    /* Chihiro has no DVD drive: disc switching would clear dvd_path. */
+    /* Chihiro has no DVD drive: disc switching would clear dvd_path. A
+     * snapshot names the netboot image it was taken with; another image
+     * cannot be swapped in, so refuse before the machine is touched. */
     bool chihiro = (int)g_config.sys.mem_limit >= 1;
+    if (chihiro) {
+        const char *have = path_basename_ptr(g_config.sys.files.dvd_path);
+        char *msg = NULL;
+        if (data->disc_path && data->disc_path[0]) {
+            const char *want = path_basename_ptr(data->disc_path);
+            if (g_ascii_strcasecmp(want, have) != 0) {
+                msg = g_strdup_printf(
+                    "Snapshot '%s' was taken with '%s'; the mounted game is "
+                    "'%s'. Restart xemu with that game to load it.",
+                    name, want, have);
+            }
+        } else if (!xemu_snapshots_chihiro_image_matches(name)) {
+            msg = g_strdup_printf(
+                "Snapshot '%s' was taken with another game than '%s'. "
+                "Restart xemu with that game to load it.", name, have);
+        }
+        if (msg) {
+            xemu_queue_error_message(msg);
+            g_free(msg);
+            return;
+        }
+    }
 
     char *current_disc_path = xemu_get_currently_loaded_disc_path();
     if (!chihiro && data->disc_path &&

@@ -44,6 +44,7 @@ typedef struct XemuSnapshotData {
 
 // Implemented in xemu-snapshots.c
 char *xemu_get_currently_loaded_disc_path(void);
+bool xemu_snapshots_chihiro_image_matches(const char *vm_name);
 int xemu_snapshots_list(QEMUSnapshotInfo **info, XemuSnapshotData **extra_data,
                         Error **err);
 void xemu_snapshots_load(const char *vm_name, Error **err);

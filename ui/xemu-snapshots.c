@@ -37,6 +37,7 @@
 
 #include "ui/console.h"
 #include "ui/input.h"
+#include "hw/xbox/chihiro/chihiro.h"
 
 static QEMUSnapshotInfo *xemu_snapshots_metadata = NULL;
 static XemuSnapshotData *xemu_snapshots_extra_data = NULL;
@@ -238,11 +239,54 @@ char *xemu_get_currently_loaded_disc_path(void)
     return file;
 }
 
+static bool xemu_chihiro_mode(void)
+{
+    return (int)g_config.sys.mem_limit >= 1;
+}
+
+/* The DIMM hooks can only fail with an errno; say why in the box. */
+static void xemu_snapshots_chihiro_reason(Error **err, const char *what,
+                                          const char *vm_name)
+{
+    const char *reason = chihiro_dimm_last_error();
+    if (!err || !*err || !reason) {
+        return;
+    }
+    error_free(*err);
+    *err = NULL;
+    error_setg(err, "Cannot %s snapshot '%s': %s.", what, vm_name, reason);
+}
+
+/* After a half-restored load the machine sits in restore-vm, from which
+ * neither save-vm nor another restore is a legal transition (QEMU aborts). */
+static bool xemu_snapshots_machine_unusable(Error **err)
+{
+    if (!runstate_is_running() && runstate_check(RUN_STATE_RESTORE_VM)) {
+        error_setg(err, "The machine is unusable since a snapshot failed to "
+                   "load: restart xemu.");
+        return true;
+    }
+    return false;
+}
+
 void xemu_snapshots_load(const char *vm_name, Error **err)
 {
+    if (xemu_snapshots_machine_unusable(err)) {
+        return;
+    }
     bool vm_running = runstate_is_running();
     vm_stop(RUN_STATE_RESTORE_VM);
     load_snapshot(vm_name, NULL, false, NULL, err);
+    if (err && *err && chihiro_dimm_last_error()) {
+        /* The DIMM check sits late in the stream: RAM and devices are
+         * already overwritten and QEMU cannot reset such a machine (the
+         * PCI reset asserts). Stay stopped; the box says to restart. */
+        error_free(*err);
+        *err = NULL;
+        error_setg(err, "Snapshot '%s' does not belong to the mounted game "
+                   "and the machine is now unusable: restart xemu.", vm_name);
+        return;
+    }
     /* A load refused by validation leaves the machine untouched: resume
      * instead of staying paused forever. */
     if (vm_running) {
@@ -250,9 +294,101 @@ void xemu_snapshots_load(const char *vm_name, Error **err)
     }
 }
 
+/* Whether a snapshot's DIMM delta was taken against the mounted image:
+ * read from the snapshot's own state stream, before anything is restored.
+ * Snapshots saved without a game name in their header need this; a
+ * mismatch found later, by the DIMM hook, leaves a half-restored machine.
+ * True on any doubt (no DIMM section found, image unreadable). */
+bool xemu_snapshots_chihiro_image_matches(const char *vm_name)
+{
+    if (!xemu_chihiro_mode()) {
+        return true;
+    }
+    Error *err = NULL;
+    BlockDriverState *bs = bdrv_all_find_vmstate_bs(NULL, false, NULL, &err);
+    if (!bs) {
+        error_free(err);
+        return true;
+    }
+    QEMUSnapshotInfo sn;
+    if (bdrv_snapshot_find(bs, &sn, vm_name) < 0) {
+        return true;
+    }
+    QDict *opts = qdict_new();
+    qdict_put_bool(opts, BDRV_OPT_READ_ONLY, true);
+    BlockDriverState *bs_ro = bdrv_open(g_config.sys.files.hdd_path, NULL, opts,
+                                        BDRV_O_RO_WRITE_SHARE | BDRV_O_AUTO_RDONLY,
+                                        &err);
+    if (!bs_ro) {
+        error_free(err);
+        return true;
+    }
+    bool match = true;
+    if (bdrv_snapshot_load_tmp(bs_ro, sn.id_str, sn.name, &err) < 0) {
+        error_free(err);
+        goto out;
+    }
+
+    /* The section: idstr "chihiro-dimm", instance id, version id, then the
+     * blob size and the blob itself, whose 28-byte header is CDIM, 1, size
+     * (lo, hi), crc, page size, pages. */
+    static const char idstr[] = "chihiro-dimm";
+    const size_t chunk = 1 << 20, keep = 64;
+    uint8_t *buf = g_malloc(chunk + keep);
+    size_t carry = 0;
+    int64_t offset = 0;
+    for (;;) {
+        int n = bdrv_load_vmstate(bs_ro, buf + carry, offset, chunk);
+        if (n <= 0) {
+            break;
+        }
+        offset += n;
+        size_t avail = carry + n;
+        uint8_t *hit = NULL;
+        for (size_t i = 0; i + sizeof(idstr) - 1 <= avail; i++) {
+            if (buf[i] == 'c' && memcmp(buf + i, idstr, sizeof(idstr) - 1) == 0) {
+                hit = buf + i;
+                break;
+            }
+        }
+        if (hit && (size_t)(hit - buf) + sizeof(idstr) - 1 + 12 + 28 <= avail) {
+            const uint8_t *p = hit + sizeof(idstr) - 1 + 4 + 4 + 4;
+            uint32_t hdr[7];
+            memcpy(hdr, p, sizeof(hdr));
+            if (hdr[0] == 0x4344494d) {
+                uint64_t snap_size = hdr[2] | (uint64_t)hdr[3] << 32;
+                uint64_t cur_size;
+                uint32_t cur_crc;
+                if (chihiro_dimm_image_identity(&cur_size, &cur_crc)) {
+                    match = snap_size == cur_size && hdr[4] == cur_crc;
+                }
+                break;
+            }
+        }
+        if (avail > keep) {
+            memmove(buf, buf + avail - keep, keep);
+            carry = keep;
+        } else {
+            carry = avail;
+        }
+    }
+    g_free(buf);
+out:
+    bdrv_flush(bs_ro);
+    bdrv_drain(bs_ro);
+    bdrv_unref(bs_ro);
+    return match;
+}
+
 void xemu_snapshots_save(const char *vm_name, Error **err)
 {
+    if (xemu_snapshots_machine_unusable(err)) {
+        return;
+    }
     save_snapshot(vm_name, true, NULL, false, NULL, err);
+    if (err && *err) {
+        xemu_snapshots_chihiro_reason(err, "save", vm_name);
+    }
 }
 
 void xemu_snapshots_delete(const char *vm_name, Error **err)
@@ -262,18 +398,25 @@ void xemu_snapshots_delete(const char *vm_name, Error **err)
 
 void xemu_snapshots_save_extra_data(QEMUFile *f)
 {
-    char *path = xemu_get_currently_loaded_disc_path();
+    /* Chihiro: the game is the netboot image, not a DVD, and the title is
+     * the executable SEGABOOT launched. */
+    char *path = xemu_chihiro_mode() ?
+                     g_strdup(g_config.sys.files.dvd_path) :
+                     xemu_get_currently_loaded_disc_path();
     size_t path_size = path ? strlen(path) : 0;
 
     size_t xbe_title_name_size = 0;
     char *xbe_title_name = NULL;
-    struct xbe *xbe_data = xemu_get_xbe_info();
+    struct xbe *xbe_data = xemu_chihiro_mode() ? NULL : xemu_get_xbe_info();
     if (xbe_data && xbe_data->cert) {
         glong items_written = 0;
         xbe_title_name = g_utf16_to_utf8(xbe_data->cert->m_title_name, 40, NULL, &items_written, NULL);
         if (xbe_title_name) {
             xbe_title_name_size = items_written;
         }
+    } else if (xemu_chihiro_mode() && chihiro_game_filename[0]) {
+        xbe_title_name = g_strdup(chihiro_game_filename);
+        xbe_title_name_size = strlen(xbe_title_name);
     }
 
     size_t thumbnail_size = 0;

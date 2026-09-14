@@ -2230,6 +2230,21 @@ typedef struct ChihiroDimmMig {
 } ChihiroDimmMig;
 
 static ChihiroDimmMig chihiro_dimm_mig;
+static char chihiro_dimm_error[256];
+
+const char *chihiro_dimm_last_error(void)
+{
+    return chihiro_dimm_error[0] ? chihiro_dimm_error : NULL;
+}
+
+static const char *chihiro_image_basename(void)
+{
+    const char *path = g_config.sys.files.dvd_path;
+    const char *sep = path ? strrchr(path, '/') : NULL;
+    const char *bsep = path ? strrchr(path, '\\') : NULL;
+    if (bsep > sep) sep = bsep;
+    return sep ? sep + 1 : (path ? path : "(none)");
+}
 
 static uint8_t *chihiro_dimm_read_image(uint64_t buf_size,
                                         uint64_t *file_size, uint32_t *crc)
@@ -2247,6 +2262,18 @@ static uint8_t *chihiro_dimm_read_image(uint64_t buf_size,
     return buf;
 }
 
+bool chihiro_dimm_image_identity(uint64_t *size, uint32_t *crc)
+{
+    uint32_t fs_size;
+    uint8_t *fs = chihiro_fatx_get_buffer(&fs_size);
+    if (!fs) {
+        return false;
+    }
+    uint8_t *ref = chihiro_dimm_read_image(fs_size, size, crc);
+    g_free(ref);
+    return ref != NULL;
+}
+
 static int chihiro_dimm_pre_save(void *opaque)
 {
     ChihiroDimmMig *m = opaque;
@@ -2258,6 +2285,8 @@ static int chihiro_dimm_pre_save(void *opaque)
                       : NULL;
     if (!ref) {
         error_report("chihiro: cannot read the game image to delta against");
+        snprintf(chihiro_dimm_error, sizeof(chihiro_dimm_error),
+                 "the game image '%s' cannot be read", chihiro_image_basename());
         return -EINVAL;
     }
 
@@ -2279,6 +2308,7 @@ static int chihiro_dimm_pre_save(void *opaque)
     }
     memcpy(blob->data + 24, &npages, 4);
     g_free(ref);
+    chihiro_dimm_error[0] = 0;
 
     m->blob_size = blob->len;
     g_free(m->blob);
@@ -2310,6 +2340,8 @@ static int chihiro_dimm_post_load(void *opaque, int version_id)
     uint32_t cur_crc;
     uint8_t *ref = NULL;
 
+    snprintf(chihiro_dimm_error, sizeof(chihiro_dimm_error),
+             "the snapshot's game data is damaged");
     if (!fs || !m->blob || m->blob_size < sizeof(hdr)) {
         goto out;
     }
@@ -2321,10 +2353,17 @@ static int chihiro_dimm_post_load(void *opaque, int version_id)
     }
 
     ref = chihiro_dimm_read_image(fs_size, &cur_size, &cur_crc);
-    if (!ref || cur_size != (hdr[2] | (uint64_t)hdr[3] << 32) ||
-        cur_crc != hdr[4]) {
+    if (!ref) {
+        snprintf(chihiro_dimm_error, sizeof(chihiro_dimm_error),
+                 "the game image '%s' cannot be read", chihiro_image_basename());
+        goto out;
+    }
+    if (cur_size != (hdr[2] | (uint64_t)hdr[3] << 32) || cur_crc != hdr[4]) {
         error_report("chihiro: mounted game image does not match this "
                      "snapshot");
+        snprintf(chihiro_dimm_error, sizeof(chihiro_dimm_error),
+                 "it was taken with another game than '%s'. Restart xemu "
+                 "with that game to load it", chihiro_image_basename());
         goto out;
     }
     memcpy(fs, ref, fs_size);
@@ -2343,6 +2382,7 @@ static int chihiro_dimm_post_load(void *opaque, int version_id)
         p += DIMM_PAGE_SIZE;
     }
     ret = 0;
+    chihiro_dimm_error[0] = 0;
 
 out:
     g_free(ref);
