@@ -1540,10 +1540,6 @@ void MainMenuChihiroView::Draw()
             { "QCOW2 Image", "qcow2" },
             { "All Files", "*" }
         };
-        FilePicker("EEPROM Xbox (debug key)", g_config.chihiro.roms.eeprom_path,
-                   rom_filters, 2, false, [](const char *path) {
-            xemu_settings_set_string(&g_config.chihiro.roms.eeprom_path, path);
-        });
         FilePicker("Snapshot Store", g_config.chihiro.roms.snapshot_store_path,
                    store_filters, 2, false, [](const char *path) {
             xemu_settings_set_string(&g_config.chihiro.roms.snapshot_store_path, path);

@@ -2976,26 +2976,28 @@ void qmp_x_exit_preconfig(Error **errp)
 
 static const char *get_eeprom_path(void)
 {
-    /* Each machine has its own EEPROM: the Chihiro's carries the debug key
-     * its BIOS expects, the Xbox's a retail key. */
+    /* Each machine has its own EEPROM: the Xbox's is the configured file
+     * with a retail key; the Chihiro's carries the debug key its BIOS
+     * expects, is never written by the machine, and lives in the data
+     * directory like a save. */
     bool is_chihiro = xemu_chihiro_mode();
-    const char **setting = is_chihiro ? &g_config.chihiro.roms.eeprom_path :
-                                        &g_config.sys.files.eeprom_path;
     XboxEEPROMVersion needed = is_chihiro ? XBOX_EEPROM_VERSION_D
                                           : XBOX_EEPROM_VERSION_R1;
-
-    if (strlen(*setting) == 0) {
-        if (is_chihiro) {
-            char *p = g_strdup_printf("%schihiro_eeprom.bin",
-                                      xemu_settings_get_base_path());
-            xemu_settings_set_string(setting, p);
-            g_free(p);
-        } else {
-            xemu_settings_set_string(setting,
+    static char *chihiro_path;
+    const char *path;
+    if (is_chihiro) {
+        if (!chihiro_path) {
+            chihiro_path = g_strdup_printf("%schihiro_eeprom.bin",
+                                           xemu_settings_get_base_path());
+        }
+        path = chihiro_path;
+    } else {
+        if (strlen(g_config.sys.files.eeprom_path) == 0) {
+            xemu_settings_set_string(&g_config.sys.files.eeprom_path,
                                      xemu_settings_get_default_eeprom_path());
         }
+        path = g_config.sys.files.eeprom_path;
     }
-    const char *path = *setting;
 
     /* The kernel decrypts the EEPROM with its own key: a Chihiro (debug)
      * BIOS needs a debug EEPROM, an Xbox BIOS a retail one. One made for
