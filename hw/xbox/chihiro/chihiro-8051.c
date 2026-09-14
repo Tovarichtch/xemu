@@ -1,6 +1,21 @@
 /*
  * 8051 CPU core for Chihiro AN2131 (Cypress EZ-USB) emulation.
  *
+ * Copyright (c) 2026 Réda Chérif-Touil
+ *
+ * This library is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2 of the License, or (at your option) any later version.
+ *
+ * This library is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with this library; if not, see <http://www.gnu.org/licenses/>.
+ *
  * Clean-room implementation from the public 8051 instruction set reference.
  * AN2131-specific register mapping is handled externally via callbacks.
  */
