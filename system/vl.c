@@ -143,6 +143,7 @@
 #include "qemu/guest-random.h"
 #include "qemu/keyval.h"
 
+#include <glib/gstdio.h>
 #include "ui/xemu-settings.h"
 #include "ui/xemu-notifications.h"
 #include "ui/xemu-net.h"
@@ -2973,15 +2974,25 @@ static const char *get_eeprom_path(void)
         xemu_settings_set_string(&g_config.sys.files.eeprom_path, path);
     }
 
-    if (qemu_access(path, F_OK) == 0 && is_chihiro) {
+    /* The kernel decrypts the EEPROM with its own key: a Chihiro (debug)
+     * BIOS needs a debug EEPROM, an Xbox BIOS a retail one. One made for
+     * the other machine is set aside and regenerated. */
+    if (qemu_access(path, F_OK) == 0) {
         FILE *f = qemu_fopen(path, "rb");
         if (f) {
             uint8_t data[256];
             bool valid = fread(data, 1, 256, f) == 256;
             fclose(f);
-            if (valid && xbox_eeprom_detect_version(data) != needed) {
-                printf("Chihiro: EEPROM has retail key, regenerating with debug key\n");
-                qemu_unlink(path);
+            bool debug = xbox_eeprom_detect_version(data) == XBOX_EEPROM_VERSION_D;
+            if (valid && debug != is_chihiro) {
+                char *aside = g_strdup_printf("%s.%s", path,
+                                              debug ? "debug" : "retail");
+                printf("EEPROM '%s' has the %s key, kept as '%s' and regenerated\n",
+                       path, debug ? "debug" : "retail", aside);
+                if (g_rename(path, aside) != 0) {
+                    qemu_unlink(path);
+                }
+                g_free(aside);
             }
         }
     }
@@ -3110,14 +3121,10 @@ void qemu_init(int argc, char **argv)
     }
 
     const char *flashrom_path = g_config.sys.files.flashrom_path;
-    /* Chihiro: an explicit BIOS from Settings > Chihiro > Files wins in
-     * Chihiro mode (128M), and also fills in whenever no Xbox flash is
-     * configured at all -- either BIOS satisfies the requirement, a
-     * first-time Chihiro setup must not insist on an Xbox flash image. */
-    if (g_config.chihiro.roms.bios_path && g_config.chihiro.roms.bios_path[0] &&
-        ((int)g_config.sys.mem_limit >= 1 ||
-         !g_config.sys.files.flashrom_path ||
-         !g_config.sys.files.flashrom_path[0])) {
+    /* Chihiro (128M) boots the BIOS from Settings > Chihiro > Files when
+     * one is set; at 64M the machine is an Xbox and boots the Xbox flash. */
+    if ((int)g_config.sys.mem_limit >= 1 && g_config.chihiro.roms.bios_path &&
+        g_config.chihiro.roms.bios_path[0]) {
         flashrom_path = g_config.chihiro.roms.bios_path;
     }
     if (g_config.general.show_welcome) {
