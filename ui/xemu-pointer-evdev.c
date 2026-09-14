@@ -1,5 +1,5 @@
 /*
- * xemu per-device pointer input (light guns, mice)
+ * xemu per-device pointer input (light guns, mice): evdev backend (Linux)
  *
  * Copyright (c) 2026 Réda Chérif-Touil (Tovarichtch)
  *
@@ -22,7 +22,6 @@
 #include "xemu-settings.h"
 #include <SDL3/SDL.h>
 
-#ifdef __linux__
 
 #include <dirent.h>
 #include <fcntl.h>
@@ -400,6 +399,11 @@ const char *xemu_pointer_backend(void)
     return "evdev";
 }
 
+bool xemu_pointer_exclusive_grab(void)
+{
+    return true;
+}
+
 void xemu_pointer_init(void)
 {
     for (int i = 0; i < XEMU_POINTER_MAX; i++) {
@@ -523,48 +527,3 @@ void xemu_pointer_set_grab(bool on, const char *id1, const char *id2)
         }
     }
 }
-
-#else /* no per-device backend on this host */
-
-const char *xemu_pointer_backend(void)
-{
-    return NULL;
-}
-
-void xemu_pointer_init(void)
-{
-}
-
-void xemu_pointer_poll(void)
-{
-}
-
-void xemu_pointer_rescan(void)
-{
-}
-
-int xemu_pointer_count(void)
-{
-    return 0;
-}
-
-const XemuPointer *xemu_pointer_get(int i)
-{
-    return NULL;
-}
-
-bool xemu_pointer_position(const char *identity, float *x, float *y)
-{
-    return false;
-}
-
-uint32_t xemu_pointer_buttons(const char *identity)
-{
-    return 0;
-}
-
-void xemu_pointer_set_grab(bool on, const char *id1, const char *id2)
-{
-}
-
-#endif

@@ -960,6 +960,8 @@ static void ChihiroPointerCell(int player)
         label = "None";
     } else if (strcmp(cur, "mouse") == 0) {
         label = "System mouse";
+        if (devices && !xemu_pointer_exclusive_grab())
+            label += " (off: pick a device)";
     } else {
         label = cur;
         for (int i = 0; i < xemu_pointer_count(); i++) {
@@ -978,8 +980,12 @@ static void ChihiroPointerCell(int player)
     if (ImGui::BeginCombo("##gunaim", label.c_str())) {
         if (ImGui::Selectable("None", !cur[0]))
             xemu_settings_set_string(sel, "");
-        if (ImGui::Selectable("System mouse", strcmp(cur, "mouse") == 0))
-            xemu_settings_set_string(sel, "mouse");
+        /* Raw Input: the cursor follows every device, so the system mouse
+         * is only offered while the backend is off (PCSX2X6). */
+        if (!devices || xemu_pointer_exclusive_grab()) {
+            if (ImGui::Selectable("System mouse", strcmp(cur, "mouse") == 0))
+                xemu_settings_set_string(sel, "mouse");
+        }
         if (devices) {
             for (int i = 0; i < xemu_pointer_count(); i++) {
                 const XemuPointer *ptr = xemu_pointer_get(i);
@@ -1018,7 +1024,10 @@ static void ChihiroRebindCell(int *scancode, int row_id,
         if (!sel || !sel[0]) {
             key_name += " (no device)";
         } else if (strcmp(sel, "mouse") == 0) {
-            key_name += " (mouse)";
+            /* Raw Input on: the system mouse no longer aims (see the combo). */
+            key_name += (g_config.chihiro.settings.pointer_devices &&
+                         !xemu_pointer_exclusive_grab()) ? " (no device)"
+                                                          : " (mouse)";
         } else {
             std::string tag = sel;
             for (int i = 0; i < xemu_pointer_count(); i++) {
@@ -1418,10 +1427,11 @@ void MainMenuChihiroView::Draw()
                 ImGui::SameLine();
                 if (ImGui::Button("Refresh"))
                     xemu_pointer_rescan();
-                Toggle("Grab pointer devices while playing",
-                       &g_config.chihiro.settings.pointer_grab,
-                       "Aimed devices stop moving the desktop cursor. "
-                       "Released in this menu.");
+                if (xemu_pointer_exclusive_grab())
+                    Toggle("Grab pointer devices while playing",
+                           &g_config.chihiro.settings.pointer_grab,
+                           "Aimed devices stop moving the desktop cursor. "
+                           "Released in this menu.");
             }
         } else {
             ImGui::TextDisabled("Pointer devices: not available on this platform");

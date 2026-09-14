@@ -914,6 +914,13 @@ static int chihiro_aim_source(int player, const char **identity)
         return AIM_NONE;
     }
     if (strcmp(sel, "mouse") == 0) {
+        /* Without an exclusive grab (Raw Input) every device drives the
+         * system cursor too, so with pointer devices on each player picks
+         * one: the cursor would follow another player's gun. */
+        if (g_config.chihiro.settings.pointer_devices &&
+            !xemu_pointer_exclusive_grab()) {
+            return AIM_NONE;
+        }
         return AIM_MOUSE;
     }
     if (!g_config.chihiro.settings.pointer_devices) {

@@ -28,11 +28,13 @@ extern "C" {
 #endif
 
 /*
- * Pointer devices read one by one by a host backend (evdev on Linux) so that
- * two players can aim with their own light gun or mouse, which the merged
- * system cursor cannot do. A device keeps its identity across replugs:
- * serial number, else VID:PID, else the physical port, else the name.
- * Enabled by chihiro.settings.pointer_devices; off, nothing is opened.
+ * Pointer devices read one by one by a host backend (evdev on Linux, Raw
+ * Input on Windows) so that two players can aim with their own light gun or
+ * mouse, which the merged system cursor cannot do. A device keeps its
+ * identity across replugs: on Linux the serial number, else VID:PID, else
+ * the physical port, else the name; on Windows VID:PID, else the port, as
+ * in PCSX2X6. Enabled by chihiro.settings.pointer_devices; off, nothing
+ * is opened.
  */
 
 #define XEMU_POINTER_MAX 8
@@ -44,8 +46,12 @@ typedef struct XemuPointer {
     bool absolute;    /* light gun or tablet; else a relative mouse */
 } XemuPointer;
 
-/* Backend name for the UI ("evdev"), NULL where unsupported. */
+/* Backend name for the UI ("evdev", "raw input"), NULL where unsupported. */
 const char *xemu_pointer_backend(void);
+
+/* True where the grab takes a device away from the desktop cursor (evdev).
+ * Raw Input cannot: every device keeps driving the system cursor. */
+bool xemu_pointer_exclusive_grab(void);
 
 void xemu_pointer_init(void);
 /* Called from the main loop under the lock: hotplug and event drain. */
@@ -64,7 +70,8 @@ bool xemu_pointer_position(const char *identity, float *x, float *y);
 uint32_t xemu_pointer_buttons(const char *identity);
 
 /* Exclusive grab of the devices aimed with, so they stop driving the
- * desktop cursor while playing. Identities may be NULL. */
+ * desktop cursor while playing (evdev); nothing where the host has no such
+ * grab. Identities may be NULL. */
 void xemu_pointer_set_grab(bool on, const char *id1, const char *id2);
 
 #ifdef __cplusplus

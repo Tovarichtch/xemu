@@ -867,6 +867,7 @@ if host_os == 'windows'
   socket = cc.find_library('ws2_32', required: true)
   winmm = cc.find_library('winmm', required: true)
   crypt32 = cc.find_library('crypt32')
+  hid = cc.find_library('hid', required: true)
 
   win = import('windows')
   version_res = win.compile_resources('version.rc',

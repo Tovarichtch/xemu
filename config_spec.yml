@@ -392,7 +392,7 @@ chihiro:
       type: enum
       values: [hotd3, vc3, gs, ctx, or2, ok]
       default: hotd3
-    # Gun aim: "mouse" = system cursor, "" = none, else the identity of a
+    # Pointer: "mouse" = system cursor, "" = none, else the identity of a
     # pointer device (chihiro.settings.pointer_devices)
     pointer_device:
       type: string
@@ -588,8 +588,9 @@ chihiro:
     wheel_autocenter_strength:
       type: integer
       default: 50
-    # Read each mouse or light gun on its own (evdev on Linux) so two players
-    # can aim with their own device. Off: the system cursor aims.
+    # Read each mouse or light gun on its own (evdev on Linux, Raw Input on
+    # Windows) so two players can aim with their own device. Off: the system
+    # cursor aims.
     pointer_devices:
       type: bool
       default: false
