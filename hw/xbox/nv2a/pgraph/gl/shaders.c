@@ -125,6 +125,11 @@ static void update_shader_uniform_locs(ShaderBinding *binding)
         }
         binding->uniform_locs.psh[i] = glGetUniformLocation(binding->gl_program, name);
     }
+
+    GLuint prog = binding->gl_program;
+    binding->uniform_locs.gsh.surfaceSize = glGetUniformLocation(prog, "gsSurfaceSize");
+    binding->uniform_locs.gsh.lineWidth = glGetUniformLocation(prog, "gsLineWidth");
+    binding->uniform_locs.gsh.keepWinding = glGetUniformLocation(prog, "gsKeepWinding");
 }
 
 static void shader_module_cache_entry_init(Lru *lru, LruNode *node,
@@ -751,6 +756,41 @@ static void apply_uniform_updates(const UniformInfo *info, int *locs,
     assert(glGetError() == GL_NO_ERROR);
 }
 
+/* Per draw: the wide-line geometry shader needs the guest line width, the
+ * surface size that turns it into clip-space units, and which winding the
+ * culling state lets through (the hardware never culls a line). */
+void pgraph_gl_wide_line_uniforms(PGRAPHState *pg)
+{
+    PGRAPHGLState *r = pg->gl_renderer_state;
+    ShaderBinding *b = r->shader_binding;
+
+    unsigned int aa_width = 1, aa_height = 1;
+    pgraph_apply_anti_aliasing_factor(pg, &aa_width, &aa_height);
+    float size[2] = { (float)pg->surface_binding_dim.width / aa_width,
+                      (float)pg->surface_binding_dim.height / aa_height };
+
+    /* draw.c poses glFrontFace(CW) when the FRONTFACE bit is set. */
+    uint32_t setupraster = pgraph_reg_r(pg, NV_PGRAPH_SETUPRASTER);
+    int keep = 2; /* either winding */
+    if (setupraster & NV_PGRAPH_SETUPRASTER_CULLENABLE) {
+        bool front_ccw = !(setupraster & NV_PGRAPH_SETUPRASTER_FRONTFACE);
+        switch (GET_MASK(setupraster, NV_PGRAPH_SETUPRASTER_CULLCTRL)) {
+        case 1: /* front faces culled: draw a back face */
+            keep = front_ccw ? 0 : 1;
+            break;
+        case 2: /* back faces culled: draw a front face */
+            keep = front_ccw ? 1 : 0;
+            break;
+        default:
+            break;
+        }
+    }
+
+    glUniform2fv(b->uniform_locs.gsh.surfaceSize, 1, size);
+    glUniform1f(b->uniform_locs.gsh.lineWidth, pg->line_width / 8.0f);
+    glUniform1i(b->uniform_locs.gsh.keepWinding, keep);
+}
+
 // FIXME: Dirty tracking
 // FIXME: Consider UBO to align with VK renderer
 static void update_shader_uniforms(PGRAPHState *pg, ShaderBinding *binding)
@@ -782,6 +822,7 @@ void pgraph_gl_bind_shaders(PGRAPHState *pg)
 
     bool binding_changed = false;
     if (r->shader_binding &&
+        r->shader_binding->state.geom.wide_lines == r->wide_lines &&
         !pgraph_glsl_check_shader_state_dirty(pg, &r->shader_binding->state)) {
         nv2a_profile_inc_counter(NV2A_PROF_SHADER_BIND_NOTDIRTY);
         goto update_uniforms;
@@ -789,6 +830,7 @@ void pgraph_gl_bind_shaders(PGRAPHState *pg)
 
     ShaderBinding *old_binding = r->shader_binding;
     ShaderState state = pgraph_glsl_get_shader_state(pg);
+    state.geom.wide_lines = r->wide_lines;
 
     NV2A_GL_DGROUP_BEGIN("%s (%s)", __func__,
                          state.vsh.is_fixed_function ? "FF" : "PROG");

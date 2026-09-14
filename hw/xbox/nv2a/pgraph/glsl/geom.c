@@ -23,6 +23,10 @@
 #include "hw/xbox/nv2a/pgraph/pgraph.h"
 #include "geom.h"
 
+/* wide_lines took the padding byte: the shader state size, and with it the
+ * seed files and dictionary, must not move. */
+QEMU_BUILD_BUG_ON(sizeof(GeomState) != 20);
+
 void pgraph_glsl_set_geom_state(PGRAPHState *pg, GeomState *state)
 {
     state->primitive_mode = (enum ShaderPrimitiveMode)pg->primitive_mode;
@@ -118,6 +122,7 @@ MString *pgraph_glsl_gen_geom(const GeomState *state, GenGeomGlslOptions opts)
     bool need_triz = false;
     bool need_quadz = false;
     bool need_linez = false;
+    bool need_wide = false;
     const char *layout_in = NULL;
     const char *layout_out = NULL;
     const char *body = NULL;
@@ -134,8 +139,14 @@ MString *pgraph_glsl_gen_geom(const GeomState *state, GenGeomGlslOptions opts)
         provoking_index = state->first_vertex_is_provoking ? "0" : "1";
         need_linez = true;
         layout_in = "layout(lines) in;\n";
-        layout_out = "layout(line_strip, max_vertices = 2) out;\n";
-        body = "  emit_line(0, 1, 0.0);\n";
+        if (state->wide_lines) {
+            need_wide = true;
+            layout_out = "layout(triangle_strip, max_vertices = 4) out;\n";
+            body = "  emit_wide_line(0, 1, 0.0);\n";
+        } else {
+            layout_out = "layout(line_strip, max_vertices = 2) out;\n";
+            body = "  emit_line(0, 1, 0.0);\n";
+        }
         break;
     case PRIM_TYPE_TRIANGLES:
     case PRIM_TYPE_TRIANGLE_STRIP:
@@ -430,6 +441,63 @@ MString *pgraph_glsl_gen_geom(const GeomState *state, GenGeomGlslOptions opts)
             "  emit_vertex(i1, pz);\n"
             "  EndPrimitive();\n"
             "}\n");
+    }
+
+    if (need_wide) {
+        /* A segment as a rectangle of the guest's width: the width is in
+         * guest pixels and the surface size in guest pixels too, so the
+         * internal scale cancels (1 pixel = 2 / size in clip space). The
+         * rectangle is emitted with the winding the culling state keeps,
+         * since the hardware never culls a line. */
+        mstring_append_fmt(
+            output,
+            "uniform vec2 gsSurfaceSize;\n"
+            "uniform float gsLineWidth;\n"
+            "uniform int gsKeepWinding;\n"
+            "void emit_wide_vertex(int index, mat4 pz, vec4 pos) {\n"
+            "  gl_Position = pos;\n"
+            "  gl_PointSize = gl_in[index].gl_PointSize;\n"
+            "  vtxD0 = v_vtxD0[%s];\n"
+            "  vtxD1 = v_vtxD1[%s];\n"
+            "  vtxB0 = v_vtxB0[%s];\n"
+            "  vtxB1 = v_vtxB1[%s];\n"
+            "  vtxFog = v_vtxFog[index];\n"
+            "  vtxT0 = v_vtxT0[index];\n"
+            "  vtxT1 = v_vtxT1[index];\n"
+            "  vtxT2 = v_vtxT2[index];\n"
+            "  vtxT3 = v_vtxT3[index];\n"
+            "  vtxPos0 = pz[0];\n"
+            "  vtxPos1 = pz[1];\n"
+            "  vtxPos2 = pz[2];\n"
+            "  triMZ = (isnan(pz[3].x) || isinf(pz[3].x)) ? 0.0 : pz[3].x;\n"
+            "  EmitVertex();\n"
+            "}\n"
+            "void emit_wide_line(int i0, int i1, float dz) {\n"
+            "  vec2 delta = v_vtxPos[i1].xy - v_vtxPos[i0].xy;\n"
+            "  vec2 v2 = vec2(-delta.y, delta.x) + v_vtxPos[i0].xy;\n"
+            "  mat4 pz = mat4(v_vtxPos[i0], v_vtxPos[i1], v2, v_vtxPos[i0].zw, dz, vec3(0.0));\n"
+            "  vec4 p0 = gl_in[i0].gl_Position;\n"
+            "  vec4 p1 = gl_in[i1].gl_Position;\n"
+            "  vec2 s0 = p0.xy / p0.w;\n"
+            "  vec2 s1 = p1.xy / p1.w;\n"
+            "  vec2 d = (s1 - s0) * gsSurfaceSize;\n"
+            "  float len = length(d);\n"
+            "  vec2 n = (len > 0.0) ? vec2(-d.y, d.x) / len : vec2(0.0, 1.0);\n"
+            "  vec2 off = n * gsLineWidth / gsSurfaceSize;\n"
+            "  vec2 a = s0 + off;\n"
+            "  vec2 b = s0 - off;\n"
+            "  vec2 c = s1 + off;\n"
+            "  float area = (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);\n"
+            "  if ((gsKeepWinding == 1 && area < 0.0) || (gsKeepWinding == 0 && area > 0.0)) {\n"
+            "    off = -off;\n"
+            "  }\n"
+            "  emit_wide_vertex(i0, pz, vec4((s0 + off) * p0.w, p0.zw));\n"
+            "  emit_wide_vertex(i0, pz, vec4((s0 - off) * p0.w, p0.zw));\n"
+            "  emit_wide_vertex(i1, pz, vec4((s1 + off) * p1.w, p1.zw));\n"
+            "  emit_wide_vertex(i1, pz, vec4((s1 - off) * p1.w, p1.zw));\n"
+            "  EndPrimitive();\n"
+            "}\n",
+            provoking_index, provoking_index, provoking_index, provoking_index);
     }
 
     if (need_quadz) {

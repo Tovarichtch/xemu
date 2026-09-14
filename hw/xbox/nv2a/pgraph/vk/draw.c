@@ -1308,6 +1308,7 @@ void pgraph_vk_begin_command_buffer(PGRAPHState *pg)
                                   &command_buffer_begin_info));
     r->command_buffer_start_time = pg->draw_time;
     r->in_command_buffer = true;
+    r->line_width_set = -1.0f;
 }
 
 // FIXME: Refactor below
@@ -1474,11 +1475,17 @@ static void begin_draw(PGRAPHState *pg)
             .extent.height = scissor_height,
         };
         vkCmdSetScissor(r->command_buffer, 0, 1, &scissor);
+    }
 
-        if (r->pipeline_binding->has_dynamic_line_width) {
-            float line_width =
-                clamp_line_width_to_device_limits(pg, pg->surface_scale_factor);
+    /* NV097_SET_LINE_WIDTH is in 1/8 pixel, scaled to the internal
+     * resolution like the GL path. The guest re-poses it per segment, so
+     * it is set on every change, and on every pipeline bind. */
+    if (r->pipeline_binding->has_dynamic_line_width) {
+        float line_width = clamp_line_width_to_device_limits(
+            pg, (pg->line_width / 8.0f) * pg->surface_scale_factor);
+        if (must_bind_pipeline || line_width != r->line_width_set) {
             vkCmdSetLineWidth(r->command_buffer, line_width);
+            r->line_width_set = line_width;
         }
     }
 

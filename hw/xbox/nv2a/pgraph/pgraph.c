@@ -232,6 +232,7 @@ void pgraph_init(NV2AState *d)
     pg->draw_time = 0;
 
     pg->material_alpha = 0.0f;
+    pg->line_width = 8; /* 1.0 pixel, in 1/8 pixel units */
     PG_SET_MASK(NV_PGRAPH_CONTROL_3, NV_PGRAPH_CONTROL_3_SHADEMODE,
          NV_PGRAPH_CONTROL_3_SHADEMODE_SMOOTH);
     pg->primitive_mode = PRIM_TYPE_INVALID;
@@ -1542,6 +1543,15 @@ DEF_METHOD(NV097, SET_SHADE_MODE)
         /* Discard */
         break;
     }
+}
+
+DEF_METHOD(NV097, SET_LINE_WIDTH)
+{
+    /* Width in 1/8 pixel. Stored verbatim: the 0x1FF clamp lives in the
+     * D3D8 runtime, and the hardware field width is not documented in any
+     * source we have, so masking here would be invented behavior. The
+     * consumer clamps to what the host GL supports. */
+    pg->line_width = parameter;
 }
 
 DEF_METHOD(NV097, SET_PROVOKING_VERTEX)

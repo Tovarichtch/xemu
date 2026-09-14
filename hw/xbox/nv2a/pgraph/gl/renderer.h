@@ -124,6 +124,12 @@ typedef struct ShaderBinding {
     struct {
         PshUniformLocs psh;
         VshUniformLocs vsh;
+        /* The wide-line geometry shader's (see glsl/geom.c). */
+        struct {
+            GLint surfaceSize;
+            GLint lineWidth;
+            GLint keepWinding;
+        } gsh;
     } uniform_locs;
 } ShaderBinding;
 
@@ -241,6 +247,9 @@ typedef struct PGRAPHGLState {
 
     GLfloat supported_aliased_line_width_range[2];
     GLfloat supported_smooth_line_width_range[2];
+    /* The draw's lines are wider than the host rasterizes: the geometry
+     * shader draws them as rectangles (part of the shader state key). */
+    bool wide_lines;
 
     struct supported_extensions {
         GLboolean texture_filter_anisotropic;
@@ -252,6 +261,7 @@ extern GloContext *g_nv2a_context_display;
 
 unsigned int pgraph_gl_bind_inline_array(NV2AState *d);
 void pgraph_gl_bind_shaders(PGRAPHState *pg);
+void pgraph_gl_wide_line_uniforms(PGRAPHState *pg);
 void pgraph_gl_bind_textures(NV2AState *d);
 void pgraph_gl_bind_vertex_attributes(NV2AState *d, unsigned int min_element, unsigned int max_element, bool inline_data, unsigned int inline_stride, unsigned int provoking_element);
 bool pgraph_gl_check_surface_to_texture_compatibility(const SurfaceBinding *surface, const TextureShape *shape);

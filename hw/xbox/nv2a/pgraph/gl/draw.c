@@ -158,6 +158,22 @@ void pgraph_gl_draw_begin(NV2AState *d)
     assert(r->color_binding || r->zeta_binding);
 
     pgraph_gl_bind_textures(d);
+    /* Lines wider than the host rasterizes go through the wide-line
+     * geometry shader: decided before the shader state is keyed, from the
+     * same width and range glLineWidth gets below. */
+    {
+        bool line_prim = pg->primitive_mode == PRIM_TYPE_LINES ||
+                         pg->primitive_mode == PRIM_TYPE_LINE_LOOP ||
+                         pg->primitive_mode == PRIM_TYPE_LINE_STRIP;
+        bool aa = GET_MASK(pgraph_reg_r(pg, NV_PGRAPH_ANTIALIASING),
+                           NV_PGRAPH_ANTIALIASING_ENABLE);
+        bool smooth = !aa && (pgraph_reg_r(pg, NV_PGRAPH_SETUPRASTER) &
+                              NV_PGRAPH_SETUPRASTER_LINESMOOTHENABLE);
+        float lw_px = (pg->line_width / 8.0f) * pg->surface_scale_factor;
+        float host_max = smooth ? r->supported_smooth_line_width_range[1]
+                                : r->supported_aliased_line_width_range[1];
+        r->wide_lines = line_prim && lw_px > host_max;
+    }
     pgraph_gl_bind_shaders(pg);
 
     glColorMask(mask_red, mask_green, mask_blue, mask_alpha);
@@ -279,13 +295,22 @@ void pgraph_gl_draw_begin(NV2AState *d)
     bool anti_aliasing = GET_MASK(pgraph_reg_r(pg, NV_PGRAPH_ANTIALIASING), NV_PGRAPH_ANTIALIASING_ENABLE);
 
     /* Edge Antialiasing */
+    /* NV097_SET_LINE_WIDTH is in 1/8 pixel: express it in pixels and scale
+     * to the internal resolution. The clamp is host plumbing (0 is a GL
+     * error, the top is driver dependent); past the top the geometry
+     * shader draws the segments as rectangles. */
+    GLfloat line_width = (pg->line_width / 8.0f) * pg->surface_scale_factor;
+    const GLfloat *lw_range = r->supported_aliased_line_width_range;
     if (!anti_aliasing && pgraph_reg_r(pg, NV_PGRAPH_SETUPRASTER) &
                               NV_PGRAPH_SETUPRASTER_LINESMOOTHENABLE) {
         glEnable(GL_LINE_SMOOTH);
-        glLineWidth(MIN(r->supported_smooth_line_width_range[1], pg->surface_scale_factor));
+        lw_range = r->supported_smooth_line_width_range;
     } else {
         glDisable(GL_LINE_SMOOTH);
-        glLineWidth(MIN(r->supported_aliased_line_width_range[1], pg->surface_scale_factor));
+    }
+    glLineWidth(MAX(lw_range[0], MIN(lw_range[1], line_width)));
+    if (r->shader_binding->state.geom.wide_lines) {
+        pgraph_gl_wide_line_uniforms(pg);
     }
     if (!anti_aliasing && pgraph_reg_r(pg, NV_PGRAPH_SETUPRASTER) &
                               NV_PGRAPH_SETUPRASTER_POLYSMOOTHENABLE) {

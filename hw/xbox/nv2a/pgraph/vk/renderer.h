@@ -343,6 +343,7 @@ typedef struct PGRAPHVkState {
     VkSemaphore command_buffer_semaphore;
     VkFence command_buffer_fence;
     unsigned int command_buffer_start_time;
+    float line_width_set; /* last vkCmdSetLineWidth of this command buffer, < 0 = none */
     bool in_command_buffer;
     uint32_t submit_count;
 

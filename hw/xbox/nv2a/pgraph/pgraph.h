@@ -188,6 +188,14 @@ typedef struct PGRAPHState {
     hwaddr report_offset;
     bool zpass_pixel_count_enable;
 
+    /* NV097_SET_LINE_WIDTH (0x0380): hardware register mapping unknown,
+     * tracked as state. Units are 1/8 pixel:
+     * D3DDevice_SetRenderState_LineWidth emits
+     * clamp(ftol(width * msaa_scale * 8.0f + 0.5f), <= 0x1FF), so the
+     * guest's multisample scale is already folded in. Reset value 8 (1.0
+     * pixel) matches the width used before any SetRenderState. */
+    uint32_t line_width;
+
     hwaddr dma_vertex_a, dma_vertex_b;
 
     uint32_t primitive_mode;
