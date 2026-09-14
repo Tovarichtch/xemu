@@ -1387,7 +1387,7 @@ void MainMenuChihiroView::Draw()
                      "Type-3 (ASIC) support coming soon");
         ImGui::EndDisabled();
         Toggle("Card Reader", &g_config.chihiro.card_reader.enable,
-               "CRP-1231 IC card reader emulation (Ghost Squad, Gundam)");
+               "Sanwa CRP-1231LR-10NAB card reader/writer (Ghost Squad, Gundam)");
         if (g_config.chihiro.card_reader.enable) {
             static const SDL_DialogFileFilter card_filters[] = {
                 { "Card Images", "bin" },

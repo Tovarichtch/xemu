@@ -27,7 +27,7 @@
 enum {
     CHIHIRO_LOG_BOOT    = 1 << 0,  /* SEGABOOT state machine, boot handoff */
     CHIHIRO_LOG_JVS     = 1 << 1,  /* JVS frames and I/O board */
-    CHIHIRO_LOG_CARD    = 1 << 2,  /* CRP-1231 card reader */
+    CHIHIRO_LOG_CARD    = 1 << 2,  /* Sanwa CRP-1231LR-10NAB card reader */
     CHIHIRO_LOG_FFB     = 1 << 3,  /* OutRun 2 drive board */
     CHIHIRO_LOG_MBCOM   = 1 << 4,  /* media board mailbox commands */
     CHIHIRO_LOG_USB     = 1 << 5,  /* AN2131 vendor requests, endpoints */

@@ -1,5 +1,5 @@
 /*
- * Chihiro card reader (Sega CRP-1231) emulation
+ * Chihiro card reader (Sanwa CRP-1231LR-10NAB) emulation
  *
  * Copyright (c) 2026 Réda Chérif-Touil
  *
@@ -180,7 +180,7 @@ void card_reader_write_byte(CardReaderState *s, uint8_t byte)
 
 void card_reader_tap_byte(CardReaderState *s, uint8_t byte)
 {
-    /* SC firmware uses 0x00 as sync byte (not 0x10 like standalone CRP-1231) */
+    /* SC firmware uses 0x00 as sync byte (not 0x10 like a standalone CRP-1231LR-10NAB) */
     if (s->rx_pos == 0 && byte != 0x00)
         return;
 

@@ -429,7 +429,7 @@ uint32_t chihiro_va_to_pa(uint32_t va)
     return (pte & 0xFFFFF000) | (va & 0xFFF);
 }
 
-/* Card reader state: one CRP-1231 per player, driven by the SC 8051 UARTs */
+/* Card reader state: one Sanwa CRP-1231LR-10NAB per player, driven by the SC 8051 UARTs */
 static CardReaderState card_state[2];
 static bool card_reader_initialized;
 
@@ -452,7 +452,7 @@ bool chihiro_card_reader_present(int player)
 /*
  * Card reader support. The serial data path is fully LLE: the game's USB
  * vendor requests reach the real SC 8051 firmware, which talks to the
- * CRP-1231 readers over its two UARTs (chihiro-an2131.c). This timer only
+ * CRP-1231LR-10NAB readers over its two UARTs (chihiro-an2131.c). This timer only
  * manages card insertion (the UI assignment) and forces the operator
  * settings the card screen gates on.
  */
@@ -580,7 +580,7 @@ static void chihiro_card_reader_tick(void)
 }
 
 /* Only the OutRun 2 family (outrun2.xbe, OR2SP) talks to a drive board. */
-/* Only the Ghost Squad cabinet carries CRP-1231 card readers; the others
+/* Only the Ghost Squad cabinet carries CRP-1231LR-10NAB card readers; the others
  * have nothing on that port and must not get cards created for them. */
 static bool chihiro_cabinet_has_card_reader(void)
 {
@@ -834,7 +834,7 @@ static void chihiro_diag_timer_cb(void *opaque)
 
     if (chihiro_game_running) {
         /* Cabinet wiring: the OutRun 2 cabinets hang the FFB drive board off
-         * SC UART1; the Ghost Squad cabinet wires two CRP-1231 there
+         * SC UART1; the Ghost Squad cabinet wires two CRP-1231LR-10NAB there
          * instead. Re-evaluated every tick so the UI toggle takes effect
          * live and hands MIDI back. */
         chihiro_card_reader_enabled = g_config.chihiro.card_reader.enable &&

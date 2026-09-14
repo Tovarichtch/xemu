@@ -82,7 +82,7 @@ void chihiro_on_quickreboot_signal(void);
 /* Called from SMC POWER handler to detect QuickReboot */
 bool chihiro_intercept_reset(void);
 
-/* Card reader emulation (CRP-1231 via ring buffer tap/injection) */
+/* Card reader emulation (Sanwa CRP-1231LR-10NAB via ring buffer tap/injection) */
 
 /* Save file persistence (Phase 2): ic11 + extmem backup area */
 bool chihiro_usb_save_load(const char *path);

@@ -43,7 +43,7 @@
 extern SDL_Window *m_window;
 extern int viewport_coords[4];
 
-/* Card reader (chihiro-cardreader.c): a slot's insertion microswitch. */
+/* Card reader (chihiro-card-reader.c): a slot's insertion microswitch. */
 bool chihiro_card_reader_present(int player);
 extern bool chihiro_card_reader_enabled;
 

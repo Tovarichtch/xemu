@@ -1132,7 +1132,7 @@ static void card_rx_deliver_ch(AN2131State *s, int slot,
         s->card_delivering[idx] = false;
     }
     {
-        /* Real CRP-1231 command turnaround is tens of ms (magnetic I/O). */
+        /* Real CRP-1231LR-10NAB command turnaround is tens of ms (magnetic I/O). */
         uint64_t need = (c->tx_pos == 0) ? 60000 : 1500;
         if (s->total_cycles - s->card_resp_cycles[idx] < need)
             return;

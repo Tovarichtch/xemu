@@ -1,5 +1,5 @@
 /*
- * Chihiro card reader (Sega CRP-1231) emulation
+ * Chihiro card reader (Sanwa CRP-1231LR-10NAB) emulation
  *
  * Copyright (c) 2026 Réda Chérif-Touil
  *
