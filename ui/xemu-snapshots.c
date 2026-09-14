@@ -51,6 +51,18 @@ const char **g_snapshot_shortcut_index_key_map[] = {
     &g_config.general.snapshots.shortcuts.f8,
 };
 
+static bool xemu_chihiro_mode(void)
+{
+    return (int)g_config.sys.mem_limit >= 1;
+}
+
+/* The image the snapshots live in: the Chihiro store, else the Xbox disk. */
+static const char *xemu_snapshots_image_path(void)
+{
+    return xemu_chihiro_mode() ? g_config.chihiro.roms.snapshot_store_path :
+                                 g_config.sys.files.hdd_path;
+}
+
 static void xemu_snapshots_load_data(BlockDriverState *bs_ro,
                                      QEMUSnapshotInfo *info,
                                      XemuSnapshotData *data, Error **err)
@@ -155,7 +167,7 @@ static void xemu_snapshots_all_load_data(QEMUSnapshotInfo **info,
     memset(*data, 0, sizeof(XemuSnapshotData) * snapshots_len);
 
     qdict_put_bool(opts, BDRV_OPT_READ_ONLY, true);
-    bs_ro = bdrv_open(g_config.sys.files.hdd_path, NULL, opts,
+    bs_ro = bdrv_open(xemu_snapshots_image_path(), NULL, opts,
                       BDRV_O_RO_WRITE_SHARE | BDRV_O_AUTO_RDONLY, err);
     if (!bs_ro) {
         return;
@@ -239,11 +251,6 @@ char *xemu_get_currently_loaded_disc_path(void)
     return file;
 }
 
-static bool xemu_chihiro_mode(void)
-{
-    return (int)g_config.sys.mem_limit >= 1;
-}
-
 /* The DIMM hooks can only fail with an errno; say why in the box. */
 static void xemu_snapshots_chihiro_reason(Error **err, const char *what,
                                           const char *vm_name)
@@ -316,7 +323,7 @@ bool xemu_snapshots_chihiro_image_matches(const char *vm_name)
     }
     QDict *opts = qdict_new();
     qdict_put_bool(opts, BDRV_OPT_READ_ONLY, true);
-    BlockDriverState *bs_ro = bdrv_open(g_config.sys.files.hdd_path, NULL, opts,
+    BlockDriverState *bs_ro = bdrv_open(xemu_snapshots_image_path(), NULL, opts,
                                         BDRV_O_RO_WRITE_SHARE | BDRV_O_AUTO_RDONLY,
                                         &err);
     if (!bs_ro) {

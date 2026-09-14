@@ -1536,6 +1536,14 @@ void MainMenuChihiroView::Draw()
                    rom_filters, 2, false, [](const char *path) {
             xemu_settings_set_string(&g_config.chihiro.roms.pc20_path, path);
         });
+        static const SDL_DialogFileFilter store_filters[] = {
+            { "QCOW2 Image", "qcow2" },
+            { "All Files", "*" }
+        };
+        FilePicker("Snapshot Store", g_config.chihiro.roms.snapshot_store_path,
+                   store_filters, 2, false, [](const char *path) {
+            xemu_settings_set_string(&g_config.chihiro.roms.snapshot_store_path, path);
+        });
     }
 }
 

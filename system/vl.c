@@ -2054,16 +2054,28 @@ static char *strdup_double_commas(const char *input);
  * missing: nothing else creates images on the user's machine. */
 static void chihiro_snapshot_store_setup(void)
 {
+    /* Earlier builds kept the store, chihiro_snapshots.qcow2, in the hard
+     * disk setting; an Xbox must not boot from it. */
+    char *hdd_name = g_path_get_basename(g_config.sys.files.hdd_path);
+    if (strcmp(hdd_name, "chihiro_snapshots.qcow2") == 0) {
+        if (strlen(g_config.chihiro.roms.snapshot_store_path) == 0) {
+            xemu_settings_set_string(&g_config.chihiro.roms.snapshot_store_path,
+                                     g_config.sys.files.hdd_path);
+        }
+        xemu_settings_set_string(&g_config.sys.files.hdd_path, "");
+    }
+    g_free(hdd_name);
     if ((int)g_config.sys.mem_limit < 1) {
         return;
     }
-    if (strlen(g_config.sys.files.hdd_path) == 0) {
+    if (strlen(g_config.chihiro.roms.snapshot_store_path) == 0) {
         char *path = g_strdup_printf("%schihiro_snapshots.qcow2",
                                      xemu_settings_get_base_path());
-        xemu_settings_set_string(&g_config.sys.files.hdd_path, path);
+        xemu_settings_set_string(&g_config.chihiro.roms.snapshot_store_path,
+                                 path);
         g_free(path);
     }
-    const char *path = g_config.sys.files.hdd_path;
+    const char *path = g_config.chihiro.roms.snapshot_store_path;
     if (qemu_access(path, F_OK) == -1) {
         Error *err = NULL;
         bdrv_img_create(path, "qcow2", NULL, NULL, NULL, 64 * MiB, 0, true,
