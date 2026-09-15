@@ -2512,6 +2512,16 @@ void MainMenuAboutView::Draw()
     }
     ImGui::SameLine();
     ImGui::Text("for more information");
+
+    /* CHIHIRO (not upstream): the author's page, where the next projects
+     * show up. */
+    ImGui::Text("Visit");
+    ImGui::SameLine();
+    if (ImGui::SmallButton("https://github.com/Tovarichtch")) {
+        SDL_OpenURL("https://github.com/Tovarichtch");
+    }
+    ImGui::SameLine();
+    ImGui::Text("to follow the next projects");
 }
 
 MainMenuTabButton::MainMenuTabButton(std::string text, std::string icon)
