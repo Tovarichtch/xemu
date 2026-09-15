@@ -57,15 +57,17 @@ void FirstBootWindow::Draw()
     ImGui::Dummy(ImVec2(0,16*g_viewport_mgr.m_scale));
 
     /* CHIHIRO (not upstream): what a first-time player should expect, one
-     * centred line each like the rest of the window. */
+     * centred line each like the rest of the window, in the theme's accent
+     * so it stands out (green, orange with the doge). */
     static const char *const notes[] = {
         "Experimental build, still under development.",
         "The first run of a game stutters while its shaders compile.",
         "The next runs are smooth.",
     };
+    ImVec4 accent = ImGui::GetStyleColorVec4(ImGuiCol_CheckMark);
     for (const char *note : notes) {
         ImGui::SetCursorPosX((ImGui::GetWindowWidth()-ImGui::CalcTextSize(note).x)/2);
-        ImGui::Text("%s", note);
+        ImGui::TextColored(accent, "%s", note);
     }
 
     ImGui::Dummy(ImVec2(0,20*g_viewport_mgr.m_scale));
