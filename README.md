@@ -114,10 +114,4 @@ doge_mode = 'wow'
 
 xemu devs can request access to code. I have already granted a few of them. I will submit the Chihiro code (without optimization) after a few playtests to make sure everything is working properly for most users. The code won't be shared with sellers and vampires.
 
-## Myself
-
-If you like what I do, feel free to tip me or leave a comment on my Ko-Fi page!
-
-[https://ko-fi.com/tovarichtch ](https://ko-fi.com/tovarichtch)
-
 (Thanks SUPA Peter for the help, and every tester out there! Helped me a lot. See you in next projects!)
