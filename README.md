@@ -45,6 +45,7 @@ and the three EEPROMs (QC, baseboard, SC).
   follow the shots.
 - **Sinden border** with its style and thickness, for guns that need it.
 - Every gun feature stays off in the games that have no gun.
+- Toggle F3 to lock the pointer in and hide xemu notifications and menu.
 
 ## Wheel and force feedback
 
