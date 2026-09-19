@@ -6,6 +6,8 @@ specific_ss.add(files(
 	'chihiro-driveboard.c',
 	'chihiro-jvs.c',
 	'chihiro-mips.c',
+	'chihiro-pic.c',
+	'chihiro-spd.c',
 	'chihiro-usb.c',
 	'chihiro-v850.c',
 	'chihiro.c',
