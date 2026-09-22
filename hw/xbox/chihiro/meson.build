@@ -4,6 +4,7 @@ specific_ss.add(files(
 	'chihiro-card-reader.c',
 	'chihiro-driveboard.c',
 	'chihiro-jvs.c',
+	'chihiro-mips.c',
 	'chihiro-usb.c',
 	'chihiro-v850.c',
 	'chihiro.c',
