@@ -4,6 +4,7 @@
  * Copyright (c) 2012 espes
  * Copyright (c) 2015 Jannik Vogel
  * Copyright (c) 2018-2025 Matt Borgerson
+ * Copyright (c) 2026 Réda Chérif-Touil
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -264,7 +265,7 @@ static void nv2a_init_memory(NV2AState *d, MemoryRegion *ram)
     pgraph_init(d);
 
     /* fire up pfifo */
-    qemu_thread_create(&d->pfifo.thread, "nv2a.pfifo_thread",
+    qemu_thread_create(&d->pfifo.thread, "nv2a.pfifo",
                        pfifo_thread, d, QEMU_THREAD_JOINABLE);
 }
 

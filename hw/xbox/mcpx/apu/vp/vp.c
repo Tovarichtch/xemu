@@ -1782,7 +1782,7 @@ static void voice_work_init(MCPXAPUState *d)
     qemu_cond_init(&vwd->work_finished);
     for (int i = 0; i < vwd->num_workers; i++) {
         vwd->workers_pending |= 1 << i;
-        qemu_thread_create(&vwd->workers[i].thread, "mcpx.voice_worker",
+        qemu_thread_create(&vwd->workers[i].thread, "mcpx.voice",
                            voice_worker_thread, d, QEMU_THREAD_JOINABLE);
     }
     qemu_cond_wait(&vwd->work_finished, &vwd->lock);

@@ -576,7 +576,7 @@ void pgraph_gl_init_shaders(PGRAPHState *pg)
     r->shader_cache.compare_nodes = shader_cache_entry_compare;
     r->shader_cache.post_node_evict = shader_cache_entry_post_evict;
 
-    qemu_thread_create(&r->shader_disk_thread, "pgraph.renderer_state->shader_cache",
+    qemu_thread_create(&r->shader_disk_thread, "nv2a.shdcache",
                        shader_reload_lru_from_disk, pg, QEMU_THREAD_JOINABLE);
 
     /* FIXME: Make this configurable */
@@ -704,8 +704,10 @@ void pgraph_gl_shader_cache_to_disk(ShaderBinding *binding)
     binding->program_size = program_size_copied;
     binding->cached = true;
 
-    char name[24];
-    snprintf(name, sizeof(name), "scache-%llx", (unsigned long long) binding->node.hash);
+    /* Fifteen characters is all a thread name may be; the low half of the
+     * hash tells the workers apart well enough. */
+    char name[16];
+    snprintf(name, sizeof(name), "scache-%08x", (unsigned) binding->node.hash);
     binding->save_thread = g_malloc0(sizeof(QemuThread));
     qemu_thread_create(binding->save_thread, name, shader_write_to_disk, binding, QEMU_THREAD_JOINABLE);
 }
