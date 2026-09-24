@@ -55,6 +55,8 @@ typedef struct VoiceWorkItem {
 
 typedef struct VoiceWorker {
     QemuThread thread;
+    /* CPU boost: per worker, so a frame wakes only those given voices. */
+    QemuCond work_pending;
     float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME];
     float sample_buf[NUM_SAMPLES_PER_FRAME][2];
     VoiceWorkItem queue[MCPX_HW_MAX_VOICES];
@@ -66,8 +68,8 @@ typedef struct VoiceWorkDispatch {
     int num_workers;
     VoiceWorker *workers;
     bool workers_should_exit;
-    QemuCond work_pending;
     uint64_t workers_pending;
+    QemuCond work_pending; /* stock: wakes every worker */
     QemuCond work_finished;
     float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME];
     VoiceWorkItem queue[MCPX_HW_MAX_VOICES];

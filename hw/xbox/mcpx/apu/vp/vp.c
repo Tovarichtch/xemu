@@ -4,6 +4,7 @@
  * Copyright (c) 2012 espes
  * Copyright (c) 2018-2019 Jannik Vogel
  * Copyright (c) 2019-2025 Matt Borgerson
+ * Copyright (c) 2026 Réda Chérif-Touil
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -19,6 +20,7 @@
  * License along with this library; if not, see <http://www.gnu.org/licenses/>.
  */
 
+#include "qemu/cpu-boost.h"
 #include "hw/xbox/mcpx/apu/apu_int.h"
 #include "adpcm.h"
 
@@ -97,12 +99,41 @@ static float attenuate(uint16_t vol)
     return (vol == 0xFFF) ? 0.0 : powf(10.0f, vol/(64.0 * -20.0f));
 }
 
+/* CPU boost: voice descriptors, SGE tables and samples are read through
+ * ram_ptr, as the ADPCM stream path does, not with a page translation per
+ * word. Writes keep the address space, so its dirty-memory tracking is
+ * untouched. */
+static inline uint32_t apu_ram_ldl(MCPXAPUState *d, hwaddr addr)
+{
+    if (xemu_cpu_boost && d->ram_ptr &&
+        addr + 4 <= memory_region_size(d->ram)) {
+        return ldl_le_p(&d->ram_ptr[addr]);
+    }
+    return ldl_le_phys(&address_space_memory, addr);
+}
+
+static inline uint16_t apu_ram_lduw(MCPXAPUState *d, hwaddr addr)
+{
+    if (xemu_cpu_boost && d->ram_ptr &&
+        addr + 2 <= memory_region_size(d->ram)) {
+        return lduw_le_p(&d->ram_ptr[addr]);
+    }
+    return lduw_le_phys(&address_space_memory, addr);
+}
+
+static inline uint8_t apu_ram_ldub(MCPXAPUState *d, hwaddr addr)
+{
+    if (xemu_cpu_boost && d->ram_ptr && addr < memory_region_size(d->ram)) {
+        return d->ram_ptr[addr];
+    }
+    return ldub_phys(&address_space_memory, addr);
+}
+
 static uint32_t voice_get_mask(MCPXAPUState *d, uint16_t voice_handle,
                                hwaddr offset, uint32_t mask)
 {
     hwaddr voice = d->regs[NV_PAPU_VPVADDR] + voice_handle * NV_PAVS_SIZE;
-    return (ldl_le_phys(&address_space_memory, voice + offset) & mask) >>
-           ctz32(mask);
+    return (apu_ram_ldl(d, voice + offset) & mask) >> ctz32(mask);
 }
 
 static void voice_set_mask(MCPXAPUState *d, uint16_t voice_handle,
@@ -110,7 +141,7 @@ static void voice_set_mask(MCPXAPUState *d, uint16_t voice_handle,
 {
     hwaddr voice = d->regs[NV_PAPU_VPVADDR]
                     + voice_handle * NV_PAVS_SIZE;
-    uint32_t v = ldl_le_phys(&address_space_memory, voice + offset) & ~mask;
+    uint32_t v = apu_ram_ldl(d, voice + offset) & ~mask;
     stl_le_phys(&address_space_memory, voice + offset,
                 v | ((val << ctz32(mask)) & mask));
 }
@@ -663,12 +694,13 @@ const MemoryRegionOps vp_ops = {
     .write = vp_write,
 };
 
-static hwaddr get_data_ptr(hwaddr sge_base, unsigned int max_sge, uint32_t addr)
+static hwaddr get_data_ptr(MCPXAPUState *d, hwaddr sge_base,
+                           unsigned int max_sge, uint32_t addr)
 {
     unsigned int entry = addr / TARGET_PAGE_SIZE;
     assert(entry <= max_sge);
     uint32_t prd_address =
-        ldl_le_phys(&address_space_memory, sge_base + entry * 4 * 2);
+        apu_ram_ldl(d, sge_base + entry * 4 * 2);
     // uint32_t prd_control =
     //     ldl_le_phys(&address_space_memory, sge_base + entry * 4 * 2 + 4);
     DPRINTF("Addr: 0x%08X, control: 0x%08X\n", prd_address, prd_control);
@@ -954,8 +986,8 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
         }
 
         hwaddr addr = d->regs[NV_PAPU_VPSSLADDR] + page * 8;
-        segment_offset = ldl_le_phys(&address_space_memory, addr);
-        segment_length = ldl_le_phys(&address_space_memory, addr + 4);
+        segment_offset = apu_ram_ldl(d, addr);
+        segment_length = apu_ram_ldl(d, addr + 4);
         assert(segment_offset != 0);
         assert(segment_length != 0);
         seg_len = (segment_length >> 0) & 0xffff;
@@ -1025,10 +1057,11 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
                     linear_addr += ba;
                     for (unsigned int word_index = 0;
                          word_index < (9 * samples_per_block); word_index++) {
-                        hwaddr addr = get_data_ptr(d->regs[NV_PAPU_VPSGEADDR],
-                                                   0xFFFFFFFF, linear_addr);
+                        hwaddr addr =
+                            get_data_ptr(d, d->regs[NV_PAPU_VPSGEADDR],
+                                         0xFFFFFFFF, linear_addr);
                         adpcm_block[word_index] =
-                            ldl_le_phys(&address_space_memory, addr);
+                            apu_ram_ldl(d, addr);
                         linear_addr += 4;
                     }
                 }
@@ -1051,7 +1084,7 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
                 addr = segment_offset + cbo * block_size;
             } else {
                 uint32_t linear_addr = ba + cbo * block_size;
-                addr = get_data_ptr(d->regs[NV_PAPU_VPSGEADDR], 0xFFFFFFFF,
+                addr = get_data_ptr(d, d->regs[NV_PAPU_VPSGEADDR], 0xFFFFFFFF,
                                     linear_addr);
             }
 
@@ -1060,19 +1093,19 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
                 float fval;
                 switch (sample_size) {
                 case NV_PAVS_VOICE_CFG_FMT_SAMPLE_SIZE_U8:
-                    ival = ldub_phys(&address_space_memory, addr);
+                    ival = apu_ram_ldub(d, addr);
                     fval = uint8_to_float(ival & 0xff);
                     break;
                 case NV_PAVS_VOICE_CFG_FMT_SAMPLE_SIZE_S16:
-                    ival = lduw_le_phys(&address_space_memory, addr);
+                    ival = apu_ram_lduw(d, addr);
                     fval = int16_to_float(ival & 0xffff);
                     break;
                 case NV_PAVS_VOICE_CFG_FMT_SAMPLE_SIZE_S24:
-                    ival = ldl_le_phys(&address_space_memory, addr);
+                    ival = apu_ram_ldl(d, addr);
                     fval = int24_to_float(ival);
                     break;
                 case NV_PAVS_VOICE_CFG_FMT_SAMPLE_SIZE_S32:
-                    ival = ldl_le_phys(&address_space_memory, addr);
+                    ival = apu_ram_ldl(d, addr);
                     fval = int32_to_float(ival);
                     break;
                 default:
@@ -1628,15 +1661,18 @@ static void *voice_worker_thread(void *arg)
             self->queue_len = 0;
         }
 
-        vwd->workers_pending &= ~(1 << worker_id);
-        if (!vwd->workers_pending) {
-            qemu_cond_signal(&vwd->work_finished);
+        if (!xemu_cpu_boost || (vwd->workers_pending & (1 << worker_id))) {
+            vwd->workers_pending &= ~(1 << worker_id);
+            if (!vwd->workers_pending) {
+                qemu_cond_signal(&vwd->work_finished);
+            }
         }
 
         int64_t end_time = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
         g_dbg.vp.workers[worker_id].time_us = end_time - start_time;
 
-        qemu_cond_wait(&vwd->work_pending, &vwd->lock);
+        qemu_cond_wait(xemu_cpu_boost ? &self->work_pending :
+                                        &vwd->work_pending, &vwd->lock);
     } while (!vwd->workers_should_exit);
 
     rcu_unregister_thread();
@@ -1742,9 +1778,18 @@ voice_work_dispatch(MCPXAPUState *d,
     if (vwd->queue_len) {
         memset(vwd->mixbins, 0, sizeof(vwd->mixbins));
 
-        // Signal workers and wait for completion
+        // Signal workers and wait for completion (CPU boost: only the
+        // workers given voices are woken).
         voice_work_schedule(d);
-        qemu_cond_broadcast(&vwd->work_pending);
+        if (xemu_cpu_boost) {
+            for (int i = 0; i < vwd->num_workers; i++) {
+                if (vwd->workers_pending & (1 << i)) {
+                    qemu_cond_signal(&vwd->workers[i].work_pending);
+                }
+            }
+        } else {
+            qemu_cond_broadcast(&vwd->work_pending);
+        }
         /* A wait can return before its signal (a spurious wakeup). */
         while (vwd->workers_pending) {
             qemu_cond_wait(&vwd->work_finished, &vwd->lock);
@@ -1783,6 +1828,7 @@ static void voice_work_init(MCPXAPUState *d)
     qemu_cond_init(&vwd->work_pending);
     qemu_cond_init(&vwd->work_finished);
     for (int i = 0; i < vwd->num_workers; i++) {
+        qemu_cond_init(&vwd->workers[i].work_pending);
         vwd->workers_pending |= 1 << i;
         qemu_thread_create(&vwd->workers[i].thread, "mcpx.voice",
                            voice_worker_thread, d, QEMU_THREAD_JOINABLE);
@@ -1799,7 +1845,11 @@ static void voice_work_finalize(MCPXAPUState *d)
 
     qemu_mutex_lock(&vwd->lock);
     vwd->workers_should_exit = true;
+    /* Whichever condition the workers wait on. */
     qemu_cond_broadcast(&vwd->work_pending);
+    for (int i = 0; i < vwd->num_workers; i++) {
+        qemu_cond_signal(&vwd->workers[i].work_pending);
+    }
     qemu_mutex_unlock(&vwd->lock);
     for (int i = 0; i < vwd->num_workers; i++) {
         qemu_thread_join(&vwd->workers[i].thread);
