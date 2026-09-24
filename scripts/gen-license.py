@@ -289,6 +289,14 @@ LIBS = [
         version="6926f5a0a78f22d42b074a0ab8032e07736babd4",
     ),
     Lib(
+        "mame-naomigd",
+        "https://github.com/mamedev/mame/blob/master/src/mame/sega/naomigd.cpp",
+        bsd_3clause,
+        "https://github.com/mamedev/mame/blob/master/docs/legal/BSD-3-Clause",
+        ships_static=all_platforms,
+        version="a88d9695e0b9225aade7bad26d8574cf1af7ec79",
+    ),
+    Lib(
         "nv2a_vsh_cpu",
         "https://github.com/xemu-project/nv2a_vsh_cpu",
         unlicense,
