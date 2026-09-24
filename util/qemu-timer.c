@@ -2,6 +2,7 @@
  * QEMU System Emulator
  *
  * Copyright (c) 2003-2008 Fabrice Bellard
+ * Copyright (c) 2026 Réda Chérif-Touil
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -25,6 +26,7 @@
 #include "qemu/osdep.h"
 #include "qemu/main-loop.h"
 #include "qemu/timer.h"
+#include "qemu/cpu-boost.h"
 #include "qemu/lockable.h"
 #include "system/cpu-timers.h"
 #include "exec/icount.h"
@@ -323,6 +325,51 @@ int qemu_timeout_ns_to_ms(int64_t ns)
 /* qemu implementation of g_poll which uses a nanosecond timeout but is
  * otherwise identical to g_poll
  */
+#if defined(XBOX) && defined(_WIN32) && !defined(CONFIG_PPOLL)
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
+#define XBOX_NO_HR_TIMER (-2)
+
+/* Poll the fds and a high-resolution waitable timer set to the timeout
+ * (Windows 10 1803+); XBOX_NO_HR_TIMER when this thread has none. */
+static int xbox_win_poll_hr(GPollFD *fds, guint nfds, int64_t timeout)
+{
+    static __thread HANDLE hr_timer;
+    static __thread int hr_state; /* 0 untried, 1 usable, -1 unavailable */
+
+    if (hr_state == 0) {
+        hr_timer = CreateWaitableTimerExW(
+            NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+            TIMER_ALL_ACCESS);
+        hr_state = hr_timer ? 1 : -1;
+    }
+    if (hr_state != 1) {
+        return XBOX_NO_HR_TIMER;
+    }
+    LARGE_INTEGER due;
+    due.QuadPart = -(timeout / 100); /* relative, 100 ns units */
+    if (due.QuadPart == 0) {
+        due.QuadPart = -1;
+    }
+    if (!SetWaitableTimer(hr_timer, &due, 0, NULL, NULL, FALSE)) {
+        return XBOX_NO_HR_TIMER;
+    }
+    GPollFD *all = g_newa(GPollFD, nfds + 1);
+    memcpy(all, fds, nfds * sizeof(GPollFD));
+    all[nfds].fd = (gintptr)hr_timer;
+    all[nfds].events = G_IO_IN;
+    all[nfds].revents = 0;
+    /* The millisecond timeout only backs the timer up. */
+    int ret = g_poll(all, nfds + 1, qemu_timeout_ns_to_ms(timeout) + 1);
+    memcpy(fds, all, nfds * sizeof(GPollFD));
+    if (ret > 0 && all[nfds].revents) {
+        ret--; /* the timer's own wake is not an fd event */
+    }
+    return ret;
+}
+#endif
+
 int qemu_poll_ns(GPollFD *fds, guint nfds, int64_t timeout)
 {
 #ifdef CONFIG_PPOLL
@@ -344,17 +391,28 @@ int qemu_poll_ns(GPollFD *fds, guint nfds, int64_t timeout)
 #else
 
 #ifdef XBOX
-    /* Timers are facilitated by this function. Busy-wait if the deadline is
-     * near, to avoid missing deadlines due to costly sleeps.
-     */
-    #define XBOX_BUSYWAIT_THRESHOLD_NS 1250000
-    if ((0 < timeout) && (timeout < XBOX_BUSYWAIT_THRESHOLD_NS)) {
-        int64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
-        int64_t end = now + timeout;
-        while (now < end) {
-            now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+    /* Timers are facilitated by this function. A poll honours only whole
+     * milliseconds, so a nearer deadline is busy-waited, or, with CPU boost
+     * on Windows 10 1803+, woken by a high-resolution waitable timer polled
+     * with the handles. */
+    if (timeout > 0) {
+#ifdef _WIN32
+        if (xemu_cpu_boost) {
+            int ret = xbox_win_poll_hr(fds, nfds, timeout);
+            if (ret != XBOX_NO_HR_TIMER) {
+                return ret;
+            }
         }
-        timeout = 0;
+#endif
+        #define XBOX_BUSYWAIT_THRESHOLD_NS 1250000
+        if (timeout < XBOX_BUSYWAIT_THRESHOLD_NS) {
+            int64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+            int64_t end = now + timeout;
+            while (now < end) {
+                now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+            }
+            timeout = 0;
+        }
     }
 #endif
 
