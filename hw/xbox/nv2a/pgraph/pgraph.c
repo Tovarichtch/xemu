@@ -4,6 +4,7 @@
  * Copyright (c) 2012 espes
  * Copyright (c) 2015 Jannik Vogel
  * Copyright (c) 2018-2025 Matt Borgerson
+ * Copyright (c) 2026 Réda Chérif-Touil
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -177,6 +178,20 @@ void pgraph_write(void *opaque, hwaddr addr, uint64_t val, unsigned int size)
     qemu_mutex_unlock(&d->pfifo.lock);
 }
 
+static void pgraph_update_irq_bh(void *opaque)
+{
+    NV2AState *d = opaque;
+    nv2a_update_irq(d);
+}
+
+/* Raising the IRQ needs the BQL, and taking it on the pfifo thread can
+ * deadlock (an IDE DMA holding the BQL waits for the memory-access flush
+ * only this thread performs): raise it from a main-loop bottom half. */
+static void pgraph_schedule_irq_update(NV2AState *d)
+{
+    aio_bh_schedule_oneshot(qemu_get_aio_context(), pgraph_update_irq_bh, d);
+}
+
 void pgraph_context_switch(NV2AState *d, unsigned int channel_id)
 {
     PGRAPHState *pg = &d->pgraph;
@@ -198,12 +213,8 @@ void pgraph_context_switch(NV2AState *d, unsigned int channel_id)
                             NV_PGRAPH_DEBUG_3_HW_CONTEXT_SWITCH));
 
         pg->waiting_for_context_switch = true;
-        qemu_mutex_unlock(&pg->lock);
-        bql_lock();
         pg->pending_interrupts |= NV_PGRAPH_INTR_CONTEXT_SWITCH;
-        nv2a_update_irq(d);
-        bql_unlock();
-        qemu_mutex_lock(&pg->lock);
+        pgraph_schedule_irq_update(d);
     }
 }
 
@@ -850,11 +861,7 @@ DEF_METHOD(NV097, NO_OPERATION)
     pg->pending_interrupts |= NV_PGRAPH_INTR_ERROR;
     pg->waiting_for_nop = true;
 
-    qemu_mutex_unlock(&pg->lock);
-    bql_lock();
-    nv2a_update_irq(d);
-    bql_unlock();
-    qemu_mutex_lock(&pg->lock);
+    pgraph_schedule_irq_update(d);
 }
 
 DEF_METHOD(NV097, WAIT_FOR_IDLE)
