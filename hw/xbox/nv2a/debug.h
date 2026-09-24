@@ -151,7 +151,6 @@ extern NV2AStats g_nv2a_stats;
 const char *nv2a_profile_get_counter_name(unsigned int cnt);
 int nv2a_profile_get_counter_value(unsigned int cnt);
 void nv2a_profile_increment(void);
-void nv2a_profile_present(void);
 void nv2a_profile_flip_stall(void);
 
 static inline void nv2a_profile_inc_counter(enum NV2A_PROF_COUNTERS_ENUM cnt)
