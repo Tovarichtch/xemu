@@ -439,6 +439,16 @@ static void shader_load_from_disk(PGRAPHState *pg, uint64_t hash)
         goto error;
     }
 
+    {
+        /* The cached blob embeds a raw ShaderState: reject files written by
+         * a build whose layout differs, or its size fields are garbage. */
+        uint64_t cached_state_size;
+        READ_OR_ERR(&cached_state_size, sizeof(cached_state_size));
+        if (cached_state_size != sizeof(state)) {
+            fclose(shader_file);
+            goto error;
+        }
+    }
     READ_OR_ERR(&program_binary_format, sizeof(program_binary_format));
     READ_OR_ERR(&state, sizeof(state));
     READ_OR_ERR(&shader_size, sizeof(shader_size));
@@ -651,6 +661,10 @@ static void *shader_write_to_disk(void *arg)
     WRITE_OR_ERR(&gl_vendor_len, sizeof(gl_vendor_len));
     WRITE_OR_ERR(shader_gl_vendor, gl_vendor_len);
 
+    {
+        uint64_t state_size = sizeof(binding->state);
+        WRITE_OR_ERR(&state_size, sizeof(state_size));
+    }
     WRITE_OR_ERR(&binding->program_format, sizeof(binding->program_format));
     WRITE_OR_ERR(&binding->state, sizeof(binding->state));
 
