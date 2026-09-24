@@ -36,9 +36,22 @@ uint64_t pcrtc_read(void *opaque, hwaddr addr, unsigned int size)
         case NV_PCRTC_START:
             r = d->pcrtc.start;
             break;
-        case NV_PCRTC_RASTER:
-            r = d->pcrtc.raster++;
+        case NV_PCRTC_RASTER: {
+            /* HEURISTIC: engines that poll the beam read a scanline derived
+             * from the realtime clock and the vblank deadline, 525 lines a
+             * frame counted from the vblank interrupt; where the hardware
+             * starts its count, and its vblank bit, are not modelled. */
+            int64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+            int64_t into_frame = NV2A_VBLANK_INTERVAL_NS -
+                                 (qatomic_read(&d->vblank_deadline) - now);
+            if (into_frame < 0) {
+                into_frame = 0;
+            } else if (into_frame >= NV2A_VBLANK_INTERVAL_NS) {
+                into_frame = NV2A_VBLANK_INTERVAL_NS - 1;
+            }
+            r = muldiv64(into_frame, 525, NV2A_VBLANK_INTERVAL_NS);
             break;
+        }
         default:
             break;
     }

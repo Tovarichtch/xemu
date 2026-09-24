@@ -194,22 +194,12 @@ int nv2a_get_screen_off(void)
     return g_nv2a->vga.sr[VGA_SEQ_CLOCK_MODE] & VGA_SR01_SCREEN_OFF;
 }
 
-uint64_t perf_cnt_vblank = 0;
-uint32_t perf_pcrtc_enabled = 0;
-
-#include <time.h>
-
-#define NV2A_VBLANK_INTERVAL_NS 16666666LL
-
 /* PCRTC VBlank driven by REALTIME wall clock at ~60Hz.
  * Decoupled from guest CPU speed — fires regardless of TCG load. */
 static void nv2a_realtime_vblank_cb(void *opaque)
 {
     NV2AState *d = opaque;
     d->pcrtc.pending_interrupts |= NV_PCRTC_INTR_0_VBLANK;
-    d->pcrtc.raster = 0;
-    perf_cnt_vblank++;
-    perf_pcrtc_enabled = d->pcrtc.enabled_interrupts;
 
     nv2a_update_irq(d);
 
@@ -222,11 +212,6 @@ static void nv2a_realtime_vblank_cb(void *opaque)
         d->vblank_deadline = now + NV2A_VBLANK_INTERVAL_NS;
     }
     timer_mod_ns(d->vblank_timer, d->vblank_deadline);
-}
-
-/* Legacy entry point — no longer called from OHCI */
-void nv2a_pcrtc_vblank_tick(void)
-{
 }
 
 static void nv2a_vga_gfx_update(void *opaque)
@@ -289,9 +274,6 @@ static void nv2a_init_vga(NV2AState *d)
     d->vblank_deadline = qemu_clock_get_ns(QEMU_CLOCK_REALTIME) +
                          NV2A_VBLANK_INTERVAL_NS;
     timer_mod_ns(d->vblank_timer, d->vblank_deadline);
-
-    /* PCRTC vblank: generated from OHCI frame boundary at ~60Hz.
-     * See nv2a_pcrtc_vblank_tick() called from hcd-ohci.c. */
 
     /* hacky. swap out vga's vram */
     memory_region_destroy(&vga->vram);

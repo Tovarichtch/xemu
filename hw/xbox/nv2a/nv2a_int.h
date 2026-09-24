@@ -54,6 +54,8 @@
 
 #define NV2A_DEVICE(obj) OBJECT_CHECK(NV2AState, (obj), "nv2a")
 
+#define NV2A_VBLANK_INTERVAL_NS 16666666LL
+
 enum FIFOEngine {
     ENGINE_SOFTWARE = 0,
     ENGINE_GRAPHICS = 1,
@@ -128,7 +130,6 @@ typedef struct NV2AState {
         uint32_t pending_interrupts;
         uint32_t enabled_interrupts;
         hwaddr start;
-        uint32_t raster;
     } pcrtc;
 
     struct {
