@@ -860,7 +860,7 @@ int mem_access_callback_address_matches(CPUState *cpu, hwaddr addr, hwaddr len)
     MemAccessCallback *cb;
     QTAILQ_FOREACH(cb, &cpu->mem_access_callbacks, entry) {
         if (access_callback_address_matches(cb, addr, len)) {
-            ret |= BP_MEM_READ | BP_MEM_WRITE;
+            ret |= qatomic_read(&cb->watch_flags);
         }
     }
 
@@ -887,6 +887,7 @@ MemAccessCallback *mem_access_callback_insert(CPUState *cpu, MemoryRegion *mr,
     cb->len = len;
     cb->func = func;
     cb->opaque = opaque;
+    cb->watch_flags = BP_MEM_READ | BP_MEM_WRITE;
 
     async_safe_run_on_cpu(cpu, do_mem_access_callback_insert,
                           RUN_ON_CPU_HOST_PTR(cb));
@@ -916,6 +917,20 @@ void mem_access_callback_remove_by_ref(CPUState *cpu, MemAccessCallback *cb)
 
     // FIXME: flush only applicable pages
     tlb_flush_all_cpus_synced(cpu);
+}
+
+void mem_access_callback_set_flags(CPUState *cpu, MemAccessCallback *cb,
+                                   int flags)
+{
+    if (!cb || qatomic_read(&cb->watch_flags) == flags) {
+        return;
+    }
+    qatomic_set(&cb->watch_flags, flags);
+    /* Filled TLB entries keep the old flags. Never flush them at once: a
+     * caller in the access path (mmu_watch_or_dirty) still uses its entry's
+     * xlat_section. Queued, the flush applies once cpu_exit() ends the TB. */
+    tlb_flush_all_cpus_synced(cpu);
+    cpu_exit(cpu);
 }
 
 void mem_check_access_callback_vaddr(CPUState *cpu,
