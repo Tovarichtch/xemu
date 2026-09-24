@@ -518,6 +518,34 @@ static bool create_logical_device(PGRAPHState *pg, Error **errp)
 
     void *next_struct = NULL;
 
+    /* UPSTREAM CANDIDATE: in SPIR-V 1.6 glslang lowers discard to
+     * OpDemoteToHelperInvocation, which needs the Vulkan 1.3 feature
+     * shaderDemoteToHelperInvocation enabled
+     * (VUID-VkShaderModuleCreateInfo-pCode-08740). It is enabled where the
+     * device has it; elsewhere the shaders are built for SPIR-V 1.5, which a
+     * Vulkan 1.2 device accepts (a 1.1 device accepts neither). */
+    VkPhysicalDeviceVulkan13Features v13_query = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
+    };
+    if (r->vk_api_version >= VK_API_VERSION_1_3) {
+        VkPhysicalDeviceFeatures2 features2_query = {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+            .pNext = &v13_query,
+        };
+        vkGetPhysicalDeviceFeatures2(r->physical_device, &features2_query);
+    }
+    pgraph_vk_spirv_1_6 = v13_query.shaderDemoteToHelperInvocation;
+
+    VkPhysicalDeviceVulkan13Features v13_features;
+    if (pgraph_vk_spirv_1_6) {
+        v13_features = (VkPhysicalDeviceVulkan13Features){
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
+            .shaderDemoteToHelperInvocation = VK_TRUE,
+            .pNext = next_struct,
+        };
+        next_struct = &v13_features;
+    }
+
     VkPhysicalDeviceCustomBorderColorFeaturesEXT custom_border_features;
     if (r->custom_border_color_extension_enabled) {
         custom_border_features = (VkPhysicalDeviceCustomBorderColorFeaturesEXT){

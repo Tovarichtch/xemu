@@ -140,6 +140,9 @@ void pgraph_vk_finalize_glsl_compiler(void)
     glslang_finalize_process();
 }
 
+/* Chosen at device creation (instance.c); SPIR-V 1.5 until then. */
+bool pgraph_vk_spirv_1_6;
+
 GByteArray *pgraph_vk_compile_glsl_to_spv(glslang_stage_t stage,
                                           const char *glsl_source)
 {
@@ -147,9 +150,11 @@ GByteArray *pgraph_vk_compile_glsl_to_spv(glslang_stage_t stage,
         .language = GLSLANG_SOURCE_GLSL,
         .stage = stage,
         .client = GLSLANG_CLIENT_VULKAN,
-        .client_version = GLSLANG_TARGET_VULKAN_1_3,
+        .client_version = pgraph_vk_spirv_1_6 ? GLSLANG_TARGET_VULKAN_1_3
+                                              : GLSLANG_TARGET_VULKAN_1_2,
         .target_language = GLSLANG_TARGET_SPV,
-        .target_language_version = GLSLANG_TARGET_SPV_1_6,
+        .target_language_version = pgraph_vk_spirv_1_6 ? GLSLANG_TARGET_SPV_1_6
+                                                       : GLSLANG_TARGET_SPV_1_5,
         .code = glsl_source,
         .default_version = 460,
         .default_profile = GLSLANG_NO_PROFILE,
