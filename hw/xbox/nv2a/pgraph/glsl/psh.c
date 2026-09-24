@@ -769,6 +769,9 @@ static void psh_append_depth_range_test(const struct PixelShader *ps,
 
 // Adjust the s, t coordinates in the given VAR to account for the 4 texel
 // border supported by the hardware.
+/* UPSTREAM CANDIDATE: the reciprocals of the real texture sizes are printed
+ * with nine significant digits: six decimals (%f) are half a texel off at
+ * 1024. */
 static void apply_border_adjustment(const struct PixelShader *ps, MString *vars, int tex_index, const char *var_template)
 {
     int i = tex_index;
@@ -782,7 +785,7 @@ static void apply_border_adjustment(const struct PixelShader *ps, MString *vars,
     mstring_append_fmt(
         vars,
         "vec3 t%dLogicalSize = vec3(%f, %f, %f);\n"
-        "%s.xyz = (%s.xyz * t%dLogicalSize + vec3(4, 4, 4)) * vec3(%f, %f, %f);\n",
+        "%s.xyz = (%s.xyz * t%dLogicalSize + vec3(4, 4, 4)) * vec3(%.9g, %.9g, %.9g);\n",
         i, ps->state->border_logical_size[i][0], ps->state->border_logical_size[i][1], ps->state->border_logical_size[i][2],
         var_name, var_name, i, ps->state->border_inv_real_size[i][0], ps->state->border_inv_real_size[i][1], ps->state->border_inv_real_size[i][2]);
 }
