@@ -948,6 +948,18 @@ void ScaleDimensions(int src_width, int src_height, int max_width, int max_heigh
     }
 }
 
+/* What the framebuffer shows, taken from the machine under the main-loop
+ * lock (LayoutFramebuffer, RenderFramebufferToPng), so that drawing it needs
+ * no lock. */
+static uint8_t fb_palette[256 * 3];
+static bool fb_screen_off;
+
+static void TakeFramebufferState(void)
+{
+    memcpy(fb_palette, nv2a_get_dac_palette(), sizeof(fb_palette));
+    fb_screen_off = nv2a_get_screen_off();
+}
+
 void RenderFramebuffer(GLint tex, int width, int height, bool flip, float scale[2])
 {
     glActiveTexture(GL_TEXTURE0);
@@ -974,10 +986,9 @@ void RenderFramebuffer(GLint tex, int width, int height, bool flip, float scale[
     glUniform4f(s->tex_scale_offset_loc, 1.0, 1.0, 0, 0);
     glUniform1i(s->tex_loc, 0);
 
-    const uint8_t *palette = nv2a_get_dac_palette();
     for (int i = 0; i < 256; i++) {
-        uint32_t e = (palette[i * 3 + 2] << 16) | (palette[i * 3 + 1] << 8) |
-                     palette[i * 3];
+        uint32_t e = (fb_palette[i * 3 + 2] << 16) |
+                     (fb_palette[i * 3 + 1] << 8) | fb_palette[i * 3];
         glUniform1ui(s->palette_loc[i], e);
     }
     glUniform1f(s->crt_gamma_loc, g_config.display.crt_gamma);
@@ -985,7 +996,7 @@ void RenderFramebuffer(GLint tex, int width, int height, bool flip, float scale[
     glClearColor(0, 0, 0, 0);
     glClear(GL_COLOR_BUFFER_BIT);
 
-    if (!nv2a_get_screen_off()) {
+    if (!fb_screen_off) {
         glDrawElements(GL_TRIANGLE_FAN, 4, GL_UNSIGNED_INT, NULL);
     }
 }
@@ -1005,10 +1016,15 @@ static float GetDisplayAspectRatio(int width, int height)
     }
 }
 
-void RenderFramebuffer(GLint tex, int width, int height, bool flip)
+/* Where the framebuffer goes in the window, set under the main-loop lock by
+ * LayoutFramebuffer and drawn by RenderFramebuffer. */
+static float fb_scale[2] = { 1.0f, 1.0f };
+static int fb_width, fb_height;
+
+void LayoutFramebuffer(GLint tex, int width, int height)
 {
     int tw, th;
-    float scale[2];
+    float *scale = fb_scale;
     int viewport_width, viewport_height;
 
     glActiveTexture(GL_TEXTURE0);
@@ -1046,7 +1062,14 @@ void RenderFramebuffer(GLint tex, int width, int height, bool flip)
     viewport_coords[2] = viewport_width;
     viewport_coords[3] = viewport_height;
 
-    RenderFramebuffer(tex, width, height, flip, scale);
+    fb_width = width;
+    fb_height = height;
+    TakeFramebufferState();
+}
+
+void RenderFramebuffer(GLint tex, bool flip)
+{
+    RenderFramebuffer(tex, fb_width, fb_height, flip, fb_scale);
 }
 
 bool RenderFramebufferToPng(GLuint tex, bool flip, std::vector<uint8_t> &png, int max_width, int max_height)
@@ -1072,6 +1095,7 @@ bool RenderFramebufferToPng(GLuint tex, bool flip, std::vector<uint8_t> &png, in
     bool blend = glIsEnabled(GL_BLEND);
     if (blend) glDisable(GL_BLEND);
     float scale[2] = {1.0, 1.0};
+    TakeFramebufferState();
     RenderFramebuffer(tex, width, height, !flip, scale);
     if (blend) glEnable(GL_BLEND);
     glPixelStorei(GL_PACK_ROW_LENGTH, width);

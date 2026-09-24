@@ -870,6 +870,7 @@ static void gl_render_frame(struct xemu_console *scon)
     xemu_hud_update();
     xemu_main_loop_unlock();
 
+    xemu_hud_render_framebuffer();
     xemu_hud_render();
     glFinish();
 
