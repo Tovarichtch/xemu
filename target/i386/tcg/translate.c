@@ -2,6 +2,7 @@
  *  i386 translation
  *
  *  Copyright (c) 2003 Fabrice Bellard
+ *  Copyright (c) 2026 Réda Chérif-Touil
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -34,6 +35,7 @@
 #include "decode-new.h"
 
 #include "exec/log.h"
+#include "ui/xemu-settings.h" /* CPU boost's setting, on every host */
 
 static int g_use_hard_fpu;
 
@@ -238,6 +240,12 @@ typedef struct DisasContext {
     int fpstt_delta;
     TCGv_fp fpregs[8];
     TCGv_fp ft0;
+    /* Deferred FIP/FDP stores, with CPU boost (see gen_flush_fip) */
+    bool fip_pend;
+    int fdp_pend_seg; /* -1 = none */
+    TCGv fip_val;
+    TCGv fdp_val;
+    TCGv_i32 fip_sel; /* the flush's own register, never the instruction's */
 } DisasContext;
 
 /*
@@ -269,6 +277,12 @@ typedef struct DisasContext {
  * EFLAGS.TF to determine singlestep trap (SYSCALL/SYSRET).
  */
 #define DISAS_EOB_RECHECK_TF   DISAS_TARGET_4
+
+/*
+ * EIP and CS have already been updated by a far call or jump: as
+ * DISAS_JUMP, but the new cs_base and flags are only known at run time.
+ */
+#define DISAS_JUMP_FAR         DISAS_TARGET_5
 
 /* The environment in which user-only runs is constrained. */
 #ifdef CONFIG_USER_ONLY
@@ -1658,6 +1672,10 @@ static void gen_flcr(DisasContext *s)
     tcg_gen_andi_i32(v, v, 0xc00);
     tcg_gen_shli_i32(v, v, 3);
     tcg_gen_ori_i32(v, v, 0x1f80);
+    if (xemu_cpu_boost) {
+        /* The host MXCSR now rounds as the x87: native SSE must know. */
+        tcg_gen_st_i32(v, tcg_env, offsetof(CPUX86State, xemu_host_mxcsr));
+    }
     tcg_gen_flcr(v);
     s->flcr_set = true;
 }
@@ -1721,11 +1739,48 @@ static void gen_mov64i_f64(TCGv_f64 ret, TCGv_i64 arg)
 #define fp_pc_wrapper(f) \
     (fpu_using_double_precision(s) ? glue(f, _f64) : glue(f, _f32))
 
+/*
+ * FIP/FCS and FDP/FDS, set by x87 instructions, are read only by helpers
+ * (fstenv, fsave), each preceded by gen_flush_fip(): their stores wait for
+ * it, and only a fault inside the block sees them stale, as cached ST(i) do.
+ * With CPU boost off they are stored per instruction.
+ *
+ * gen_flush_fip() runs from gen_bb_epilogue(), before every helper call and
+ * basic-block end, while s->tmp* may hold the helper's arguments (fldcw's in
+ * s->tmp2_i32): never use them there; fip_sel, one temp per block, carries
+ * both selectors.
+ */
+static void gen_flush_fip(DisasContext *s)
+{
+    if (!s->fip_pend && s->fdp_pend_seg < 0) {
+        return;
+    }
+    if (!s->fip_sel) {
+        s->fip_sel = tcg_temp_new_i32();
+    }
+    if (s->fip_pend) {
+        s->fip_pend = false;
+        tcg_gen_ld_i32(s->fip_sel, tcg_env,
+                       offsetof(CPUX86State, segs[R_CS].selector));
+        tcg_gen_st16_i32(s->fip_sel, tcg_env, offsetof(CPUX86State, fpcs));
+        tcg_gen_st_tl(s->fip_val, tcg_env, offsetof(CPUX86State, fpip));
+    }
+    if (s->fdp_pend_seg >= 0) {
+        tcg_gen_ld_i32(s->fip_sel, tcg_env,
+                       offsetof(CPUX86State,
+                                segs[s->fdp_pend_seg].selector));
+        s->fdp_pend_seg = -1;
+        tcg_gen_st16_i32(s->fip_sel, tcg_env, offsetof(CPUX86State, fpds));
+        tcg_gen_st_tl(s->fdp_val, tcg_env, offsetof(CPUX86State, fpdp));
+    }
+}
+
 static void gen_flush_fp(DisasContext *s)
 {
     fp_pc_wrapper(flush_fp_regs)(s);
     s->fpstt_delta = 0;
     s->flcr_set = false;
+    gen_flush_fip(s);
 }
 
 /*
@@ -2552,7 +2607,7 @@ static void gen_far_call(DisasContext *s)
                               tcg_constant_i32(s->dflag - 1),
                               eip_next_i32(s));
     }
-    s->base.is_jmp = DISAS_JUMP;
+    s->base.is_jmp = DISAS_JUMP_FAR;
 }
 
 static void gen_far_jmp(DisasContext *s)
@@ -2566,7 +2621,7 @@ static void gen_far_jmp(DisasContext *s)
         gen_op_movl_seg_real(s, R_CS, s->T1);
         gen_op_jmp_v(s, s->T0);
     }
-    s->base.is_jmp = DISAS_JUMP;
+    s->base.is_jmp = DISAS_JUMP_FAR;
 }
 
 static void gen_svm_check_intercept(DisasContext *s, uint32_t type)
@@ -2786,10 +2841,26 @@ gen_eob(DisasContext *s, int mode)
         tcg_gen_exit_tb(NULL, 0);
     } else if (s->flags & HF_TF_MASK) {
         gen_helper_single_step(tcg_env);
-    } else if (mode == DISAS_JUMP &&
+    } else if ((mode == DISAS_JUMP || mode == DISAS_JUMP_FAR) &&
                /* give irqs a chance to happen */
                !inhibit_reset) {
-        tcg_gen_lookup_and_goto_ptr();
+        /* CPU boost: a near jump probes the jump cache inline, without the
+         * helper call; a far one needs the cs_base and flags of run time. */
+        if (!xemu_cpu_boost || mode == DISAS_JUMP_FAR ||
+            (s->flags & HF_RF_MASK)) {
+            tcg_gen_lookup_and_goto_ptr();
+        } else {
+            TCGv_i64 pc = tcg_temp_new_i64();
+
+            tcg_gen_extu_tl_i64(pc, cpu_eip);
+            if (!(s->flags & HF_CS64_MASK)) {
+                if (s->cs_base) {
+                    tcg_gen_addi_i64(pc, pc, s->cs_base);
+                }
+                tcg_gen_ext32u_i64(pc, pc);
+            }
+            tcg_gen_lookup_and_goto_ptr_fast(pc, s->cs_base, s->flags);
+        }
     } else {
         tcg_gen_exit_tb(NULL, 0);
     }
@@ -3153,13 +3224,21 @@ static void gen_x87(DisasContext *s, X86DecodedInsn *decode)
         if (update_fdp) {
             int last_seg = s->override >= 0 ? s->override : decode->mem.def_seg;
 
-            tcg_gen_ld_i32(s->tmp2_i32, tcg_env,
-                           offsetof(CPUX86State,
-                                    segs[last_seg].selector));
-            tcg_gen_st16_i32(s->tmp2_i32, tcg_env,
-                             offsetof(CPUX86State, fpds));
-            tcg_gen_st_tl(last_addr, tcg_env,
-                          offsetof(CPUX86State, fpdp));
+            if (xemu_cpu_boost) {
+                if (!s->fdp_val) {
+                    s->fdp_val = tcg_temp_new();
+                }
+                tcg_gen_mov_tl(s->fdp_val, last_addr);
+                s->fdp_pend_seg = last_seg;
+            } else {
+                tcg_gen_ld_i32(s->tmp2_i32, tcg_env,
+                               offsetof(CPUX86State,
+                                        segs[last_seg].selector));
+                tcg_gen_st16_i32(s->tmp2_i32, tcg_env,
+                                 offsetof(CPUX86State, fpds));
+                tcg_gen_st_tl(last_addr, tcg_env,
+                              offsetof(CPUX86State, fpdp));
+            }
         }
     } else {
         /* register float ops */
@@ -3482,12 +3561,20 @@ static void gen_x87(DisasContext *s, X86DecodedInsn *decode)
     }
 
     if (update_fip) {
-        tcg_gen_ld_i32(s->tmp2_i32, tcg_env,
-                       offsetof(CPUX86State, segs[R_CS].selector));
-        tcg_gen_st16_i32(s->tmp2_i32, tcg_env,
-                         offsetof(CPUX86State, fpcs));
-        tcg_gen_st_tl(eip_cur_tl(s),
-                      tcg_env, offsetof(CPUX86State, fpip));
+        if (xemu_cpu_boost) {
+            if (!s->fip_val) {
+                s->fip_val = tcg_temp_new();
+            }
+            tcg_gen_mov_tl(s->fip_val, eip_cur_tl(s));
+            s->fip_pend = true;
+        } else {
+            tcg_gen_ld_i32(s->tmp2_i32, tcg_env,
+                           offsetof(CPUX86State, segs[R_CS].selector));
+            tcg_gen_st16_i32(s->tmp2_i32, tcg_env,
+                             offsetof(CPUX86State, fpcs));
+            tcg_gen_st_tl(eip_cur_tl(s),
+                          tcg_env, offsetof(CPUX86State, fpip));
+        }
     }
     return;
 
@@ -4230,6 +4317,7 @@ void tcg_x86_init(void)
 #if defined(XBOX) && defined(__x86_64__)
     g_use_hard_fpu = g_config.perf.hard_fpu;
 #endif
+    xemu_cpu_boost = g_config.perf.native_sse;
 }
 
 static void i386_tr_init_disas_context(DisasContextBase *dcbase, CPUState *cpu)
@@ -4289,6 +4377,11 @@ static void i386_tr_init_disas_context(DisasContextBase *dcbase, CPUState *cpu)
         dc->fpregs[i] = NULL;
     }
     dc->fpstt_delta = 0;
+    dc->fip_pend = false;
+    dc->fdp_pend_seg = -1;
+    dc->fip_val = NULL;
+    dc->fdp_val = NULL;
+    dc->fip_sel = NULL;
     dc->ft0 = NULL;
     dc->flcr_set = false;
 }
@@ -4403,6 +4496,7 @@ static void i386_tr_tb_stop(DisasContextBase *dcbase, CPUState *cpu)
     case DISAS_EOB_ONLY:
     case DISAS_EOB_RECHECK_TF:
     case DISAS_JUMP:
+    case DISAS_JUMP_FAR:
         gen_eob(dc, dc->base.is_jmp);
         break;
     default:

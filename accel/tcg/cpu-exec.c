@@ -2,6 +2,7 @@
  *  emulator main execution loop
  *
  *  Copyright (c) 2003-2005 Fabrice Bellard
+ *  Copyright (c) 2026 Réda Chérif-Touil
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -47,6 +48,7 @@
 #include "tb-context.h"
 #include "tb-internal.h"
 #include "internal-common.h"
+#include "qemu/cpu-boost.h"
 
 /* -icount align implementation. */
 
@@ -232,6 +234,16 @@ TranslationBlock *inv_tb_htable_lookup(CPUState *cpu, TCGTBCPUState s)
     return tb_htable_lookup_common(cpu, s, &tb_ctx.inv_htable, inv_tb_lookup_cmp);
 }
 
+/* HACK (CPU boost): xemu builds only x86, so this hottest hook is called
+ * directly, not through two pointers. */
+TCGTBCPUState x86_get_tb_cpu_state(CPUState *cs);
+
+static inline TCGTBCPUState xemu_get_tb_cpu_state(CPUState *cpu)
+{
+    return xemu_cpu_boost ? x86_get_tb_cpu_state(cpu) :
+                            cpu->cc->tcg_ops->get_tb_cpu_state(cpu);
+}
+
 /**
  * tb_lookup:
  * @cpu: CPU that will execute the returned translation block
@@ -407,7 +419,7 @@ const void *HELPER(lookup_tb_ptr)(CPUArchState *env)
      */
     cpu->neg.can_do_io = true;
 
-    TCGTBCPUState s = cpu->cc->tcg_ops->get_tb_cpu_state(cpu);
+    TCGTBCPUState s = xemu_get_tb_cpu_state(cpu);
     s.cflags = curr_cflags(cpu);
 
     if (check_for_breakpoints(cpu, s.pc, &s.cflags)) {
@@ -579,7 +591,7 @@ void cpu_exec_step_atomic(CPUState *cpu)
         g_assert(!cpu->running);
         cpu->running = true;
 
-        TCGTBCPUState s = cpu->cc->tcg_ops->get_tb_cpu_state(cpu);
+        TCGTBCPUState s = xemu_get_tb_cpu_state(cpu);
         s.cflags = curr_cflags(cpu);
 
         /* Execute in a serial context. */
@@ -965,7 +977,7 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
 
         while (!cpu_handle_interrupt(cpu, &last_tb)) {
             TranslationBlock *tb;
-            TCGTBCPUState s = cpu->cc->tcg_ops->get_tb_cpu_state(cpu);
+            TCGTBCPUState s = xemu_get_tb_cpu_state(cpu);
             s.cflags = cpu->cflags_next_tb;
 
             /*

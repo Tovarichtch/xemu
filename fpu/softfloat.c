@@ -83,6 +83,7 @@ this code that are retained.
 #include <math.h>
 #include "qemu/bitops.h"
 #include "fpu/softfloat.h"
+#include "qemu/cpu-boost.h"
 
 /* We only need stdlib for abort() */
 
@@ -2166,18 +2167,44 @@ static double hard_f64_mul(double a, double b)
     return a * b;
 }
 
+/*
+ * CPU boost: a product with a zero operand is exactly zero and raises no
+ * flag, so only two normal operands can underflow and need the software path.
+ */
+static bool f32_mul_post(union_float32 a, union_float32 b)
+{
+    if (!xemu_cpu_boost) {
+        return f32_addsubmul_post(a, b);
+    }
+    if (QEMU_HARDFLOAT_2F32_USE_FP) {
+        return fpclassify(a.h) != FP_ZERO && fpclassify(b.h) != FP_ZERO;
+    }
+    return !float32_is_zero(a.s) && !float32_is_zero(b.s);
+}
+
+static bool f64_mul_post(union_float64 a, union_float64 b)
+{
+    if (!xemu_cpu_boost) {
+        return f64_addsubmul_post(a, b);
+    }
+    if (QEMU_HARDFLOAT_2F64_USE_FP) {
+        return fpclassify(a.h) != FP_ZERO && fpclassify(b.h) != FP_ZERO;
+    }
+    return !float64_is_zero(a.s) && !float64_is_zero(b.s);
+}
+
 float32 QEMU_FLATTEN
 float32_mul(float32 a, float32 b, float_status *s)
 {
     return float32_gen2(a, b, s, hard_f32_mul, soft_f32_mul,
-                        f32_is_zon2, f32_addsubmul_post);
+                        f32_is_zon2, f32_mul_post);
 }
 
 float64 QEMU_FLATTEN
 float64_mul(float64 a, float64 b, float_status *s)
 {
     return float64_gen2(a, b, s, hard_f64_mul, soft_f64_mul,
-                        f64_is_zon2, f64_addsubmul_post);
+                        f64_is_zon2, f64_mul_post);
 }
 
 float64 float64r32_mul(float64 a, float64 b, float_status *status)

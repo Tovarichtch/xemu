@@ -48,7 +48,7 @@ static void x86_cpu_exec_exit(CPUState *cs)
     env->eflags = cpu_compute_eflags(env);
 }
 
-static TCGTBCPUState x86_get_tb_cpu_state(CPUState *cs)
+TCGTBCPUState x86_get_tb_cpu_state(CPUState *cs)
 {
     CPUX86State *env = cpu_env(cs);
     uint32_t flags, cs_base;

@@ -118,6 +118,8 @@ void do_smm_enter(X86CPU *cpu);
 /* system/bpt_helper.c */
 bool check_hw_breakpoints(CPUX86State *env, bool force_dr6_update);
 
+#include "qemu/cpu-boost.h"
+
 /*
  * Do the tasks usually performed by gen_eob().  Callers of this function
  * should also handle TF as appropriate.

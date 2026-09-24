@@ -1905,6 +1905,11 @@ typedef struct CPUArchState {
     float_status mmx_status; /* for 3DNow! float ops */
     float_status sse_status;
     uint32_t mxcsr;
+    /* Native SSE: this vCPU thread's host MXCSR, as the hard x87 path last
+     * loaded it (gen_flcr) or native SSE set it; 0 until then. Not
+     * thread-local: the helpers run on this thread only, and MinGW TLS
+     * costs a call. */
+    uint32_t xemu_host_mxcsr;
     ZMMReg xmm_regs[CPU_NB_REGS == 8 ? 8 : 32] QEMU_ALIGNED(16);
     ZMMReg xmm_t0 QEMU_ALIGNED(16);
     MMXReg mmx_t0;

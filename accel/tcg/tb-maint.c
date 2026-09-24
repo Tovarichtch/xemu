@@ -34,6 +34,7 @@
 #include "tb-context.h"
 #include "tb-internal.h"
 #include "internal-common.h"
+#include "qemu/cpu-boost.h"
 #ifdef CONFIG_USER_ONLY
 #include "user/page-protection.h"
 #define runstate_is_running()  true
@@ -904,9 +905,15 @@ static void tb_jmp_cache_inval_tb(TranslationBlock *tb)
     CPUState *cpu;
 
     if (tb_cflags(tb) & CF_PCREL) {
-        /* A TB may be at any virtual address */
-        CPU_FOREACH(cpu) {
-            tcg_flush_jmp_cache(cpu);
+        /*
+         * A TB may be at any virtual address. CPU boost keeps the jump
+         * caches: a stale entry fails the CF_INVALID cflags compare, and
+         * remaps flush them on the tlb_flush paths.
+         */
+        if (!xemu_cpu_boost) {
+            CPU_FOREACH(cpu) {
+                tcg_flush_jmp_cache(cpu);
+            }
         }
     } else {
         uint32_t h = tb_jmp_cache_hash_func(tb->pc);

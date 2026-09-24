@@ -20,6 +20,7 @@
 #define TCG_CPU_H
 
 #include "cpu.h"
+#include "accel/tcg/tb-cpu-state.h"
 
 #define XSAVE_FCW_FSW_OFFSET    0x000
 #define XSAVE_FTW_FOP_OFFSET    0x004
@@ -83,5 +84,8 @@ extern const TCGCPUOps x86_tcg_ops;
 bool tcg_cpu_realizefn(CPUState *cs, Error **errp);
 
 int x86_mmu_index_pl(CPUX86State *env, unsigned pl);
+
+/* Not static: xemu's cpu_exec calls it directly (accel/tcg/cpu-exec.c). */
+TCGTBCPUState x86_get_tb_cpu_state(CPUState *cs);
 
 #endif /* TCG_CPU_H */

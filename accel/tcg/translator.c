@@ -2,6 +2,7 @@
  * Generic intermediate code generation.
  *
  * Copyright (C) 2016-2017 Lluís Vilanova <vilanova@ac.upc.edu>
+ * Copyright (c) 2026 Réda Chérif-Touil
  *
  * This work is licensed under the terms of the GNU GPL, version 2 or later.
  * See the COPYING file in the top-level directory.
@@ -21,6 +22,78 @@
 #include "internal-common.h"
 #include "disas/disas.h"
 #include "tb-internal.h"
+#include "tb-jmp-cache.h"
+#include "tb-hash.h"
+#include "tcg/tcg-temp-internal.h"
+#include "hw/core/cpu.h"
+
+void tcg_gen_lookup_and_goto_ptr_fast(TCGv_i64 pc, uint64_t cs_base,
+                                      uint32_t flags)
+{
+#ifdef CONFIG_SOFTMMU
+    uint32_t cflags = tcg_ctx->gen_tb->cflags;
+    TCGLabel *slow;
+    TCGv_i64 t, hash;
+    TCGv_i32 t32;
+    TCGv_ptr ent, tb, code, hoff;
+
+    if (cflags & (CF_NO_GOTO_PTR | CF_COUNT_MASK | CF_SINGLE_STEP |
+                  CF_MEMI_ONLY | CF_USE_ICOUNT | CF_BP_PAGE | CF_NOIRQ)) {
+        tcg_gen_lookup_and_goto_ptr();
+        return;
+    }
+
+    QEMU_BUILD_BUG_ON(sizeof(((CPUJumpCache *)0)->array[0]) != 16);
+    QEMU_BUILD_BUG_ON(offsetof(CPUState, breakpoints.tqh_first) !=
+                      offsetof(CPUState, breakpoints));
+
+    slow = gen_new_label();
+    t = tcg_temp_ebb_new_i64();
+    hash = tcg_temp_ebb_new_i64();
+    t32 = tcg_temp_ebb_new_i32();
+    ent = tcg_temp_ebb_new_ptr();
+    tb = tcg_temp_ebb_new_ptr();
+    code = tcg_temp_ebb_new_ptr();
+    hoff = tcg_temp_ebb_new_ptr();
+
+    /* tb_jmp_cache_hash_func() */
+    tcg_gen_shri_i64(t, pc, TARGET_PAGE_BITS - TB_JMP_PAGE_BITS);
+    tcg_gen_xor_i64(t, t, pc);
+    tcg_gen_shri_i64(hash, t, TARGET_PAGE_BITS - TB_JMP_PAGE_BITS);
+    tcg_gen_andi_i64(hash, hash, TB_JMP_PAGE_MASK);
+    tcg_gen_andi_i64(t, t, TB_JMP_ADDR_MASK);
+    tcg_gen_or_i64(hash, hash, t);
+    tcg_gen_shli_i64(hash, hash, 4);
+
+    tcg_gen_ld_ptr(ent, tcg_env,
+                   offsetof(CPUState, tb_jmp_cache) - sizeof(CPUState));
+    tcg_gen_trunc_i64_ptr(hoff, hash);
+    tcg_gen_add_ptr(ent, ent, hoff);
+
+    /* same tests, same order as tb_lookup() */
+    tcg_gen_ld_ptr(tb, ent, offsetof(CPUJumpCache, array[0].tb));
+    tcg_gen_brcondi_ptr(TCG_COND_EQ, tb, 0, slow);
+    tcg_gen_ld_i64(t, ent, offsetof(CPUJumpCache, array[0].pc));
+    tcg_gen_brcond_i64(TCG_COND_NE, t, pc, slow);
+    tcg_gen_ld_i64(t, tb, offsetof(TranslationBlock, cs_base));
+    tcg_gen_brcondi_i64(TCG_COND_NE, t, cs_base, slow);
+    tcg_gen_ld_i32(t32, tb, offsetof(TranslationBlock, flags));
+    tcg_gen_brcondi_i32(TCG_COND_NE, t32, flags, slow);
+    tcg_gen_ld_i32(t32, tb, offsetof(TranslationBlock, cflags));
+    tcg_gen_brcondi_i32(TCG_COND_NE, t32, cflags, slow);
+    tcg_gen_ld_i64(t, tcg_env,
+                   offsetof(CPUState, breakpoints) - sizeof(CPUState));
+    tcg_gen_brcondi_i64(TCG_COND_NE, t, 0, slow);
+
+    tcg_gen_ld_ptr(code, tb, offsetof(TranslationBlock, tc.ptr));
+    tcg_gen_goto_ptr(code);
+
+    gen_set_label(slow);
+    tcg_gen_lookup_and_goto_ptr();
+#else
+    tcg_gen_lookup_and_goto_ptr();
+#endif
+}
 
 static void set_can_do_io(DisasContextBase *db, bool val)
 {

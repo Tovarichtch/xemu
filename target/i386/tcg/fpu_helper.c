@@ -2,6 +2,7 @@
  *  x86 FPU, MMX/3DNow!/SSE/SSE2/SSE3/SSSE3/SSE4/PNI helpers
  *
  *  Copyright (c) 2003 Fabrice Bellard
+ *  Copyright (c) 2026 Réda Chérif-Touil
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -1566,9 +1567,50 @@ static const struct fpatan_data fpatan_table[9] = {
       make_floatx80_init(0xbfbc, 0xece675d1fc8f8cbcULL) },
 };
 
+#if defined(XBOX) && defined(__x86_64__) && defined(USE_HARD_FPU)
+/* CPU boost, in the hard-FPU build: FPATAN of two normal operands whose
+ * exponents are less than 80 apart runs on the host instruction, which can
+ * differ from QEMU's series in the last bit. Special values keep the code
+ * below, where the x87 flags live. */
+static bool fpatan_hard_value(CPUX86State *env, floatx80 *out)
+{
+    int32_t e0 = extractFloatx80Exp(ST0), e1 = extractFloatx80Exp(ST1);
+    uint64_t s0 = extractFloatx80Frac(ST0), s1 = extractFloatx80Frac(ST1);
+    int32_t d;
+
+    if (e0 == 0 || e0 == 0x7fff || e1 == 0 || e1 == 0x7fff) {
+        return false;           /* zero, denormal, infinity or NaN */
+    }
+    if (!(s0 >> 63) || !(s1 >> 63)) {
+        return false;           /* unnormal: an invalid encoding here */
+    }
+    d = e0 - e1;
+    if (d >= 80 || d <= -80) {
+        return false;           /* the code below takes its own shortcut */
+    }
+    {
+        long double r;
+        __asm__ ("fpatan" : "=t"(r) : "0"(ST0.fval), "u"(ST1.fval) : "st(1)");
+        out->fval = r;
+    }
+    return true;
+}
+#endif
+
 void helper_fpatan(CPUX86State *env)
 {
     int old_flags = save_exception_flags(env);
+#if defined(XBOX) && defined(__x86_64__) && defined(USE_HARD_FPU)
+    floatx80 hard_r;
+    if (xemu_cpu_boost && fpatan_hard_value(env, &hard_r)) {
+        /* The series result is inexact by construction; so is this one. */
+        float_raise(float_flag_inexact, &env->fp_status);
+        ST1 = hard_r;
+        fpop(env);
+        merge_exception_flags(env, old_flags);
+        return;
+    }
+#endif
     uint64_t arg0_sig = extractFloatx80Frac(ST0);
     int32_t arg0_exp = extractFloatx80Exp(ST0);
     bool arg0_sign = extractFloatx80Sign(ST0);

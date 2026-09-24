@@ -2,6 +2,7 @@
  *  Common CPU TLB handling
  *
  *  Copyright (c) 2003 Fabrice Bellard
+ *  Copyright (c) 2026 Réda Chérif-Touil
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -47,6 +48,7 @@
 #include "tb-internal.h"
 #include "tlb-bounds.h"
 #include "internal-common.h"
+#include "qemu/cpu-boost.h"
 #ifdef CONFIG_PLUGIN
 #include "qemu/plugin-memory.h"
 #endif
@@ -1337,14 +1339,42 @@ static bool victim_tlb_hit(CPUState *cpu, size_t mmu_idx, size_t index,
     return false;
 }
 
+/*
+ * CPU boost: a store that leaves memory unchanged cannot stale translated
+ * code, so the page's blocks are kept, not retranslated. @store_size 0:
+ * value unknown.
+ */
+static bool store_changes_memory(ram_addr_t ram_addr, unsigned size,
+                                 uint64_t store_val, unsigned store_size)
+{
+    uint64_t cur = 0;
+
+    if (store_size != size || size > sizeof(cur)) {
+        return true;
+    }
+    memcpy(&cur, qemu_map_ram_ptr(NULL, ram_addr), size);
+    if (size < sizeof(cur)) {
+        store_val &= MAKE_64BIT_MASK(0, size * 8);
+    }
+    return cur != store_val;
+}
+
 static void notdirty_write(CPUState *cpu, vaddr mem_vaddr, unsigned size,
-                           CPUTLBEntryFull *full, uintptr_t retaddr)
+                           CPUTLBEntryFull *full, uintptr_t retaddr,
+                           uint64_t store_val, unsigned store_size)
 {
     ram_addr_t ram_addr = mem_vaddr + full->xlat_section;
 
     trace_memory_notdirty_write_access(mem_vaddr, ram_addr, size);
 
     if (!physical_memory_get_dirty_flag(ram_addr, DIRTY_MEMORY_CODE)) {
+        if (xemu_cpu_boost &&
+            !store_changes_memory(ram_addr, size, store_val, store_size)) {
+            /* Leave the entry slow so the next store is inspected too. */
+            physical_memory_set_dirty_range(ram_addr, size,
+                                            DIRTY_CLIENTS_NOCODE);
+            return;
+        }
         tb_invalidate_phys_range_fast(cpu, ram_addr, size, retaddr);
     }
 
@@ -1427,7 +1457,7 @@ int probe_access_full(CPUArchState *env, vaddr addr, int size,
     /* Handle clean RAM pages.  */
     if (unlikely(flags & TLB_NOTDIRTY)) {
         int dirtysize = size == 0 ? 1 : size;
-        notdirty_write(env_cpu(env), addr, dirtysize, *pfull, retaddr);
+        notdirty_write(env_cpu(env), addr, dirtysize, *pfull, retaddr, 0, 0);
         flags &= ~TLB_NOTDIRTY;
     }
 
@@ -1451,7 +1481,7 @@ int probe_access_full_mmu(CPUArchState *env, vaddr addr, int size,
     /* Handle clean RAM pages.  */
     if (unlikely(flags & TLB_NOTDIRTY)) {
         int dirtysize = size == 0 ? 1 : size;
-        notdirty_write(env_cpu(env), addr, dirtysize, *pfull, 0);
+        notdirty_write(env_cpu(env), addr, dirtysize, *pfull, 0, 0, 0);
         flags &= ~TLB_NOTDIRTY;
     }
 
@@ -1474,7 +1504,7 @@ int probe_access_flags(CPUArchState *env, vaddr addr, int size,
     /* Handle clean RAM pages. */
     if (unlikely(flags & TLB_NOTDIRTY)) {
         int dirtysize = size == 0 ? 1 : size;
-        notdirty_write(env_cpu(env), addr, dirtysize, full, retaddr);
+        notdirty_write(env_cpu(env), addr, dirtysize, full, retaddr, 0, 0);
         flags &= ~TLB_NOTDIRTY;
     }
 
@@ -1514,7 +1544,7 @@ void *probe_access(CPUArchState *env, vaddr addr, int size,
 
         /* Handle clean RAM pages.  */
         if (flags & TLB_NOTDIRTY) {
-            notdirty_write(env_cpu(env), addr, size, full, retaddr);
+            notdirty_write(env_cpu(env), addr, size, full, retaddr, 0, 0);
         }
     }
 
@@ -1631,6 +1661,10 @@ typedef struct MMULookupLocals {
     MMULookupPageData page[2];
     MemOp memop;
     int mmu_idx;
+    /* Value a store is about to write, so an unchanged one can be spotted.
+     * store_size is 0 when unknown. */
+    uint64_t store_val;
+    unsigned store_size;
 } MMULookupLocals;
 
 /**
@@ -1702,7 +1736,8 @@ static bool mmu_lookup1(CPUState *cpu, MMULookupPageData *data, MemOp memop,
  * record writes to protected clean pages.
  */
 static void mmu_watch_or_dirty(CPUState *cpu, MMULookupPageData *data,
-                               MMUAccessType access_type, uintptr_t ra)
+                               MMUAccessType access_type, uintptr_t ra,
+                               uint64_t store_val, unsigned store_size)
 {
     CPUTLBEntryFull *full = data->full;
     vaddr addr = data->addr;
@@ -1721,7 +1756,7 @@ static void mmu_watch_or_dirty(CPUState *cpu, MMULookupPageData *data,
 
     /* Note that notdirty is only set for writes. */
     if (flags & TLB_NOTDIRTY) {
-        notdirty_write(cpu, addr, size, full, ra);
+        notdirty_write(cpu, addr, size, full, ra, store_val, store_size);
         flags &= ~TLB_NOTDIRTY;
     }
     data->flags = flags;
@@ -1749,6 +1784,10 @@ static bool mmu_lookup(CPUState *cpu, vaddr addr, MemOpIdx oi,
     l->memop = get_memop(oi);
     l->mmu_idx = get_mmuidx(oi);
 
+    if (type != MMU_DATA_STORE || (l->memop & MO_BSWAP) != MO_LE) {
+        l->store_size = 0;
+    }
+
     tcg_debug_assert(l->mmu_idx < NB_MMU_MODES);
 
     l->page[0].addr = addr;
@@ -1764,7 +1803,8 @@ static bool mmu_lookup(CPUState *cpu, vaddr addr, MemOpIdx oi,
     if (likely(!crosspage)) {
         flags = l->page[0].flags;
         if (unlikely(flags & (TLB_WATCHPOINT | TLB_NOTDIRTY))) {
-            mmu_watch_or_dirty(cpu, &l->page[0], type, ra);
+            mmu_watch_or_dirty(cpu, &l->page[0], type, ra,
+                               l->store_val, l->store_size);
         }
         if (unlikely(flags & TLB_BSWAP)) {
             l->memop ^= MO_BSWAP;
@@ -1790,8 +1830,10 @@ static bool mmu_lookup(CPUState *cpu, vaddr addr, MemOpIdx oi,
 
         flags = l->page[0].flags | l->page[1].flags;
         if (unlikely(flags & (TLB_WATCHPOINT | TLB_NOTDIRTY))) {
-            mmu_watch_or_dirty(cpu, &l->page[0], type, ra);
-            mmu_watch_or_dirty(cpu, &l->page[1], type, ra);
+            /* Split stores are left alone: the value would have to be
+             * split too, for a case that is rare. */
+            mmu_watch_or_dirty(cpu, &l->page[0], type, ra, 0, 0);
+            mmu_watch_or_dirty(cpu, &l->page[1], type, ra, 0, 0);
         }
 
         /*
@@ -1893,7 +1935,7 @@ static void *atomic_mmu_lookup(CPUState *cpu, vaddr addr, MemOpIdx oi,
     hostaddr = (void *)((uintptr_t)addr + tlbe->addend);
 
     if (unlikely(tlb_addr & TLB_NOTDIRTY)) {
-        notdirty_write(cpu, addr, size, full, retaddr);
+        notdirty_write(cpu, addr, size, full, retaddr, 0, 0);
     }
 
     if (unlikely(tlb_addr & TLB_WATCHPOINT)) {
@@ -2747,6 +2789,8 @@ static void do_st1_mmu(CPUState *cpu, vaddr addr, uint8_t val,
     MMULookupLocals l;
     bool crosspage;
 
+    l.store_val = val;
+    l.store_size = 1;
     cpu_req_mo(cpu, TCG_MO_LD_ST | TCG_MO_ST_ST);
     crosspage = mmu_lookup(cpu, addr, oi, ra, MMU_DATA_STORE, &l);
     tcg_debug_assert(!crosspage);
@@ -2761,6 +2805,8 @@ static void do_st2_mmu(CPUState *cpu, vaddr addr, uint16_t val,
     bool crosspage;
     uint8_t a, b;
 
+    l.store_val = val;
+    l.store_size = 2;
     cpu_req_mo(cpu, TCG_MO_LD_ST | TCG_MO_ST_ST);
     crosspage = mmu_lookup(cpu, addr, oi, ra, MMU_DATA_STORE, &l);
     if (likely(!crosspage)) {
@@ -2783,6 +2829,8 @@ static void do_st4_mmu(CPUState *cpu, vaddr addr, uint32_t val,
     MMULookupLocals l;
     bool crosspage;
 
+    l.store_val = val;
+    l.store_size = 4;
     cpu_req_mo(cpu, TCG_MO_LD_ST | TCG_MO_ST_ST);
     crosspage = mmu_lookup(cpu, addr, oi, ra, MMU_DATA_STORE, &l);
     if (likely(!crosspage)) {
@@ -2804,6 +2852,8 @@ static void do_st8_mmu(CPUState *cpu, vaddr addr, uint64_t val,
     MMULookupLocals l;
     bool crosspage;
 
+    l.store_val = val;
+    l.store_size = 8;
     cpu_req_mo(cpu, TCG_MO_LD_ST | TCG_MO_ST_ST);
     crosspage = mmu_lookup(cpu, addr, oi, ra, MMU_DATA_STORE, &l);
     if (likely(!crosspage)) {
@@ -2827,6 +2877,7 @@ static void do_st16_mmu(CPUState *cpu, vaddr addr, Int128 val,
     uint64_t a, b;
     int first;
 
+    l.store_size = 0;
     cpu_req_mo(cpu, TCG_MO_LD_ST | TCG_MO_ST_ST);
     crosspage = mmu_lookup(cpu, addr, oi, ra, MMU_DATA_STORE, &l);
     if (likely(!crosspage)) {

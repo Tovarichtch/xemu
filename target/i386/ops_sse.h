@@ -3,6 +3,7 @@
  *
  *  Copyright (c) 2005 Fabrice Bellard
  *  Copyright (c) 2008 Intel Corporation  <andrew.zaborowski@intel.com>
+ *  Copyright (c) 2026 Réda Chérif-Touil
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -491,8 +492,11 @@ void glue(helper_pshufhw, SUFFIX)(Reg *d, Reg *s, int order)
     {                                                                   \
         int i;                                                          \
         d->ZMM_S(0) = F(32, v->ZMM_S(0), s->ZMM_S(0));                  \
-        for (i = 1; i < 2 << SHIFT; i++) {                              \
-            d->ZMM_L(i) = v->ZMM_L(i);                                  \
+        /* CPU boost: non-VEX encodings have d == v, a self-move. */    \
+        if (!xemu_cpu_boost || d != v) {                                \
+            for (i = 1; i < 2 << SHIFT; i++) {                          \
+                d->ZMM_L(i) = v->ZMM_L(i);                              \
+            }                                                           \
         }                                                               \
     }                                                                   \
                                                                         \
@@ -500,8 +504,10 @@ void glue(helper_pshufhw, SUFFIX)(Reg *d, Reg *s, int order)
     {                                                                   \
         int i;                                                          \
         d->ZMM_D(0) = F(64, v->ZMM_D(0), s->ZMM_D(0));                  \
-        for (i = 1; i < 1 << SHIFT; i++) {                              \
-            d->ZMM_Q(i) = v->ZMM_Q(i);                                  \
+        if (!xemu_cpu_boost || d != v) {                                \
+            for (i = 1; i < 1 << SHIFT; i++) {                          \
+                d->ZMM_Q(i) = v->ZMM_Q(i);                              \
+            }                                                           \
         }                                                               \
     }
 
@@ -511,9 +517,72 @@ void glue(helper_pshufhw, SUFFIX)(Reg *d, Reg *s, int order)
 
 #endif
 
+#if defined(XBOX) && defined(__x86_64__)
+/*
+ * Native SSE arithmetic, on by default (the "CPU boost" setting) and taken
+ * only with round-to-nearest and no flush-to-zero, where the host rounds
+ * exactly as the guest's SSE unit does. It differs from the real CPU in two
+ * ways: it raises no exception flags, so stmxcsr and fxsave show only those
+ * of the software path; and the compiler may swap the operands of add and
+ * mul, which changes which NaN comes back when both are NaN.
+ */
+#define XEMU_HOST_F32 float
+#define XEMU_HOST_F64 double
+
+/* This header is included once per vector width; define the helper once. */
+#ifndef XEMU_SSE_NATIVE_DECLARED
+#define XEMU_SSE_NATIVE_DECLARED
+
+static inline bool sse_native_ok(CPUX86State *env)
+{
+    const float_status *s = &env->sse_status;
+    if (!(xemu_cpu_boost &&
+          s->float_rounding_mode == float_round_nearest_even &&
+          !s->flush_to_zero && !s->flush_inputs_to_zero)) {
+        return false;
+    }
+    /* The host must round to nearest without flushing, MXCSR 0x1f80. The
+     * hard x87 path loads the guest's x87 rounding into the host MXCSR
+     * (gen_flcr, which notes it here) and leaves it until its next load:
+     * the software path runs meanwhile. */
+    uint32_t mxcsr = env->xemu_host_mxcsr;
+    if (likely(mxcsr == 0x1f80)) {
+        return true;
+    }
+    if (mxcsr == 0) {
+        /* First native operation on this vCPU, or after a reset. */
+        if ((__builtin_ia32_stmxcsr() & ~0x3fu) != 0x1f80) {
+            __builtin_ia32_ldmxcsr(0x1f80);
+        }
+        env->xemu_host_mxcsr = 0x1f80;
+        return true;
+    }
+    return false;
+}
+#endif
+
+#define XEMU_SSE_OP(size, a, b, op, softfn)                              \
+    ({                                                                   \
+        float ## size _r;                                                \
+        if (likely(sse_native_ok(env))) {                                \
+            union { float ## size s; XEMU_HOST_F ## size h; }            \
+                _ua = { .s = (a) }, _ub = { .s = (b) }, _ur;             \
+            _ur.h = _ua.h op _ub.h;                                      \
+            _r = _ur.s;                                                  \
+        } else {                                                         \
+            _r = softfn((a), (b), &env->sse_status);                     \
+        }                                                                \
+        _r;                                                              \
+    })
+
+#define FPU_ADD(size, a, b) XEMU_SSE_OP(size, a, b, +, float ## size ## _add)
+#define FPU_SUB(size, a, b) XEMU_SSE_OP(size, a, b, -, float ## size ## _sub)
+#define FPU_MUL(size, a, b) XEMU_SSE_OP(size, a, b, *, float ## size ## _mul)
+#else
 #define FPU_ADD(size, a, b) float ## size ## _add(a, b, &env->sse_status)
 #define FPU_SUB(size, a, b) float ## size ## _sub(a, b, &env->sse_status)
 #define FPU_MUL(size, a, b) float ## size ## _mul(a, b, &env->sse_status)
+#endif
 #define FPU_DIV(size, a, b) float ## size ## _div(a, b, &env->sse_status)
 
 /* Note that the choice of comparison op here is important to get the
@@ -695,6 +764,48 @@ void helper_cvtsq2sd(CPUX86State *env, ZMMReg *d, uint64_t val)
 /* float to integer */
 
 #if SHIFT == 1
+#if defined(XBOX) && defined(__x86_64__)
+/*
+ * Native float-to-integer conversions under the arithmetic's gate: the host
+ * runs the guest's own instruction and returns its exact result, indefinite
+ * value included, raising no exception flag. Callers pass env->sse_status.
+ */
+#define XEMU_NATIVE_CONV_OK(s) \
+    sse_native_ok(container_of((s), CPUX86State, sse_status))
+
+#define XEMU_NATIVE_CONV32(NAME, BUILTIN)                               \
+    static inline int64_t xemu_native_##NAME(float32 a)                 \
+    {                                                                   \
+        union { float32 s; float h; } u = { .s = a };                   \
+        __v4sf v = { u.h, 0, 0, 0 };                                    \
+        return BUILTIN(v);                                              \
+    }
+
+#define XEMU_NATIVE_CONV64(NAME, BUILTIN)                               \
+    static inline int64_t xemu_native_##NAME(float64 a)                 \
+    {                                                                   \
+        union { float64 s; double h; } u = { .s = a };                  \
+        __v2df v = { u.h, 0 };                                          \
+        return BUILTIN(v);                                              \
+    }
+
+XEMU_NATIVE_CONV32(float32_to_int32, __builtin_ia32_cvtss2si)
+XEMU_NATIVE_CONV32(float32_to_int32_round_to_zero, __builtin_ia32_cvttss2si)
+XEMU_NATIVE_CONV32(float32_to_int64, __builtin_ia32_cvtss2si64)
+XEMU_NATIVE_CONV32(float32_to_int64_round_to_zero, __builtin_ia32_cvttss2si64)
+XEMU_NATIVE_CONV64(float64_to_int32, __builtin_ia32_cvtsd2si)
+XEMU_NATIVE_CONV64(float64_to_int32_round_to_zero, __builtin_ia32_cvttsd2si)
+XEMU_NATIVE_CONV64(float64_to_int64, __builtin_ia32_cvtsd2si64)
+XEMU_NATIVE_CONV64(float64_to_int64_round_to_zero, __builtin_ia32_cvttsd2si64)
+
+#define XEMU_NATIVE_CONV(RETTYPE, FN, a, s)                             \
+        if (likely(XEMU_NATIVE_CONV_OK(s))) {                           \
+            return (RETTYPE)xemu_native_##FN(a);                        \
+        }
+#else
+#define XEMU_NATIVE_CONV(RETTYPE, FN, a, s)
+#endif
+
 /*
  * x86 mandates that we return the indefinite integer value for the result
  * of any float-to-integer conversion that raises the 'invalid' exception.
@@ -705,6 +816,8 @@ void helper_cvtsq2sd(CPUX86State *env, ZMMReg *d, uint64_t val)
     {                                                                   \
         int oldflags, newflags;                                         \
         RETTYPE r;                                                      \
+                                                                        \
+        XEMU_NATIVE_CONV(RETTYPE, FN, a, s)                             \
                                                                         \
         oldflags = get_float_exception_flags(s);                        \
         set_float_exception_flags(0, s);                                \

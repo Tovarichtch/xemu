@@ -79,6 +79,16 @@ void tcg_gen_goto_tb(unsigned idx);
  */
 void tcg_gen_lookup_and_goto_ptr(void);
 
+void tcg_gen_goto_ptr(TCGv_ptr ptr);
+
+/*
+ * Probe the jump cache from generated code, falling back to
+ * tcg_gen_lookup_and_goto_ptr().  The caller guarantees @cs_base and
+ * @flags hold the values get_tb_cpu_state() would return at this exit.
+ */
+void tcg_gen_lookup_and_goto_ptr_fast(TCGv_i64 pc, uint64_t cs_base,
+                                      uint32_t flags);
+
 void tcg_gen_plugin_cb(unsigned from);
 void tcg_gen_plugin_mem_cb(TCGv_i64 addr, unsigned meminfo);
 
