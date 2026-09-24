@@ -2,6 +2,7 @@
  * xemu User Interface
  *
  * Copyright (C) 2020-2025 Matt Borgerson
+ * Copyright (c) 2026 Réda Chérif-Touil
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -30,6 +31,7 @@
 #include "block/qdict.h"
 #include "block/block-io.h"
 #include "migration/qemu-file.h"
+#include "migration/savevm.h"
 #include "migration/snapshot.h"
 #include "qapi/error.h"
 #include "qapi/qapi-commands-block.h"
@@ -273,27 +275,44 @@ static bool xemu_snapshots_machine_unusable(Error **err)
 
 void xemu_snapshots_load(const char *vm_name, Error **err)
 {
-    if (xemu_snapshots_machine_unusable(err)) {
+    /* QEMU tests the devices that refuse snapshots (a cabinet link) only
+     * after it has reset the machine and reverted the disks: test first. A
+     * snapshot that is not there fails before anything is touched, but with
+     * the machine stopped: test that first too, so that it keeps running. */
+    if (xemu_snapshots_machine_unusable(err) ||
+        qemu_savevm_state_blocked(err)) {
+        return;
+    }
+    Error *local_err = NULL;
+    if (bdrv_all_has_snapshot(vm_name, false, NULL, &local_err) <= 0) {
+        if (!local_err) {
+            error_setg(&local_err, "Snapshot '%s' does not exist.", vm_name);
+        }
+        error_propagate(err, local_err);
         return;
     }
     bool vm_running = runstate_is_running();
     vm_stop(RUN_STATE_RESTORE_VM);
-    load_snapshot(vm_name, NULL, false, NULL, err);
-    if (err && *err && chihiro_dimm_last_error()) {
-        /* The DIMM check sits late in the stream: RAM and devices are
-         * already overwritten and QEMU cannot reset such a machine (the
-         * PCI reset asserts). Stay stopped; the box says to restart. */
-        error_free(*err);
-        *err = NULL;
-        error_setg(err, "Snapshot '%s' does not belong to the mounted game "
-                   "and the machine is now unusable: restart xemu.", vm_name);
+    if (load_snapshot(vm_name, NULL, false, NULL, &local_err)) {
+        if (vm_running) {
+            vm_start();
+        }
         return;
     }
-    /* A load refused by validation leaves the machine untouched: resume
-     * instead of staying paused forever. */
-    if (vm_running) {
-        vm_start();
+    /* Past these checks most failures (the DIMM check late in the stream, a
+     * section format too old) leave disks, RAM and devices half-restored,
+     * and QEMU cannot reset such a machine (the PCI reset asserts): on any
+     * failure it stays stopped, as upstream leaves it, and the box says to
+     * restart. */
+    if (chihiro_dimm_last_error()) {
+        error_setg(err, "Snapshot '%s' does not belong to the mounted game "
+                   "and the machine is now unusable: restart xemu.", vm_name);
+    } else {
+        error_setg(err, "Snapshot '%s' could not be loaded (%s) and the "
+                   "machine is now unusable: restart xemu.", vm_name,
+                   local_err ? error_get_pretty(local_err) : "no reason given");
     }
+    error_free(local_err);
 }
 
 /* Whether a snapshot's DIMM delta was taken against the mounted image:
