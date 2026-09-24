@@ -1393,12 +1393,27 @@ static void create_texture(PGRAPHState *pg, int texture_idx)
     NV2A_VK_DGROUP_END();
 }
 
+/* UPSTREAM CANDIDATE: the wrap mode and the border colour are sampler state,
+ * which GL applies on its fast path, so their methods leave the slot clean.
+ * Here they are part of the binding: one built with other values is stale. */
+static bool texture_sampler_stale(PGRAPHState *pg, int i)
+{
+    PGRAPHVkState *r = pg->vk_renderer_state;
+    const TextureKey *key = &r->texture_bindings[i]->key;
+
+    return pgraph_is_texture_enabled(pg, i) &&
+           (key->address != pgraph_reg_r(pg, NV_PGRAPH_TEXADDRESS0 + i * 4) ||
+            key->border_color !=
+                pgraph_reg_r(pg, NV_PGRAPH_BORDERCOLOR0 + i * 4));
+}
+
 static bool check_textures_dirty(PGRAPHState *pg)
 {
     PGRAPHVkState *r = pg->vk_renderer_state;
 
     for (int i = 0; i < NV2A_MAX_TEXTURES; i++) {
-        if (!r->texture_bindings[i] || pg->texture_dirty[i]) {
+        if (!r->texture_bindings[i] || pg->texture_dirty[i] ||
+            texture_sampler_stale(pg, i)) {
             return true;
         }
     }
