@@ -187,7 +187,9 @@ typedef struct PGRAPHState {
     hwaddr dma_report;
     hwaddr report_offset;
     bool zpass_pixel_count_enable;
-
+    /* NV097_SET_TWO_SIDE_LIGHT_EN (0x17C4): hardware register mapping
+     * unknown, tracked as state like texture_matrix_enable. */
+    bool two_side_light_en;
     /* NV097_SET_LINE_WIDTH (0x0380): hardware register mapping unknown,
      * tracked as state. Units are 1/8 pixel:
      * D3DDevice_SetRenderState_LineWidth emits
@@ -218,6 +220,10 @@ typedef struct PGRAPHState {
     bool ltc1_dirty[NV2A_LTC1_COUNT];
 
     float material_alpha;
+
+    /* NV097_SET_BACK_MATERIAL_ALPHA (0x17AC): stored, not read yet (the FF
+     * shader gives back faces the front alpha). */
+    float back_material_alpha;
 
     // should figure out where these are in lighting context
     float light_infinite_half_vector[NV2A_MAX_LIGHTS][3];

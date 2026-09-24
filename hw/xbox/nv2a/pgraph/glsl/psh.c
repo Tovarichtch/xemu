@@ -1091,8 +1091,13 @@ static MString* psh_convert(struct PixelShader *ps)
         mstring_append(vars, "vec4 pT3 = vtxT3;\n");
     }
     mstring_append(vars, "\n");
-    mstring_append(vars, "vec4 v0 = pD0;\n");
-    mstring_append(vars, "vec4 v1 = pD1;\n");
+    /* With two-sided lighting the rasterizer picks the front or back
+     * colour set by triangle facing; with it off, front colours serve
+     * both faces. */
+    mstring_append(vars,
+        "bool useBack = twoSideSel != 0u && !gl_FrontFacing;\n");
+    mstring_append(vars, "vec4 v0 = useBack ? pB0 : pD0;\n");
+    mstring_append(vars, "vec4 v1 = useBack ? pB1 : pD1;\n");
     mstring_append(vars, "vec4 ab;\n");
     mstring_append(vars, "vec4 cd;\n");
     mstring_append(vars, "vec4 mux_sum;\n");
@@ -1647,6 +1652,9 @@ void pgraph_glsl_set_psh_uniform_values(PGRAPHState *pg,
                                         const PshUniformLocs locs,
                                         PshUniformValues *values)
 {
+    if (locs[PshUniform_twoSideSel] != -1) {
+        values->twoSideSel[0] = pg->two_side_light_en ? 1 : 0;
+    }
     if (locs[PshUniform_consts] != -1) {
         for (int i = 0; i < 9; i++) {
             uint32_t constant[2];

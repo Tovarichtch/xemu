@@ -69,6 +69,13 @@ bool pgraph_glsl_check_shader_state_dirty(PGRAPHState *pg,
         }
     }
 
+    /* The key holds two-sided lighting only while lighting is on. */
+    if (state->vsh.is_fixed_function &&
+        (pg->two_side_light_en && state->vsh.fixed_function.lighting) !=
+            state->vsh.fixed_function.two_sided) {
+        return true;
+    }
+
     if (pg->uniform_attrs != state->vsh.uniform_attrs ||
         pg->swizzle_attrs != state->vsh.swizzle_attrs ||
         pg->compressed_attrs != state->vsh.compressed_attrs ||

@@ -459,6 +459,8 @@ static int nv2a_pre_load(void *opaque)
 {
     NV2AState *d = opaque;
     nv2a_lock_fifo(d);
+    /* Off unless the snapshot says otherwise (vmstate_nv2a_two_side). */
+    d->pgraph.two_side_light_en = false;
     return 0;
 }
 
@@ -478,6 +480,26 @@ const VMStateDescription vmstate_nv2a_pgraph_vertex_attributes = {
         // FIXME
         VMSTATE_END_OF_LIST()
     }
+};
+
+static bool nv2a_two_side_needed(void *opaque)
+{
+    NV2AState *d = opaque;
+
+    return d->pgraph.two_side_light_en;
+}
+
+/* Two-sided lighting: D3D sends it only when it changes, so a load that lost
+ * it would light the back faces wrongly until the game turned it off and on. */
+static const VMStateDescription vmstate_nv2a_two_side = {
+    .name = "nv2a/two-side-light",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = nv2a_two_side_needed,
+    .fields = (const VMStateField[]) {
+        VMSTATE_BOOL(pgraph.two_side_light_en, NV2AState),
+        VMSTATE_END_OF_LIST()
+    },
 };
 
 static const VMStateDescription vmstate_nv2a = {
@@ -604,6 +626,10 @@ static const VMStateDescription vmstate_nv2a = {
         VMSTATE_BOOL(pgraph.waiting_for_context_switch, NV2AState),
         VMSTATE_BOOL_V(pgraph.zpass_pixel_count_enable, NV2AState, 4),
         VMSTATE_END_OF_LIST()
+    },
+    .subsections = (const VMStateDescription * const []) {
+        &vmstate_nv2a_two_side,
+        NULL
     },
 };
 

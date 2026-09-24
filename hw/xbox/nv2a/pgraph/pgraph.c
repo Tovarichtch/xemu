@@ -1962,6 +1962,27 @@ DEF_METHOD_INC(NV097, SET_SCENE_AMBIENT_COLOR)
     pg->ltctxa_dirty[NV_IGRAPH_XF_LTCTXA_FR_AMB] = true;
 }
 
+DEF_METHOD_INC(NV097, SET_BACK_SCENE_AMBIENT_COLOR)
+{
+    int slot = (method - NV097_SET_BACK_SCENE_AMBIENT_COLOR) / 4;
+    /* Back-side twin of SET_SCENE_AMBIENT_COLOR (the ambient and emission
+     * product), read by the FF shader as sceneBackAmbientColor. */
+    pg->ltctxa[NV_IGRAPH_XF_LTCTXA_BR_AMB][slot] = parameter;
+    pg->ltctxa_dirty[NV_IGRAPH_XF_LTCTXA_BR_AMB] = true;
+}
+
+DEF_METHOD(NV097, SET_BACK_MATERIAL_ALPHA)
+{
+    pg->back_material_alpha = *(float *)&parameter;
+}
+
+DEF_METHOD_INC(NV097, SET_BACK_MATERIAL_EMISSION)
+{
+    int slot = (method - NV097_SET_BACK_MATERIAL_EMISSION) / 4;
+    pg->ltctxa[NV_IGRAPH_XF_LTCTXA_BCM_COL][slot] = parameter;
+    pg->ltctxa_dirty[NV_IGRAPH_XF_LTCTXA_BCM_COL] = true;
+}
+
 DEF_METHOD_INC(NV097, SET_VIEWPORT_OFFSET)
 {
     int slot = (method - NV097_SET_VIEWPORT_OFFSET) / 4;
@@ -2501,6 +2522,11 @@ DEF_METHOD(NV097, SET_LOGIC_OP)
 DEF_METHOD(NV097, CLEAR_REPORT_VALUE)
 {
     d->pgraph.renderer->ops.clear_report_value(d);
+}
+
+DEF_METHOD(NV097, SET_TWO_SIDE_LIGHT_EN)
+{
+    pg->two_side_light_en = parameter != 0;
 }
 
 DEF_METHOD(NV097, SET_ZPASS_PIXEL_COUNT_ENABLE)

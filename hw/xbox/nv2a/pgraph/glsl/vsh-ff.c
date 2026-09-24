@@ -4,6 +4,7 @@
  * Copyright (c) 2015 espes
  * Copyright (c) 2015 Jannik Vogel
  * Copyright (c) 2020-2025 Matt Borgerson
+ * Copyright (c) 2026 Réda Chérif-Touil
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -131,6 +132,13 @@ GLSL_DEFINE(eyePosition, GLSL_C(NV_IGRAPH_XF_XFCTX_EYEP))
 "#define lightSpecularColor(i) "
     "ltctxb[" stringify(NV_IGRAPH_XF_LTCTXB_L0_SPC) " + (i)*6].xyz\n"
 "\n"
+"#define lightBackAmbientColor(i) "
+    "ltctxb[" stringify(NV_IGRAPH_XF_LTCTXB_L0_BAMB) " + (i)*6].xyz\n"
+"#define lightBackDiffuseColor(i) "
+    "ltctxb[" stringify(NV_IGRAPH_XF_LTCTXB_L0_BDIF) " + (i)*6].xyz\n"
+"#define lightBackSpecularColor(i) "
+    "ltctxb[" stringify(NV_IGRAPH_XF_LTCTXB_L0_BSPC) " + (i)*6].xyz\n"
+"\n"
 "#define lightSpotFalloff(i) "
     "ltctxa[" stringify(NV_IGRAPH_XF_LTCTXA_L0_K) " + (i)*2].xyz\n"
 "#define lightSpotDirection(i) "
@@ -140,6 +148,7 @@ GLSL_DEFINE(eyePosition, GLSL_C(NV_IGRAPH_XF_XFCTX_EYEP))
     "ltc1[" stringify(NV_IGRAPH_XF_LTC1_r0) " + (i)].x\n"
 "\n"
 GLSL_DEFINE(sceneAmbientColor, GLSL_LTCTXA(NV_IGRAPH_XF_LTCTXA_FR_AMB) ".xyz")
+GLSL_DEFINE(sceneBackAmbientColor, GLSL_LTCTXA(NV_IGRAPH_XF_LTCTXA_BR_AMB) ".xyz")
 GLSL_DEFINE(materialEmissionColor, GLSL_LTCTXA(NV_IGRAPH_XF_LTCTXA_CM_COL) ".xyz")
 "\n"
 );
@@ -257,7 +266,6 @@ GLSL_DEFINE(materialEmissionColor, GLSL_LTCTXA(NV_IGRAPH_XF_LTCTXA_CM_COL) ".xyz
         mstring_append(body, "  oB0 = backDiffuse;\n");
         mstring_append(body, "  oB1 = backSpecular;\n");
     } else {
-        //FIXME: Do 2 passes if we want 2 sided-lighting?
         static char alpha_source_diffuse[] = "diffuse.a";
         static char alpha_source_specular[] = "specular.a";
         static char alpha_source_material[] = "material_alpha";
@@ -287,6 +295,12 @@ GLSL_DEFINE(materialEmissionColor, GLSL_LTCTXA(NV_IGRAPH_XF_LTCTXA_CM_COL) ".xyz
 
         mstring_append(body, "oD1 = vec4(0.0, 0.0, 0.0, specular.a);\n");
 
+        if (state->fixed_function.two_sided) {
+            mstring_append(body,
+                "oB0 = vec4(sceneBackAmbientColor, oD0.a);\n"
+                "oB1 = vec4(0.0, 0.0, 0.0, backSpecular.a);\n");
+        }
+
         if (state->fixed_function.local_eye) {
             mstring_append(body,
                 "vec3 VPeye = normalize(eyePosition.xyz / eyePosition.w - tPosition.xyz / tPosition.w);\n"
@@ -313,8 +327,10 @@ GLSL_DEFINE(materialEmissionColor, GLSL_LTCTXA(NV_IGRAPH_XF_LTCTXA_CM_COL) ".xyz
                     "                                 + lightLocalAttenuation[%d].y * d\n"
                     "                                 + lightLocalAttenuation[%d].z * d * d);\n"
                     "    vec3 halfVector = normalize(VP + %s);\n"
-                    "    float nDotVP = max(0.0, dot(tNormal, VP));\n"
-                    "    float nDotHV = max(0.0, dot(tNormal, halfVector));\n",
+                    "    float nDotVPraw = dot(tNormal, VP);\n"
+                    "    float nDotHVraw = dot(tNormal, halfVector);\n"
+                    "    float nDotVP = max(0.0, nDotVPraw);\n"
+                    "    float nDotHV = max(0.0, nDotHVraw);\n",
                     i, i, i, i, i,
                     state->fixed_function.local_eye ? "VPeye" : "vec3(0.0, 0.0, 0.0)"
                 );
@@ -329,15 +345,18 @@ GLSL_DEFINE(materialEmissionColor, GLSL_LTCTXA(NV_IGRAPH_XF_LTCTXA_CM_COL) ".xyz
                     "  {\n"
                     "    float attenuation = 1.0;\n"
                     "    vec3 lightDirection = normalize(lightInfiniteDirection[%d]);\n"
-                    "    float nDotVP = max(0.0, dot(tNormal, lightDirection));\n",
+                    "    float nDotVPraw = dot(tNormal, lightDirection);\n"
+                    "    float nDotVP = max(0.0, nDotVPraw);\n",
                     i);
                 if (state->fixed_function.local_eye) {
                     mstring_append(body,
-                        "    float nDotHV = max(0.0, dot(tNormal, normalize(lightDirection + VPeye)));\n"
+                        "    float nDotHVraw = dot(tNormal, normalize(lightDirection + VPeye));\n"
+                        "    float nDotHV = max(0.0, nDotHVraw);\n"
                     );
                 } else {
                     mstring_append_fmt(body,
-                        "    float nDotHV = max(0.0, dot(tNormal, lightInfiniteHalfVector[%d]));\n",
+                        "    float nDotHVraw = dot(tNormal, lightInfiniteHalfVector[%d]);\n"
+                        "    float nDotHV = max(0.0, nDotHVraw);\n",
                         i
                     );
                 }
@@ -385,6 +404,22 @@ GLSL_DEFINE(materialEmissionColor, GLSL_LTCTXA(NV_IGRAPH_XF_LTCTXA_CM_COL) ".xyz
 
             mstring_append(body,
                 "    oD0.xyz += lightAmbient;\n");
+            if (state->fixed_function.two_sided) {
+                /* Two-sided lighting: the back face is lit with the
+                 * negated normal and the back light registers. */
+                mstring_append_fmt(body,
+                    "    {\n"
+                    "      float bDotVP = max(0.0, -nDotVPraw);\n"
+                    "      float bDotHV = max(0.0, -nDotHVraw);\n"
+                    "      float bpf = (bDotVP == 0.0 || bDotHV == 0.0)"
+                    " ? 0.0 : pow(bDotHV, specularPower);\n"
+                    "      oB0.xyz += lightBackAmbientColor(%d) * attenuation;\n"
+                    "      oB0.xyz += lightBackDiffuseColor(%d) * attenuation"
+                    " * bDotVP;\n"
+                    "      oB1.xyz += lightBackSpecularColor(%d) * attenuation"
+                    " * bpf;\n"
+                    "    }\n", i, i, i);
+            }
 
             switch (state->fixed_function.diffuse_src) {
             case MATERIAL_COLOR_SRC_MATERIAL:
@@ -420,9 +455,10 @@ GLSL_DEFINE(materialEmissionColor, GLSL_LTCTXA(NV_IGRAPH_XF_LTCTXA_CM_COL) ".xyz
                                  "}\n");
         }
 
-        /* TODO: Implement two-sided lighting */
-        mstring_append(body, "  oB0 = backDiffuse;\n");
-        mstring_append(body, "  oB1 = backSpecular;\n");
+        if (!state->fixed_function.two_sided) {
+            mstring_append(body, "  oB0 = backDiffuse;\n");
+            mstring_append(body, "  oB1 = backSpecular;\n");
+        }
     }
 
     if (!state->specular_enable) {

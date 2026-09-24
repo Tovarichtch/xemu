@@ -40,6 +40,10 @@ typedef struct FixedFunctionVshState {
     enum MaterialColorSource diffuse_src;
     enum MaterialColorSource specular_src;
     bool local_eye;
+    /* NV097_SET_TWO_SIDE_LIGHT_EN: back-face colours are lit with the
+     * negated normal and the back light/material registers instead of
+     * passing the vertex back colours through. */
+    bool two_sided;
 } FixedFunctionVshState;
 
 typedef struct ProgrammableVshState {

@@ -72,6 +72,7 @@ static void set_fixed_function_vsh_state(PGRAPHState *pg,
                 (enum VshLight)GET_MASK(pgraph_reg_r(pg, NV_PGRAPH_CSV0_D),
                                         NV_PGRAPH_CSV0_D_LIGHT0 << (i * 2));
         }
+        state->two_sided = pg->two_side_light_en;
     }
 
     if (pgraph_reg_r(pg, NV_PGRAPH_CONTROL_3) & NV_PGRAPH_CONTROL_3_FOGENABLE) {
