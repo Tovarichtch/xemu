@@ -24,6 +24,17 @@
 #include "debug.h"
 #include "renderer.h"
 
+/* The NV2A dithers to hide quantisation on 5/6-bit channel surfaces
+ * (R5G6B5, X1R5G5B5); on 8888 targets host dithering only stipples
+ * gradients, so the DITHERENABLE that games leave on stays off there.
+ * REASONED from D3D dither semantics; the 8888 stipple is visible on screen. */
+static bool pgraph_color_surface_dithers(PGRAPHState *pg)
+{
+    unsigned int f = pg->surface_shape.color_format;
+    return f >= NV097_SET_SURFACE_FORMAT_COLOR_LE_X1R5G5B5_Z1R5G5B5 &&
+           f <= NV097_SET_SURFACE_FORMAT_COLOR_LE_R5G6B5;
+}
+
 void pgraph_gl_clear_surface(NV2AState *d, uint32_t parameter)
 {
     PGRAPHState *pg = &d->pgraph;
@@ -108,8 +119,9 @@ void pgraph_gl_clear_surface(NV2AState *d, uint32_t parameter)
     glScissor(xmin, ymin, scissor_width, scissor_height);
 
     /* Dither */
-    /* FIXME: Maybe also disable it here? + GL implementation dependent */
-    if (pgraph_reg_r(pg, NV_PGRAPH_CONTROL_0) & NV_PGRAPH_CONTROL_0_DITHERENABLE) {
+    if ((pgraph_reg_r(pg, NV_PGRAPH_CONTROL_0) &
+         NV_PGRAPH_CONTROL_0_DITHERENABLE) &&
+        pgraph_color_surface_dithers(pg)) {
         glEnable(GL_DITHER);
     } else {
         glDisable(GL_DITHER);
@@ -282,9 +294,10 @@ void pgraph_gl_draw_begin(NV2AState *d)
     }
 
     /* Dither */
-    /* FIXME: GL implementation dependent */
-    if (pgraph_reg_r(pg, NV_PGRAPH_CONTROL_0) &
-            NV_PGRAPH_CONTROL_0_DITHERENABLE) {
+    bool dither = (pgraph_reg_r(pg, NV_PGRAPH_CONTROL_0) &
+                   NV_PGRAPH_CONTROL_0_DITHERENABLE) &&
+                  pgraph_color_surface_dithers(pg);
+    if (dither) {
         glEnable(GL_DITHER);
     } else {
         glDisable(GL_DITHER);
