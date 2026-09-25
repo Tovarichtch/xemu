@@ -27,6 +27,8 @@
 #include "hw/xbox/nv2a/pgraph/texture.h"
 #include "debug.h"
 #include "renderer.h"
+#include "ui/xemu-settings.h"
+#include "data/segaboot_logo.rgba.h"
 
 static TextureBinding* generate_texture(const TextureShape s, const uint8_t *texture_data, const uint8_t *palette_data);
 static void texture_binding_destroy(gpointer data);
@@ -447,6 +449,40 @@ void pgraph_gl_bind_textures(NV2AState *d)
             }
             key_out->binding->data_hash = tex_data_hash;
             key_out->binding->scale = 1;
+            /* DOGE easter egg: SEGABOOT's "Chihiro" logo (512x128 A4R4G4B4)
+             * becomes the embedded image, keyed on the guest data hash, so
+             * any other SEGABOOT version keeps its own logo. */
+            if (xemu_doge_mode() && tex_data_hash == 0xec2bbfd4787e2b7dULL &&
+                key_out->binding->gl_target == GL_TEXTURE_2D &&
+                state.width == 512 && state.height == 128) {
+                /* A new texture object, as some drivers keep the old
+                 * storage on respecification; four times the texels, so
+                 * the photo stays sharp when scaled. Sampler state follows
+                 * at bind time. */
+                GLuint logo_tex = 0;
+                glGenTextures(1, &logo_tex);
+                glBindTexture(GL_TEXTURE_2D, logo_tex);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_BASE_LEVEL, 0);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL,
+                                state.levels - 1);
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 2048, 512, 0,
+                             GL_RGBA, GL_UNSIGNED_BYTE, segaboot_logo_data);
+                if (state.levels > 1) {
+                    glGenerateMipmap(GL_TEXTURE_2D);
+                }
+                GLenum logo_err = glGetError();
+                if (logo_err == GL_NO_ERROR) {
+                    glDeleteTextures(1, &key_out->binding->gl_texture);
+                    key_out->binding->gl_texture = logo_tex;
+                    fprintf(stderr, "nv2a: SEGABOOT logo replaced\n");
+                } else {
+                    glDeleteTextures(1, &logo_tex);
+                    glBindTexture(GL_TEXTURE_2D, key_out->binding->gl_texture);
+                    fprintf(stderr,
+                            "nv2a: SEGABOOT logo swap refused: GL error 0x%x\n",
+                            logo_err);
+                }
+            }
         } else {
             // Saved an upload! Reuse existing texture in graphics memory.
             glBindTexture(key_out->binding->gl_target,

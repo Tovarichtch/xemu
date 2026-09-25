@@ -27,9 +27,12 @@
 #include "qemu/osdep.h"
 #include "hw/xbox/nv2a/pgraph/s3tc.h"
 #include "hw/xbox/nv2a/pgraph/swizzle.h"
+
 #include "qemu/fast-hash.h"
+#include "data/segaboot_logo.rgba.h"
 #include "qemu/lru.h"
 #include "renderer.h"
+#include "ui/xemu-settings.h"
 
 static void texture_cache_release_node_resources(PGRAPHVkState *r, TextureBinding *snode);
 
@@ -495,7 +498,20 @@ static void upload_texture_image(PGRAPHState *pg, int texture_idx,
 
     nv2a_profile_inc_counter(NV2A_PROF_TEX_UPLOAD);
 
-    g_autofree TextureLayout *layout = get_texture_layout(pg, texture_idx);
+    g_autofree TextureLayout *layout = NULL;
+    if (binding->logo) {
+        vkf = kelvin_color_format_vk_map
+                  [NV097_SET_TEXTURE_FORMAT_COLOR_SZ_A8B8G8R8];
+        layout = g_malloc0(sizeof(TextureLayout));
+        uint8_t *px = g_malloc(segaboot_logo_size);
+        memcpy(px, segaboot_logo_data, segaboot_logo_size);
+        layout->layers[0].levels[0] = (TextureLevel){
+            .width = 2048, .height = 512, .depth = 1,
+            .decoded_size = segaboot_logo_size, .decoded_data = px,
+        };
+    } else {
+        layout = get_texture_layout(pg, texture_idx);
+    }
     const int num_layers = state->cubemap ? 6 : 1;
 
     // Calculate decoded texture data size
@@ -1291,7 +1307,7 @@ void pgraph_vk_image_pool_flush(PGRAPHVkState *r)
 }
 
 /* The sampled view of a texture node's image, from its creation info; the
- * view type follows the guest shape. */
+ * view type follows the guest shape, which a doge logo node keeps. */
 static void create_texture_view(PGRAPHVkState *r, TextureBinding *snode,
                                 const VkColorFormatInfo *vkf)
 {
@@ -1344,9 +1360,11 @@ static void texture_cow_if_referenced(PGRAPHState *pg, TextureBinding *snode,
     pgraph_vk_trash_push(r, &e);
 
     /* The new image is the retired one's twin: its own creation info, not
-     * one rebuilt from the guest shape. */
+     * one rebuilt from the guest shape (a doge logo node is larger). */
     TextureShape *state = &snode->key.state;
-    VkColorFormatInfo vkf = kelvin_color_format_vk_map[state->color_format];
+    VkColorFormatInfo vkf = kelvin_color_format_vk_map
+        [snode->logo ? NV097_SET_TEXTURE_FORMAT_COLOR_SZ_A8B8G8R8 :
+                       state->color_format];
     VkImageCreateInfo ici = snode->image_ci;
     ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     VmaAllocationCreateInfo aci = {
@@ -1909,6 +1927,17 @@ static void create_texture(PGRAPHState *pg, int texture_idx)
         }
     }
 
+    /* A doge logo node holds only while the guest data is the logo's: new
+     * data makes it an ordinary texture again, rebuilt below. */
+    if (binding_found && snode->logo && content_hash &&
+        content_hash != snode->hash) {
+        /* A new seq makes every unit bind it again. */
+        texture_cache_release_node_resources(r, snode);
+        snode->seq = ++r->texture_binding_seq;
+        binding_found = false;
+        possibly_dirty = true;
+    }
+
     if (binding_found) {
         if (surface_to_texture_cube) {
             unsigned int maxdt = 0;
@@ -1966,6 +1995,24 @@ static void create_texture(PGRAPHState *pg, int texture_idx)
     assert(state.dimensionality < ARRAY_SIZE(dimensionality_to_vk_image_type));
     assert(state.dimensionality <
            ARRAY_SIZE(dimensionality_to_vk_image_view_type));
+
+    /* DOGE (not upstream): SEGABOOT's "Chihiro" logo becomes the embedded
+     * image, the same picture at four times the texel count (see the GL
+     * renderer). The cache key keeps the guest's shape; only this image
+     * and its upload change. */
+    snode->logo = false;
+    if (xemu_doge_mode() && content_hash == 0xec2bbfd4787e2b7dULL &&
+        !surface_to_texture &&
+        state.dimensionality == 2 && !state.cubemap &&
+        state.width == 512 && state.height == 128) {
+        snode->logo = true;
+        state.color_format = NV097_SET_TEXTURE_FORMAT_COLOR_SZ_A8B8G8R8;
+        state.width = 2048;
+        state.height = 512;
+        state.levels = 1;
+        vkf = kelvin_color_format_vk_map[state.color_format];
+        fprintf(stderr, "nv2a: SEGABOOT logo replaced (vk)\n");
+    }
 
     /* In-place sampling: in place for the class the copy serves, minus
      * feedback, with the surface's exact VkFormat (no MUTABLE_FORMAT). */

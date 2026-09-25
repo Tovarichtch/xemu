@@ -62,6 +62,9 @@ void xemu_chihiro_mode_ask(bool chihiro);
  * the next launch. */
 const char *xemu_chihiro_image(void);
 
+/* DOGE (not upstream) easter egg: [doge] doge_mode = 'wow', read once. */
+bool xemu_doge_mode(void);
+
 // Get path of the config file on disk
 const char *xemu_settings_get_path(void);
 

@@ -54,6 +54,7 @@
 #include "xemu-os-utils.h"
 
 #include "data/xemu_64x64.png.h"
+#include "data/doge_64x64.png.h"
 
 #include "hw/xbox/smbus.h" // For eject, drive tray
 #include "hw/xbox/nv2a/nv2a.h"
@@ -932,7 +933,8 @@ static bool event_watch_callback(void *userdata, SDL_Event *event)
 
 /* CHIHIRO (not upstream): the window title names the fork, the upstream
  * release it builds on, the playtest, and the game once it is known:
- * "xemu Chihiro 0.8.134 | Playtest #2 | Virtua Cop 3". */
+ * "xemu Chihiro 0.8.134 | Playtest #2 | Virtua Cop 3". The SDL app name
+ * stays "xemu", the stream name audio servers and recorders match on. */
 #define XEMU_BUILD_TITLE "xemu Chihiro"
 #define XEMU_BUILD_LABEL "Playtest #2"
 
@@ -987,8 +989,8 @@ static void window_title(char *title, size_t n)
             }
         }
     }
-    snprintf(title, n, "%s %.*s%s | %s%s%s", XEMU_BUILD_TITLE, vlen,
-             xemu_version,
+    snprintf(title, n, "%s%s %.*s%s | %s%s%s", XEMU_BUILD_TITLE,
+             xemu_doge_mode() ? " wow" : "", vlen, xemu_version,
 #ifdef XEMU_DEBUG_BUILD
              " Debug",
 #else
@@ -1211,7 +1213,9 @@ static void display_very_early_init(DisplayOptions *o)
 
     int width, height, channels = 0;
     stbi_set_flip_vertically_on_load(0);
-    unsigned char *icon_data = stbi_load_from_memory(xemu_64x64_data, xemu_64x64_size, &width, &height, &channels, 4);
+    unsigned char *icon_data = xemu_doge_mode() ?
+        stbi_load_from_memory(doge_64x64_data, doge_64x64_size, &width, &height, &channels, 4) :
+        stbi_load_from_memory(xemu_64x64_data, xemu_64x64_size, &width, &height, &channels, 4);
     if (icon_data) {
         SDL_Surface *icon = SDL_CreateSurfaceFrom(width, height, SDL_PIXELFORMAT_RGBA32, icon_data, width*4);
         if (icon) {

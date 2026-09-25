@@ -442,3 +442,13 @@ bool xemu_chihiro_mode(void)
     }
     return mode;
 }
+
+/* DOGE (not upstream) */
+bool xemu_doge_mode(void)
+{
+    static int mode = -1;
+    if (mode < 0) {
+        mode = g_ascii_strcasecmp(g_config.doge.doge_mode, "wow") == 0;
+    }
+    return mode;
+}

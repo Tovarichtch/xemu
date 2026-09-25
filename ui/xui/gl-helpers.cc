@@ -26,6 +26,9 @@
 #include "data/logo_sdf.png.h"
 #include "data/xemu_64x64.png.h"
 #include "data/xmu_mask.png.h"
+#include "data/doge_watermark.png.h"
+#include "data/doge_64x64.png.h"
+#include "ui/xemu-settings.h"
 #include "notifications.hh"
 #include "stb_image.h"
 #include <fpng.h>
@@ -452,9 +455,55 @@ enum tex_item_names {
     obj_xmu
 };
 
+Watermark g_watermark;
+
+static void LoadWatermark(void)
+{
+    if (!xemu_doge_mode()) {
+        return;
+    }
+    stbi_set_flip_vertically_on_load(0);
+    int w, h, ch = 0;
+    unsigned char *data = stbi_load_from_memory(
+        doge_watermark_data, doge_watermark_size, &w, &h, &ch, 4);
+    assert(data != NULL);
+    g_watermark.rgba.assign(data, data + (size_t)w * h * 4);
+    g_watermark.w = w;
+    g_watermark.h = h;
+    g_watermark.tex = InitTexture(data, w, h, 4);
+    stbi_image_free(data);
+}
+
+extern "C" bool chihiro_game_running;
+
+/* Blend the watermark, fitted and centred, into a top-down RGB image. */
+static void CompositeWatermark(uint8_t *rgb, int width, int height)
+{
+    const Watermark &m = g_watermark;
+    if (m.rgba.empty() || !chihiro_game_running) return;
+    float s = fminf((float)width / m.w, (float)height / m.h);
+    int dw = (int)(m.w * s), dh = (int)(m.h * s);
+    int ox = (width - dw) / 2, oy = (height - dh) / 2;
+    for (int y = 0; y < dh; y++) {
+        int sy = (int)(y / s);
+        if (sy >= m.h) sy = m.h - 1;
+        uint8_t *dst = rgb + ((size_t)(oy + y) * width + ox) * 3;
+        for (int x = 0; x < dw; x++, dst += 3) {
+            int sx = (int)(x / s);
+            if (sx >= m.w) sx = m.w - 1;
+            const uint8_t *src = &m.rgba[((size_t)sy * m.w + sx) * 4];
+            int a = src[3] * XEMU_WATERMARK_ALPHA / 255;
+            for (int c = 0; c < 3; c++) {
+                dst[c] = (uint8_t)((dst[c] * (255 - a) + src[c] * a) / 255);
+            }
+        }
+    }
+}
+
 void InitCustomRendering(void)
 {
     glActiveTexture(GL_TEXTURE0);
+    LoadWatermark();
     g_controller_duke_tex =
         LoadTextureFromMemory(controller_mask_data, controller_mask_size);
     g_controller_s_tex =
@@ -472,7 +521,9 @@ void InitCustomRendering(void)
     g_logo_shader = NewDecalShader(ShaderType::Logo);
     logo_fbo = new Fbo(512, 512);
 
-    g_icon_tex = LoadTextureFromMemory(xemu_64x64_data, xemu_64x64_size, false);
+    g_icon_tex = xemu_doge_mode() ?
+        LoadTextureFromMemory(doge_64x64_data, doge_64x64_size, false) :
+        LoadTextureFromMemory(xemu_64x64_data, xemu_64x64_size, false);
 
     g_framebuffer_shader = NewDecalShader(ShaderType::BlitGamma);
 }
@@ -920,7 +971,7 @@ void RenderXmu(float frame_x, float frame_y, uint32_t primary_color,
 
 void RenderLogo(uint32_t time)
 {
-    uint32_t color = 0x62ca13ff;
+    uint32_t color = xemu_doge_mode() ? 0xe0a23cff : 0x62ca13ff;
 
     g_logo_shader->time = time;
     glUseProgram(g_logo_shader->prog);
@@ -1114,6 +1165,7 @@ bool RenderFramebufferToPng(GLuint tex, bool flip, std::vector<uint8_t> &png, in
     glPixelStorei(GL_PACK_ALIGNMENT, 1);
     glReadPixels(0, 0, width, height, GL_RGB, GL_UNSIGNED_BYTE, pixels.data());
     fbo.Restore();
+    CompositeWatermark(pixels.data(), width, height);
 
     return fpng::fpng_encode_image_to_memory(pixels.data(), width, height, 3, png);
 }

@@ -20,7 +20,10 @@
  * License along with this library; if not, see <http://www.gnu.org/licenses/>.
  */
 
+#include "qemu/fast-hash.h"
 #include "qemu/cpu-boost.h"
+#include "data/segaboot_jingle.raw.h"
+#include "ui/xemu-settings.h"
 #include "hw/xbox/mcpx/apu/apu_int.h"
 #include "adpcm.h"
 
@@ -1038,6 +1041,40 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
 
     block_size *= samples_per_block;
 
+    /* DOGE (not upstream): SEGABOOT's jingle (a 3 s 8-bit stereo buffer at
+     * 22050 Hz, ebo 66149) is recognised by the hash of its first 4 KB when
+     * a voice starts it, and the voice then plays the embedded rendition
+     * instead. Guest memory is never written. Each voice keeps the buffer it
+     * recognised (the dispatch lock serialises the frames that set and read
+     * it), so a sound from another buffer or in another format plays as it
+     * is, after a reset too. */
+    static struct {
+        bool match;
+        uint32_t ba;
+    } jingle_voice[MCPX_HW_MAX_VOICES];
+    bool jingle = xemu_doge_mode() && !stream && !adpcm && stereo &&
+                  ebo == 66149 &&
+                  sample_size == NV_PAVS_VOICE_CFG_FMT_SAMPLE_SIZE_U8 &&
+                  container_size == 1;
+    if (jingle && cbo == 0) {
+        uint8_t head[4096];
+        for (size_t off = 0; off < sizeof(head); off += 4) {
+            uint32_t w = ldl_le_phys(
+                &address_space_memory,
+                get_data_ptr(d, d->regs[NV_PAPU_VPSGEADDR], 0xFFFFFFFF,
+                             ba + off));
+            memcpy(head + off, &w, 4);
+        }
+        jingle_voice[v].match =
+            fast_hash(head, sizeof(head)) == 0x2bb1bd72102025aaULL;
+        jingle_voice[v].ba = ba;
+        if (jingle_voice[v].match) {
+            fprintf(stderr, "apu: SEGABOOT jingle replaced\n");
+        }
+    }
+    jingle = jingle && jingle_voice[v].match && jingle_voice[v].ba == ba;
+    uint32_t cbo_start = cbo;
+
     // FIXME: Restructure this loop
     int sample_count = 0;
     for (; (sample_count < num_samples_requested) && (cbo <= ebo);
@@ -1119,6 +1156,16 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
 
         if (!stereo) {
             samples[sample_count][1] = samples[sample_count][0];
+        }
+    }
+
+    if (jingle) {
+        for (int i = 0; i < sample_count; i++) {
+            size_t k = ((size_t)cbo_start + i) * 2;
+            if (k + 1 < segaboot_jingle_size) {
+                samples[i][0] = uint8_to_float(segaboot_jingle_data[k]);
+                samples[i][1] = uint8_to_float(segaboot_jingle_data[k + 1]);
+            }
         }
     }
 

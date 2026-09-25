@@ -34,6 +34,7 @@
 #include "actions.hh"
 #include "common.hh"
 #include "xemu-hud.h"
+#include "ui/xemu-settings.h"
 #include "misc.hh"
 #include "gl-helpers.hh"
 #include "input-manager.hh"
@@ -337,6 +338,18 @@ static void InitializeStyle()
     c[ImGuiCol_NavHighlight]          = ImVec4(0.28f, 0.71f, 0.25f, 1.00f);
     c[ImGuiCol_NavWindowingHighlight] = ImVec4(1.00f, 1.00f, 1.00f, 0.70f);
     c[ImGuiCol_NavWindowingDimBg]     = ImVec4(0.80f, 0.80f, 0.80f, 0.20f);
+
+    /* DOGE (not upstream): every xemu green turns Shiba orange, same
+     * saturation and brightness. */
+    if (xemu_doge_mode()) {
+        for (int i = 0; i < ImGuiCol_COUNT; i++) {
+            float h, s, v;
+            ImGui::ColorConvertRGBtoHSV(c[i].x, c[i].y, c[i].z, h, s, v);
+            if (s > 0.3f && h > 0.2f && h < 0.45f) {
+                ImGui::ColorConvertHSVtoRGB(0.1f, s, v, c[i].x, c[i].y, c[i].z);
+            }
+        }
+    }
     c[ImGuiCol_ModalWindowDimBg]      = ImVec4(0.16f, 0.16f, 0.16f, 0.73f);
 
     ImGuiStyle &s = ImGui::GetStyle();
@@ -582,8 +595,28 @@ void xemu_hud_update(void)
     // if (show_demo) ImGui::ShowDemoWindow(&show_demo);
 }
 
+/* DOGE (not upstream): the watermark over the whole window, above the game
+ * and every menu. Fitted, centred, XEMU_WATERMARK_ALPHA. */
+extern "C" bool chihiro_game_running;
+
+static void DrawWatermark(void)
+{
+    /* Not over SEGABOOT: the boot screen stays clean, the game does not. */
+    if (!g_watermark.tex || !chihiro_game_running) return;
+    ImGuiViewport *vp = ImGui::GetMainViewport();
+    float W = vp->Size.x, H = vp->Size.y;
+    float s = fminf(W / g_watermark.w, H / g_watermark.h);
+    float dw = g_watermark.w * s, dh = g_watermark.h * s;
+    ImVec2 p0(vp->Pos.x + (W - dw) / 2, vp->Pos.y + (H - dh) / 2);
+    ImGui::GetForegroundDrawList()->AddImage(
+        (ImTextureID)(intptr_t)g_watermark.tex, p0,
+        ImVec2(p0.x + dw, p0.y + dh), ImVec2(0, 0), ImVec2(1, 1),
+        IM_COL32(255, 255, 255, XEMU_WATERMARK_ALPHA));
+}
+
 void xemu_hud_render()
 {
+    DrawWatermark();
     ImGui::Render();
     ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
 

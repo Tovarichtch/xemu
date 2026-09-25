@@ -262,6 +262,7 @@ typedef struct TextureBinding {
     /* In-place sampling: the image is the surface's own (never destroy it);
      * image_view is a private view on it, owned by this binding. */
     bool s2t_borrowed;
+    bool logo; /* doge mode: the SEGABOOT logo replaced */
     VkImageCreateInfo image_ci; /* creation parameters (image pool key) */
 } TextureBinding;
 

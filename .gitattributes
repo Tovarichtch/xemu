@@ -9,3 +9,6 @@ Cargo.lock      diff=toml merge=binary
 *.patch         -text -whitespace
 
 data/*.bin      binary
+data/*.raw      binary
+data/*.rgba     binary
+data/*.png      binary
