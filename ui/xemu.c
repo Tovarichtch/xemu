@@ -914,9 +914,9 @@ static const char *const chihiro_game_titles[] = {
     [CONFIG_CHIHIRO_JVS_PROFILE_VC3] = "Virtua Cop 3",
     [CONFIG_CHIHIRO_JVS_PROFILE_GS] = "Ghost Squad",
     [CONFIG_CHIHIRO_JVS_PROFILE_CTX] = "Crazy Taxi: High Roller",
-    [CONFIG_CHIHIRO_JVS_PROFILE_OR2] = "OutRun 2",
+    [CONFIG_CHIHIRO_JVS_PROFILE_OR2] = "OutRun 2 / OutRun 2 SP",
     [CONFIG_CHIHIRO_JVS_PROFILE_OK] = "Ollie King",
-    [CONFIG_CHIHIRO_JVS_PROFILE_WMMT2] = "Wangan Midnight Maximum Tune 2",
+    [CONFIG_CHIHIRO_JVS_PROFILE_WMMT2] = "Wangan Midnight Maximum Tune 1 / 2",
     [CONFIG_CHIHIRO_JVS_PROFILE_GUNDAM] = "Gundam Battle Operating Simulator",
 };
 
