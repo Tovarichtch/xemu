@@ -5,6 +5,7 @@ pfiles = [
   'xmu_mask.png',
   'logo_sdf.png',
   'xemu_64x64.png',
+  'shader_seeds.bin',
   'abxy.ttf',
   'Roboto-Medium.ttf',
   'RobotoCondensed-Regular.ttf',
