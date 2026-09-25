@@ -2,6 +2,7 @@
 // xemu User Interface
 //
 // Copyright (C) 2020-2022 Matt Borgerson
+// Copyright (c) 2026 Réda Chérif-Touil
 //
 // This program is free software; you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
@@ -986,10 +987,20 @@ void RenderFramebuffer(GLint tex, int width, int height, bool flip, float scale[
     glUniform4f(s->tex_scale_offset_loc, 1.0, 1.0, 0, 0);
     glUniform1i(s->tex_loc, 0);
 
-    for (int i = 0; i < 256; i++) {
-        uint32_t e = (fb_palette[i * 3 + 2] << 16) |
-                     (fb_palette[i * 3 + 1] << 8) | fb_palette[i * 3];
-        glUniform1ui(s->palette_loc[i], e);
+    /* 256 uniform calls for a palette that changes only when the guest writes
+     * the DAC: send it only when it differs from what this program holds. */
+    const uint8_t *palette = fb_palette;
+    static uint8_t palette_sent[256 * 3];
+    static GLuint palette_prog; /* a rebuilt program starts with no uniforms */
+    if (nv2a_stock_active() || palette_prog != s->prog ||
+        memcmp(palette_sent, palette, sizeof(palette_sent))) {
+        for (int i = 0; i < 256; i++) {
+            uint32_t e = (palette[i * 3 + 2] << 16) |
+                         (palette[i * 3 + 1] << 8) | palette[i * 3];
+            glUniform1ui(s->palette_loc[i], e);
+        }
+        memcpy(palette_sent, palette, sizeof(palette_sent));
+        palette_prog = s->prog;
     }
     glUniform1f(s->crt_gamma_loc, g_config.display.crt_gamma);
 

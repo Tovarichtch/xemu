@@ -379,11 +379,12 @@ void DebugVideoWindow::Draw()
         static ImPlotAxisFlags rt_axis = ImPlotAxisFlags_NoTickLabels;
         ImPlot::PushStyleVar(ImPlotStyleVar_PlotPadding, ImVec2(5,5));
         ImPlot::PushStyleVar(ImPlotStyleVar_FillAlpha, 0.25f);
-        static ScrollingBuffer fps;
+        /* Displayed FPS: distinct guest frames the UI presented. */
+        static ScrollingBuffer disp_fps;
         static float t = 0;
         if (runstate_is_running()) {
             t += ImGui::GetIO().DeltaTime;
-            fps.AddPoint(t, g_nv2a_stats.display_fps);
+            disp_fps.AddPoint(t, g_nv2a_stats.display_fps);
         }
         x_start = t - 10.0;
         x_end = t;
@@ -396,11 +397,19 @@ void DebugVideoWindow::Draw()
         if (ImPlot::BeginPlot("##ScrollingFPS", ImVec2(plot_width,75*g_viewport_mgr.m_scale))) {
             ImPlot::SetupAxes(NULL, NULL, rt_axis, rt_axis | ImPlotAxisFlags_Lock);
             ImPlot::SetupAxesLimits(x_start, x_end, 0, 65, ImPlotCond_Always);
-            if (fps.Data.size() > 0) {
-                ImPlot::PlotShaded("##fps", &fps.Data[0].x, &fps.Data[0].y, fps.Data.size(), 0, 0, fps.Offset, 2 * sizeof(float));
-                ImPlot::PlotLine("##fps", &fps.Data[0].x, &fps.Data[0].y, fps.Data.size(), 0, fps.Offset, 2 * sizeof(float));
+            ImVec4 disp_col = ImVec4(0.26f, 0.59f, 0.98f, 1.0f);
+            if (disp_fps.Data.size() > 0) {
+                ImPlot::PushStyleColor(ImPlotCol_Line, disp_col);
+                ImPlot::PushStyleColor(ImPlotCol_Fill, disp_col);
+                ImPlot::PushStyleVar(ImPlotStyleVar_LineWeight, 2.0f);
+                ImPlot::PlotShaded("##dispfps", &disp_fps.Data[0].x, &disp_fps.Data[0].y, disp_fps.Data.size(), 0, 0, disp_fps.Offset, 2 * sizeof(float));
+                ImPlot::PlotLine("##dispfps", &disp_fps.Data[0].x, &disp_fps.Data[0].y, disp_fps.Data.size(), 0, disp_fps.Offset, 2 * sizeof(float));
+                ImPlot::PopStyleVar();
+                ImPlot::PopStyleColor(2);
             }
-            ImPlot::Annotation(x_start, 65, ImPlot::GetLastItemColor(), ImVec2(0,0), true, "FPS: %d", g_nv2a_stats.display_fps);
+            ImPlot::Annotation(x_start, 62, ImVec4(0.0f, 0.0f, 0.0f, 0.4f),
+                               ImVec2(0, 0), true, "%d fps",
+                               g_nv2a_stats.display_fps);
             ImPlot::EndPlot();
         }
 

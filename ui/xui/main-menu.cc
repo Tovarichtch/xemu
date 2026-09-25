@@ -1711,6 +1711,35 @@ void MainMenuChihiroView::Draw()
                    "Enable if the wheel pulls away from center instead of toward it");
         }
     }
+
+    if (ImGui::CollapsingHeader("Experimental Settings")) {
+        /* Saved at once, not only at shutdown, so a crash cannot lose them. */
+        bool perf_changed = false;
+        perf_changed |= Toggle("GPU boost", &g_config.perf.optimizations,
+                               "Smoother, faster rendering. "
+                               "Off = stock xemu (restart needed)");
+        /* Both live in the tuned GPU, which runs unless GPU boost was off at
+         * start-up. */
+        bool boost = !nv2a_stock_active();
+        ImGui::BeginDisabled(!boost);
+        const char *rhw = boost ? "Real hardware speed" :
+                                  "Real hardware speed (Requires GPU boost)";
+        const char *sfp = boost ? "Smooth first play" :
+                                  "Smooth first play (Requires GPU boost)";
+        perf_changed |= Toggle(rhw, &g_config.perf.real_hw_speed,
+                               "Run at the real cabinet's speed. "
+                               "Off = uncapped");
+        perf_changed |= Toggle(sfp, &g_config.perf.shader_seeding,
+                               "Prepare effects during boot to avoid "
+                               "early stutter");
+        ImGui::EndDisabled();
+        perf_changed |= Toggle("CPU boost", &g_config.perf.native_sse,
+                               "Games run faster. Turn off only if a game "
+                               "misbehaves (restart needed)");
+        if (perf_changed) {
+            xemu_settings_save();
+        }
+    }
 }
 
 void MainMenuDisplayView::Draw()
