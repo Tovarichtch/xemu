@@ -372,11 +372,11 @@ GLSL_DEFINE(materialEmissionColor, GLSL_LTCTXA(NV_IGRAPH_XF_LTCTXA_CM_COL) ".xyz
                  * and spt.w = -cos(phi/2) * S with
                  * S = 1/(cos(theta/2)-cos(phi/2)) through a sign-preserving
                  * fast-rsqrt reciprocal: a hard-edged cone (theta == phi)
-                 * legitimately yields a large finite S (~2e19). The previous
-                 * angle reconstruction via 1/length(spt.xyz) overflowed
-                 * float32 (dot = 9e38 > FLT_MAX) to inf and zeroed every
-                 * such spotlight. The cooked ramp already is the D3D8
-                 * spotlight factor with its division precooked.
+                 * legitimately yields a large finite S (~2e19), and an angle
+                 * rebuilt through 1/length(spt.xyz) would overflow float32
+                 * (dot = 9e38 > FLT_MAX) and zero such a spotlight. The
+                 * cooked ramp already is the D3D8 spotlight factor with its
+                 * division precooked.
                  * FIXME: D3DLIGHT8.Falloff power curve still unmodeled
                  * (no effect on hard cones: the ramp zone has zero width). */
                 mstring_append_fmt(body,

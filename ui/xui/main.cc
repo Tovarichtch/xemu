@@ -74,7 +74,6 @@ static int g_vsync;
 static GLuint g_tex;
 static bool g_flip_req;
 
-
 /* One player's crosshair image (chihiro.jvs*.crosshair_path). */
 struct Crosshair {
     GLuint tex = 0;
