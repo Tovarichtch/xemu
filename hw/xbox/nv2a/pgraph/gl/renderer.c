@@ -113,7 +113,11 @@ static void pgraph_gl_flip_stall(NV2AState *d)
     PGRAPHGLState *r = d->pgraph.gl_renderer_state;
 
     NV2A_GL_DFRAME_TERMINATOR();
+    int64_t probe_t0 = unlikely(xemu_tbrate_enabled()) ? get_clock() : 0;
     pgraph_gl_shaders_flip_service(d);
+    if (probe_t0) {
+        qatomic_add(&xemu_tbrate_flipsvc_ns, get_clock() - probe_t0);
+    }
 
     /* Close this frame's open fragment-query segment (one segment per run
      * of draws sharing a cost profile); the model reads the segments after
@@ -128,8 +132,12 @@ static void pgraph_gl_flip_stall(NV2AState *d)
         glFinish();
     } else {
         if (r->flip_fence) {
+            int64_t fence_t0 = probe_t0 ? get_clock() : 0;
             glClientWaitSync(r->flip_fence, GL_SYNC_FLUSH_COMMANDS_BIT,
                              (GLuint64)5000000000);
+            if (fence_t0) {
+                qatomic_add(&xemu_tbrate_fence_ns, get_clock() - fence_t0);
+            }
             glDeleteSync(r->flip_fence);
         }
         r->flip_fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);

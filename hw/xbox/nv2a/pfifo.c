@@ -38,7 +38,7 @@ uint64_t pfifo_read(void *opaque, hwaddr addr, unsigned int size)
 {
     NV2AState *d = (NV2AState *)opaque;
 
-    qemu_mutex_lock(&d->pfifo.lock);
+    xemu_tbrate_lock(&d->pfifo.lock);
 
     uint64_t r = 0;
     switch (addr) {
@@ -68,7 +68,7 @@ void pfifo_write(void *opaque, hwaddr addr, uint64_t val, unsigned int size)
 
     nv2a_reg_log_write(NV_PFIFO, addr, size, val);
 
-    qemu_mutex_lock(&d->pfifo.lock);
+    xemu_tbrate_lock(&d->pfifo.lock);
 
     switch (addr) {
     case NV_PFIFO_INTR_0:

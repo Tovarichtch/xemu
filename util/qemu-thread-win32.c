@@ -373,6 +373,16 @@ void qemu_thread_create(QemuThread *thread, const char *name,
     if (name_threads && name && !set_thread_description(hThread, name)) {
         fprintf(stderr, "qemu: failed to set thread description: %s\n", name);
     }
+    {
+        /* XEMU_TBRATE: names the threads for the per-thread processor
+         * times read from outside. */
+        const char *e = getenv("XEMU_TBRATE");
+        if (e && e[0] && e[0] != '0') {
+            fprintf(stderr, "TBRATE: thread %s is %u\n", name ? name : "?",
+                    thread->tid);
+            fflush(stderr);
+        }
+    }
     CloseHandle(hThread);
 
     thread->data = data;

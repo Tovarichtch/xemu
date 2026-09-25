@@ -49,6 +49,121 @@
 #include "tb-internal.h"
 #include "internal-common.h"
 #include "qemu/cpu-boost.h"
+#include "system/cpus.h"
+
+/* XEMU_TBRATE: this thread's processor time in ns (Windows counts it in
+ * scheduler ticks, fine over five seconds). */
+static int64_t xemu_thread_cpu_ns(void)
+{
+#ifdef _WIN32
+    FILETIME created, exited, kernel, user;
+
+    if (!GetThreadTimes(GetCurrentThread(), &created, &exited, &kernel,
+                        &user)) {
+        return 0;
+    }
+    return ((((int64_t)kernel.dwHighDateTime << 32) | kernel.dwLowDateTime) +
+            (((int64_t)user.dwHighDateTime << 32) | user.dwLowDateTime)) * 100;
+#else
+    struct timespec ts;
+
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
+    return ts.tv_sec * 1000000000LL + ts.tv_nsec;
+#endif
+}
+
+/* XEMU_TBRATE: where the dispatcher restarts most often after a block-end
+ * exit (Misra-Gries heavy hitters, sixteen slots). */
+static int xemu_tbrate_prev_exit;
+static struct {
+    vaddr pc;
+    uint64_t n;
+} xemu_tbrate_hot[16];
+
+static void xemu_tbrate_hot_add(vaddr pc)
+{
+    int free_slot = -1;
+
+    for (int i = 0; i < ARRAY_SIZE(xemu_tbrate_hot); i++) {
+        if (xemu_tbrate_hot[i].n && xemu_tbrate_hot[i].pc == pc) {
+            xemu_tbrate_hot[i].n++;
+            return;
+        }
+        if (!xemu_tbrate_hot[i].n && free_slot < 0) {
+            free_slot = i;
+        }
+    }
+    if (free_slot >= 0) {
+        xemu_tbrate_hot[free_slot].pc = pc;
+        xemu_tbrate_hot[free_slot].n = 1;
+        return;
+    }
+    for (int i = 0; i < ARRAY_SIZE(xemu_tbrate_hot); i++) {
+        xemu_tbrate_hot[i].n--;
+    }
+}
+
+static void xemu_tbrate_report_exits(double s)
+{
+    XemuTbRate *r = &xemu_tbrate;
+
+    fprintf(stderr, "TBRATE: back to the dispatcher, per second: %.2f M "
+            "block-end exits (%.2f M of them missed jump-cache lookups), "
+            "%.2f M unchained jumps (%.2f M into two-page blocks), %.2f M "
+            "stop requests, %.1f k exceptions; restarts after block ends at",
+            r->exit_eob / s / 1e6, r->lookup_miss / s / 1e6,
+            r->exit_jump / s / 1e6, r->jump_2page / s / 1e6,
+            r->exit_req / s / 1e6, r->longjmps / s / 1e3);
+    for (int k = 0; k < 3; k++) {
+        int best = -1;
+        for (int i = 0; i < ARRAY_SIZE(xemu_tbrate_hot); i++) {
+            if (xemu_tbrate_hot[i].n &&
+                (best < 0 || xemu_tbrate_hot[i].n > xemu_tbrate_hot[best].n)) {
+                best = i;
+            }
+        }
+        if (best < 0) {
+            break;
+        }
+        fprintf(stderr, " %08" VADDR_PRIx " (%.2f M/s)",
+                xemu_tbrate_hot[best].pc, xemu_tbrate_hot[best].n / s / 1e6);
+        xemu_tbrate_hot[best].n = 0;
+    }
+    fprintf(stderr, "\n");
+}
+
+/* XEMU_TBRATE: the hardware interrupts the vCPU took, busiest first. */
+static void xemu_tbrate_report_irqs(double s)
+{
+    uint32_t seen[256];
+
+    memcpy(seen, xemu_vcpu_waits.irqs, sizeof(seen));
+    fprintf(stderr,
+            "TBRATE: hardware interrupts taken, per second, by vector:");
+    for (int k = 0; k < 8; k++) {
+        int best = -1;
+        for (int v = 0; v < 256; v++) {
+            if (seen[v] && (best < 0 || seen[v] > seen[best])) {
+                best = v;
+            }
+        }
+        if (best < 0) {
+            break;
+        }
+        fprintf(stderr, " 0x%02x:%.0f", best, seen[best] / s);
+        seen[best] = 0;
+    }
+    fprintf(stderr, " (vCPU thread %d)\n", qemu_get_thread_id());
+}
+
+static void xemu_tbrate_reset_exits(void)
+{
+    XemuTbRate *r = &xemu_tbrate;
+
+    memset(xemu_tbrate_hot, 0, sizeof(xemu_tbrate_hot));
+    r->exit_eob = r->lookup_miss = r->exit_jump = r->jump_2page = 0;
+    r->exit_req = r->longjmps = 0;
+}
 
 /* -icount align implementation. */
 
@@ -428,6 +543,9 @@ const void *HELPER(lookup_tb_ptr)(CPUArchState *env)
 
     tb = tb_lookup(cpu, s);
     if (tb == NULL) {
+        if (unlikely(xemu_tbrate_enabled())) {
+            xemu_tbrate.lookup_miss++;
+        }
         return tcg_code_gen_epilogue;
     }
 
@@ -445,6 +563,56 @@ static vaddr log_pc(CPUState *cpu, const TranslationBlock *tb)
         return cpu->cc->get_pc(cpu);
     } else {
         return tb->pc;
+    }
+}
+
+/* Debug probe (XEMU_TBRATE=1): every five seconds of wall time, the guest
+ * instructions and blocks that ran, the dispatcher entries, and where this
+ * thread's time went (running, waiting for the big lock, halted,
+ * translating). Flushed: Windows buffers a redirected stderr. */
+static void __attribute__((noinline)) xemu_tbrate_tick(void)
+{
+    static uint64_t entries;
+    static int64_t start, cpu_start;
+    if (!(++entries & 0xFFFF)) {
+        int64_t now = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+        if (!start || now - start >= 5000) {
+            int64_t cpu_now = xemu_thread_cpu_ns();
+            if (start) {
+                double s = (now - start) / 1000.0;
+                fprintf(stderr, "TBRATE: %.1f M guest instructions/s in "
+                        "%.1f M blocks/s, the dispatcher entering %.2f M "
+                        "times/s\n", xemu_tbrate.insns / s / 1e6,
+                        xemu_tbrate.blocks / s / 1e6, entries / s / 1e6);
+                fprintf(stderr, "TBRATE: the vCPU thread, per second: "
+                        "%.0f ms on a processor, %.0f ms waiting for the "
+                        "big lock (%.1f k waits), %.0f ms waiting for the "
+                        "GPU's locks (%.1f k waits), %.0f ms halted, %.0f "
+                        "ms translating\n", (cpu_now - cpu_start) / s / 1e6,
+                        xemu_vcpu_waits.bql_ns / s / 1e6,
+                        xemu_vcpu_waits.bql_waits / s / 1e3,
+                        xemu_vcpu_waits.gpu_ns / s / 1e6,
+                        xemu_vcpu_waits.gpu_waits / s / 1e3,
+                        xemu_vcpu_waits.halt_ns / s / 1e6,
+                        xemu_tbrate.gen_ns / s / 1e6);
+                fprintf(stderr, "TBRATE: the GPU thread, per second: "
+                        "%.0f ms in the flip's shader service, %.0f ms "
+                        "waiting on the previous frame's fence, both "
+                        "under the pgraph lock\n",
+                        qatomic_xchg(&xemu_tbrate_flipsvc_ns, 0) / s / 1e6,
+                        qatomic_xchg(&xemu_tbrate_fence_ns, 0) / s / 1e6);
+                xemu_tbrate_report_exits(s);
+                xemu_tbrate_report_irqs(s);
+                fflush(stderr);
+            }
+            start = now;
+            cpu_start = cpu_now;
+            entries = 0;
+            xemu_tbrate.blocks = xemu_tbrate.insns = 0;
+            xemu_tbrate.gen_ns = 0;
+            xemu_vcpu_waits = (XemuVcpuWaits){ 0 };
+            xemu_tbrate_reset_exits();
+        }
     }
 }
 
@@ -470,6 +638,9 @@ cpu_tb_exec(CPUState *cpu, TranslationBlock *itb, int *tb_exit)
     }
 
     qemu_thread_jit_execute();
+    if (unlikely(xemu_tbrate_enabled())) {
+        xemu_tbrate_tick();
+    }
     ret = tcg_qemu_tb_exec(cpu_env(cpu), tb_ptr);
     cpu->neg.can_do_io = true;
     qemu_plugin_disable_mem_helpers(cpu);
@@ -483,6 +654,18 @@ cpu_tb_exec(CPUState *cpu, TranslationBlock *itb, int *tb_exit)
      */
     last_tb = tcg_splitwx_to_rw((void *)(ret & ~TB_EXIT_MASK));
     *tb_exit = ret & TB_EXIT_MASK;
+    if (unlikely(xemu_tbrate_enabled())) {
+        if (*tb_exit > TB_EXIT_IDX1) {
+            xemu_tbrate.exit_req++;
+            xemu_tbrate_prev_exit = 0;
+        } else if (!last_tb) {
+            xemu_tbrate.exit_eob++;
+            xemu_tbrate_prev_exit = 1;
+        } else {
+            xemu_tbrate.exit_jump++;
+            xemu_tbrate_prev_exit = 0;
+        }
+    }
 
     trace_exec_tb_exit(last_tb, *tb_exit);
 
@@ -979,6 +1162,10 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
             TranslationBlock *tb;
             TCGTBCPUState s = xemu_get_tb_cpu_state(cpu);
             s.cflags = cpu->cflags_next_tb;
+            if (unlikely(xemu_tbrate_prev_exit)) {
+                xemu_tbrate_prev_exit = 0;
+                xemu_tbrate_hot_add(s.pc);
+            }
 
             /*
              * When requested, use an exact setting for cflags for the next
@@ -1003,7 +1190,13 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
                 uint32_t h;
 
                 mmap_lock();
-                tb = tb_gen_code(cpu, s);
+                if (unlikely(xemu_tbrate_enabled())) {
+                    int64_t t0 = get_clock();
+                    tb = tb_gen_code(cpu, s);
+                    xemu_tbrate.gen_ns += get_clock() - t0;
+                } else {
+                    tb = tb_gen_code(cpu, s);
+                }
                 mmap_unlock();
 
                 /*
@@ -1024,6 +1217,9 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
              * for the second page can change.
              */
             if (tb_page_addr1(tb) != -1) {
+                if (unlikely(xemu_tbrate_enabled()) && last_tb) {
+                    xemu_tbrate.jump_2page++;
+                }
                 last_tb = NULL;
             }
 #endif
@@ -1046,6 +1242,10 @@ static int cpu_exec_setjmp(CPUState *cpu, SyncClocks *sc)
 {
     /* Prepare setjmp context for exception handling. */
     if (unlikely(sigsetjmp(cpu->jmp_env, 0) != 0)) {
+        if (unlikely(xemu_tbrate_enabled())) {
+            xemu_tbrate.longjmps++;
+            xemu_tbrate_prev_exit = 0;
+        }
         cpu_exec_longjmp_cleanup(cpu);
     }
 

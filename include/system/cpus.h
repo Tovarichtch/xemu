@@ -1,6 +1,8 @@
 #ifndef QEMU_CPUS_H
 #define QEMU_CPUS_H
 
+#include "qemu/thread.h"
+
 /* register accel-specific operations */
 void cpus_register_accel(const AccelOpsClass *i);
 
@@ -21,6 +23,44 @@ void qemu_process_cpu_events_common(CPUState *cpu);
 void cpu_thread_signal_created(CPUState *cpu);
 void cpu_thread_signal_destroyed(CPUState *cpu);
 void cpu_handle_guest_debug(CPUState *cpu);
+
+/*
+ * Debug probe (XEMU_TBRATE=1): the vCPU thread's waits, for the big lock
+ * held by another thread and halted until an interrupt (lock retake
+ * included). Read and reset by the report in accel/tcg/cpu-exec.c. One
+ * vCPU, so plain counters.
+ */
+typedef struct XemuVcpuWaits {
+    int64_t bql_ns;
+    uint64_t bql_waits;
+    int64_t halt_ns;
+    uint32_t irqs[256];     /* hardware interrupts taken, by vector */
+    int64_t gpu_ns;         /* waiting for a lock the GPU thread holds */
+    uint64_t gpu_waits;
+} XemuVcpuWaits;
+extern XemuVcpuWaits xemu_vcpu_waits;
+extern int xemu_tbrate_state;   /* -1 until the environment is read */
+bool xemu_tbrate_init(void);
+/* The GPU thread's own account, added atomically, read by the report. */
+extern int64_t xemu_tbrate_flipsvc_ns, xemu_tbrate_fence_ns;
+void xemu_tbrate_lock_slow(QemuMutex *m);
+
+static inline bool xemu_tbrate_enabled(void)
+{
+    return likely(xemu_tbrate_state >= 0) ? xemu_tbrate_state
+                                          : xemu_tbrate_init();
+}
+
+/* A GPU lock taken on the guest's behalf; with the probe on, a wait for a
+ * lock the GPU thread holds is timed. */
+static inline void xemu_tbrate_lock(QemuMutex *m)
+{
+    if (likely(!xemu_tbrate_enabled())) {
+        qemu_mutex_lock(m);
+    } else {
+        xemu_tbrate_lock_slow(m);
+    }
+}
 
 /* end interface for cpus accelerator threads */
 

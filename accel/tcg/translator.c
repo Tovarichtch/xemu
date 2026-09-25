@@ -26,6 +26,7 @@
 #include "tb-hash.h"
 #include "tcg/tcg-temp-internal.h"
 #include "hw/core/cpu.h"
+#include "system/cpus.h"
 
 void tcg_gen_lookup_and_goto_ptr_fast(TCGv_i64 pc, uint64_t cs_base,
                                       uint32_t flags)
@@ -93,6 +94,25 @@ void tcg_gen_lookup_and_goto_ptr_fast(TCGv_i64 pc, uint64_t cs_base,
 #else
     tcg_gen_lookup_and_goto_ptr();
 #endif
+}
+
+XemuTbRate xemu_tbrate;
+
+/* The block's own count, emitted where the caller points emit_before_op. */
+static void gen_tbrate_count(int num_insns)
+{
+    TCGv_ptr p = tcg_temp_ebb_new_ptr();
+    TCGv_i64 t = tcg_temp_ebb_new_i64();
+
+    tcg_gen_movi_ptr(p, (intptr_t)&xemu_tbrate);
+    tcg_gen_ld_i64(t, p, offsetof(XemuTbRate, blocks));
+    tcg_gen_addi_i64(t, t, 1);
+    tcg_gen_st_i64(t, p, offsetof(XemuTbRate, blocks));
+    tcg_gen_ld_i64(t, p, offsetof(XemuTbRate, insns));
+    tcg_gen_addi_i64(t, t, num_insns);
+    tcg_gen_st_i64(t, p, offsetof(XemuTbRate, insns));
+    tcg_temp_free_i64(t);
+    tcg_temp_free_ptr(p);
 }
 
 static void set_can_do_io(DisasContextBase *db, bool val)
@@ -278,6 +298,14 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
     /* Emit code to exit the TB, as indicated by db->is_jmp.  */
     ops->tb_stop(db, cpu);
     gen_tb_end(tb, cflags, icount_start_insn, db->num_insns);
+
+    /* XEMU_TBRATE: counted before the first instruction, past the exit
+     * check, now that the number of instructions is known. */
+    if (unlikely(xemu_tbrate_enabled())) {
+        tcg_ctx->emit_before_op = first_insn_start;
+        gen_tbrate_count(db->num_insns);
+        tcg_ctx->emit_before_op = NULL;
+    }
 
     /*
      * Manage can_do_io for the translation block: set to false before

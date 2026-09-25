@@ -47,7 +47,7 @@ uint64_t pgraph_read(void *opaque, hwaddr addr, unsigned int size)
     NV2AState *d = (NV2AState *)opaque;
     PGRAPHState *pg = &d->pgraph;
 
-    qemu_mutex_lock(&pg->lock);
+    xemu_tbrate_lock(&pg->lock);
 
     uint64_t r = 0;
     switch (addr) {
@@ -90,8 +90,8 @@ void pgraph_write(void *opaque, hwaddr addr, uint64_t val, unsigned int size)
 
     nv2a_reg_log_write(NV_PGRAPH, addr, size, val);
 
-    qemu_mutex_lock(&d->pfifo.lock); // FIXME: Factor out fifo lock here
-    qemu_mutex_lock(&pg->lock);
+    xemu_tbrate_lock(&d->pfifo.lock); // FIXME: Factor out fifo lock here
+    xemu_tbrate_lock(&pg->lock);
 
     switch (addr) {
     case NV_PGRAPH_INTR:

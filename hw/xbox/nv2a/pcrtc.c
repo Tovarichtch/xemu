@@ -82,7 +82,7 @@ void pcrtc_write(void *opaque, hwaddr addr, uint64_t val, unsigned int size)
         /* The scanout moved: the render thread resolves the new front buffer
          * (GL); kick it under the fifo lock, as the pgraph MMIO path does. */
         qatomic_set(&d->pgraph.scanout_changed, true);
-        qemu_mutex_lock(&d->pfifo.lock);
+        xemu_tbrate_lock(&d->pfifo.lock);
         pfifo_kick(d);
         qemu_mutex_unlock(&d->pfifo.lock);
 

@@ -33,6 +33,7 @@
 #include "qemu/error-report.h"
 #include "migration/vmstate.h"
 #include "system/runstate.h"
+#include "system/cpus.h"
 #include "qemu/timer.h"
 #include "ui/console.h"
 #include "hw/display/vga_int.h"
