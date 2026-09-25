@@ -2,6 +2,7 @@
  * xemu Input Management
  *
  * Copyright (C) 2020-2021 Matt Borgerson
+ * Copyright (c) 2026 Réda Chérif-Touil
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -34,18 +35,17 @@
 #include "xui/xemu-hud.h"
 #include <stdio.h>
 #include <stdlib.h>
+#include <math.h>
 
 #include "system/blockdev.h"
 #include "hw/xbox/chihiro/chihiro-jvs.h"
 #include "hw/xbox/chihiro/chihiro.h"
-#include "hw/xbox/chihiro/chihiro-driveboard.h"
+#include "hw/xbox/chihiro/chihiro-driveboard-sega838.h"
+#include "hw/xbox/chihiro/chihiro-driveboard-v257.h"
+#include "hw/xbox/chihiro/chihiro-cardreader-hw210.h"
 
 extern SDL_Window *m_window;
 extern int viewport_coords[4];
-
-/* Card reader (chihiro-card-reader.c): a slot's insertion microswitch. */
-bool chihiro_card_reader_present(int player);
-extern bool chihiro_card_reader_enabled;
 
 // #define DEBUG_INPUT
 
@@ -193,11 +193,12 @@ int *g_chihiro_vc3_map[4] = {
     &g_config.chihiro.jvs.vc3.reload,
 };
 
-int *g_chihiro_gs_map[4] = {
+int *g_chihiro_gs_map[5] = {
     &g_config.chihiro.jvs.gs.trigger,
     &g_config.chihiro.jvs.gs.body_button,
     &g_config.chihiro.jvs.gs.change,
     &g_config.chihiro.jvs.gs.reload,
+    &g_config.chihiro.jvs.gs.card,
 };
 
 /* Steering and pedals are shared by the driving games (g_chihiro_drive_map). */
@@ -220,6 +221,16 @@ int *g_chihiro_or2_map[3] = {
     &g_config.chihiro.jvs.or2.view_change,
 };
 
+int *g_chihiro_wmmt2_map[7] = {
+    &g_config.chihiro.jvs.wmmt2.shift_up,
+    &g_config.chihiro.jvs.wmmt2.shift_down,
+    &g_config.chihiro.jvs.wmmt2.shift_left,
+    &g_config.chihiro.jvs.wmmt2.shift_right,
+    &g_config.chihiro.jvs.wmmt2.view_change,
+    &g_config.chihiro.jvs.wmmt2.intrude_change,
+    &g_config.chihiro.jvs.wmmt2.card,
+};
+
 int *g_chihiro_ok_map[6] = {
     &g_config.chihiro.jvs.ok.swing_left,
     &g_config.chihiro.jvs.ok.swing_right,
@@ -227,6 +238,24 @@ int *g_chihiro_ok_map[6] = {
     &g_config.chihiro.jvs.ok.board_rear,
     &g_config.chihiro.jvs.ok.left_grab,
     &g_config.chihiro.jvs.ok.right_grab,
+};
+
+/* Gundam's twin sticks, in the order of its INPUT TEST. */
+int *g_chihiro_gundam_map[14] = {
+    &g_config.chihiro.jvs.gundam.l_up,
+    &g_config.chihiro.jvs.gundam.l_down,
+    &g_config.chihiro.jvs.gundam.l_left,
+    &g_config.chihiro.jvs.gundam.l_right,
+    &g_config.chihiro.jvs.gundam.l_trigger,
+    &g_config.chihiro.jvs.gundam.l_button,
+    &g_config.chihiro.jvs.gundam.r_up,
+    &g_config.chihiro.jvs.gundam.r_down,
+    &g_config.chihiro.jvs.gundam.r_left,
+    &g_config.chihiro.jvs.gundam.r_right,
+    &g_config.chihiro.jvs.gundam.r_trigger,
+    &g_config.chihiro.jvs.gundam.r_button,
+    &g_config.chihiro.jvs.gundam.pedal,
+    &g_config.chihiro.jvs.gundam.card,
 };
 
 /* Player 2: start and coin only. */
@@ -247,11 +276,12 @@ int *g_chihiro_p2_vc3_map[4] = {
     &g_config.chihiro.jvs_p2.vc3_reload,
 };
 
-int *g_chihiro_p2_gs_map[4] = {
+int *g_chihiro_p2_gs_map[5] = {
     &g_config.chihiro.jvs_p2.gs_trigger,
     &g_config.chihiro.jvs_p2.gs_body_button,
     &g_config.chihiro.jvs_p2.gs_change,
     &g_config.chihiro.jvs_p2.gs_reload,
+    &g_config.chihiro.jvs_p2.gs_card,
 };
 
 static void check_and_reset_in_range(int *btn, int min, int max,
@@ -855,6 +885,30 @@ static float chihiro_axis_travel(int binding)
 
 static bool chihiro_check_input(int binding, const bool *kbd, uint32_t mouseBtn);
 
+/* True on the frame a key goes down, not while it is held. */
+static bool key_pressed(bool down, bool *was)
+{
+    bool pressed = down && !*was;
+
+    *was = down;
+    return pressed;
+}
+
+/* One of Gundam's sticks, six controls of g_chihiro_gundam_map in the order
+ * of its INPUT TEST, onto a switch byte. */
+static uint8_t gundam_stick(int *const *controls, const bool *kbd,
+                            uint32_t mouseBtn)
+{
+    static const uint8_t bits[6] = { 0x20, 0x10, 0x08, 0x04, 0x02, 0x01 };
+    uint8_t sw = 0;
+
+    for (int i = 0; i < 6; i++) {
+        if (chihiro_check_input(*controls[i], kbd, mouseBtn))
+            sw |= bits[i];
+    }
+    return sw;
+}
+
 /* How far an input is pressed, 0..1. */
 static float chihiro_input_travel(int binding, const bool *kbd,
                                   uint32_t mouseBtn)
@@ -862,6 +916,28 @@ static float chihiro_input_travel(int binding, const bool *kbd,
     if (CHIHIRO_BINDING_IS_PROGRESSIVE(binding))
         return chihiro_axis_travel(binding);
     return chihiro_check_input(binding, kbd, mouseBtn) ? 1.0f : 0.0f;
+}
+
+/* Where a raw wheel's column really is, for a drive board that reads it: the
+ * travel without the centre deadzone that pins the JVS channel, which would
+ * leave the board's spring a dead band with a step at each edge. */
+static float chihiro_wheel_travel(int binding, const bool *kbd,
+                                  uint32_t mouseBtn)
+{
+    ControllerState *pad;
+    float v;
+
+    if (!CHIHIRO_BINDING_IS_JOY_HALFAXIS(binding))
+        return chihiro_input_travel(binding, kbd, mouseBtn);
+    pad = chihiro_binding_pad(binding);
+    if (!pad || !pad->sdl_joystick)
+        return 0.0f;
+    v = SDL_GetJoystickAxis(pad->sdl_joystick,
+                            CHIHIRO_JOY_HALFAXIS(binding)) / 32767.0f;
+    if (!CHIHIRO_JOY_HALFAXIS_POSITIVE(binding))
+        v = -v;
+    v *= g_wheel_steering_scale;
+    return v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
 }
 
 static bool chihiro_check_input(int binding, const bool *kbd, uint32_t mouseBtn)
@@ -1072,12 +1148,16 @@ static void chihiro_update_jvs_p2(ChihiroJVSState *jvs, const bool *kbd,
     if (chihiro_check_input(g_config.chihiro.jvs_p2.start, kbd, mouseBtn))
         sw0 |= 0x80;
 
-    /* The second reader's physical insertion microswitch: it follows the
-     * assigned card, not the reader toggle -- with no card in the slot the
-     * game must see the switch released, or it retries reads forever. */
-    if (profile == CONFIG_CHIHIRO_JVS_PROFILE_GS &&
-        chihiro_card_reader_enabled && chihiro_card_reader_present(1))
-        sw1 |= 0x20;
+    /* The second reader: its Card In key and its slot's insertion switch. */
+    if (profile == CONFIG_CHIHIRO_JVS_PROFILE_GS) {
+        static bool card_key;
+
+        if (key_pressed(chihiro_check_input(g_config.chihiro.jvs_p2.gs_card,
+                                            kbd, mouseBtn), &card_key))
+            chihiro_hw210_card_key(1);
+        if (chihiro_hw210_enabled && chihiro_card_reader_present(1))
+            sw1 |= 0x20;
+    }
 
     jvs->player_switches[1][0] = sw0;
     jvs->player_switches[1][1] = sw1;
@@ -1093,6 +1173,7 @@ static void chihiro_update_jvs_p2(ChihiroJVSState *jvs, const bool *kbd,
 static void xemu_input_update_jvs(void)
 {
     if (!chihiro_jvs_global) return;
+    chihiro_card_ui_sync();
     ChihiroJVSState *jvs = chihiro_jvs_global;
 
     const bool *kbd = SDL_GetKeyboardState(NULL);
@@ -1148,17 +1229,22 @@ static void xemu_input_update_jvs(void)
                 sw1 |= 0x40;
         }
         if (profile == CONFIG_CHIHIRO_JVS_PROFILE_GS) {
+            static bool card_key;
+
             if (chihiro_check_input(g_config.chihiro.jvs.gs.change, kbd, mouseBtn))
                 sw1 |= 0x40;
-            /* Physical insertion microswitch: follows the assigned card,
-             * not the reader toggle. */
-            if (chihiro_card_reader_enabled && chihiro_card_reader_present(0))
+            /* Card In pushes the card in hand; the switch follows the slot. */
+            if (key_pressed(chihiro_check_input(g_config.chihiro.jvs.gs.card,
+                                                kbd, mouseBtn), &card_key))
+                chihiro_hw210_card_key(0);
+            if (chihiro_hw210_enabled && chihiro_card_reader_present(0))
                 sw1 |= 0x20;
         }
         break;
     }
     case CONFIG_CHIHIRO_JVS_PROFILE_CTX:
-    case CONFIG_CHIHIRO_JVS_PROFILE_OR2: {
+    case CONFIG_CHIHIRO_JVS_PROFILE_OR2:
+    case CONFIG_CHIHIRO_JVS_PROFILE_WMMT2: {
         int b_sl  = g_config.chihiro.jvs.steer_left;
         int b_sr  = g_config.chihiro.jvs.steer_right;
         int b_gas = g_config.chihiro.jvs.gas;
@@ -1180,6 +1266,18 @@ static void xemu_input_update_jvs(void)
                 steer_val = (sl || sr) ? steer_pos : 0x8000;
             }
             jvs->analog[0] = steer_val;
+            /* The wheel's own encoder, for a cabinet that has a board reading
+             * it. Same units the board works in. */
+            if (chihiro_v257_global) {
+                uint16_t enc = steer_val;
+                if (CHIHIRO_BINDING_IS_PROGRESSIVE(b_sl) ||
+                    CHIHIRO_BINDING_IS_PROGRESSIVE(b_sr)) {
+                    float w = chihiro_wheel_travel(b_sr, kbd, mouseBtn) -
+                              chihiro_wheel_travel(b_sl, kbd, mouseBtn);
+                    enc = (uint16_t)(0x8000 + (int)(w * 32767.0f));
+                }
+                v257_set_wheel(chihiro_v257_global, enc >> 6);
+            }
         }
 
         jvs->analog[1] =
@@ -1194,6 +1292,30 @@ static void xemu_input_update_jvs(void)
                 sw0 |= 0x10;
             if (chihiro_check_input(g_config.chihiro.jvs.ctx.jump, kbd, mouseBtn))
                 sw0 |= 0x02;
+        } else if (profile == CONFIG_CHIHIRO_JVS_PROFILE_WMMT2) {
+            /* Player 1's second switch byte: gears 1/2/3/4 on bits 7/6/4/5,
+             * an H shifter (V322.xbe 0x00055950, 0x000559B0), the two wheel
+             * buttons on bits 1 and 0 (0x00055850, 0x00055880). */
+            if (chihiro_check_input(g_config.chihiro.jvs.wmmt2.shift_up, kbd, mouseBtn))
+                sw1 |= 0x10;
+            if (chihiro_check_input(g_config.chihiro.jvs.wmmt2.shift_down, kbd, mouseBtn))
+                sw1 |= 0x20;
+            if (chihiro_check_input(g_config.chihiro.jvs.wmmt2.shift_left, kbd, mouseBtn))
+                sw1 |= 0x80;
+            if (chihiro_check_input(g_config.chihiro.jvs.wmmt2.shift_right, kbd, mouseBtn))
+                sw1 |= 0x40;
+            if (chihiro_check_input(g_config.chihiro.jvs.wmmt2.view_change, kbd, mouseBtn))
+                sw1 |= 0x02;
+            if (chihiro_check_input(g_config.chihiro.jvs.wmmt2.intrude_change, kbd, mouseBtn))
+                sw1 |= 0x01;
+            /* The card slot is the reader's own mouth, not a switch. */
+            {
+                static bool card_key;
+
+                if (key_pressed(chihiro_check_input(g_config.chihiro.jvs.wmmt2.card,
+                                                    kbd, mouseBtn), &card_key))
+                    chihiro_crp1231_card_key();
+            }
         } else {
             /* OR2: view change is player-1 sw0 bit 4. The sequential shifter is
              * NOT on player 1 -- it is wired to the SECOND player's up/down pins,
@@ -1234,6 +1356,34 @@ static void xemu_input_update_jvs(void)
             sw0 |= 0x01;
         break;
     }
+    case CONFIG_CHIHIRO_JVS_PROFILE_GUNDAM: {
+        /* gs_gtest.xbe INPUT TEST (0x15130): STICK L is player 1's byte 0
+         * (UP 0x20, DOWN 0x10, LEFT 0x08, RIGHT 0x04, TRIGGER 0x02, BUTTON
+         * 0x01), STICK R player 2's (after the P2 update below), PEDAL
+         * analog channel 1. */
+        sw0 |= gundam_stick(&g_chihiro_gundam_map[0], kbd, mouseBtn);
+        {
+            int b = g_config.chihiro.jvs.gundam.pedal;
+            if (CHIHIRO_BINDING_IS_PROGRESSIVE(b))
+                jvs->analog[1] =
+                    (uint16_t)(chihiro_input_travel(b, kbd, mouseBtn) * 65535.0f);
+            else
+                jvs->analog[1] = chihiro_check_input(b, kbd, mouseBtn) ? 0xFFFF : 0;
+        }
+        /* The slot's insertion switch, CARD IN: player 1's byte 1, bit 0x80
+         * (gs.xbe FUN_000971d0(1, 0, 1)). As at Ghost Squad's slots, Card In
+         * pushes the card in hand and the game locks it (FUN_00066a30). */
+        {
+            static bool card_key;
+
+            if (key_pressed(chihiro_check_input(g_config.chihiro.jvs.gundam.card,
+                                                kbd, mouseBtn), &card_key))
+                chihiro_hw210_card_key(0);
+            if (chihiro_hw210_enabled && chihiro_card_reader_present(0))
+                sw1 |= 0x80;
+        }
+        break;
+    }
     }
 
     if (chihiro_check_input(g_config.chihiro.jvs.start, kbd, mouseBtn))
@@ -1256,6 +1406,12 @@ static void xemu_input_update_jvs(void)
             jvs->player_switches[1][0] |= 0x20;
         if (chihiro_check_input(g_config.chihiro.jvs.or2.gear_down, kbd, mouseBtn))
             jvs->player_switches[1][0] |= 0x10;
+    }
+
+    /* Gundam's STICK R lives on the second player's switch byte 0. */
+    if (profile == CONFIG_CHIHIRO_JVS_PROFILE_GUNDAM) {
+        jvs->player_switches[1][0] |=
+            gundam_stick(&g_chihiro_gundam_map[6], kbd, mouseBtn);
     }
 
     jvs->system_switches = chihiro_check_input(g_config.chihiro.jvs.test, kbd, mouseBtn) ? 0x80 : 0x00;
@@ -1438,6 +1594,124 @@ static void chihiro_ffb_close(ControllerState *c)
     c->haptic_autocenter_lv = -1;
 }
 
+/* The V257's force on the player's wheel. The spring is the board's own law
+ * (chihiro-driveboard-v257.h): -2.014 fa' tanh(e / 163) of a 338 full scale,
+ * positive toward a higher position. The rest is scaled for a consumer wheel,
+ * about ten times weaker than the cabinet's servo, after FFBArcadePlugin's
+ * Maximum Tune mappings:
+ *   HEURISTIC  pushes at the wheel's full scale (the board gives them 22 %).
+ *   HEURISTIC  damping on the wheel's own damper, at the Wheel Weight share
+ *              (40 % by default).
+ *   HEURISTIC  a collision's push as a knock: full force for 80 ms, spring
+ *              under 30 %, damper released (the cabinet's is one 33 ms frame).
+ * SDL pushes a wheel toward a lower axis value for a positive constant level;
+ * which way the axis runs is the steering binding's. */
+#define V257_KNOCK_MS     80
+#define V257_KNOCK_MIN    96
+#define V257_KNOCK_SPRING 0.3   /* the spring's share left during a knock */
+
+static void v257_render_ffb(ControllerState *c)
+{
+    static int prev, knock_push;
+    static int64_t knock_until;
+    V257DriveBoard *db = chihiro_v257_global;
+    int target, spring, damping, torque;
+    bool on = v257_drive(db, &target, &spring, &damping, &torque);
+    int str = g_config.chihiro.settings.ffb_strength;
+    int weight = g_config.chihiro.settings.wheel_weight;
+    int64_t now = g_get_monotonic_time() / 1000;
+    double pull;
+    bool knock;
+
+    if (str < 0) str = 0;
+    weight = weight < 0 ? 0 : weight > 100 ? 100 : weight;
+
+    /* A collision's push begins: the knock runs its course, whatever the
+     * board does with the push meanwhile. */
+    if (abs(torque) >= V257_KNOCK_MIN &&
+        (!prev || (torque > 0) != (prev > 0))) {
+        knock_push = torque > 0 ? 0x7F : -0x7F;
+        knock_until = now + V257_KNOCK_MS;
+    }
+    prev = torque;
+    knock = now < knock_until;
+    if (knock)
+        torque = knock_push;
+
+    /* The spring as a share of full force, the board's law. */
+    pull = -2.014 * spring * tanh(((int)db->wheel - target) / 163.0) / 338.0;
+    if (knock)
+        pull = MAX(-V257_KNOCK_SPRING, MIN(pull, V257_KNOCK_SPRING));
+    on = on || torque;
+
+    if (c->haptic && c->haptic_constant >= 0) {
+        int b_sr = g_config.chihiro.jvs.steer_right;
+        double dir = CHIHIRO_BINDING_IS_JOY_HALFAXIS(b_sr) &&
+                     !CHIHIRO_JOY_HALFAXIS_POSITIVE(b_sr) ? 1.0 : -1.0;
+        SDL_HapticEffect e;
+        int lvl, coeff;
+
+        chihiro_ffb_set_running(c, on);
+        if (!on)
+            return;
+        if (c->sdl_joystick && c->haptic_autocenter_lv != 0) {
+            SDL_SetHapticAutocenter(c->haptic, 0);
+            c->haptic_autocenter_lv = 0;
+        }
+        lvl = (int)(dir * (pull + torque / 127.0) * 32767.0 * str / 100.0);
+        if (g_config.chihiro.settings.ffb_invert) lvl = -lvl;
+        lvl = chihiro_ffb_clamp(lvl);
+        if (lvl != c->haptic_constant_lv) {
+            c->haptic_constant_lv = lvl;
+            memset(&e, 0, sizeof(e));
+            e.constant.type = SDL_HAPTIC_CONSTANT;
+            e.constant.direction.type = SDL_HAPTIC_STEERING_AXIS;
+            e.constant.length = SDL_HAPTIC_INFINITY;
+            e.constant.level = (Sint16)lvl;
+            SDL_UpdateHapticEffect(c->haptic, c->haptic_constant, &e);
+        }
+        /* Condition effects are re-sent only when they change: new-lg4ff
+         * trips over ones updated every frame. */
+        if (c->haptic_damper >= 0) {
+            coeff = knock ? 0 : chihiro_ffb_clamp(damping * 0x7FFF / 0x7F *
+                                                  weight / 100 * str / 100);
+            if (coeff != c->haptic_damper_lv) {
+                c->haptic_damper_lv = coeff;
+                memset(&e, 0, sizeof(e));
+                e.condition.type = SDL_HAPTIC_DAMPER;
+                e.condition.direction.type = SDL_HAPTIC_STEERING_AXIS;
+                e.condition.length = SDL_HAPTIC_INFINITY;
+                e.condition.right_coeff[0] = e.condition.left_coeff[0] =
+                    (Sint16)coeff;
+                e.condition.right_sat[0] = e.condition.left_sat[0] = 0xFFFF;
+                SDL_UpdateHapticEffect(c->haptic, c->haptic_damper, &e);
+            }
+        }
+        /* The spring is the constant force above; the wheel's own stays
+         * slack. */
+        if (c->haptic_spring >= 0 && c->haptic_spring_lv != 0) {
+            c->haptic_spring_lv = 0;
+            memset(&e, 0, sizeof(e));
+            e.condition.type = SDL_HAPTIC_SPRING;
+            e.condition.direction.type = SDL_HAPTIC_STEERING_AXIS;
+            e.condition.length = SDL_HAPTIC_INFINITY;
+            SDL_UpdateHapticEffect(c->haptic, c->haptic_spring, &e);
+        }
+        return;
+    }
+
+    /* A pad has no column to push. The push, which the cabinet's wheel gives
+     * as a knock, it gives as rumble for as long as the board pushes; the
+     * spring and the damping, a pull and a weight, have nothing to act on. */
+    if (c->type == INPUT_DEVICE_SDL_GAMEPAD) {
+        uint32_t raw = (uint32_t)abs(torque) * 0xFFFF / 0x7F *
+                       (uint32_t)str / 100;
+        uint16_t r = raw > 0xFFFF ? 0xFFFF : (uint16_t)raw;
+        c->gp.rumble_l = r;
+        c->gp.rumble_r = r;
+    }
+}
+
 static void chihiro_ffb_update(ControllerState *c)
 {
     if (!c || !chihiro_driveboard_global) {
@@ -1474,6 +1748,12 @@ static void chihiro_ffb_update(ControllerState *c)
     if (!g_config.chihiro.settings.force_feedback) {
         chihiro_ffb_set_running(c, false);
         c->gp.rumble_l = c->gp.rumble_r = 0;
+        return;
+    }
+
+    if (chihiro_v257_global &&
+        chihiro_cabinet_drive_board() == CHIHIRO_DRIVE_V257) {
+        v257_render_ffb(c);
         return;
     }
 
@@ -1605,6 +1885,9 @@ void xemu_input_update_controllers(void)
     QTAILQ_FOREACH (iter, &available_controllers, entry) {
         xemu_input_update_controller(iter);
     }
+    /* Before the force feedback: a drive board that reads the wheel works
+     * from where it is this frame, not the last. */
+    xemu_input_update_jvs();
 
     // Chihiro drive-board force feedback goes to the device that steers:
     // wheel haptics if it has them, gamepad rumble otherwise. With a drive
@@ -1619,7 +1902,6 @@ void xemu_input_update_controllers(void)
         }
         xemu_input_update_rumble(iter);
     }
-    xemu_input_update_jvs();
     xemu_input_grab_pointers(); /* CHIHIRO + LIGHTGUN (not upstream) */
 }
 

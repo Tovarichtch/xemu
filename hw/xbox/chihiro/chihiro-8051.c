@@ -70,6 +70,7 @@ static inline void direct_write(Cpu8051State *s, uint8_t addr, uint8_t val)
     case SFR_DPH: s->dptr = (s->dptr & 0x00FF) | (val << 8); return;
     default: break;
     }
+    s->irq_recheck = true;
     if (s->sfr_write_cb) { s->sfr_write_cb(s, addr, val); return; }
     s->sfr[addr - 0x80] = val;
 }
@@ -183,6 +184,7 @@ static void timer_tick(Cpu8051State *s)
                 t0++;
                 if (t0 == 0) {
                     tcon |= 0x20;  /* TF0 — overflow flag */
+                    s->irq_recheck = true;
                 }
                 s->sfr[SFR_TL0 - 0x80] = (uint8_t)t0;
                 s->sfr[SFR_TH0 - 0x80] = (uint8_t)(t0 >> 8);
@@ -193,6 +195,7 @@ static void timer_tick(Cpu8051State *s)
                 if (tl == 0) {
                     tl = s->sfr[SFR_TH0 - 0x80];
                     tcon |= 0x20;
+                    s->irq_recheck = true;
                 }
                 s->sfr[SFR_TL0 - 0x80] = tl;
             }
@@ -207,6 +210,7 @@ static void timer_tick(Cpu8051State *s)
             t1++;
             if (t1 == 0) {
                 tcon |= 0x80;  /* TF1 */
+                s->irq_recheck = true;
             }
             s->sfr[SFR_TL1 - 0x80] = (uint8_t)t1;
             s->sfr[SFR_TH1 - 0x80] = (uint8_t)(t1 >> 8);
@@ -216,19 +220,16 @@ static void timer_tick(Cpu8051State *s)
             if (tl == 0) {
                 tl = s->sfr[SFR_TH1 - 0x80];
                 tcon |= 0x80;
+                s->irq_recheck = true;
             }
             s->sfr[SFR_TL1 - 0x80] = tl;
         }
     }
 
-    /* Written back only when a timer actually changed it. This runs once
-     * per machine cycle -- 6 million times a second per board, two boards
-     * -- and the next cycle reads the same byte straight back, so an
-     * unconditional store puts a store-to-load dependency on every cycle
-     * of the interpreter. The value written is identical; only the store
-     * is skipped. */
+    /* Stored only when a flag was raised: this runs every instruction. */
     if (s->sfr[SFR_TCON - 0x80] != tcon) {
         s->sfr[SFR_TCON - 0x80] = tcon;
+        s->events++;
     }
 }
 
@@ -935,6 +936,7 @@ int cpu8051_step(Cpu8051State *s)
         s->pc = (uint16_t)pop8(s) << 8;
         s->pc |= pop8(s);
         s->in_interrupt = false;
+        s->irq_recheck = true;
         return 2;
 
     /* ── JBC bit,rel ── */
@@ -957,6 +959,8 @@ void cpu8051_interrupt(Cpu8051State *s, uint8_t vector)
 {
     s->halted = false;
     s->in_interrupt = true;
+    s->irq_recheck = true;
+    s->events++;
     push8(s, (uint8_t)(s->pc));
     push8(s, (uint8_t)(s->pc >> 8));
     s->pc = vector;

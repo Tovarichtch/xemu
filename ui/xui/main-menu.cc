@@ -2,6 +2,7 @@
 // xemu User Interface
 //
 // Copyright (C) 2020-2022 Matt Borgerson
+// Copyright (c) 2026 Réda Chérif-Touil
 //
 // This program is free software; you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
@@ -42,10 +43,13 @@
 #include "../xemu-xbe.h"
 
 #include "../thirdparty/fatx/fatx.h"
+#include <algorithm>
+#include <vector>
+#include <strings.h>
 
 extern "C" {
-extern int chihiro_region_setting;
 extern bool chihiro_freeplay_setting;
+bool chihiro_gundam_card_repair(const char *card_path, char *why, size_t why_len);
 }
 
 #define DEFAULT_XMU_SIZE 8388608
@@ -1184,14 +1188,31 @@ void MainMenuChihiroView::DrawGameTab()
     ImGui::Text("Game Profile");
     ImGui::NextColumn();
     ImGui::SetNextItemWidth(-FLT_MIN);
-    if (ChevronCombo("###ChihiroProfile", &g_config.chihiro.jvs.profile,
-                     "The House of the Dead III\0"
-                     "Virtua Cop 3\0"
-                     "Ghost Squad\0"
-                     "Crazy Taxi: High Roller\0"
-                     "OutRun 2\0"
-                     "Ollie King\0",
+    /* Built from the table of profile names, sorted; the setting keeps the
+     * enum's value. */
+    static std::string profile_items;
+    static std::vector<int> profile_order;
+    if (profile_items.empty()) {
+        for (int i = 0; i < xemu_chihiro_profile_count(); i++)
+            profile_order.push_back(i);
+        std::sort(profile_order.begin(), profile_order.end(),
+                  [](int a, int b) {
+                      return strcasecmp(xemu_chihiro_profile_title(a),
+                                        xemu_chihiro_profile_title(b)) < 0;
+                  });
+        for (int i : profile_order) {
+            profile_items += xemu_chihiro_profile_title(i);
+            profile_items += '\0';
+        }
+        profile_items += '\0';
+    }
+    int shown = 0;
+    for (size_t i = 0; i < profile_order.size(); i++)
+        if (profile_order[i] == g_config.chihiro.jvs.profile)
+            shown = (int)i;
+    if (ChevronCombo("###ChihiroProfile", &shown, profile_items.c_str(),
                      "Select JVS input profile for the current game")) {
+        g_config.chihiro.jvs.profile = profile_order[shown];
         m_rebinding = nullptr;
     }
     ImGui::NextColumn();
@@ -1255,9 +1276,9 @@ void MainMenuChihiroView::DrawGameTab()
         case CONFIG_CHIHIRO_JVS_PROFILE_GS: {
             static const char *labels[] = {
                 "Trigger", "Action Button", "Change Firerate",
-                "(Optional) Manual reload"
+                "(Optional) Manual reload", "Card In"
             };
-            for (int i = 0; i < 4; i++)
+            for (int i = 0; i < 5; i++)
                 ChihiroRebindRow(labels[i], map_gs[i],
                                  row++, m_rebinding, active_player);
             break;
@@ -1280,6 +1301,16 @@ void MainMenuChihiroView::DrawGameTab()
                                  row++, m_rebinding, 0);
             break;
         }
+        case CONFIG_CHIHIRO_JVS_PROFILE_WMMT2: {
+            static const char *labels[] = {
+                "Shift Up", "Shift Down", "Shift Left", "Shift Right",
+                "View Change", "Intrude Change", "Card In"
+            };
+            for (int i = 0; i < 7; i++)
+                ChihiroRebindRow(labels[i], g_chihiro_wmmt2_map[i],
+                                 row++, m_rebinding, 0);
+            break;
+        }
         case CONFIG_CHIHIRO_JVS_PROFILE_OK: {
             /* The cabinet's left/right arrows choose in the menus. */
             static const char *labels[] = {
@@ -1289,6 +1320,22 @@ void MainMenuChihiroView::DrawGameTab()
             };
             for (int i = 0; i < 6; i++)
                 ChihiroRebindRow(labels[i], g_chihiro_ok_map[i],
+                                 row++, m_rebinding, 0);
+            break;
+        }
+        case CONFIG_CHIHIRO_JVS_PROFILE_GUNDAM: {
+            /* The cabinet's parts: two levers, each with a trigger and a
+             * thumb button, and a pedal (INPUT TEST: STICK L/R, TRIGGER,
+             * BUTTON, PEDAL, CARD IN). */
+            static const char *labels[] = {
+                "Left Lever Up", "Left Lever Down", "Left Lever Left", "Left Lever Right",
+                "Left Trigger", "Left Thumb Button",
+                "Right Lever Up", "Right Lever Down", "Right Lever Left", "Right Lever Right",
+                "Right Trigger", "Right Thumb Button",
+                "Pedal", "Card In"
+            };
+            for (int i = 0; i < 14; i++)
+                ChihiroRebindRow(labels[i], g_chihiro_gundam_map[i],
                                  row++, m_rebinding, 0);
             break;
         }
@@ -1307,6 +1354,7 @@ void MainMenuChihiroView::DrawGameTab()
             g_config.chihiro.jvs_p2.gs_trigger = 0;
             g_config.chihiro.jvs_p2.gs_body_button = 0;
             g_config.chihiro.jvs_p2.gs_change = 0;
+            g_config.chihiro.jvs_p2.gs_card = 25;
         } else {
             g_config.chihiro.jvs.hotd3.trigger = 1001;
             g_config.chihiro.jvs.hotd3.body_button = 1003;
@@ -1316,6 +1364,8 @@ void MainMenuChihiroView::DrawGameTab()
             g_config.chihiro.jvs.gs.trigger = 1001;
             g_config.chihiro.jvs.gs.body_button = 1003;
             g_config.chihiro.jvs.gs.change = 44;
+            g_config.chihiro.jvs.gs.card = 6;
+            g_config.chihiro.jvs.wmmt2.card = 6;
             g_config.chihiro.jvs.ctx.drive_gear = 225;
             g_config.chihiro.jvs.ctx.reverse = 224;
             g_config.chihiro.jvs.ctx.jump = 44;
@@ -1328,6 +1378,20 @@ void MainMenuChihiroView::DrawGameTab()
             g_config.chihiro.jvs.ok.board_rear = 81;
             g_config.chihiro.jvs.ok.left_grab = 29;
             g_config.chihiro.jvs.ok.right_grab = 27;
+            g_config.chihiro.jvs.gundam.l_up = 26;
+            g_config.chihiro.jvs.gundam.l_down = 22;
+            g_config.chihiro.jvs.gundam.l_left = 4;
+            g_config.chihiro.jvs.gundam.l_right = 7;
+            g_config.chihiro.jvs.gundam.l_trigger = 20;
+            g_config.chihiro.jvs.gundam.l_button = 8;
+            g_config.chihiro.jvs.gundam.r_up = 82;
+            g_config.chihiro.jvs.gundam.r_down = 81;
+            g_config.chihiro.jvs.gundam.r_left = 80;
+            g_config.chihiro.jvs.gundam.r_right = 79;
+            g_config.chihiro.jvs.gundam.r_trigger = 229;
+            g_config.chihiro.jvs.gundam.r_button = 228;
+            g_config.chihiro.jvs.gundam.pedal = 44;
+            g_config.chihiro.jvs.gundam.card = 6;
         }
         xemu_settings_save();
     }
@@ -1375,35 +1439,102 @@ void MainMenuChihiroView::Draw()
                "Disable coin requirement (applies on reset)");
         chihiro_freeplay_setting = g_config.chihiro.settings.freeplay;
         ChevronCombo("Region", &g_config.chihiro.settings.region,
-                     "Japan\0USA\0Export\0",
-                     "Arcade region setting (applies on reset)");
-        chihiro_region_setting = g_config.chihiro.settings.region;
-        ImGui::BeginDisabled();
-        int board_dummy = 0;
-        ChevronCombo("Board Type", &board_dummy,
-                     "Type-1 (FPGA)\0",
-                     "Type-3 (ASIC) support coming soon");
-        ImGui::EndDisabled();
+                     "Auto\0Japan\0USA\0Export\0",
+                     "Cabinet region (applies on reset). Auto follows the "
+                     "game's own list of regions: Export where the game "
+                     "accepts it, Japan for the Japan-only titles");
+        ChevronCombo("Board Type", &g_config.chihiro.settings.board_type,
+                     "Auto\0Type-1 (FPGA)\0Type-3 (ASIC)\0",
+                     "Media board (needs a restart). Auto follows the game: "
+                     "Type-1 for Crazy Taxi High Roller and The House of the "
+                     "Dead III, Type-3 for the rest");
+    }
+
+    if (ImGui::CollapsingHeader("Cabinet Link")) {
+        ImGui::TextWrapped(
+            "Linked cabinets are set up in the Network menu: how many, "
+            "which one this is, and the host to reach. The link runs the "
+            "cabinet's real network board, which needs its firmware "
+            "(ver1305.bin) under Files above, and it is built when xemu "
+            "starts: a change there takes effect the next time xemu is "
+            "started.");
+    }
+
+    if (ImGui::CollapsingHeader("Card Reader")) {
+        /* Every reader is listed under the game whose cabinet carries it,
+         * whatever runs: cards are assigned before a game starts, and a slot
+         * never goes to another cabinet's reader. */
         Toggle("Card Reader", &g_config.chihiro.card_reader.enable,
-               "Sanwa CRP-1231LR-10NAB card reader/writer (Ghost Squad, Gundam)");
-        if (g_config.chihiro.card_reader.enable) {
-            static const SDL_DialogFileFilter card_filters[] = {
-                { "Card Images", "bin" },
-                { "All Files", "*" }
-            };
-            FilePicker("Player 1 Card",
-                       g_config.chihiro.card_reader.card1_path, card_filters, 2,
-                       false, [](const char *path) {
-                           xemu_settings_set_string(
-                               &g_config.chihiro.card_reader.card1_path, path);
-                       }, true);
-            FilePicker("Player 2 Card",
-                       g_config.chihiro.card_reader.card2_path, card_filters, 2,
-                       false, [](const char *path) {
-                           xemu_settings_set_string(
-                               &g_config.chihiro.card_reader.card2_path, path);
-                       }, true);
+               "Answer the cabinet's card reader.");
+        ImGui::TextWrapped(
+            "A slot is the card in the player's hand. The game's Card In key "
+            "pushes it into the machine, or a new blank card when the slot "
+            "is empty, and the machine hands it back when the game is done "
+            "with it. Cards the machine makes are kept in the cards folder "
+            "and set here.");
+
+        static const SDL_DialogFileFilter card_filters[] = {
+            { "Card Images", "bin" },
+            { "All Files", "*" }
+        };
+
+        ImGui::BeginDisabled(!g_config.chihiro.card_reader.enable);
+
+        SectionTitle("Ghost Squad");
+        FilePicker("Slot 1",
+                   g_config.chihiro.card_reader.hw210.slot1,
+                   card_filters, 2, false, [](const char *path) {
+                       xemu_settings_set_string(
+                           &g_config.chihiro.card_reader.hw210.slot1, path);
+                   }, true);
+        FilePicker("Slot 2",
+                   g_config.chihiro.card_reader.hw210.slot2,
+                   card_filters, 2, false, [](const char *path) {
+                       xemu_settings_set_string(
+                           &g_config.chihiro.card_reader.hw210.slot2, path);
+                   }, true);
+
+        SectionTitle("Maximum Tune");
+        FilePicker("Maximum Tune 1 Card",
+                   g_config.chihiro.card_reader.crp1231.mt1,
+                   card_filters, 2, false, [](const char *path) {
+                       xemu_settings_set_string(
+                           &g_config.chihiro.card_reader.crp1231.mt1, path);
+                   }, true);
+        FilePicker("Maximum Tune 2 Card",
+                   g_config.chihiro.card_reader.crp1231.mt2,
+                   card_filters, 2, false, [](const char *path) {
+                       xemu_settings_set_string(
+                           &g_config.chihiro.card_reader.crp1231.mt2, path);
+                   }, true);
+        ImGui::TextDisabled("Regional cards. Tune 2 reads Tune 1 cards, not the reverse.");
+
+        SectionTitle("Gundam Battle Operating Simulator");
+        FilePicker("Gundam Card",
+                   g_config.chihiro.card_reader.hw210.gundam,
+                   card_filters, 2, false, [](const char *path) {
+                       xemu_settings_set_string(
+                           &g_config.chihiro.card_reader.hw210.gundam, path);
+                   }, true);
+        {
+            /* The operator's CARD REPAIR without the test menu: the game
+             * refuses a card whose last game was cut short, and the cabinet
+             * keeps a copy of every card it read. */
+            static char repair_word[200];
+            const char *gcard = g_config.chihiro.card_reader.hw210.gundam;
+            ImGui::BeginDisabled(!gcard || !gcard[0]);
+            if (ImGui::Button("Repair Card"))
+                chihiro_gundam_card_repair(gcard, repair_word,
+                                           sizeof(repair_word));
+            ImGui::EndDisabled();
+            ImGui::SameLine();
+            if (repair_word[0])
+                ImGui::TextUnformatted(repair_word);
+            else
+                ImGui::TextDisabled("If you quit before the end of a game.");
         }
+
+        ImGui::EndDisabled();
     }
 
     if (ImGui::CollapsingHeader("Light Gun")) {
@@ -1511,6 +1642,10 @@ void MainMenuChihiroView::Draw()
             ImGui::SliderInt("FFB Strength",
                              &g_config.chihiro.settings.ffb_strength, 0, 200,
                              "%d%%");
+            ImGui::SliderInt("Wheel Weight",
+                             &g_config.chihiro.settings.wheel_weight, 0, 100,
+                             "%d%%");
+            ImGui::SetItemTooltip("Wheel heaviness (Maximum Tune)");
             Toggle("Invert Force Feedback",
                    &g_config.chihiro.settings.ffb_invert,
                    "Enable if the wheel pulls away from center instead of toward it");
@@ -1544,6 +1679,15 @@ void MainMenuChihiroView::Draw()
                    rom_filters, 2, false, [](const char *path) {
             xemu_settings_set_string(&g_config.chihiro.roms.pc20_path, path);
         });
+        FilePicker("DIMM Board network firmware (optional)",
+                   g_config.chihiro.roms.net_firmware_path, rom_filters, 2, false,
+                   [](const char *path) {
+            xemu_settings_set_string(&g_config.chihiro.roms.net_firmware_path, path);
+        });
+        ImGui::TextWrapped("Optional: linked cabinets run it, and its "
+                           "version answers the titles that check one. The "
+                           "media board's V850 firmware needs no file, the "
+                           "game uploads it.");
         static const SDL_DialogFileFilter store_filters[] = {
             { "QCOW2 Image", "qcow2" },
             { "All Files", "*" }
@@ -1804,6 +1948,72 @@ void MainMenuNetworkView::Draw()
     default: break;
     }
     if (enabled) ImGui::EndDisabled();
+
+    DrawCabinetLink();
+}
+
+/* Linked Chihiro cabinets (Settings > Network). The host opens a door per
+ * other cabinet (port + that cabinet's number) and relays everything; the
+ * others only need its address. Takes effect when xemu next starts. */
+void MainMenuNetworkView::DrawCabinetLink(void)
+{
+    SectionTitle("Chihiro Cabinet Link");
+    Toggle("Link cabinets", &g_config.chihiro.link.enable,
+           "Play a Chihiro title across several xemu instances, as linked "
+           "cabinets. The cabinet's network board and the doors between "
+           "the instances are built when xemu starts, so this and the "
+           "settings below take effect the next time xemu is started");
+    if (!g_config.chihiro.link.enable) return;
+
+    int cabinets = g_config.chihiro.link.cabinets - 2;
+    if (ChevronCombo("Cabinets", &cabinets, "2\0" "3\0" "4\0",
+                     "How many cabinets take part; the same on every one"))
+        g_config.chihiro.link.cabinets = cabinets + 2;
+    int cabinet = g_config.chihiro.link.cabinet - 1;
+    if (ChevronCombo("This cabinet", &cabinet, "1\0" "2\0" "3\0" "4\0",
+                     "Its number in the link, different on every one; by "
+                     "convention cabinet 1 is the host"))
+        g_config.chihiro.link.cabinet = cabinet + 1;
+
+    float size_ratio = 0.5;
+    float width = ImGui::GetColumnWidth() * size_ratio;
+    ImGui::PushFont(g_font_mgr.m_menu_font_small);
+    PrepareComboTitleDescription(
+        "Host address",
+        "Where cabinet 1 is (an IP address or a name). Leave it empty on the "
+        "host itself",
+        size_ratio);
+    static char host[128];
+    static bool host_loaded;
+    if (!host_loaded) {
+        strncpy(host, g_config.chihiro.link.host, sizeof(host) - 1);
+        host_loaded = true;
+    }
+    ImGui::SetNextItemWidth(width);
+    if (ImGui::InputText("###link_host", host, sizeof(host)))
+        xemu_settings_set_string(&g_config.chihiro.link.host, host);
+    PrepareComboTitleDescription(
+        "Port",
+        "The host listens on this port plus each other cabinet's number "
+        "(9102 for cabinet 2, up to 9104 for cabinet 4, with the default "
+        "port); open them on its router for play over the Internet",
+        size_ratio);
+    ImGui::SetNextItemWidth(width);
+    ImGui::InputInt("###link_port", &g_config.chihiro.link.port, 0, 0);
+    ImGui::PopFont();
+
+    ImGui::TextWrapped(
+        "The game's own cabinet number is written for Ollie King, OutRun 2, "
+        "OutRun 2 SP and Maximum Tune, from a title's second boot on (its "
+        "first boot creates the settings it is written into); other titles "
+        "take it in their test menu under GAME ASSIGNMENTS. The cabinets may "
+        "start in any order: one that joins keeps knocking until the host "
+        "answers.");
+    ImGui::TextWrapped(
+        "Maximum Tune looks for the other cabinets by timing an answer from "
+        "each one, and counts only those that answer within one frame, under "
+        "16 ms. Its cabinets belong on a wired network: over Wi-Fi the answer "
+        "comes back a frame late and the cabinet is left out of the race.");
 }
 
 void MainMenuNetworkView::DrawPcapOptions(bool appearing)
@@ -2383,6 +2593,23 @@ void MainMenuSystemView::Draw()
             "64 MiB (Default)\0"
             "128 MiB\0",
             "Increase to 128 MiB for debug or homebrew applications")) {
+        m_dirty = true;
+    }
+
+    /* CHIHIRO (not upstream): the media board's DIMM, as its JP1/JP2 jumpers
+     * set it. A Chihiro cabinet was shipped with the size its game needed. */
+    if (ChevronCombo(
+            "Media Board DIMM", &g_config.chihiro.settings.dimm_size,
+            "128 MiB\0"
+            "256 MiB\0"
+            "512 MiB\0"
+            "1024 MiB\0"
+            "Automatic (Default)\0",
+            "How much memory the Chihiro media board carries, as its JP1/JP2 "
+            "jumpers set it. A game whose image is larger than this cannot "
+            "boot: Gundam Battle Operating Simulator needs 1024 MiB. Automatic "
+            "takes the smallest module the game's own image fits in, which is "
+            "the one its cabinet carried. Applies on reset.")) {
         m_dirty = true;
     }
 

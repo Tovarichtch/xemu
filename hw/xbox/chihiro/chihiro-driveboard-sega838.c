@@ -1,5 +1,5 @@
 /*
- * OutRun 2 drive board (force feedback) emulation
+ * Sega 838-13683 drive board (OutRun 2 force feedback)
  *
  * Copyright (c) 2026 Réda Chérif-Touil
  *
@@ -16,9 +16,8 @@
  * You should have received a copy of the GNU Lesser General Public
  * License along with this library; if not, see <http://www.gnu.org/licenses/>.
  */
-#include "chihiro-driveboard.h"
-#include <string.h>
-#include <stdio.h>
+#include "qemu/osdep.h"
+#include "chihiro-driveboard-sega838.h"
 
 DriveBoardState *chihiro_driveboard_global = NULL;
 
@@ -73,7 +72,7 @@ void driveboard_receive_byte(DriveBoardState *db, uint8_t byte)
         driveboard_push_response(db, 0x00);
         break;
 
-    /* --- SUD effect commands (see chihiro-driveboard.h field notes) --- */
+    /* --- SUD effect commands (packages: see chihiro-driveboard-sega838.h) --- */
     case 0x00:  /* wire 0x80: motor power. 00 00 = off, anything else = on. */
         db->motor_active = !(p1 == 0 && p2 == 0);
         if (!db->motor_active) {
@@ -122,8 +121,8 @@ void driveboard_receive_byte(DriveBoardState *db, uint8_t byte)
         break;
     case 0x0B:  /* wire 0x8B: VIBRATION -- road/engine buzz, NOT centering.
                  * P1 = level*8 (0x20-0x78, rises with speed), P2 = freq*2. OR2's
-                 * continuous vibration channel (docs/chihiro-force-feedback.md,
-                 * command 0x0B; re-confirmed in db_dispatch_effects). */
+                 * continuous vibration channel (command 0x0B, outrun2.xbe's
+                 * db_dispatch_effects). */
         db->road_power = p1;
         db->road_freq  = p2;
         driveboard_push_response(db, 0x00);

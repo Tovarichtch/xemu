@@ -102,6 +102,16 @@ struct Cpu8051State {
     /* Interrupt state */
     bool     halted;
     bool     in_interrupt;  /* Set by cpu8051_interrupt, cleared by RETI */
+    /* Set whenever something could have changed the interrupt state, so the
+     * owner knows it must re-evaluate. Sources are enumerated and closed:
+     * SFR write, timer overflow, RETI, interrupt entry, external event, and
+     * on the AN2131 a register write. */
+    bool     irq_recheck;
+    /* What changes the chip other than an instruction's effect on its
+     * registers and internal RAM. The core counts the interrupts it enters
+     * and the timer flags it raises; the chip around it adds its own (see
+     * an2131_idle_turn). */
+    uint32_t events;
     uint64_t cycles;
 
     /* Timer 0 CLK/12 prescaler (ticks once per 3 machine cycles when CKCON.3=0) */

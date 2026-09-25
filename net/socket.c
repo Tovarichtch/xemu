@@ -784,3 +784,18 @@ int net_init_socket(const Netdev *netdev, const char *name,
     }
     return 0;
 }
+
+/* xemu: whether a connect-mode socket netdev has its connection up. A
+ * connection that was refused leaves the netdev in place with a dead
+ * socket; the cabinet link asks before trying again. */
+bool net_socket_is_connected(NetClientState *nc)
+{
+    NetSocketState *s = DO_UPCAST(NetSocketState, nc, nc);
+    struct sockaddr_storage peer;
+    socklen_t len = sizeof(peer);
+
+    if (nc->info->type != NET_CLIENT_DRIVER_SOCKET || s->fd < 0) {
+        return false;
+    }
+    return getpeername(s->fd, (struct sockaddr *)&peer, &len) == 0;
+}

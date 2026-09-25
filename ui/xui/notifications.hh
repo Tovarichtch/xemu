@@ -25,22 +25,26 @@
 class NotificationManager
 {
 private:
-    std::deque<const char *> m_notification_queue;
+    struct Notification {
+        const char *msg;
+        bool warning;  // drawn in the warning colour, not the theme's
+    };
+    std::deque<Notification> m_notification_queue;
     std::deque<const char *> m_error_queue;
 
     const int kNotificationDuration = 4000;
     uint32_t m_notification_end_time;
-    const char *m_msg;
+    Notification m_current;
     bool m_active;
 
 public:
     NotificationManager();
-    void QueueNotification(const char *msg);
+    void QueueNotification(const char *msg, bool warning = false);
     void QueueError(const char *msg);
     void Draw();
 
 private:
-    void DrawNotification(float t, const char *msg);
+    void DrawNotification(float t, const Notification &n);
 };
 
 extern NotificationManager notification_manager;

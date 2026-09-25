@@ -32,6 +32,7 @@
 #include "system/address-spaces.h"
 #include "system/block-backend.h"
 #include "chihiro.h"
+#include "chihiro-asic.h"
 #include "system/blockdev.h"
 #include "system/system.h"
 #include "block/blkmemory.h"
@@ -46,7 +47,11 @@
 #include "exec/watchpoint.h"
 #include "ui/input.h"
 #include "chihiro-jvs.h"
-#include "chihiro-card-reader.h"
+#include "chihiro-cardreader-hw210.h"
+#include "chihiro-cardreader-crp1231.h"
+#include "chihiro-driveboard-v257.h"
+#include "chihiro-netboard.h"
+#include "ui/xemu-notifications.h"
 
 /*
  * Chihiro Mediaboard LPC I/O
@@ -121,6 +126,15 @@ static struct {
 
 static void mediaboard_init(void);
 
+/* The board's address before the game gives it one (mbcom 0x0415, 0x0608):
+ * 10.0.0.<cabinet>, from which the network board makes its MAC address. */
+static uint32_t chihiro_cabinet_ip(void)
+{
+    int cabinet = g_config.chihiro.link.enable ? g_config.chihiro.link.cabinet : 1;
+    if (cabinet < 1 || cabinet > 4) cabinet = 1;
+    return 0x0000000A | ((uint32_t)cabinet << 24);
+}
+
 /* #define DEBUG_CHIHIRO */
 
 /* Always log LPC accesses during development */
@@ -170,6 +184,10 @@ typedef struct ChihiroLPCState {
     /* Type-3 ASIC control registers (written by SEGABOOT after firmware upload) */
     uint32_t asic_cpu_ctrl;     /* 0x80000140: ASIC CPU start/ready latch */
 
+    /* The firmware.asic the game copies to 0x84800000, word by word. */
+    uint8_t *fw_upload;         /* allocated on the first word, FW_UPLOAD_SIZE */
+    uint32_t fw_upload_hi;      /* highest byte offset written, + 4 */
+
     /* DIMM board mailbox: commands at 0x84000020, responses at 0x84000000 */
     uint32_t dimm_cmd[8];      /* 8-dword command block written by SEGABOOT */
     uint32_t dimm_resp[8];     /* 8-dword response block read by SEGABOOT */
@@ -188,6 +206,9 @@ typedef struct ChihiroLPCState {
      * poll keeps firing into a running game — harmless while the
      * mediaboard is idle, fatal while it is streaming (cinematics). */
     bool mig_game_running;
+    /* The game's name picks the cabinet (card reader, drive board, input),
+     * so a snapshot carries it. */
+    uint8_t mig_game_filename[64];
     bool mig_quickreboot_pending;
     bool mig_active;
 } ChihiroLPCState;
@@ -198,6 +219,7 @@ typedef struct ChihiroLPCState {
 static bool chihiro_active;
 bool chihiro_game_running;  /* Set after QuickReboot — disables SEGABOOT DMA scan */
 static int game_mode_bus_starts;  /* BUS START count since game_running became true */
+static void chihiro_patch_running_game(void);
 static bool chihiro_boot3_reached; /* Set when SEGABOOT reaches boot=3 (checks complete) */
 static bool chihiro_quickreboot_pending; /* Set at QuickReboot, consumed by port 0x40F0 handler */
 static bool chihiro_mbcom_bootstrap_done; /* Reset on QuickReboot so game gets fresh DIMM_SIZE */
@@ -207,20 +229,260 @@ char chihiro_game_dir[1024];   /* Game directory path (from dvd_path) */
 
 static char chihiro_save_path[2048];
 static bool chihiro_resolve_save_path(void);
+/* The DIMM's system area follows the save file (see the IDE map below). */
+static void chihiro_dimm_sys_load(void);
+static bool chihiro_dimm_sys_flush(void);
+static bool chihiro_dimm_sys_dirty;
 static void chihiro_resolve_card_path(int player, char *out, size_t out_len);
+static const CardStock *chihiro_cabinet_card_stock(void);
+static bool chihiro_cabinet_is(const char *xbe);
+static void chihiro_backup_tick(void);
+static QEMUBH *chihiro_netboard_bh;
+static void chihiro_netboard_irq_bh(void *opaque);
+static void chihiro_netboard_irq(void);
+bool lpc_log_verbose = false;
 bool chihiro_board_type3;      /* true = ASIC (Type-3), false = FPGA (Type-1) */
-int chihiro_region_setting;   /* 0=JP, 1=US, 2=EX → eeprom[0x1F00] = value+1 */
+static bool chihiro_board_type_known;
+static bool chihiro_cabinet_is_type1(void);
+
+/* Which board the machine presents: the setting, or on Auto the cabinet
+ * table, once the game is known. */
+static void chihiro_resolve_board_type(void)
+{
+    const char *why;
+
+    if (chihiro_board_type_known) return;
+
+    if (g_config.chihiro.settings.board_type ==
+        CONFIG_CHIHIRO_SETTINGS_BOARD_TYPE_TYPE1) {
+        chihiro_board_type3 = false;
+        why = "chosen in the settings";
+    } else if (g_config.chihiro.settings.board_type ==
+               CONFIG_CHIHIRO_SETTINGS_BOARD_TYPE_TYPE3) {
+        chihiro_board_type3 = true;
+        why = "chosen in the settings";
+    } else {
+        if (!chihiro_game_filename[0]) {
+            /* Not named yet: Type-1 until the image has been read. */
+            chihiro_board_type3 = false;
+            return;
+        }
+        /* The cabinet table's type1 rows; everything else, known or not,
+         * is a Type-3. */
+        chihiro_board_type3 = !chihiro_cabinet_is_type1();
+        why = "Auto, from the game";
+    }
+    chihiro_board_type_known = true;
+    fprintf(stderr, "Chihiro: media board presented as %s (%s)\n",
+            chihiro_board_type3 ? "Type-3 (ASIC)" : "Type-1 (FPGA)", why);
+}
+
+bool chihiro_is_type3(void)
+{
+    chihiro_resolve_board_type();
+    return chihiro_board_type3;
+}
+/* The Net-DIMM board's mailbox, which a networked game asks its firmware
+ * version before it starts: answers at 0x91000000, commands at 0x91000200.
+ * The older acLib (Ollie King, acMediaDeviceInit at 0x000F6C20) reaches the
+ * same blocks as the "mbcom:" IDE sectors 0x9008000 (answers) and 0x9008001
+ * (commands), rings by reading 0x90000000 and waits for bit 2 of port
+ * 0x40E0. */
+#define NETDIMM_RESP_BASE 0x91000000u
+#define NETDIMM_CMD_BASE  0x91000200u
+#define NETDIMM_RESP_LBA  0x9008000u
+#define NETDIMM_CMD_LBA   0x9008001u
+/* Those two sectors head a window of 1 MB the same way: sector n of it is
+ * the board's SDRAM at 0x600000 + n * 512, where the bulk data of a command
+ * travels (an address string for 0x0415, a sockaddr, a packet). */
+#define NETDIMM_WINDOW_LBA  NETDIMM_RESP_LBA
+#define NETDIMM_WINDOW_SECTORS (CHIHIRO_NETBOARD_WINDOW_SIZE / 512)
+static uint32_t chihiro_netdimm_resp[8];
+static uint32_t chihiro_netdimm_cmd[8];
+static int chihiro_netdimm_cmd_idx;
+static int chihiro_netdimm_resp_idx;
+
+static void chihiro_netdimm_signal(void);
+
+/* The game writes the eight command words in a row to the same port, the way
+ * it does for the Type-3 board, so the index walks on its own. */
+static void chihiro_netdimm_answer(void)
+{
+    static int logged = 0;
+
+    uint16_t op = (chihiro_netdimm_cmd[0] >> 16) & 0xFFFF;
+
+    memset(chihiro_netdimm_resp, 0, sizeof(chihiro_netdimm_resp));
+    chihiro_netdimm_resp[0] = chihiro_netdimm_cmd[0] | 0x80000000u;
+    switch (op) {
+    case 0x0001:                        /* CONNECT, answered with the DIMM size */
+        chihiro_netdimm_resp[1] = mediaboard.dimm_size;
+        break;
+    case 0x0100:                        /* state and progress */
+        chihiro_netdimm_resp[1] = mediaboard.status;
+        chihiro_netdimm_resp[2] = mediaboard.progress;
+        break;
+    case 0x0101:        /* firmware version, 0x0001 above it and nothing
+                         * after: the real 13.05 firmware answers 00011305
+                         * 00000000 (MEASURED) */
+        chihiro_netdimm_resp[1] = 0x00010000u | mediaboard.fw_version;
+        break;
+    case 0x0103:        /* serial: the media board's, where the real board
+                         * answers its own EEPROM's */
+        memcpy(&chihiro_netdimm_resp[1], mediaboard.serial, 16);
+        break;
+    default:
+        if ((op & 0xFF00) == 0x0400) {
+            /* The 0x04xx sockets without a network board: a board with no
+             * cable. Each word is the call's return value (MEASURED on Golf
+             * 2006 and the mahjong titles): socket, setsockopt, bind, listen
+             * succeed, gethostbyname finds no host, anything needing a peer
+             * fails. */
+            switch (op) {
+            case 0x040B:            /* socket: the board's own, no cable needed */
+            case 0x040E:            /* setsockopt */
+            case 0x0402:            /* bind */
+            case 0x0408:            /* listen */
+            /* gethostbyname: no name server behind an unplugged port */
+            case 0x0405:
+                chihiro_netdimm_resp[1] = 0;
+                break;
+            /* accept: nobody there; whatever needs a peer fails */
+            default:
+                chihiro_netdimm_resp[1] = 0xFFFFFFFFu;
+                break;
+            }
+        }
+        break;
+    }
+    chihiro_netdimm_resp_idx = 0;
+    /* The game waits for the network board's completion: bit 2 of port
+     * 0x40E0 and IRQ 10. */
+    chihiro_netdimm_signal();
+    if (lpc_log_verbose && logged < 8) { logged++;
+        fprintf(stderr, "[%07lld] NETDIMM command %04X seq %04X arg %08X -> %08X\n",
+                TS_MS, (chihiro_netdimm_cmd[0] >> 16) & 0xFFFF,
+                chihiro_netdimm_cmd[0] & 0xFFFF, chihiro_netdimm_cmd[1],
+                chihiro_netdimm_resp[0]); }
+}
+
 bool chihiro_freeplay_setting; /* ic11 byte 0x23/0x63 = freeplay in ACBU coin struct */
 static uint8_t *chihiro_flash_rom;
 static uint32_t chihiro_flash_rom_size;
 
+/* What the board reports when no network firmware image is named. */
+#define MB_FIRM_VERSION_DEFAULT 0x0317
+#define MB_FIRM_VERSION_MARK    "FIRM_VERSION is here!"
+
+/* The version network titles check, read from the network firmware's flash
+ * image (netboard Ver13.05): the little-endian word after the marker above,
+ * on the next 4-byte boundary, which the firmware prints high byte first
+ * (VA 0x80021620): 0x13050621 is 13.05(06.21). Games compare with >=. */
+static uint16_t mediaboard_net_firmware_version(void)
+{
+    const char *path = g_config.chihiro.roms.net_firmware_path;
+    if (!path || !path[0])
+        return MB_FIRM_VERSION_DEFAULT;
+
+    gchar *img = NULL;
+    gsize len = 0;
+    if (!g_file_get_contents(path, &img, &len, NULL)) {
+        fprintf(stderr, "Chihiro: cannot read the network firmware %s\n", path);
+        return MB_FIRM_VERSION_DEFAULT;
+    }
+
+    uint16_t ver = MB_FIRM_VERSION_DEFAULT;
+    const gsize marklen = strlen(MB_FIRM_VERSION_MARK);
+    for (gsize i = 0; i + marklen + 24 < len; i++) {
+        if (memcmp(img + i, MB_FIRM_VERSION_MARK, marklen) != 0)
+            continue;
+        gsize at = (i + marklen + 1 + 3) & ~(gsize)3;   /* past the NUL, aligned */
+        for (gsize j = at; j < at + 16 && j + 4 <= len; j += 4) {
+            uint32_t w = ldl_le_p(img + j);
+            if (!w)
+                continue;
+            ver = (uint16_t)(w >> 16);
+            fprintf(stderr, "Chihiro: network firmware reports version "
+                    "%X.%02X(%02X.%02X)\n",
+                    (w >> 24) & 0xFF, (w >> 16) & 0xFF,
+                    (w >> 8) & 0xFF, w & 0xFF);
+            break;
+        }
+        break;
+    }
+    if (ver == MB_FIRM_VERSION_DEFAULT)
+        fprintf(stderr, "Chihiro: %s carries no version field, the board keeps "
+                "%X.%02X\n", path, MB_FIRM_VERSION_DEFAULT >> 8,
+                MB_FIRM_VERSION_DEFAULT & 0xFF);
+    g_free(img);
+    return ver;
+}
+
+/* The JP1/JP2 jumpers the kernel reads at SEGA_DIMM_SIZE: 0 is 128 MB, 3 is
+ * 1024 MB (the setting's enum index). Past those, Auto: the smallest module
+ * that holds the game's image (Gundam's 576 MiB needs 1024; the others fit
+ * 512). Settled once and logged. */
+unsigned chihiro_dimm_factor(void)
+{
+    static unsigned factor;
+    static bool known;
+
+    if (known)
+        return factor;
+    known = true;
+
+    int set = g_config.chihiro.settings.dimm_size;
+    if (set >= SEGA_DIMM_SIZE_128M && set <= SEGA_DIMM_SIZE_1024M) {
+        factor = (unsigned)set;
+        fprintf(stderr, "Chihiro: media board DIMM %u MB, from the setting\n",
+                128u << factor);
+        return factor;
+    }
+
+    factor = SEGA_DIMM_SIZE_512M;
+    const char *path = g_config.sys.files.dvd_path;
+    int64_t size = -1;
+    if (path && path[0]) {
+        FILE *f = qemu_fopen(path, "rb");
+        if (f) {
+            if (fseek(f, 0, SEEK_END) == 0)
+                size = ftell(f);
+            fclose(f);
+        }
+    }
+    if (size > 0) {
+        /* The smallest DIMM the image fits in, the largest if none. */
+        factor = SEGA_DIMM_SIZE_1024M;
+        for (unsigned i = SEGA_DIMM_SIZE_128M; i < SEGA_DIMM_SIZE_1024M; i++) {
+            if (size <= ((int64_t)128 << 20) << i) {
+                factor = i;
+                break;
+            }
+        }
+        fprintf(stderr, "Chihiro: media board DIMM %u MB, worked out from the "
+                "%lld MiB image\n", 128u << factor,
+                (long long)(size >> 20));
+    } else {
+        fprintf(stderr, "Chihiro: media board DIMM %u MB — no image to size it "
+                "against\n", 128u << factor);
+    }
+    return factor;
+}
+
+/* Refuses every snapshot, taken or loaded, while a linked cabinet's network
+ * board runs. */
+static const VMStateDescription vmstate_chihiro_cabinet_link = {
+    .name = "chihiro-cabinet-link",
+    .unmigratable = 1,
+};
+
 static void mediaboard_init(void)
 {
-    mediaboard.dimm_factor = SEGA_DIMM_SIZE_512M;
-    mediaboard.dimm_size   = 0x08000000u << mediaboard.dimm_factor; /* 512MB */
+    mediaboard.dimm_factor = (uint8_t)chihiro_dimm_factor();
+    mediaboard.dimm_size   = 0x08000000u << mediaboard.dimm_factor;
     /* On real hardware, the SH4 on the DIMM board (VxWorks) provides these
      * values. 0x0317 = 3.17, from GXTX's real Chihiro SYSTEM INFO. */
-    mediaboard.fw_version  = 0x0317;
+    mediaboard.fw_version  = mediaboard_net_firmware_version();
     mediaboard.board_type  = 4; /* Chihiro */
     /* Instant READY/100% — the real SH4/VxWorks on the DIMM board progresses
      * through phases 0→5, 0→100%. This may cause MEDIA BOARD TEST in the
@@ -228,7 +490,7 @@ static void mediaboard_init(void)
      * full progression. Games don't care — they only check final state. */
     mediaboard.status      = MB_STATUS_READY;
     mediaboard.progress    = 100;
-    mediaboard.net_ip      = 0x0100000A; /* 10.0.0.1 LE */
+    mediaboard.net_ip      = chihiro_cabinet_ip();
     memset(mediaboard.serial, 0, sizeof(mediaboard.serial));
 
     /* Read serial from flash ROM MBDT header if available */
@@ -236,16 +498,108 @@ static void mediaboard_init(void)
         memcmp(chihiro_flash_rom + 0xFFE00, "MBDT", 4) == 0) {
         memcpy(mediaboard.serial, chihiro_flash_rom + 0xFFE10, 16);
     }
+
+    /* The network board itself, running that firmware, when the cabinet is
+     * linked (Settings > Network > Cabinet Link). Alone, the C stubs above
+     * answer the mailbox. The board is not in a snapshot and the other
+     * cabinets would not come back with one, so none is taken or loaded
+     * while it runs. */
+    if (g_config.chihiro.link.enable) {
+        const char *firmware = g_config.chihiro.roms.net_firmware_path;
+        if (!firmware || !firmware[0]) {
+            xemu_queue_error_message("Cabinet link: the network board needs its "
+                                     "firmware (ver1305.bin), see Settings > "
+                                     "Chihiro > Files");
+        } else if (chihiro_netboard_init(firmware, mediaboard.serial,
+                                         mediaboard.net_ip)) {
+            chihiro_netboard_bh = qemu_bh_new(chihiro_netboard_irq_bh, NULL);
+            chihiro_netboard_set_host_interrupt(chihiro_netboard_irq);
+            chihiro_netboard_attach_net();
+            vmstate_register(NULL, 0, &vmstate_chihiro_cabinet_link, NULL);
+        } else {
+            xemu_queue_error_message("Cabinet link: the network firmware could "
+                                     "not be read");
+        }
+    }
 }
 
 static ChihiroLPCState *chihiro_lpc_global;
+
+/* The network board's source only, as its firmware raises it
+ * (chihiro_netboard_irq_bh): bit 0 is the media board's. */
+static void chihiro_netdimm_signal(void)
+{
+    if (!chihiro_lpc_global) return;
+    chihiro_lpc_global->mbcom_e0_status |= 0x04;
+    qemu_irq_raise(chihiro_lpc_global->irq10);
+}
+
+/* The network board rings the Xbox from its own thread; the interrupt is
+ * raised on the main loop, where the LPC state lives: bit 2 of port
+ * 0x40E0 (the acLib's source 3, SegaEther) and IRQ 10. */
+static void chihiro_netboard_irq_bh(void *opaque)
+{
+    if (!chihiro_lpc_global) return;
+    chihiro_lpc_global->mbcom_e0_status |= 0x04;
+    qemu_irq_raise(chihiro_lpc_global->irq10);
+}
+
+static void chihiro_netboard_irq(void)
+{
+    if (chihiro_netboard_bh)
+        qemu_bh_schedule(chihiro_netboard_bh);
+}
+
+/* The game opens its link (mbcom 0x0606) with its test menu's cabinet count
+ * and number (the second argument's low bytes); a mismatch with the link's
+ * stops the link forming, so it is said once. Maximum Tune counts itself. */
+static void chihiro_link_watch_command(const uint32_t *pkt)
+{
+    static bool said;
+    int nodes = pkt[2] & 0xFF, index = (pkt[2] >> 8) & 0xFF;
+    char msg[192];
+
+    if (said || !g_config.chihiro.link.enable || (pkt[0] >> 16) != 0x0606)
+        return;
+    if (nodes < 2 || (nodes == g_config.chihiro.link.cabinets &&
+                      index + 1 == g_config.chihiro.link.cabinet))
+        return;
+    said = true;
+    snprintf(msg, sizeof(msg), "The game is set as cabinet %d of %d, the link as "
+             "cabinet %d of %d: set GAME ASSIGNMENTS in the game's test menu",
+             index + 1, nodes, g_config.chihiro.link.cabinet,
+             g_config.chihiro.link.cabinets);
+    xemu_queue_notification_warning(msg);
+}
 uint32_t chihiro_usb_sm_pa;  /* PA of USB state machine globals at VA 0xC3F10 */
 
 unsigned chihiro_log_mask;
-bool lpc_log_verbose = false;
 
 static uint8_t chihiro_mbcom_command[512];
 static uint8_t chihiro_mbcom_response[512];
+
+/* SEGABOOT parks each media board command in a slot and spins until it is
+ * marked done. The slot table is read out of the lookup routine, the same 46
+ * bytes in both SEGABOOT builds of the flash:
+ *   B9 <first slot> | 33 D2 56 EB 06 ... | 83 C2 <stride> 83 C1 <stride>
+ *   81 FA <table size>
+ * (fpr21042: 16 slots of 0x60 at 0x000AA7B0 for the build at 0x0003E250, 64
+ * at 0x00112820 for the one at 0x00041010, which boots). A reply is 128 bytes
+ * of the board's memory, fetched through the 0x4000 register window. */
+typedef struct ChihiroMbcomSlots {
+    uint32_t slots;     /* first slot */
+    uint32_t meta;      /* slot header, 0x20 below the slot itself */
+    uint32_t stride;
+    uint32_t count;
+    bool     known;
+} ChihiroMbcomSlots;
+
+static ChihiroMbcomSlots chihiro_mbcom_slots;
+
+#define CHIHIRO_MBCOM_SLOT_MAX       64
+/* The bus answers in milliseconds, so a slot still untouched after a second
+ * is one nobody is going to answer. */
+#define CHIHIRO_MBCOM_SLOT_GRACE_MS  1000
 
 /* USB devices for delayed hotplug (simulates AN2131 I2C firmware boot) */
 static USBDevice *chihiro_usb_qc = NULL;
@@ -288,6 +642,9 @@ void chihiro_on_ohci_bus_start(void)
      * BUS START means SEGABOOT reloaded after a soft reinit (QuickReboot). */
     if (chihiro_game_running) {
         game_mode_bus_starts++;
+        if (game_mode_bus_starts == 1) {
+            chihiro_patch_running_game();
+        }
         if (game_mode_bus_starts >= 2) {
             fprintf(stderr, "[%07lld] QUICKREBOOT (BUS START #%d in game mode)\n",
                     TS_MS, game_mode_bus_starts);
@@ -295,6 +652,7 @@ void chihiro_on_ohci_bus_start(void)
             chihiro_boot3_reached = false;
             chihiro_quickreboot_pending = true;
             chihiro_mbcom_bootstrap_done = false;
+            chihiro_mbcom_slots.known = false;
             chihiro_e1_armed = false;
             memset(chihiro_mbcom_command, 0, 32);
             memset(chihiro_mbcom_response, 0, 32);
@@ -429,162 +787,461 @@ uint32_t chihiro_va_to_pa(uint32_t va)
     return (pte & 0xFFFFF000) | (va & 0xFFF);
 }
 
-/* Card reader state: one Sanwa CRP-1231LR-10NAB per player, driven by the SC 8051 UARTs */
-static CardReaderState card_state[2];
+/* The Tamura HW210 readers, one per player, driven by the SC 8051 UARTs,
+ * and their slots (see chihiro_hw210_card_key). A snapshot keeps them with
+ * the two JVS values the slots follow. */
+typedef struct {
+    CardReaderState reader[2];
+    int32_t  slot[2];
+    uint32_t pushed_at[2];
+    bool     lock[2];           /* chihiro_jvs_card_lock, at a save */
+    uint32_t switch_reads;      /* chihiro_jvs_switch_reads, likewise */
+} ChihiroHW210;
+static ChihiroHW210 hw210;
 static bool card_reader_initialized;
 
 /* Exposed to the SC (AN2131) layer so the 8051 UART drives the readers
  * directly. [0] = MIDI/UART1 reader, [1] = RS-232C/UART0 reader. */
-CardReaderState *chihiro_card_reader_global = card_state;
+CardReaderState *chihiro_card_reader_global = hw210.reader;
 /* A card game owns the SC MIDI (UART1) channel: the OutRun 2 drive board must
  * not intercept it (only OR2 uses the drive board, and it has no card reader).
  * Before this the FFB drive board answered on MIDI for every game and its
  * bytes corrupted player 1's card channel. */
-bool chihiro_card_reader_enabled;
+bool chihiro_hw210_enabled;
+bool chihiro_crp1231_enabled;
 
 /* Physical card-insertion microswitch state for the JVS input path. */
 bool chihiro_card_reader_present(int player)
 {
     if (player < 0 || player > 1) return false;
-    return card_state[player].card_present;
+    return hw210.reader[player].card_present;
+}
+
+/* A file the reader refused (the reason is in the log), named on screen. */
+static void chihiro_card_refused(const char *path)
+{
+    char *name = g_path_get_basename(path);
+    char msg[300];
+    snprintf(msg, sizeof(msg), "Not a card: %.250s", name);
+    g_free(name);
+    xemu_queue_notification_warning(msg);
+}
+
+static void chihiro_hw210_insert(int player, const char *path)
+{
+    card_reader_insert(&hw210.reader[player], path, chihiro_cabinet_card_stock());
+    if (path[0] && !hw210.reader[player].card_present)
+        chihiro_card_refused(path);
+}
+
+/* The setting that names a slot's card. Maximum Tune 1 and 2 have one each:
+ * 2 rewrites a card of 1 in its own format, which 1 then refuses. */
+static const char **chihiro_card_slot_setting(ChihiroCardSlot slot)
+{
+    switch (slot) {
+    case CHIHIRO_CARD_SLOT_CRP1231:
+        return chihiro_cabinet_is("V307")
+                   ? &g_config.chihiro.card_reader.crp1231.mt1
+                   : &g_config.chihiro.card_reader.crp1231.mt2;
+    case CHIHIRO_CARD_SLOT_GUNDAM:
+        return &g_config.chihiro.card_reader.hw210.gundam;
+    case CHIHIRO_CARD_SLOT_HW210_P1:
+        return &g_config.chihiro.card_reader.hw210.slot1;
+    default:
+        return &g_config.chihiro.card_reader.hw210.slot2;
+    }
+}
+
+/* The Card In key: the card in hand, or a blank, goes into the reader's
+ * mouth and is drawn in when the game asks for a card (new cards come from the
+ * dispenser); a second press takes back a card still in the mouth. */
+void chihiro_crp1231_card_key(void)
+{
+    CRP1231State *r = chihiro_crp1231_global;
+    const char *hand = *chihiro_card_slot_setting(CHIHIRO_CARD_SLOT_CRP1231);
+
+    if (!chihiro_crp1231_enabled || !r)
+        return;
+    switch (r->card_pos) {
+    case CRP1231_CARD_IN:
+        xemu_queue_notification_warning("The card is in the reader");
+        return;
+    case CRP1231_CARD_GATE:
+        /* Handed back and taken at the game's next look (crp1231_respond);
+         * nothing else goes in meanwhile. */
+        xemu_queue_notification_warning("The card is coming out");
+        return;
+    case CRP1231_CARD_ENTRY:
+        crp1231_take_back(r);
+        xemu_queue_notification("Card out");
+        return;
+    }
+    if (!crp1231_offer(r, hand)) {
+        chihiro_card_refused(hand);
+        return;
+    }
+    fprintf(stderr, "Chihiro: CRP-1231 card offered: %s\n",
+            hand && hand[0] ? hand : "(blank)");
+    xemu_queue_notification(hand && hand[0] ? "Card in" : "Blank card in");
+}
+
+/* Where each HW210 slot's card is. Card In pushes the card in hand, or a blank
+ * from the cabinet's stock. A game waiting for a card locks it (vsg.xbe
+ * FUN_0002da90 state 1, gs.xbe FUN_00066a30) and ejects it by releasing the
+ * lock, when the drawer's spring pushes it out; a card no game waits for
+ * springs back after the push. A locked card is never pulled (both games
+ * break). HEURISTIC: a push lasts 30 of the game's switch reads, half a
+ * second. */
+enum { HW210_EMPTY, HW210_PUSHED, HW210_LOCKED };
+#define HW210_PUSH_READS 30
+
+static ChihiroCardSlot chihiro_hw210_card_slot(int player)
+{
+    if (chihiro_cabinet_is("gs"))
+        return CHIHIRO_CARD_SLOT_GUNDAM;
+    return player ? CHIHIRO_CARD_SLOT_HW210_P2 : CHIHIRO_CARD_SLOT_HW210_P1;
+}
+
+bool chihiro_hw210_card_issue(const CardReaderState *s, char *out,
+                              size_t out_len)
+{
+    int player = s - hw210.reader;
+
+    return player >= 0 && player < 2 &&
+           chihiro_card_issue(chihiro_hw210_card_slot(player), out, out_len);
+}
+
+void chihiro_hw210_card_key(int player)
+{
+    char path[1200];
+
+    if (!chihiro_hw210_enabled || !card_reader_initialized ||
+        !chihiro_cabinet_card_lock(player))
+        return;
+    if (hw210.slot[player] == HW210_LOCKED) {
+        xemu_queue_notification_warning("Card locked, the game is using it");
+        return;
+    }
+    if (hw210.slot[player] == HW210_PUSHED)
+        return;
+
+    chihiro_resolve_card_path(player, path, sizeof(path));
+    if (!path[0] &&
+        !chihiro_card_issue(chihiro_hw210_card_slot(player), path,
+                            sizeof(path))) {
+        xemu_queue_notification_warning("No blank card could be made");
+        return;
+    }
+    chihiro_hw210_insert(player, path);
+    if (!hw210.reader[player].card_present)
+        return;
+    hw210.slot[player] = HW210_PUSHED;
+    hw210.pushed_at[player] = chihiro_jvs_switch_reads;
+    fprintf(stderr, "Chihiro: card P%d pushed in: %s\n", player + 1, path);
 }
 
 /*
  * Card reader support. The serial data path is fully LLE: the game's USB
  * vendor requests reach the real SC 8051 firmware, which talks to the
- * CRP-1231LR-10NAB readers over its two UARTs (chihiro-an2131.c). This timer only
- * manages card insertion (the UI assignment) and forces the operator
- * settings the card screen gates on.
+ * HW210 readers over its two UARTs (chihiro-an2131.c). This timer only
+ * manages card insertion (the UI assignment).
  */
-static void chihiro_card_force_operator_settings(void)
-{
-    /* serial_flag=0: keeps module alive (sf==3 kills it) */
-    uint32_t sf_pa = chihiro_va_to_pa(0x467fd0);
-    if (sf_pa != 0xFFFFFFFF) {
-        uint32_t v = 0;
-        cpu_physical_memory_write(sf_pa, &v, 4);
-    }
-    /* card_en=1: tells game card reader HW is present */
-    uint32_t ce_pa = chihiro_va_to_pa(0x447265);
-    if (ce_pa != 0xFFFFFFFF) {
-        uint8_t v = 1;
-        cpu_physical_memory_write(ce_pa, &v, 1);
-    }
-    /* sched_mode=0: disable closing-time card scheduler.
-     * DAT_00447270=1 → FUN_00033120()=1 → detection SM sets bit8
-     * per player → module bit3 set → FUN_0002c750()=0 → no card screen */
-    uint32_t sm_pa = chihiro_va_to_pa(0x447270);
-    if (sm_pa != 0xFFFFFFFF) {
-        uint32_t v = 0;
-        cpu_physical_memory_write(sm_pa, &v, 4);
-    }
-}
-
-/*
- * module 0x22 bit0=1: card_module_init_cb reads card_en at boot (before our
- * force), so the module header bit0 stays 0 for the US region. Walk the
- * hardware module linked list to find and force it. Re-scan each tick until
- * the game has initialized the data block (flags != 0 after masking bit 0),
- * since the module list may be rebuilt across SEGABOOT → game transitions.
- */
-static void chihiro_card_force_module22(int tick)
-{
-    static uint32_t mod22_data_va;
-
-    uint32_t node_va = 0x451030;
-    uint32_t found_data = 0;
-    for (int i = 0; i < 32 && node_va != 0; i++) {
-        uint32_t node_pa = chihiro_va_to_pa(node_va);
-        if (node_pa == 0xFFFFFFFF) break;
-        uint32_t id;
-        cpu_physical_memory_read(node_pa, &id, 4);
-        if (id == 0x22) {
-            cpu_physical_memory_read(node_pa + 0x10, &found_data, 4);
-            break;
-        }
-        cpu_physical_memory_read(node_pa + 0x38, &node_va, 4);
-    }
-
-    if (found_data == 0)
-        return;
-
-    mod22_data_va = found_data;
-
-    uint32_t data_pa = chihiro_va_to_pa(mod22_data_va);
-    if (data_pa == 0xFFFFFFFF)
-        return;
-
-    uint32_t flags;
-    cpu_physical_memory_read(data_pa, &flags, 4);
-
-    uint32_t want = (flags | 1) & ~8u;
-    if (flags != want) {
-        if (tick % 300 == 0)
-            CHIHIRO_LOGF(CARD, "module 0x22 flags=0x%08X → 0x%08X\n",
-                         flags, want);
-        cpu_physical_memory_write(data_pa, &want, 4);
-    }
-
-    for (int p = 0; p < 2; p++) {
-        uint32_t pp_pa = chihiro_va_to_pa(mod22_data_va + 8 + p * 0x12a0);
-        if (pp_pa == 0xFFFFFFFF) continue;
-        uint32_t pf;
-        cpu_physical_memory_read(pp_pa, &pf, 4);
-        if (!(pf & 1)) {
-            pf |= 1;
-            cpu_physical_memory_write(pp_pa, &pf, 4);
-        }
-    }
-}
-
 static void chihiro_card_reader_tick(void)
 {
-    static int card_tick;
-    static char card_last_path[2][1200];
-    card_tick++;
-
     if (!card_reader_initialized) {
-        card_reader_init(&card_state[0]);
-        card_reader_init(&card_state[1]);
-        char path[1200];
-        for (int p = 0; p < 2; p++) {
-            chihiro_resolve_card_path(p, path, sizeof(path));
-            snprintf(card_last_path[p], sizeof(card_last_path[p]), "%s", path);
-            card_reader_insert(&card_state[p], path);
-        }
+        card_reader_init(&hw210.reader[0]);
+        card_reader_init(&hw210.reader[1]);
+        hw210.slot[0] = hw210.slot[1] = HW210_EMPTY;
         card_reader_initialized = true;
         fprintf(stderr, "Chihiro: card reader enabled\n");
     }
 
-    chihiro_card_force_operator_settings();
-    chihiro_card_force_module22(card_tick);
-
-    /* Inserting a card is the player's gesture: the UI assignment IS the
-     * inserted card. Changing it swaps cards (the old one is flushed and
-     * ejected first), clearing it ejects with no replacement. CARD_IN is set
-     * via JVS sw1 |= 0x20 (PUSH5) in xemu-input.c. */
     for (int p = 0; p < 2; p++) {
-        char now_path[1200];
-        chihiro_resolve_card_path(p, now_path, sizeof(now_path));
-        if (strcmp(now_path, card_last_path[p]) != 0) {
-            snprintf(card_last_path[p], sizeof(card_last_path[p]), "%s",
-                     now_path);
-            card_reader_remove(&card_state[p]);
-            card_state[p].card_path[0] = '\0';
-            if (now_path[0])
-                card_reader_insert(&card_state[p], now_path);
+        uint32_t reads = chihiro_jvs_switch_reads - hw210.pushed_at[p];
+        bool lock = chihiro_jvs_card_lock[p];
+        const char *out = NULL;
+
+        switch (hw210.slot[p]) {
+        case HW210_PUSHED:
+            if (lock) {
+                hw210.slot[p] = HW210_LOCKED;
+                CHIHIRO_LOGF(CARD, "P%d card locked %u switch reads after "
+                             "the push\n", p + 1, reads);
+                chihiro_card_note("Card in", false);
+            } else if (reads >= HW210_PUSH_READS) {
+                out = "Card not taken";
+            }
+            break;
+        case HW210_LOCKED:
+            if (!lock)
+                out = "Card out";
+            break;
+        }
+        if (out) {
+            card_reader_remove(&hw210.reader[p]);
             fprintf(stderr, "Chihiro: card P%d %s\n", p + 1,
-                    now_path[0] ? "inserted" : "ejected");
+                    hw210.slot[p] == HW210_LOCKED ? "ejected" : "not taken");
+            chihiro_card_note(out, hw210.slot[p] == HW210_PUSHED);
+            hw210.slot[p] = HW210_EMPTY;
         }
     }
 }
 
-/* Only the OutRun 2 family (outrun2.xbe, OR2SP) talks to a drive board. */
-/* Only the Ghost Squad cabinet carries CRP-1231LR-10NAB card readers; the others
- * have nothing on that port and must not get cards created for them. */
-static bool chihiro_cabinet_has_card_reader(void)
+static const VMStateDescription vmstate_chihiro_hw210_reader = {
+    .name = "chihiro-cardreader-hw210/reader",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT8_ARRAY(rx_buf, CardReaderState, CARD_TOTAL_SIZE + 32),
+        VMSTATE_INT32(rx_pos, CardReaderState),
+        VMSTATE_INT32(rx_expected, CardReaderState),
+        VMSTATE_UINT8_ARRAY(tx_buf, CardReaderState, 2048 + 8),
+        VMSTATE_INT32(tx_len, CardReaderState),
+        VMSTATE_INT32(tx_pos, CardReaderState),
+        VMSTATE_BOOL(card_present, CardReaderState),
+        VMSTATE_UINT8_ARRAY(card_data, CardReaderState, CARD_TOTAL_SIZE),
+        VMSTATE_BOOL(dirty, CardReaderState),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
+static int hw210_pre_save(void *opaque)
 {
-    return strncasecmp(chihiro_game_filename, "vsg", 3) == 0;
+    memcpy(hw210.lock, chihiro_jvs_card_lock, sizeof(hw210.lock));
+    hw210.switch_reads = chihiro_jvs_switch_reads;
+    return 0;
+}
+
+/* A card that comes back may be an older state of a card whose file has
+ * moved on since, and writing it there would undo those games. It comes
+ * back with no file, so its next write makes a new one, as the CRP-1231's
+ * does; dropped before the section is read, a load that fails half-way
+ * keeps no file either. */
+static int hw210_pre_load(void *opaque)
+{
+    for (int p = 0; p < 2; p++)
+        hw210.reader[p].card_path[0] = '\0';
+    return 0;
+}
+
+static int hw210_post_load(void *opaque, int version_id)
+{
+    bool refused = false;
+
+    for (int p = 0; p < 2; p++) {
+        CardReaderState *r = &hw210.reader[p];
+        if (r->rx_pos < 0 || r->rx_pos > (int)sizeof(r->rx_buf) ||
+            r->rx_expected < 0 || r->rx_expected > (int)sizeof(r->rx_buf) ||
+            r->tx_len < 0 || r->tx_len > (int)sizeof(r->tx_buf) ||
+            r->tx_pos < 0 || r->tx_pos > r->tx_len) {
+            /* Cleared too: a failed load can still be resumed. */
+            r->rx_pos = r->rx_expected = 0;
+            r->tx_len = r->tx_pos = 0;
+            refused = true;
+        }
+    }
+    if (refused) {
+        return -EINVAL;
+    }
+    memcpy(chihiro_jvs_card_lock, hw210.lock, sizeof(hw210.lock));
+    chihiro_jvs_switch_reads = hw210.switch_reads;
+    card_reader_initialized = true;
+    return 0;
+}
+
+/* Half a command in and a card locked in its drawer: a snapshot that lost
+ * either would bring back a phantom card or a false "Card out". */
+static const VMStateDescription vmstate_chihiro_hw210 = {
+    .name = "chihiro-cardreader-hw210",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .pre_save = hw210_pre_save,
+    .pre_load = hw210_pre_load,
+    .post_load = hw210_post_load,
+    .fields = (const VMStateField[]) {
+        VMSTATE_STRUCT_ARRAY(reader, ChihiroHW210, 2, 1,
+                             vmstate_chihiro_hw210_reader, CardReaderState),
+        VMSTATE_INT32_ARRAY(slot, ChihiroHW210, 2),
+        VMSTATE_UINT32_ARRAY(pushed_at, ChihiroHW210, 2),
+        VMSTATE_BOOL_ARRAY(lock, ChihiroHW210, 2),
+        VMSTATE_UINT32(switch_reads, ChihiroHW210),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
+/* One row per cabinet: input profile, card reader, drive board, media board.
+ * A row matches a case-insensitive prefix of the XBE's name, directory
+ * stripped ("A\V322.xbe" as "V322.xbe"), so revisions match their title. */
+typedef struct {
+    const char           *xbe;      /* case-insensitive prefix of the basename */
+    int                   profile;  /* CONFIG_CHIHIRO_JVS_PROFILE_*, -1 = none */
+    ChihiroCardReaderKind card;
+    ChihiroDriveBoardKind drive;
+    bool                  type1;    /* shipped on a Type-1 media board */
+    ChihiroMonitorKind    monitor;  /* the scan frequency it is wired for */
+    const CardStock      *stock;    /* what a fresh card from its stock carries */
+    const char           *cards;    /* what the cards it issues are named */
+    uint8_t               locks[2]; /* card lock outputs, JVS GPO bank 0 */
+} ChihiroCabinet;
+
+/* Blocks 4 to 6 of a fresh card, as each game's header check wants them.
+ * Ghost Squad (vsg.xbe): 95 71, type 36 4X, serial 0, version 03 F2 in block
+ * 6, read off real cards. Gundam B.O.S. (gs.xbe FUN_00065730, FUN_000657c0):
+ * type 45 2X, X the BCD serial's digit sum modulo 10, serial at least 2001;
+ * with no Banpresto card dumped, the smallest accepted serial. Block 0 is the
+ * card's number (see CardStock). */
+static const CardStock chihiro_card_stock_vsg = {
+    .header = { 0x95, 0x71, 0x36, 0x40, 0, 0, 0, 0,
+                0, 0, 0, 0, 0, 0, 0, 0,
+                0, 0, 0, 0, 0, 0, 0x03, 0xF2 },
+    .numbered = false,
+};
+static const CardStock chihiro_card_stock_gs = {
+    .header = { 0, 0, 0x45, 0x23, 0x00, 0x00, 0x20, 0x01,
+                0, 0, 0, 0, 0, 0, 0, 0,
+                0, 0, 0, 0, 0, 0, 0, 0 },
+    .numbered = true,
+};
+
+/* The card locks. Ghost Squad (vsg.xbe) drives one solenoid per slot from
+ * JVS bank 0: 0x20 for player 1 and 0x01 for player 2 (tables 0x20D52C,
+ * 0x21D010, 0x20CD5C; 0x40 is player 1's gun recoil there, PLAYER 1 GUN
+ * REACTION in the OUTPUT TEST). It holds a card it finds in a slot
+ * (FUN_0002da90, state 1) and lets go to eject it (state 2): read errors,
+ * the player's choice, the end of a game. Gundam B.O.S. has one, on 0x40
+ * (the OUTPUT TEST of gs_gtest.xbe names it CARD LOCK): gs.xbe
+ * FUN_00064760(1) as the card is detected (FUN_00066a30) and at the start
+ * of each read (FUN_00065590), FUN_00064760(0) at rest and at the end of a
+ * game (FUN_000667a0, FUN_000669e0). */
+static const ChihiroCabinet chihiro_cabinets[] = {
+    { "hod3xb",    CONFIG_CHIHIRO_JVS_PROFILE_HOTD3, CHIHIRO_CARD_NONE,    CHIHIRO_DRIVE_NONE,    true,  CHIHIRO_MONITOR_15KHZ, NULL, NULL, { 0, 0 } },
+    { "ctx_ac",    CONFIG_CHIHIRO_JVS_PROFILE_CTX,   CHIHIRO_CARD_NONE,    CHIHIRO_DRIVE_NONE,    true,  CHIHIRO_MONITOR_15KHZ, NULL, NULL, { 0, 0 } },
+    { "vc3",       CONFIG_CHIHIRO_JVS_PROFILE_VC3,   CHIHIRO_CARD_NONE,    CHIHIRO_DRIVE_NONE,    false, CHIHIRO_MONITOR_15KHZ, NULL, NULL, { 0, 0 } },
+    { "vsg",       CONFIG_CHIHIRO_JVS_PROFILE_GS,    CHIHIRO_CARD_HW210,   CHIHIRO_DRIVE_NONE,    false, CHIHIRO_MONITOR_15KHZ, &chihiro_card_stock_vsg, "ghostsquad", { 0x20, 0x01 } },
+    { "outrun2",   CONFIG_CHIHIRO_JVS_PROFILE_OR2,   CHIHIRO_CARD_NONE,    CHIHIRO_DRIVE_SEGA838, false, CHIHIRO_MONITOR_15KHZ, NULL, NULL, { 0, 0 } },
+    { "OllieKing", CONFIG_CHIHIRO_JVS_PROFILE_OK,    CHIHIRO_CARD_NONE,    CHIHIRO_DRIVE_NONE,    false, CHIHIRO_MONITOR_15KHZ, NULL, NULL, { 0, 0 } },
+    /* Maximum Tune 1 and 2. Namco numbered these discs V3xx; the test-mode
+     * image V322TEST.xbe is the same cabinet. */
+    { "V307",      CONFIG_CHIHIRO_JVS_PROFILE_WMMT2, CHIHIRO_CARD_CRP1231, CHIHIRO_DRIVE_V257,    false, CHIHIRO_MONITOR_15KHZ, NULL, "wmmt1", { 0, 0 } },
+    { "V322",      CONFIG_CHIHIRO_JVS_PROFILE_WMMT2, CHIHIRO_CARD_CRP1231, CHIHIRO_DRIVE_V257,    false, CHIHIRO_MONITOR_15KHZ, NULL, "wmmt2", { 0, 0 } },
+    /* Gundam B.O.S. (gs.xbe, test gs_gtest.xbe): one HW210-family reader on
+     * SC UART1, Ghost Squad's player 1 wire, same frames and blocks (gs.xbe
+     * FUN_00079a90, FUN_0007ae00); UART0 is never opened. */
+    { "gs",        CONFIG_CHIHIRO_JVS_PROFILE_GUNDAM, CHIHIRO_CARD_HW210,  CHIHIRO_DRIVE_NONE,    false, CHIHIRO_MONITOR_15KHZ, &chihiro_card_stock_gs, "gundam", { 0x40, 0x00 } },
+    /* 31 kHz sit-down cabinets: only the monitor is stated (MJ3 Evolution
+     * stops on Caution 51 at 15 kHz). */
+    { "mj3",       -1,                               CHIHIRO_CARD_NONE,    CHIHIRO_DRIVE_NONE,    false, CHIHIRO_MONITOR_31KHZ, NULL, NULL, { 0, 0 } },
+    { "mj2",       -1,                               CHIHIRO_CARD_NONE,    CHIHIRO_DRIVE_NONE,    false, CHIHIRO_MONITOR_31KHZ, NULL, NULL, { 0, 0 } },
+    { "golf",      -1,                               CHIHIRO_CARD_NONE,    CHIHIRO_DRIVE_NONE,    false, CHIHIRO_MONITOR_31KHZ, NULL, NULL, { 0, 0 } },
+};
+
+static void chihiro_cabinet_announce(const ChihiroCabinet *c);
+
+/* The cabinet is settled once the game names itself, and kept: the 8051
+ * asks for it every instruction. */
+static const ChihiroCabinet *chihiro_cabinet_known;
+static bool chihiro_cabinet_settled;
+
+/* The game executable changed, so the answer has to be worked out again. */
+static void chihiro_cabinet_forget(void)
+{
+    chihiro_cabinet_settled = false;
+}
+
+static const ChihiroCabinet *chihiro_cabinet(void)
+{
+    /* The name carries the directory it was booted from ("A\\V322.xbe"). */
+    const char *n = chihiro_game_filename;
+    const char *sep;
+
+    if (chihiro_cabinet_settled)
+        return chihiro_cabinet_known;
+
+    if (!n[0])
+        return NULL;   /* the game has not named itself yet */
+
+    for (sep = n; *sep; sep++)
+        if (*sep == '\\' || *sep == '/')
+            n = sep + 1;
+
+    for (size_t i = 0; i < ARRAY_SIZE(chihiro_cabinets); i++) {
+        const char *pfx = chihiro_cabinets[i].xbe;
+        if (strncasecmp(n, pfx, strlen(pfx)) == 0) {
+            chihiro_cabinet_announce(&chihiro_cabinets[i]);
+            chihiro_cabinet_known = &chihiro_cabinets[i];
+            chihiro_cabinet_settled = true;
+            return chihiro_cabinet_known;
+        }
+    }
+    chihiro_cabinet_announce(NULL);
+    chihiro_cabinet_known = NULL;
+    chihiro_cabinet_settled = true;
+    return NULL;
+}
+
+static bool chihiro_cabinet_is_type1(void)
+{
+    const ChihiroCabinet *c = chihiro_cabinet();
+    return c && c->type1;
+}
+
+/* Said once, when the game first names itself: what the table decided this
+ * cabinet is. A line in the log beats reading the table and guessing. */
+static void chihiro_cabinet_announce(const ChihiroCabinet *c)
+{
+    static const char *cards[] = { "no card reader", "Tamura HW210", "CRP-1231" };
+    static const char *drives[] = { "no drive board", "Sega 838", "Namco V257" };
+    static const ChihiroCabinet *said;
+
+    if (c == said) return;
+    said = c;
+    if (!c) {
+        fprintf(stderr, "Chihiro: cabinet not in the table, nothing fitted\n");
+        return;
+    }
+    fprintf(stderr, "Chihiro: cabinet %s — input profile %d, %s, %s%s\n",
+            c->xbe, c->profile, cards[c->card], drives[c->drive],
+            c->type1 ? ", Type-1 media board" : "");
+}
+
+ChihiroCardReaderKind chihiro_cabinet_card_reader(void)
+{
+    const ChihiroCabinet *c = chihiro_cabinet();
+    return c ? c->card : CHIHIRO_CARD_NONE;
+}
+
+/* The header a fresh card from this cabinet's stock carries, NULL when it
+ * sells none. */
+static const CardStock *chihiro_cabinet_card_stock(void)
+{
+    const ChihiroCabinet *c = chihiro_cabinet();
+    return c ? c->stock : NULL;
+}
+
+/* Whether the running title is the one this row names. For the few things
+ * that are a game's own RAM, not its cabinet. */
+static bool chihiro_cabinet_is(const char *xbe)
+{
+    const ChihiroCabinet *c = chihiro_cabinet();
+    return c && strcmp(c->xbe, xbe) == 0;
+}
+
+ChihiroDriveBoardKind chihiro_cabinet_drive_board(void)
+{
+    const ChihiroCabinet *c = chihiro_cabinet();
+    return c ? c->drive : CHIHIRO_DRIVE_NONE;
+}
+
+uint8_t chihiro_cabinet_card_lock(int player)
+{
+    const ChihiroCabinet *c = chihiro_cabinet();
+    return c && player >= 0 && player < 2 ? c->locks[player] : 0;
+}
+
+ChihiroMonitorKind chihiro_cabinet_monitor(void)
+{
+    const ChihiroCabinet *c = chihiro_cabinet();
+    return c ? c->monitor : CHIHIRO_MONITOR_15KHZ;
 }
 
 /* Execution VAs of the SEGABOOT the board boots: the second megabyte of the
@@ -785,6 +1442,7 @@ void chihiro_set_game_executable(const char *name)
         return;
     }
     g_strlcpy(chihiro_game_filename, name, sizeof(chihiro_game_filename));
+    chihiro_cabinet_forget();
     printf("Chihiro: game → '%s'\n", chihiro_game_filename);
 }
 
@@ -843,6 +1501,7 @@ static void chihiro_on_boot3(void)
     }
     if (!chihiro_usb_save_load(chihiro_save_path))
         fprintf(stderr, "Chihiro: no save found at %s\n", chihiro_save_path);
+    chihiro_dimm_sys_load();
 }
 
 /*
@@ -854,14 +1513,20 @@ static void chihiro_diag_timer_cb(void *opaque)
     ChihiroLPCState *s = (ChihiroLPCState *)opaque;
 
     if (chihiro_game_running) {
-        /* Cabinet wiring: the OutRun 2 cabinets hang the FFB drive board off
-         * SC UART1; the Ghost Squad cabinet wires two CRP-1231LR-10NAB there
-         * instead. Re-evaluated every tick so the UI toggle takes effect
-         * live and hands MIDI back. */
-        chihiro_card_reader_enabled = g_config.chihiro.card_reader.enable &&
-                                      chihiro_cabinet_has_card_reader();
-        if (chihiro_card_reader_enabled)
+        /* What hangs off the SC UARTs (the cabinet table), re-evaluated every
+         * tick so the reader toggle takes effect live. */
+        bool cards_on = g_config.chihiro.card_reader.enable;
+        chihiro_hw210_enabled = cards_on &&
+            chihiro_cabinet_card_reader() == CHIHIRO_CARD_HW210;
+        chihiro_crp1231_enabled = cards_on &&
+            chihiro_cabinet_card_reader() == CHIHIRO_CARD_CRP1231;
+        /* The V257 keeps its own cadence: this tick is its clock. */
+        if (chihiro_v257_global &&
+            chihiro_cabinet_drive_board() == CHIHIRO_DRIVE_V257)
+            v257_tick(chihiro_v257_global);
+        if (chihiro_hw210_enabled)
             chihiro_card_reader_tick();
+        chihiro_backup_tick();
         timer_mod(s->diag_timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 16);
         return;
     }
@@ -885,6 +1550,17 @@ static void chihiro_diag_timer_cb(void *opaque)
     }
 
     timer_mod(s->diag_timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 100);
+}
+
+/* Starts the periodic tick, created here when a restored snapshot skipped
+ * SEGABOOT, which normally creates it. */
+static void chihiro_diag_timer_start(ChihiroLPCState *s, int64_t ms)
+{
+    if (!s->diag_timer)
+        s->diag_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL,
+                                     chihiro_diag_timer_cb, s);
+    s->diag_armed = true;
+    timer_mod(s->diag_timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + ms);
 }
 
 /*
@@ -1123,80 +1799,70 @@ bool chihiro_intercept_reset(void)
     return false;  /* Always allow qemu_system_reset_request */
 }
 
-/* warmboot_diag_cb removed — kernel handles QuickReboot natively via
- * STICKY section (LaunchDataPage) and MmPersistContiguousMemory.
- * See project_quickreboot_mechanism.md for details. */
+/* Dolphin's window for the same board: 0x84800000-0x84818000, which is exactly
+ * the 98304 bytes of every known firmware.asic. */
+#define FW_UPLOAD_BASE 0x84800000u
+#define FW_UPLOAD_SIZE 0x00018000u
 
+static void chihiro_fw_upload_word(ChihiroLPCState *s, uint32_t addr, uint32_t val)
+{
+    uint32_t off = addr - FW_UPLOAD_BASE;
+    if (off > FW_UPLOAD_SIZE - 4) return;
+    if (!s->fw_upload)
+        s->fw_upload = g_malloc0(FW_UPLOAD_SIZE);
+    if (off == 0) {
+        /* Offset 0 opens a new image. */
+        memset(s->fw_upload, 0, FW_UPLOAD_SIZE);
+        s->fw_upload_hi = 0;
+        fprintf(stderr, "Chihiro: ASIC firmware upload begins at 0x%08X\n",
+                addr);
+    }
+    stl_le_p(s->fw_upload + off, val);
+    if (off + 4 > s->fw_upload_hi) s->fw_upload_hi = off + 4;
+}
+
+/* The host released the ASIC's CPU: the board decrypts and runs the upload,
+ * SEGABOOT's copy of the flash firmware or a game's own firmware.asic. */
+static void chihiro_fw_upload_hand_over(ChihiroLPCState *s)
+{
+    if (!s->fw_upload) {
+        CHIHIRO_ERRF("ASIC CPU released with no firmware uploaded\n");
+        return;
+    }
+    chihiro_asic_load_firmware(s->fw_upload, s->fw_upload_hi,
+                               "the host upload");
+}
+
+/* The Type-1 board's answer to a DIMM command (a Type-3's V850 answers for
+ * itself): 16-bit words, resp[0] = seq, resp[1] = cmd | 0x8000, then data. */
 static void chihiro_dimm_process_cmd(ChihiroLPCState *s)
 {
     uint16_t seq = s->dimm_cmd[0] & 0xFFFF;
     uint16_t cmd = (s->dimm_cmd[0] >> 16) & 0xFFFF;
 
     memset(s->dimm_resp, 0, sizeof(s->dimm_resp));
+    s->dimm_resp[0] = seq;
+    s->dimm_resp[1] = cmd | 0x8000;
 
-    if (chihiro_board_type3) {
-        /* Type-3 (ASIC) response format — matches Dolphin AMMediaboard.cpp:
-         * resp[0] = command_word | 0x80000000 (bit 31 = response valid flag)
-         * resp[1+] = response data */
-        s->dimm_resp[0] = s->dimm_cmd[0] | 0x80000000;
-
-        switch (cmd) {
-        case MB_CMD_INIT:
-            s->dimm_resp[1] = mediaboard.dimm_size;
-            break;
-        case MB_CMD_STATUS:
-            s->dimm_resp[1] = mediaboard.status;
-            s->dimm_resp[2] = mediaboard.progress;
-            break;
-        case MB_CMD_GET_VERSION:
-            s->dimm_resp[1] = mediaboard.fw_version;
-            s->dimm_resp[2] = 1;
-            break;
-        case MB_CMD_SYSTEM_TYPE: { /* Dolphin byte layout */
-            uint8_t *p = (uint8_t *)&s->dimm_resp[1];
-            p[0] = 1;    /* flag (must be nonzero) */
-            p[1] = 1;    /* media type: GDROM=1 */
-            p[2] = 0;    /* development mode: 0=normal */
-            p[3] = 0;
-            s->dimm_resp[2] = 0; /* access count */
-            break;
-        }
-        case MB_CMD_GET_SERIAL:
-            memcpy(&s->dimm_resp[1], mediaboard.serial, 16);
-            break;
-        default:
-            break;
-        }
-
-        if (lpc_log_verbose) fprintf(stderr, "[%07lld] DIMM T3: cmd=0x%04X seq=%u resp: %08X %08X %08X %08X\n",
-                TS_MS, cmd, seq, s->dimm_resp[0], s->dimm_resp[1],
-                s->dimm_resp[2], s->dimm_resp[3]);
-    } else {
-        /* Type-1 (FPGA) response format — 16-bit word packed:
-         * resp[0] = seq, resp[1] = cmd | 0x8000, resp[2+] = data */
-        s->dimm_resp[0] = seq;
-        s->dimm_resp[1] = cmd | 0x8000;
-
-        switch (cmd) {
-        case MB_CMD_INIT:
-            s->dimm_resp[2] = mediaboard.dimm_size;
-            break;
-        case MB_CMD_STATUS:
-            s->dimm_resp[2] = mediaboard.status;
-            s->dimm_resp[3] = mediaboard.progress;
-            break;
-        case MB_CMD_GET_VERSION:
-            s->dimm_resp[2] = mediaboard.fw_version;
-            break;
-        case MB_CMD_SYSTEM_TYPE: /* low byte must be >=2 to pass board check */
-            s->dimm_resp[2] = 0x8002;
-            break;
-        case MB_CMD_GET_SERIAL:
-            memcpy(&s->dimm_resp[2], mediaboard.serial, 16);
-            break;
-        default:
-            break;
-        }
+    switch (cmd) {
+    case MB_CMD_INIT:
+        s->dimm_resp[2] = mediaboard.dimm_size;
+        break;
+    case MB_CMD_STATUS:
+        s->dimm_resp[2] = mediaboard.status;
+        s->dimm_resp[3] = mediaboard.progress;
+        break;
+    case MB_CMD_GET_VERSION:
+        s->dimm_resp[2] = mediaboard.fw_version;
+        break;
+    case MB_CMD_SYSTEM_TYPE: /* low byte must be >=2 to pass board check */
+        s->dimm_resp[2] = 0x8002;
+        break;
+    case MB_CMD_GET_SERIAL:
+        memcpy(&s->dimm_resp[2], mediaboard.serial, 16);
+        break;
+    default:
+        break;
     }
 
     s->dimm_resp_ready = true;
@@ -1204,6 +1870,33 @@ static void chihiro_dimm_process_cmd(ChihiroLPCState *s)
     s->dimm_cmd_count++;
 }
 
+
+/* 0x80000140, the ASIC's CPU latch. SEGABOOT and acLib upload the firmware
+ * only while bit 0 reads 0, then write 1 to release the core; nothing ever
+ * writes 0 back (PROVEN, code). While the V850 is held the SADDR window
+ * reads the media board flash, whose word at 0x140 has bit 0 clear
+ * (0x000E9EA0 in fpr21042, as a probe on a real board read; LIKELY taken
+ * before SEGABOOT). Maximum Tune 1 and 2, Gundam and MJ3 ship no
+ * firmware.asic (MEASURED), so the core runs on across the game handover and
+ * QuickReboot (LIKELY). The latch is the host's: a core that stops after its
+ * release still reads 1 (LIKELY). Type-1 has no V850. */
+static uint32_t chihiro_asic_latch(ChihiroLPCState *s)
+{
+    if (!chihiro_is_type3() || chihiro_asic_released()) {
+        return s->asic_cpu_ctrl;
+    }
+    if (chihiro_flash_rom && chihiro_flash_rom_size >= 0x144) {
+        return ldl_le_p(chihiro_flash_rom + 0x140);
+    }
+    return 0;
+}
+
+/* The network device on the media board: present (bit 0 clear); the NetDIMM
+ * mailbox answers it. */
+static uint32_t chihiro_pci_stat_value(void)
+{
+    return 0x00;
+}
 
 static uint64_t chihiro_lpc_io_read(void *opaque, hwaddr addr,
                                     unsigned size)
@@ -1227,7 +1920,7 @@ static uint64_t chihiro_lpc_io_read(void *opaque, hwaddr addr,
     case 0x00: /* Port 0x4000: read baseboard register at lpc_reg_addr */
         switch (s->lpc_reg_addr) {
         case 0x80000140:
-            r = s->asic_cpu_ctrl;
+            r = chihiro_asic_latch(s);
             if (chihiro_game_running) {
                 static int cpu_rdy_log = 0;
                 if (lpc_log_verbose && cpu_rdy_log < 30) { cpu_rdy_log++;
@@ -1235,7 +1928,7 @@ static uint64_t chihiro_lpc_io_read(void *opaque, hwaddr addr,
                             TS_MS, (unsigned)r); }
             }
             break;
-        case 0x80000160: r = 0x00; break; /* bit0=0 → Ethernet present */
+        case 0x80000160: r = chihiro_pci_stat_value(); break;
         case 0x80000164: r = 0x01; break;
         /* DMA control register (acLib indexes the table {0,1,2,4,8,0x10,0x20});
          * the game writes 8 here. We answer a constant instead of latching. */
@@ -1244,13 +1937,15 @@ static uint64_t chihiro_lpc_io_read(void *opaque, hwaddr addr,
             /* Indirect read: return value at address in bb_reg_addr (0xA0000020) */
             uint32_t target = s->bb_reg_addr;
             if (target == 0x80000140) {
-                r = s->asic_cpu_ctrl;
+                r = chihiro_asic_latch(s);
             } else if (target == 0x80000160) {
-                r = 0x00; /* bit0=0 → Ethernet present */
+                r = chihiro_pci_stat_value();
                 if (chihiro_game_running) {
                     static int pcistat_log = 0;
                     if (lpc_log_verbose && pcistat_log < 50) { pcistat_log++;
-                        fprintf(stderr, "[%07lld] GAME SADDR READ 0x80000160 → 0x00 (Ether present)\n", TS_MS); }
+                        fprintf(stderr, "[%07lld] GAME SADDR READ 0x80000160 → 0x%02X "
+                                "(network %s)\n", TS_MS, (unsigned)r,
+                                (r & 1) ? "absent" : "present"); }
                 }
             } else if (target == 0x80000164) {
                 r = 0x01;
@@ -1282,8 +1977,43 @@ static uint64_t chihiro_lpc_io_read(void *opaque, hwaddr addr,
         }
         case 0xA0000020: r = s->bb_reg_addr; break;
         case 0xA0000040: r = s->bb_reg_status; break;
-        case 0x90000000: r = 0x01; break; /* shared memory status = ready */
-        default: r = 0; break;
+        case 0x90000000:
+            /* shared memory status = ready; the read is also the acLib's
+             * doorbell for the network board (setIntReadStatus) */
+            r = 0x01;
+            chihiro_netboard_host_ring();
+            break;
+        default:
+            if (s->lpc_reg_addr == NETDIMM_RESP_BASE) {
+                static int nd_r = 0;
+                if (chihiro_netboard_present()) {
+                    uint32_t pkt[8];
+                    chihiro_netboard_host_response(pkt, sizeof(pkt));
+                    r = pkt[chihiro_netdimm_resp_idx & 7];
+                } else {
+                    r = chihiro_netdimm_resp[chihiro_netdimm_resp_idx & 7];
+                }
+                if (lpc_log_verbose && nd_r < 20) { nd_r++;
+                    fprintf(stderr, "[%07lld] NETDIMM response read [%d] -> %08X\n",
+                            TS_MS, chihiro_netdimm_resp_idx, (unsigned)r); }
+                if (chihiro_netdimm_resp_idx < 7) chihiro_netdimm_resp_idx++;
+            } else if (s->lpc_reg_addr == NETDIMM_CMD_BASE) {
+                /* The game reads the command window to see it is free, then
+                 * writes the eight words. That read is the start of a message.
+                 * With the board there, the word is the slot as it stands:
+                 * the firmware zeroes it when it has taken the command. */
+                if (chihiro_netboard_present()) {
+                    uint32_t pkt[8];
+                    chihiro_netboard_host_command_slot(pkt, sizeof(pkt));
+                    r = pkt[0];
+                } else {
+                    r = 0;
+                }
+                chihiro_netdimm_cmd_idx = 0;
+            } else {
+                r = 0;
+            }
+            break;
         }
         if (CHIHIRO_LOG && lpc_log_verbose) {
             static int lpc_read_log = 0;
@@ -1321,7 +2051,7 @@ static uint64_t chihiro_lpc_io_read(void *opaque, hwaddr addr,
     case 0xF0: /* Board mode. SEGABOOT checks high byte: 0=Type-1, non-zero=Type-3.
                * acLib v0.71+ (WMMT1, Type-3): high byte selects device type
                * '!' vs ')'. Type ')' triggers SC search → EEPROM version read. */
-        r = chihiro_board_type3 ? 0x0100 : 0x0001;
+        r = chihiro_is_type3() ? 0x0100 : 0x0001;
         { static int f0_log = 0; if (lpc_log_verbose && f0_log < 500) { f0_log++;
             fprintf(stderr, "[%07lld] F0 READ → 0x%04X (type3=%d)\n",
                     TS_MS, (unsigned)r, chihiro_board_type3); } }
@@ -1330,10 +2060,10 @@ static uint64_t chihiro_lpc_io_read(void *opaque, hwaddr addr,
         }
         break;
     case SEGA_DIMM_SIZE:
-        r = mediaboard.dimm_factor;     /* JP1/JP2 jumpers. Kernel computes mbcom LBA:
-                                         * mbcom_start = (0x40000 << factor) - 0x8000.
-                                         * Must match IDE capacity and CHIHIRO_MBCOM_BASE. */
-        if (chihiro_board_type3)
+        r = mediaboard.dimm_factor;     /* JP1/JP2 jumpers. The kernel lays the disk
+                                         * out from this, and so do we: see
+                                         * chihiro_mbcom_base() and the IDENTIFY. */
+        if (chihiro_is_type3())
             r |= 0x40;  /* Type-3: dip switch register on media board */
         break;
     case 0x26:  /* Port 0x4026: scratch register (read-write) */
@@ -1365,6 +2095,95 @@ static uint64_t chihiro_lpc_io_read(void *opaque, hwaddr addr,
 
 static void chihiro_mbcom_process(void);
 
+/* A message from the board is in 0x84000000: E0 bit 0 and IRQ 10, 2 ms later
+ * once the game runs. */
+static void chihiro_dimm_raise_message(ChihiroLPCState *s)
+{
+    if (chihiro_game_running && s->dimm_resp_timer) {
+        timer_mod(s->dimm_resp_timer,
+                  qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 2);
+    } else {
+        s->mbcom_e0_status |= 0x01;
+        qemu_irq_lower(s->irq10);
+        qemu_irq_raise(s->irq10);
+    }
+}
+
+void chihiro_dimm_board_posted(const uint32_t *msg8)
+{
+    ChihiroLPCState *s = chihiro_lpc_global;
+    static int late_log;
+
+    if (!s) {
+        return;
+    }
+    if ((msg8[0] & 0x80000000u) && late_log < 8) {
+        late_log++;
+        CHIHIRO_ERRF("cmd %04X: the V850 answered late\n",
+                     (msg8[0] >> 16) & 0x7FFF);
+    }
+    memcpy(s->dimm_resp, msg8, sizeof(s->dimm_resp));
+    chihiro_dimm_raise_message(s);
+}
+
+/* The host rang the media board: a command, or its reply to one of the
+ * board's own. The board's next message, when it comes at once, is raised
+ * here; later ones come through chihiro_dimm_board_posted(). A silent board
+ * raises nothing, as on a cabinet (SEGABOOT: Error 22 after about 40 s, or a
+ * frozen logo while it waits on 0x0100). */
+static bool chihiro_dimm_board_answer(ChihiroLPCState *s)
+{
+    static int miss_log;
+    uint32_t opcode = (s->dimm_cmd[0] >> 16) & 0xFFFF;
+    uint32_t msg[8];
+
+    if (chihiro_asic_mailbox_exchange(s->dimm_cmd, msg)) {
+        /* State 5 is ready; any other means the board waits for the game to
+         * be loaded into the DIMM, which is not modelled. Said once. */
+        static bool busy_said;
+        if (opcode == 0x0100 && msg[0] == (s->dimm_cmd[0] | 0x80000000u) &&
+            msg[1] != 5 && !busy_said) {
+            busy_said = true;
+            CHIHIRO_ERRF("the media board reports state %u at %u%%: it waits "
+                         "for the game to be loaded into the DIMM, not "
+                         "modelled\n", msg[1], msg[2]);
+        }
+        memcpy(s->dimm_resp, msg, sizeof(msg));
+        return true;
+    }
+    /* A reply to one of the board's own commands has no answer. */
+    if (!(s->dimm_cmd[0] & 0x80000000u) && miss_log < 8) {
+        miss_log++;
+        CHIHIRO_ERRF("cmd %04X: the V850 %s\n", opcode,
+                     chihiro_asic_running() ? "has not answered yet" :
+                                              "is not running");
+    }
+    return false;
+}
+
+/* A word the game writes through the SADDR window, in a burst or alone, into
+ * the media board's mailbox or its firmware upload. A command is only stored:
+ * the game runs it with a write to 0x84000040 once all of it is in. */
+static void chihiro_saddr_store(ChihiroLPCState *s, uint32_t wa, uint32_t val)
+{
+    /* The board shares this window: it has to see the write now. */
+    if (wa >= 0x84000000 && wa <= 0x8400003C) {
+        chihiro_asic_host_mailbox_write(wa - 0x84000000, val);
+    }
+    if (wa >= 0x84000020 && wa <= 0x8400003C) {
+        s->dimm_cmd[(wa - 0x84000020) / 4] = val;
+    } else if (wa >= 0x84000000 && wa <= 0x8400001C) {
+        uint32_t idx = (wa - 0x84000000) / 4;
+        s->dimm_resp[idx] = val;
+        if (idx == 0 && val == 0) {
+            memset(s->dimm_resp, 0, sizeof(s->dimm_resp));
+            s->dimm_resp_ready = false;
+        }
+    } else if (wa >= FW_UPLOAD_BASE && wa < FW_UPLOAD_BASE + FW_UPLOAD_SIZE) {
+        chihiro_fw_upload_word(s, wa, val);
+    }
+}
+
 static void chihiro_lpc_io_write(void *opaque, hwaddr addr, uint64_t val,
                                  unsigned size)
 {
@@ -1384,6 +2203,25 @@ static void chihiro_lpc_io_write(void *opaque, hwaddr addr, uint64_t val,
     switch (addr) {
     case 0x00: /* Port 0x4000: write to baseboard register at lpc_reg_addr */
         s->lpc_reg_data = (uint32_t)val;
+        if (s->lpc_reg_addr == NETDIMM_CMD_BASE) {
+            if (chihiro_netdimm_cmd_idx < 8) {
+                chihiro_netdimm_cmd[chihiro_netdimm_cmd_idx++] = (uint32_t)val;
+                if (chihiro_netdimm_cmd_idx == 8) {
+                    if (chihiro_netboard_present()) {
+                        chihiro_link_watch_command(chihiro_netdimm_cmd);
+                        chihiro_netboard_host_command(chihiro_netdimm_cmd,
+                                                      sizeof(chihiro_netdimm_cmd));
+                    } else {
+                        chihiro_netdimm_answer();
+                    }
+                }
+            }
+        } else if (s->lpc_reg_addr == NETDIMM_RESP_BASE) {
+            memset(chihiro_netdimm_resp, 0, sizeof(chihiro_netdimm_resp));
+            chihiro_netdimm_resp_idx = 0;
+            chihiro_netdimm_cmd_idx = 0;
+            chihiro_netboard_host_release();
+        }
         switch (s->lpc_reg_addr) {
         case 0xA0000020: /* Indirect address pointer */
             s->bb_reg_addr = (uint32_t)val;
@@ -1438,23 +2276,7 @@ static void chihiro_lpc_io_write(void *opaque, hwaddr addr, uint64_t val,
                         burst_data_log++;
                     }
                 }
-                if (wa >= 0x84000020 && wa <= 0x8400003C) {
-                    uint32_t idx = (wa - 0x84000020) / 4;
-                    if (idx < 8) {
-                        s->dimm_cmd[idx] = (uint32_t)val;
-                        /* Data stored — processing deferred to EXEC trigger
-                         * at 0x84000040 which the game writes after the burst. */
-                    }
-                } else if (wa >= 0x84000000 && wa <= 0x8400001C) {
-                    uint32_t idx = (wa - 0x84000000) / 4;
-                    if (idx < 8) {
-                        s->dimm_resp[idx] = (uint32_t)val;
-                    }
-                    if (idx == 0 && val == 0) {
-                        memset(s->dimm_resp, 0, sizeof(s->dimm_resp));
-                        s->dimm_resp_ready = false;
-                    }
-                }
+                chihiro_saddr_store(s, wa, (uint32_t)val);
                 s->bb_dma_count++;
                 s->bb_reg_addr += 4;  /* auto-increment */
             } else {
@@ -1466,22 +2288,18 @@ static void chihiro_lpc_io_write(void *opaque, hwaddr addr, uint64_t val,
                             TS_MS, wa, (unsigned)val);
                     regmode_log_count++;
                 }
-                if (wa >= 0x84000020 && wa <= 0x8400003C) {
-                    uint32_t idx = (wa - 0x84000020) / 4;
-                    if (idx < 8) {
-                        s->dimm_cmd[idx] = (uint32_t)val;
-                    }
-                } else if (wa >= 0x84000000 && wa <= 0x8400001C) {
-                    uint32_t idx = (wa - 0x84000000) / 4;
-                    if (idx < 8) {
-                        s->dimm_resp[idx] = (uint32_t)val;
-                    }
-                    if (idx == 0 && val == 0) {
-                        memset(s->dimm_resp, 0, sizeof(s->dimm_resp));
-                        s->dimm_resp_ready = false;
-                    }
+                if ((wa >= 0x84000000 && wa <= 0x8400003C) ||
+                    (wa >= FW_UPLOAD_BASE &&
+                     wa < FW_UPLOAD_BASE + FW_UPLOAD_SIZE)) {
+                    chihiro_saddr_store(s, wa, (uint32_t)val);
                 } else if (wa == 0x80000140) {
                     s->asic_cpu_ctrl = (uint32_t)val;
+                    /* Bit 0 releases the V850, and the image is complete by
+                     * the time it is written. A released core keeps its own. */
+                    if ((val & 1) && !chihiro_asic_released()) {
+                        chihiro_fw_upload_hand_over(s);
+                    }
+                    chihiro_asic_set_running(val & 1);
                 } else if (wa == 0xA0001E60) {
                     if (lpc_log_verbose) fprintf(stderr, "[%07lld] SADDR WRITE 0xA0001E60 <- 0x%08X (fw state)\n",
                             TS_MS, (unsigned)val);
@@ -1491,6 +2309,9 @@ static void chihiro_lpc_io_write(void *opaque, hwaddr addr, uint64_t val,
                             TS_MS, (unsigned)val);
                     if (val & 1) {
                         static int exec_dump = 0;
+                        static int game_exec_log = 0;
+                        bool answered = true;
+
                         if (lpc_log_verbose && exec_dump < 30) {
                             fprintf(stderr, "[%07lld] EXEC dimm_cmd: %08X %08X %08X %08X %08X %08X %08X %08X\n",
                                     TS_MS,
@@ -1498,28 +2319,20 @@ static void chihiro_lpc_io_write(void *opaque, hwaddr addr, uint64_t val,
                                     s->dimm_cmd[4], s->dimm_cmd[5], s->dimm_cmd[6], s->dimm_cmd[7]);
                             exec_dump++;
                         }
-                        chihiro_dimm_process_cmd(s);
-                        {
-                            static int game_exec_log = 0;
-                            if (lpc_log_verbose && chihiro_game_running && game_exec_log < 50) {
-                                fprintf(stderr, "[%07lld] GAME-EXEC #%d: cmd=%08X → resp: %08X %08X %08X %08X\n",
-                                        TS_MS, game_exec_log,
-                                        s->dimm_cmd[0], s->dimm_resp[0], s->dimm_resp[1],
-                                        s->dimm_resp[2], s->dimm_resp[3]);
-                                game_exec_log++;
-                            }
-                        }
-
-                        /* V850 unsolicited 0x0002/0x0003 are RESET REQUESTS
-                         * (acLibUpdateMedia → XLaunchNewImageA). Do NOT send. */
-
-                        if (chihiro_game_running && s->dimm_resp_timer) {
-                            timer_mod(s->dimm_resp_timer,
-                                      qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 2);
+                        if (chihiro_is_type3()) {
+                            answered = chihiro_dimm_board_answer(s);
                         } else {
-                            s->mbcom_e0_status |= 0x01;
-                            qemu_irq_lower(s->irq10);
-                            qemu_irq_raise(s->irq10);
+                            chihiro_dimm_process_cmd(s);
+                        }
+                        if (lpc_log_verbose && chihiro_game_running && game_exec_log < 50) {
+                            fprintf(stderr, "[%07lld] GAME-EXEC #%d: cmd=%08X → resp: %08X %08X %08X %08X\n",
+                                    TS_MS, game_exec_log,
+                                    s->dimm_cmd[0], s->dimm_resp[0], s->dimm_resp[1],
+                                    s->dimm_resp[2], s->dimm_resp[3]);
+                            game_exec_log++;
+                        }
+                        if (answered) {
+                            chihiro_dimm_raise_message(s);
                         }
                     }
                 }
@@ -1537,6 +2350,8 @@ static void chihiro_lpc_io_write(void *opaque, hwaddr addr, uint64_t val,
         break;
     case SEGA_IRQ10_ACK: { /* 0xE0 — ack: clear specific bits */
         uint8_t old_e0 = s->mbcom_e0_status;
+        if (val & 0x04)
+            chihiro_netboard_host_ack();
         s->mbcom_e0_status &= ~(uint8_t)val;
         if (s->mbcom_e0_status == 0)
             qemu_irq_lower(s->irq10);
@@ -1561,7 +2376,7 @@ static void chihiro_lpc_io_write(void *opaque, hwaddr addr, uint64_t val,
                            * scratch 0x0102 = status register (bit8=busy), NOT a command */
         static int e1_log = 0;
         if (val != 0) {
-            if (!chihiro_game_running &&
+            if (!chihiro_is_type3() && !chihiro_game_running &&
                 (chihiro_mbcom_command[0] != 0 || chihiro_mbcom_command[1] != 0)) {
                 chihiro_mbcom_process();
                 s->mbcom_e0_status |= 0x01;
@@ -1577,7 +2392,7 @@ static void chihiro_lpc_io_write(void *opaque, hwaddr addr, uint64_t val,
                             chihiro_mbcom_command[0], chihiro_mbcom_command[1]); }
             }
         } else {
-            if (chihiro_game_running && chihiro_board_type3 && chihiro_e1_armed) {
+            if (chihiro_game_running && chihiro_is_type3() && chihiro_e1_armed) {
                 /* ')' mode (Type-3 game): E1=0 is the game worker's
                  * confirmation that it processed the ARM cycle. Clear E0
                  * so the worker can proceed to read SADDR. */
@@ -1602,7 +2417,9 @@ static void chihiro_lpc_io_write(void *opaque, hwaddr addr, uint64_t val,
                             TS_MS, s->lpc_scratch_4026,
                             chihiro_mbcom_response[0], chihiro_mbcom_response[1],
                             chihiro_mbcom_response[2], chihiro_mbcom_response[3]); }
-            } else if (chihiro_e1_armed && (chihiro_mbcom_command[0] != 0 || chihiro_mbcom_command[1] != 0)) {
+            } else if (!chihiro_is_type3() && chihiro_e1_armed &&
+                       (chihiro_mbcom_command[0] != 0 ||
+                        chihiro_mbcom_command[1] != 0)) {
                 /* DMA_PROCESS ('!' mode / SEGABOOT) */
                 const uint8_t *w = chihiro_mbcom_command;
                 uint16_t seq = w[0] | (w[1] << 8);
@@ -1674,6 +2491,12 @@ uint32_t chihiro_ic11_size = 0;
 uint8_t *chihiro_pc20_data = NULL;
 uint32_t chihiro_pc20_size = 0;
 
+const uint8_t *chihiro_flash_rom_bytes(uint32_t *size)
+{
+    if (size) *size = chihiro_flash_rom_size;
+    return chihiro_flash_rom;
+}
+
 bool chihiro_flash_rom_loaded(void)
 {
     return chihiro_flash_rom != NULL;
@@ -1681,16 +2504,9 @@ bool chihiro_flash_rom_loaded(void)
 
 int chihiro_detected_game_profile(void)
 {
-    if (!chihiro_game_filename[0]) return -1;
+    const ChihiroCabinet *c = chihiro_cabinet();
 
-    if (strcasecmp(chihiro_game_filename, "hod3xb.xbe") == 0)   return 0;
-    if (strcasecmp(chihiro_game_filename, "vc3.xbe") == 0)       return 1;
-    if (strcasecmp(chihiro_game_filename, "vsg.xbe") == 0)       return 2;
-    if (strcasecmp(chihiro_game_filename, "ctx_ac[r].xbe") == 0) return 3;
-    if (strcasecmp(chihiro_game_filename, "outrun2.xbe") == 0)   return 4;
-    if (strcasecmp(chihiro_game_filename, "OllieKing.xbe") == 0) return 5;
-
-    return -1;
+    return c ? c->profile : -1;
 }
 
 static bool chihiro_read_flash_rom(const char *path)
@@ -1832,102 +2648,272 @@ static void chihiro_dimm_resp_timer_cb(void *opaque)
     qemu_irq_raise(s->irq10);
 }
 
+/* Guest memory by virtual address, one page at a time. */
+static bool chihiro_guest_rw(uint32_t va, void *buf, uint32_t len, bool write)
+{
+    uint8_t *p = buf;
+
+    while (len) {
+        uint32_t pa = chihiro_va_to_pa(va);
+        uint32_t run = 0x1000 - (va & 0xFFF);
+
+        if (run > len) {
+            run = len;
+        }
+        if (pa == 0xFFFFFFFF || (uint64_t)pa + run > 0x08000000u) {
+            return false;
+        }
+        if (write) {
+            cpu_physical_memory_write(pa, p, run);
+        } else {
+            cpu_physical_memory_read(pa, p, run);
+        }
+        va += run;
+        p += run;
+        len -= run;
+    }
+    return true;
+}
+
+/* HACK: a game's own bug corrected in its memory at the first USB bus start,
+ * only where the whole signature matches (the image, whose digests the kernel
+ * checks, is never touched).
+ * Gundam B.O.S. checks the network firmware version as two numbers, the first
+ * at least 12 AND the second at least 09 (gs.xbe 0x6499A: cmp cl,0x12 / jc;
+ * cmp al,9 / jnc), so 13.05, the only dumped firmware, gets "Error 14", as on
+ * a real cabinet on 13.05. The second jump (0F 83) becomes nop / jmp (90 E9).
+ * The game is patched rather than the firmware: 13.05 is the only dump, and it
+ * stays as dumped. */
+typedef struct {
+    const char    *xbe;         /* chihiro_game_filename */
+    uint32_t       va;          /* where the bytes live in the running game */
+    const uint8_t *expect;      /* what must be there */
+    const uint8_t *replace;     /* what goes there instead */
+    uint32_t       len;
+    const char    *why;
+} ChihiroGamePatch;
+
+static const uint8_t chihiro_gundam_check[] = {
+    0x3C, 0x09, 0x0F, 0x83, 0xDE, 0x00, 0x00, 0x00
+};
+static const uint8_t chihiro_gundam_patched[] = {
+    0x3C, 0x09, 0x90, 0xE9, 0xDE, 0x00, 0x00, 0x00
+};
+
+static const ChihiroGamePatch chihiro_game_patches[] = {
+    { "gs.xbe", 0x0006499F, chihiro_gundam_check, chihiro_gundam_patched,
+      sizeof(chihiro_gundam_check),
+      "Gundam reads the network firmware version as two separate numbers and "
+      "refuses 13.05; its second compare no longer decides" },
+};
+
+static void chihiro_patch_running_game(void)
+{
+    for (size_t i = 0; i < ARRAY_SIZE(chihiro_game_patches); i++) {
+        const ChihiroGamePatch *gp = &chihiro_game_patches[i];
+        uint8_t have[16];
+
+        if (g_ascii_strcasecmp(chihiro_game_filename, gp->xbe) != 0 ||
+            gp->len > sizeof(have)) {
+            continue;
+        }
+        if (!chihiro_guest_rw(gp->va, have, gp->len, false)) {
+            fprintf(stderr, "Chihiro: %s is not mapped at %08X yet, its patch "
+                    "is skipped\n", gp->xbe, gp->va);
+            continue;
+        }
+        if (memcmp(have, gp->replace, gp->len) == 0) {
+            continue;                       /* already there */
+        }
+        if (memcmp(have, gp->expect, gp->len) != 0) {
+            fprintf(stderr, "Chihiro: %s is not the revision the patch knows, "
+                    "left alone\n", gp->xbe);
+            continue;
+        }
+        if (chihiro_guest_rw(gp->va, (void *)gp->replace, gp->len, true)) {
+            fprintf(stderr, "Chihiro: HACK, %s patched at %08X: %s\n",
+                    gp->xbe, gp->va, gp->why);
+        }
+    }
+}
+
+/* The mov that carries the slot table, then the fourteen bytes behind it and
+ * the add that carries the stride. */
+static const uint8_t chihiro_mbcom_slot_sig[] = {
+    0x33, 0xD2, 0x56, 0xEB, 0x06, 0x8D, 0x9B, 0x00, 0x00, 0x00, 0x00,
+    0xF6, 0x41, 0x03, 0x80, 0x8D, 0x71, 0xE0, 0x75, 0x04, 0x38, 0x01,
+    0x74, 0x12, 0x83, 0xC2
+};
+
+#define CHIHIRO_SEGABOOT_CODE_START 0x00011000u
+#define CHIHIRO_SEGABOOT_CODE_END   0x00115000u
+#define CHIHIRO_MBCOM_SIG_SPAN      48
+
+static void chihiro_read_slot_table(const uint8_t *win, size_t i,
+                                    ChihiroMbcomSlots *out)
+{
+    const uint8_t *p = win + i + 5 + sizeof(chihiro_mbcom_slot_sig);
+    uint32_t stride = p[0];
+    uint32_t slots, size;
+
+    if (p[1] != 0x83 || p[2] != 0xC1 || p[3] != stride ||
+        p[4] != 0x81 || p[5] != 0xFA) {
+        return;
+    }
+    slots = ldl_le_p(win + i + 1);
+    size = ldl_le_p(p + 6);
+    if (stride < 0x20 || !size || size % stride || slots < 0x20) {
+        return;
+    }
+    out->slots = slots;
+    out->meta = slots - 0x20;
+    out->stride = stride;
+    out->count = size / stride;
+}
+
+static bool chihiro_find_mbcom_slots(void)
+{
+    /* A page at a time, keeping the tail of the previous one so a match that
+     * straddles a page boundary is still seen. */
+    uint8_t win[64 + 0x1000];
+    ChihiroMbcomSlots found = { 0 };
+
+    memset(win, 0, sizeof(win));
+
+    for (uint32_t va = CHIHIRO_SEGABOOT_CODE_START;
+         va < CHIHIRO_SEGABOOT_CODE_END; va += 0x1000) {
+        memmove(win, win + 0x1000, 64);
+        if (!chihiro_guest_rw(va, win + 64, 0x1000, false)) {
+            memset(win + 64, 0, 0x1000);
+            continue;
+        }
+
+        for (size_t i = 0; i + CHIHIRO_MBCOM_SIG_SPAN <= sizeof(win); i++) {
+            if (win[i] == 0xB9 &&
+                !memcmp(win + i + 5, chihiro_mbcom_slot_sig,
+                        sizeof(chihiro_mbcom_slot_sig))) {
+                chihiro_read_slot_table(win, i, &found);
+            }
+        }
+        if (found.count) {
+            break;
+        }
+    }
+
+    if (!found.count) {
+        return false;
+    }
+    found.known = true;
+    chihiro_mbcom_slots = found;
+    fprintf(stderr,
+            "[%07lld] Chihiro: SEGABOOT parks its media board commands in %u "
+            "slots of %u bytes at %08X, read from its own code\n",
+            TS_MS, found.count, found.stride, found.slots);
+    return true;
+}
+
+/* HEURISTIC safety net, not the bus: answers a command SEGABOOT parked that
+ * nothing took for a whole second. */
+static void chihiro_answer_mbcom_slots(ChihiroLPCState *s)
+{
+    static int64_t first_seen[CHIHIRO_MBCOM_SLOT_MAX];
+    int64_t now_ms = qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL);
+    uint32_t stride = chihiro_mbcom_slots.stride;
+
+    for (uint32_t sl = 0; sl < chihiro_mbcom_slots.count
+                          && sl < CHIHIRO_MBCOM_SLOT_MAX; sl++) {
+        uint32_t data_va = chihiro_mbcom_slots.slots + sl * stride;
+        uint32_t meta_va = chihiro_mbcom_slots.meta + sl * stride;
+        uint8_t data_byte0 = 0;
+        uint16_t meta_marker = 0, cmd_opcode = 0;
+
+        if (!chihiro_guest_rw(data_va, &data_byte0, 1, false) ||
+            !chihiro_guest_rw(meta_va + 2, &meta_marker, 2, false)) {
+            continue;
+        }
+        if (data_byte0 == 0 || meta_marker != 0) {
+            first_seen[sl] = 0;
+            continue;
+        }
+        if (!first_seen[sl]) {
+            first_seen[sl] = now_ms;
+        }
+        if (now_ms - first_seen[sl] < CHIHIRO_MBCOM_SLOT_GRACE_MS) {
+            continue;
+        }
+        if (!chihiro_guest_rw(data_va + 2, &cmd_opcode, 2, false)) {
+            continue;
+        }
+
+        if (cmd_opcode == MB_CMD_GET_NET_PROPERTY) {
+            /* No network behind the board: an all-zero property block (the window
+             * reads back as zero), shown as NETWORK TYPE NONE. */
+            uint32_t offset = 0;
+
+            if (!chihiro_guest_rw(meta_va + 4, &offset, 4, true)) {
+                continue;
+            }
+            meta_marker = 0x0001;
+        } else {
+            /* Failed rather than invented: SEGABOOT frees the slot and goes on. */
+            meta_marker = 0x8000;
+        }
+
+        if (!chihiro_guest_rw(meta_va + 2, &meta_marker, 2, true)) {
+            continue;
+        }
+        first_seen[sl] = 0;
+        s->mbcom_e0_status |= 0x05;
+        s->lpc_scratch_4026 &= ~0x0100;
+        qemu_irq_raise(s->irq10);
+    }
+}
+
 static void chihiro_irq10_timer_cb(void *opaque)
 {
     ChihiroLPCState *s = opaque;
-    /* IRQ10 for SEGABOOT baseboard communication. The board only signals a
-     * host that is already talking to it — the first LPC access is that
-     * proof, and it is a bus event rather than a peek into guest memory. */
-    if (s->host_seen && !chihiro_game_running) {
+    /* IRQ10 for SEGABOOT's Type-1 baseboard communication. The board only
+     * signals a host that is already talking to it — the first LPC access is
+     * that proof, and it is a bus event rather than a peek into guest memory.
+     * A Type-3 gets no pulse: its V850 raises IRQ 10 when it answers. */
+    if (s->host_seen && !chihiro_game_running && !chihiro_is_type3()) {
         qemu_irq_raise(s->irq10);
     }
 
-    /* Game-mode mbcom bootstrap.
-     *
-     * Type-1 ('!' mode): Pre-load DIMM_SIZE (0x8001) and fire IRQ10
-     * immediately. Worker uses IDE DMA polling, no handshake needed.
-     *
-     * Type-3 (')' mode): Start the V850 unsolicited handshake sequence.
-     * Real firmware sends cmd 0x0002 (DMA state 4) then cmd 0x0003 (DMA
-     * state 5). Each is a handshake: V850 sends unsolicited → game responds
-     * 0x0001 → V850 ACKs with 0x8001+DIMM_SIZE. The heartbeat timer drives
-     * this state machine. After both handshakes, switch to reactive mode
-     * where each EXEC gets an immediate response+E0+IRQ10. */
-    if (chihiro_game_running && chihiro_mbcom_enabled) {
-        if (!chihiro_mbcom_bootstrap_done) {
-            memset(chihiro_mbcom_command, 0, 32);
-
-            if (chihiro_board_type3) {
-                /* ')' mode: purely reactive. Game state machine calls
-                 * FUN_0014c580 to set up connection, then sends cmd 0x0001
-                 * via EXEC. Our response (0x8001+DIMM_SIZE) serves as the
-                 * handshake message. No proactive heartbeat needed. */
-                fprintf(stderr, "[%07lld] *** GAME MBCOM BOOTSTRAP T3: reactive mode (no heartbeat) ***\n", TS_MS);
-            } else {
-                /* '!' mode: fire DIMM_SIZE + IRQ10 immediately */
-                s->dimm_cmd[0] = 1 | (0x0001 << 16);
-                chihiro_dimm_process_cmd(s);
-                s->dimm_resp_ready = true;
-                s->mbcom_e0_status |= 0x01;
-                s->mbcom_resp_ready = true;
-                s->lpc_scratch_4026 &= ~0x0100;
-                qemu_irq_lower(s->irq10);
-                qemu_irq_raise(s->irq10);
-                fprintf(stderr, "[%07lld] *** GAME MBCOM BOOTSTRAP T1: 0x8001 loaded, IRQ10 edge fired ***\n", TS_MS);
-            }
-            chihiro_mbcom_bootstrap_done = true;
+    /* Type-1 game-mode mbcom bootstrap ('!' mode): pre-load DIMM_SIZE
+     * (0x8001) and fire IRQ10 at once; the worker polls through IDE DMA, with
+     * no handshake. A Type-3 game asks its V850 itself (0x0001 by EXEC). */
+    if (chihiro_game_running && chihiro_mbcom_enabled &&
+        !chihiro_mbcom_bootstrap_done) {
+        memset(chihiro_mbcom_command, 0, 32);
+        if (!chihiro_is_type3()) {
+            s->dimm_cmd[0] = 1 | (0x0001 << 16);
+            chihiro_dimm_process_cmd(s);
+            s->dimm_resp_ready = true;
+            s->mbcom_e0_status |= 0x01;
+            s->mbcom_resp_ready = true;
+            s->lpc_scratch_4026 &= ~0x0100;
+            qemu_irq_lower(s->irq10);
+            qemu_irq_raise(s->irq10);
+            fprintf(stderr, "[%07lld] *** GAME MBCOM BOOTSTRAP T1: 0x8001 loaded, IRQ10 edge fired ***\n", TS_MS);
         }
-
-        /* Type-3 unsolicited 0x0002 is scheduled by the EXEC handler
-         * after the game's cmd 0x0100 status query. The heartbeat timer
-         * delivers it 200ms later, after the status response is consumed. */
+        chihiro_mbcom_bootstrap_done = true;
     }
 
-    /* DMA META scan: provide mbcom slot responses to SEGABOOT */
-    if (chihiro_mbcom_enabled && !chihiro_game_running
+    /* Pick up the media board commands SEGABOOT is spinning on (Type-1: a
+     * Type-3's V850 answers them itself). */
+    if (chihiro_mbcom_enabled && !chihiro_game_running && !chihiro_is_type3()
         && chihiro_lpc_global && chihiro_lpc_global->diag_armed) {
-        static const struct { uint32_t slot_va; uint32_t meta_va; uint32_t stride; }
-            slot_layouts[] = {
-                { 0xAA7B0, 0xAA790, 0x60 },
-                { 0x89760, 0x89740, 0x40 },
-            };
-        for (int layout = 0; layout < 2; layout++) {
-            uint32_t slot_base_pa = chihiro_va_to_pa(slot_layouts[layout].slot_va);
-            if (slot_base_pa == 0xFFFFFFFF) continue;
-            uint32_t meta_base_pa = chihiro_va_to_pa(slot_layouts[layout].meta_va);
-            if (meta_base_pa == 0xFFFFFFFF) continue;
-            if (slot_base_pa >= 0x800000 || meta_base_pa >= 0x800000) continue;
-            uint32_t stride = slot_layouts[layout].stride;
-            for (int sl = 0; sl < 16; sl++) {
-                uint32_t data_pa = slot_base_pa + sl * stride;
-                uint32_t meta_pa = meta_base_pa + sl * stride;
-                if (data_pa + 4 >= 0x800000 || meta_pa + 12 >= 0x800000) continue;
-                uint8_t data_byte0;
-                uint16_t meta_marker;
-                cpu_physical_memory_read(data_pa, &data_byte0, 1);
-                cpu_physical_memory_read(meta_pa + 2, &meta_marker, 2);
-                if (data_byte0 == 0 || meta_marker != 0) continue;
-                uint16_t cmd_opcode = 0;
-                cpu_physical_memory_read(data_pa + 2, &cmd_opcode, 2);
-                uint32_t resp_data = 0, resp_data2 = 0;
-                switch (cmd_opcode) {
-                case MB_CMD_INIT: resp_data = mediaboard.dimm_size; break;
-                case MB_CMD_STATUS: resp_data = mediaboard.status; resp_data2 = mediaboard.progress; break;
-                case MB_CMD_GET_VERSION: resp_data = mediaboard.fw_version; break;
-                case MB_CMD_SYSTEM_TYPE: resp_data = 0x8002; break;
-                case MB_CMD_GET_SERIAL: memcpy(&resp_data, mediaboard.serial, 4); break;
-                default: resp_data = 0; break;
-                }
-                meta_marker = 0x0001;
-                cpu_physical_memory_write(meta_pa + 2, &meta_marker, 2);
-                cpu_physical_memory_write(meta_pa + 4, &resp_data, 4);
-                if (cmd_opcode == 0x0100)
-                    cpu_physical_memory_write(meta_pa + 8, &resp_data2, 4);
-                s->mbcom_e0_status |= 0x05;
-                s->lpc_scratch_4026 &= ~0x0100;
-                qemu_irq_raise(s->irq10);
+        if (!chihiro_mbcom_slots.known) {
+            /* Looked for twice a second until SEGABOOT's code is mapped;
+             * once the two tables are known this never runs again. */
+            static unsigned tries;
+            if (++tries % 32 == 1) {
+                chihiro_find_mbcom_slots();
             }
-            break;
+        }
+        if (chihiro_mbcom_slots.known) {
+            chihiro_answer_mbcom_slots(s);
         }
     }
 
@@ -1970,10 +2956,12 @@ static void chihiro_lpc_realize(DeviceState *dev, Error **errp)
     memset(s->mbcom_read_buffer, 0, sizeof(s->mbcom_read_buffer));
     memset(s->mbcom_write_buffer, 0, sizeof(s->mbcom_write_buffer));
 
-    /* ASIC CPU control: bit 0 = FPGA initialized.
-     * Game's FUN_0014c240 reads 0x80000140 bit 0 — if clear,
-     * FUN_0014c580 skips ALL DMA buffer setup (return 5) and
-     * the game can never send/receive mbcom via SADDR. */
+    /* 0x80000140 bit 0 is the media board CPU's release. While it reads 0
+     * the acLib uploads the firmware, writes 1 and returns 5 to be called
+     * again (FUN_0014c580); with 1 it sets up its mailboxes. A Type-1 has no
+     * V850 and reads 1; a Type-3 reads the flash through it until the host
+     * releases its V850 (chihiro_asic_latch). */
+    chihiro_asic_init();
     s->asic_cpu_ctrl = 1;
 
     /* Initialize IRQ10 for baseboard communication */
@@ -2034,6 +3022,8 @@ static int chihiro_lpc_pre_save(void *opaque)
     s->mig_game_running = chihiro_game_running;
     s->mig_quickreboot_pending = chihiro_quickreboot_pending;
     s->mig_active = chihiro_active;
+    g_strlcpy((char *)s->mig_game_filename, chihiro_game_filename,
+              sizeof(s->mig_game_filename));
     return 0;
 }
 
@@ -2045,12 +3035,21 @@ static int chihiro_lpc_post_load(void *opaque, int version_id)
         chihiro_quickreboot_pending = s->mig_quickreboot_pending;
         chihiro_active = s->mig_active;
     }
+    if (version_id >= 4 && s->mig_game_filename[0]) {
+        /* Goes through the single writer, so the cabinet is worked out
+         * again from the restored name. */
+        s->mig_game_filename[sizeof(s->mig_game_filename) - 1] = '\0';
+        chihiro_set_game_executable((const char *)s->mig_game_filename);
+    }
+    /* The periodic tick is not migrated and its deadline belongs to the
+     * replaced session: restart it, or the readers and drive boards stop. */
+    chihiro_diag_timer_start(s, 16);
     return 0;
 }
 
 static const VMStateDescription vmstate_chihiro_lpc = {
     .name = "chihiro-lpc",
-    .version_id = 3,
+    .version_id = 4,
     .minimum_version_id = 1,
     .pre_save = chihiro_lpc_pre_save,
     .post_load = chihiro_lpc_post_load,
@@ -2087,6 +3086,7 @@ static const VMStateDescription vmstate_chihiro_lpc = {
         VMSTATE_BOOL_V(mig_game_running, ChihiroLPCState, 3),
         VMSTATE_BOOL_V(mig_quickreboot_pending, ChihiroLPCState, 3),
         VMSTATE_BOOL_V(mig_active, ChihiroLPCState, 3),
+        VMSTATE_BUFFER_V(mig_game_filename, ChihiroLPCState, 4),
         VMSTATE_END_OF_LIST()
     }
 };
@@ -2116,9 +3116,34 @@ type_init(chihiro_register_types)
 /* ═══════════════════════════════════════════════════════════════════════
  * Save file persistence (Phase 2)
  *
- * Persists QC ic11 (512B) + extmem backup region (32KB) per game.
- * File: ~/.local/share/xemu/xemu/saves/<game>.sav
+ * Persists QC ic11 (512 B) and the baseboard SRAM's backup half (the two
+ * windows the game's backup occupies, 55 KB) per game.
+ * File: saves/<game>.sav in xemu's data folder
  * ═══════════════════════════════════════════════════════════════════════ */
+
+bool chihiro_file_replace(const char *path, const ChihiroFilePart *parts,
+                          int count)
+{
+    char *tmp = g_strdup_printf("%s.tmp", path);
+    FILE *f = qemu_fopen(tmp, "wb");
+    bool ok = f != NULL;
+
+    for (int i = 0; ok && i < count; i++) {
+        ok = fwrite(parts[i].data, 1, parts[i].size, f) == parts[i].size;
+    }
+    if (f && fclose(f) != 0) {
+        ok = false;
+    }
+    if (ok) {
+        ok = g_rename(tmp, path) == 0;
+    }
+    if (!ok) {
+        g_remove(tmp);
+        CHIHIRO_ERRF("cannot write %s\n", path);
+    }
+    g_free(tmp);
+    return ok;
+}
 
 /* Per-game data goes where the rest of xemu keeps its state (see the shader
  * cache): xemu_settings_get_base_path() honours portable mode and is correct
@@ -2130,6 +3155,99 @@ static bool chihiro_data_dir(const char *name, char *out, size_t out_len)
     snprintf(out, out_len, "%s%s", base, name);
     g_mkdir_with_parents(out, 0755);
     return true;
+}
+
+/* A card issued to a player with none: a new empty file (a blank) in
+ * <data>/cards/, named after the game, the player and the day
+ * ("wmmt2_<year>-<month>-<day>.bin", then "_2", "_3"), created exclusively. The slot
+ * is assigned at the UI's next frame. */
+static struct {
+    bool        due;
+    const char **cfg;    /* the setting that names the slot's card */
+    char        path[1200];
+} chihiro_card_issued[CHIHIRO_CARD_SLOTS];
+
+bool chihiro_card_issue(ChihiroCardSlot slot, char *out, size_t out_len)
+{
+    const ChihiroCabinet *c = chihiro_cabinet();
+    const char **cfg;
+    char dir[1024], who[8] = "";
+    char *day;
+    GDateTime *now;
+    bool ok = false;
+
+    if (!c || !c->cards || !chihiro_data_dir("cards", dir, sizeof(dir)))
+        return false;
+    cfg = chihiro_card_slot_setting(slot);
+    if (slot == CHIHIRO_CARD_SLOT_HW210_P1)
+        snprintf(who, sizeof(who), "_p1");
+    else if (slot == CHIHIRO_CARD_SLOT_HW210_P2)
+        snprintf(who, sizeof(who), "_p2");
+
+    now = g_date_time_new_now_local();
+    day = g_date_time_format(now, "%Y-%m-%d");
+    g_date_time_unref(now);
+    for (int n = 1; n < 1000 && !ok; n++) {
+        char name[128], more[16] = "";
+        char *path;
+        int fd;
+
+        if (n > 1)
+            snprintf(more, sizeof(more), "_%d", n);
+        snprintf(name, sizeof(name), "%s%s_%s%s.bin", c->cards, who, day, more);
+        path = g_build_filename(dir, name, NULL);
+        fd = qemu_open_old(path, O_WRONLY | O_CREAT | O_EXCL | O_BINARY, 0644);
+        if (fd >= 0) {
+            close(fd);
+            snprintf(out, out_len, "%s", path);
+            ok = true;
+        } else if (errno != EEXIST) {
+            fprintf(stderr, "Chihiro: cannot make a card at %s: %s\n", path,
+                    strerror(errno));
+            g_free(path);
+            break;
+        }
+        g_free(path);
+    }
+    g_free(day);
+    if (!ok)
+        return false;
+
+    fprintf(stderr, "Chihiro: new card issued: %s\n", out);
+    chihiro_card_issued[slot].cfg = cfg;
+    snprintf(chihiro_card_issued[slot].path,
+             sizeof(chihiro_card_issued[slot].path), "%s", out);
+    chihiro_card_issued[slot].due = true;
+    return true;
+}
+
+/* The readers run under the big lock, which the UI also holds while it
+ * draws the notifications, so theirs are queued at once. */
+void chihiro_card_note(const char *msg, bool warning)
+{
+    if (warning)
+        xemu_queue_notification_warning(msg);
+    else
+        xemu_queue_notification(msg);
+}
+
+void chihiro_card_ui_sync(void)
+{
+    for (int i = 0; i < CHIHIRO_CARD_SLOTS; i++) {
+        const char *name;
+        char msg[200];
+
+        if (!chihiro_card_issued[i].due)
+            continue;
+        chihiro_card_issued[i].due = false;
+        xemu_settings_set_string(chihiro_card_issued[i].cfg,
+                                 chihiro_card_issued[i].path);
+        xemu_settings_save();
+        name = strrchr(chihiro_card_issued[i].path, G_DIR_SEPARATOR);
+        snprintf(msg, sizeof(msg), "New card: %s",
+                 name ? name + 1 : chihiro_card_issued[i].path);
+        xemu_queue_notification(msg);
+    }
 }
 
 /* Game name without its .xbe extension, e.g. "vsg" — the stem shared by the
@@ -2158,16 +3276,44 @@ static bool chihiro_resolve_save_path(void)
 
     snprintf(chihiro_save_path, sizeof(chihiro_save_path),
              "%s/%s.sav", saves_dir, base);
+    /* "A\V322.xbe" keeps its backslash: one file on Linux, a folder "A" that
+     * must exist on Windows. */
+    char *dir = g_path_get_dirname(chihiro_save_path);
+    g_mkdir_with_parents(dir, 0755);
+    g_free(dir);
     return true;
 }
 
-/* ONLY an explicit per-player card file chosen in Settings > Chihiro is
- * read. With no card assigned the reader is EMPTY: the game offers to play
- * without a card, and no synthetic or auto-resolved card is fabricated. */
+/* An older configuration's card1_path and card2_path move to the reader's
+ * slots once. */
+static void chihiro_migrate_card_paths(void)
+{
+    static const struct { const char **old; const char **now; } moves[] = {
+        { &g_config.chihiro.card_reader.card1_path,
+          &g_config.chihiro.card_reader.hw210.slot1 },
+        { &g_config.chihiro.card_reader.card2_path,
+          &g_config.chihiro.card_reader.hw210.slot2 },
+    };
+
+    for (size_t i = 0; i < ARRAY_SIZE(moves); i++) {
+        const char *old = *moves[i].old;
+        const char *now = *moves[i].now;
+        if (!old || !old[0] || (now && now[0]))
+            continue;
+        fprintf(stderr, "Chihiro: card moved to the HW210 reader: %s\n", old);
+        xemu_settings_set_string(moves[i].now, old);
+        xemu_settings_set_string(moves[i].old, "");
+    }
+}
+
 static void chihiro_resolve_card_path(int player, char *out, size_t out_len)
 {
-    const char *cfg = (player == 0) ? g_config.chihiro.card_reader.card1_path
-                                    : g_config.chihiro.card_reader.card2_path;
+    const char *cfg = "";
+
+    /* The Gundam cabinet's one reader sits on Ghost Squad's player 1 wire,
+     * but it takes Banpresto cards, not Sega ones, so it has its own slot. */
+    if (player == 0 || !chihiro_cabinet_is("gs"))
+        cfg = *chihiro_card_slot_setting(chihiro_hw210_card_slot(player));
     if (cfg && cfg[0]) {
         snprintf(out, out_len, "%s", cfg);
         return;
@@ -2175,13 +3321,166 @@ static void chihiro_resolve_card_path(int player, char *out, size_t out_len)
     out[0] = '\0'; /* unassigned: no card in this reader */
 }
 
+/* The backup SRAM is battery-backed, so the save follows the game's writes:
+ * rewritten at most every five seconds while the game writes it, at once on
+ * exit. */
+static void chihiro_backup_tick(void)
+{
+    static int64_t last_flush;
+    int64_t now = qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL);
+
+    if (!chihiro_usb_save_dirty() && !chihiro_dimm_sys_dirty)
+        return;
+    if (now - last_flush < 5000)
+        return;
+    if (!chihiro_save_path[0] && !chihiro_resolve_save_path()) return;
+    chihiro_usb_save_flush(chihiro_save_path);
+    chihiro_dimm_sys_flush();
+    last_flush = now;
+}
+
+/*
+ * The operator's CARD REPAIR (gs_gtest.xbe FUN_00013320), done to the card
+ * file. A game cut short leaves its card open (B[0x41] set on read, gs.xbe
+ * FUN_000660c0, cleared on the final write, FUN_0005beb0); the cabinet keeps
+ * ten copies of cards it read in its backup (FUN_000658b0, keyed on block 0),
+ * and CARD REPAIR puts the copy back, from the live backup or the saved one.
+ * The game's checks only (header 45 2X, serial past 2000: FUN_00017700,
+ * FUN_00017790); the copy must carry the card's number and not be retired
+ * (B[0x40]); B[0x41] is cleared and the game's checksum rebuilt (folded ones'
+ * complement over B[0x40..0x1FF], FUN_00017640). The copies sit 0x84 into the
+ * SBJK1290 block (gs.xbe 0x000EF874), 0x200 apart, at 0x8490 in the backup.
+ */
+bool chihiro_gundam_card_repair(const char *card_path, char *why, size_t why_len)
+{
+    uint8_t card[CARD_TOTAL_SIZE];
+    uint8_t image[0x10000];
+    const uint8_t *backup = NULL;
+    FILE *f;
+
+    if (!card_path || !card_path[0]) {
+        snprintf(why, why_len, "No card.");
+        return false;
+    }
+    f = qemu_fopen(card_path, "rb");
+    if (!f || fread(card, 1, sizeof(card), f) != sizeof(card)) {
+        if (f) fclose(f);
+        snprintf(why, why_len, "Cannot read the card file.");
+        return false;
+    }
+    fclose(f);
+
+    if (((card[0x22] << 8 | card[0x23]) & 0xFFF0) != 0x4520) {
+        snprintf(why, why_len, "Not a Gundam card.");
+        return false;
+    }
+    {
+        unsigned serial = 0;
+        for (int i = 0x24; i < 0x28; i++)
+            serial = serial * 100 + (card[i] >> 4) * 10 + (card[i] & 0xF);
+        if (serial <= 2000) {
+            snprintf(why, why_len, "Not a Gundam card (serial %u).", serial);
+            return false;
+        }
+    }
+    if (card[0x40] != 0) {
+        snprintf(why, why_len, "Retired card, the game would not repair it either.");
+        return false;
+    }
+    /* The solenoid is on: the game is reading or writing this card. */
+    if (chihiro_jvs_card_lock[0]) {
+        snprintf(why, why_len, "The game is using the card.");
+        return false;
+    }
+
+    /* The cabinet's backup: live if this cabinet is the one running, else
+     * the file it was last saved to. */
+    if (chihiro_game_running && chihiro_cabinet_is("gs"))
+        backup = chihiro_usb_backup_live();
+    if (!backup) {
+        char saves_dir[1024], path[1200];
+        if (!chihiro_data_dir("saves", saves_dir, sizeof(saves_dir))) {
+            snprintf(why, why_len, "No saves folder.");
+            return false;
+        }
+        snprintf(path, sizeof(path), "%s/gs.sav", saves_dir);
+        if (!g_file_test(path, G_FILE_TEST_EXISTS)) {
+            snprintf(why, why_len, "No save yet, the cabinet never read this card.");
+            return false;
+        }
+        memset(image, 0, sizeof(image));
+        if (!chihiro_usb_save_read_backup(path, image)) {
+            snprintf(why, why_len, "The save file is damaged.");
+            return false;
+        }
+        backup = image;
+    }
+
+    /* The game's backup block, by its own tag. */
+    uint32_t cache = 0;
+    for (uint32_t off = 0x8000; off < 0x10000 - 12; off += 0x200) {
+        if (memcmp(backup + off, "SBJK1290", 8) == 0) {
+            cache = off + 12 + 0x84;
+            break;
+        }
+    }
+    if (!cache || cache + 10 * 0x200 > 0x10000) {
+        snprintf(why, why_len, "The cabinet has no card copies yet.");
+        return false;
+    }
+
+    for (int k = 0; k < 10; k++) {
+        const uint8_t *copy = backup + cache + k * 0x200;
+        if (memcmp(copy, card, 8) != 0)
+            continue;
+        memcpy(card, copy, 0x200);
+        card[0x41] = 0;
+        card[0x42] = card[0x43] = 0;
+        {
+            uint32_t sum = 0;
+            for (int i = 0x40; i < 0x200; i += 2)
+                sum += card[i] | (card[i + 1] << 8);
+            sum = (sum >> 16) + (sum & 0xFFFF);
+            sum = ~((sum >> 16) + sum);
+            card[0x42] = sum & 0xFF;
+            card[0x43] = (sum >> 8) & 0xFF;
+        }
+        /* A reader holding this card writes the repair itself. */
+        bool written = false;
+        for (int p = 0; p < 2; p++) {
+            if (card_reader_initialized && hw210.reader[p].card_present &&
+                strcmp(hw210.reader[p].card_path, card_path) == 0) {
+                memcpy(hw210.reader[p].card_data, card, sizeof(card));
+                written = card_reader_flush(&hw210.reader[p]);
+            }
+        }
+        if (!written) {
+            ChihiroFilePart part = { card, sizeof(card) };
+            if (!chihiro_file_replace(card_path, &part, 1)) {
+                snprintf(why, why_len, "Cannot write the card file.");
+                return false;
+            }
+        }
+        fprintf(stderr, "Chihiro: Gundam card repaired from the cabinet's copy %d: %s\n",
+                k, card_path);
+        snprintf(why, why_len, "Card repaired!");
+        return true;
+    }
+    snprintf(why, why_len, "No copy of this card: never read here, or ten "
+             "others read since.");
+    return false;
+}
+
 static void chihiro_exit_notify(Notifier *notifier, void *data)
 {
     (void)notifier;
     (void)data;
+    chihiro_netboard_exit();
     if (!chihiro_active) return;
     if (!chihiro_save_path[0] && !chihiro_resolve_save_path()) return;
-    chihiro_usb_save_flush(chihiro_save_path);
+    if (chihiro_usb_save_flush(chihiro_save_path))
+        fprintf(stderr, "Chihiro: save flushed to %s\n", chihiro_save_path);
+    chihiro_dimm_sys_flush();
 }
 
 static Notifier chihiro_exit_notifier = { .notify = chihiro_exit_notify };
@@ -2201,8 +3500,10 @@ void chihiro_save_init(void)
     qemu_add_exit_notifier(&chihiro_exit_notifier);
     chihiro_exit_notifier_registered = true;
 
+    chihiro_migrate_card_paths();
     if (chihiro_resolve_save_path()) {
         chihiro_usb_save_load(chihiro_save_path);
+        chihiro_dimm_sys_load();
     }
 }
 
@@ -2214,22 +3515,239 @@ void chihiro_save_init(void)
  *   - Response sector: mbcom_base + 0x4800 (read by SEGABOOT)
  *   - Command sector:  mbcom_base + 0x4801 (written by SEGABOOT)
  *
- * For DIMM size 512MB (size_factor=2):
- *   mbcom_base = (0x40000 << 2) - 0x8000 = 0xF8000
- *   Response LBA = 0xFC800
- *   Command LBA  = 0xFC801
+ * The disk is laid out from the DIMM jumpers, the way the kernel's MediaBoard
+ * driver lays it out: mbcom is the 0x8000 sectors below the DIMM's end and
+ * mbfs, the game's filesystem, is everything below mbcom, so a 512 MB board
+ * offers 496 MiB of game and a 1 GB board 1008 MiB. The images are formatted
+ * for exactly that: Gundam Battle Operating Simulator is written for the
+ * 1008 MiB of its 1 GB board, its gs.xbe sits at 564 MiB, and a disk cut at
+ * 496 MiB hands SEGABOOT a game with no executable, and SEGABOOT stays at its
+ * system menu. MEASURED on the Gundam image: 51 files past 496 MiB.
+ *
+ *   mbcom_base = (0x40000 << factor) - 0x8000    (0xF8000 for 512 MB)
+ *   Response LBA = mbcom_base + 0x4800, Command LBA = mbcom_base + 0x4801
  */
 
-#define CHIHIRO_MBCOM_BASE      0xF8000
-#define CHIHIRO_MBCOM_RESPONSE  (CHIHIRO_MBCOM_BASE + 0x4800)  /* 0xFC800 */
-#define CHIHIRO_MBCOM_COMMAND   (CHIHIRO_MBCOM_BASE + 0x4801)  /* 0xFC801 */
+static uint32_t chihiro_mbcom_base(void)
+{
+    return (0x40000u << chihiro_dimm_factor()) - 0x8000u;
+}
 #define CHIHIRO_MBROM0          0x8000000
 #define CHIHIRO_MBROM1          0x8000800
+
+/* ── The DIMM's system area ───────────────────────────────────────────────
+ * The 0x8000 sectors above the game's filesystem (the kernel's "mbsys:"),
+ * with the mailbox in the middle; games keep big records there (OutRun 2
+ * SP's ranking). Battery-backed on the cabinet: the written sectors follow
+ * the save as <game>.dimm. Not in snapshots: a load does not roll it back. */
+#define CHIHIRO_DIMM_SYS_SECTORS 0x8000u
+#define CHIHIRO_DIMM_SYS_MAGIC   0x53444843u   /* "CHDS" */
+#define CHIHIRO_DIMM_SYS_VERSION 1
+
+static uint8_t *chihiro_dimm_sys;                       /* 16 MB, on first use */
+static uint32_t chihiro_dimm_sys_first, chihiro_dimm_sys_end;  /* written: [first, end) */
+
+static uint8_t *chihiro_dimm_sys_buffer(void)
+{
+    if (!chihiro_dimm_sys)
+        chihiro_dimm_sys = g_malloc0((size_t)CHIHIRO_DIMM_SYS_SECTORS * 512);
+    return chihiro_dimm_sys;
+}
+
+static void chihiro_dimm_sys_read(uint32_t sector, void *buf, int n)
+{
+    memcpy(buf, chihiro_dimm_sys_buffer() + (size_t)sector * 512, (size_t)n * 512);
+}
+
+static void chihiro_dimm_sys_write(uint32_t sector, const void *buf, int n)
+{
+    memcpy(chihiro_dimm_sys_buffer() + (size_t)sector * 512, buf, (size_t)n * 512);
+    if (chihiro_dimm_sys_end == 0) {
+        chihiro_dimm_sys_first = sector;
+        chihiro_dimm_sys_end = sector + n;
+    } else {
+        chihiro_dimm_sys_first = MIN(chihiro_dimm_sys_first, sector);
+        chihiro_dimm_sys_end = MAX(chihiro_dimm_sys_end, sector + n);
+    }
+    chihiro_dimm_sys_dirty = true;
+}
+
+/* <game>.dimm next to <game>.sav */
+static bool chihiro_dimm_sys_path(char *out, size_t out_len)
+{
+    size_t len = strlen(chihiro_save_path);
+    if (len < 4 || strcmp(chihiro_save_path + len - 4, ".sav") != 0) return false;
+    snprintf(out, out_len, "%.*s.dimm", (int)(len - 4), chihiro_save_path);
+    return true;
+}
+
+/* File: magic, version, first sector, sector count, then the sectors. */
+static void chihiro_dimm_sys_load(void)
+{
+    char path[1024];
+    uint32_t hdr[4];
+
+    if (!chihiro_dimm_sys_path(path, sizeof(path))) return;
+    /* A fresh start for this game, unless it has already written. */
+    if (!chihiro_dimm_sys_dirty) {
+        chihiro_dimm_sys_first = chihiro_dimm_sys_end = 0;
+        if (chihiro_dimm_sys)
+            memset(chihiro_dimm_sys, 0, (size_t)CHIHIRO_DIMM_SYS_SECTORS * 512);
+    }
+    FILE *f = qemu_fopen(path, "rb");
+    if (!f) return;
+    if (fread(hdr, sizeof(hdr), 1, f) == 1 && hdr[0] == CHIHIRO_DIMM_SYS_MAGIC &&
+        hdr[1] == CHIHIRO_DIMM_SYS_VERSION && hdr[2] < CHIHIRO_DIMM_SYS_SECTORS &&
+        hdr[3] <= CHIHIRO_DIMM_SYS_SECTORS - hdr[2]) {
+        uint8_t *dst = chihiro_dimm_sys_buffer() + (size_t)hdr[2] * 512;
+        if (fread(dst, 512, hdr[3], f) == hdr[3]) {
+            chihiro_dimm_sys_first = hdr[2];
+            chihiro_dimm_sys_end = hdr[2] + hdr[3];
+            fprintf(stderr, "Chihiro: DIMM system area loaded from %s "
+                    "(%u sectors)\n", path, hdr[3]);
+        }
+    }
+    fclose(f);
+    chihiro_dimm_sys_dirty = false;
+}
+
+static bool chihiro_dimm_sys_flush(void)
+{
+    char path[1024];
+
+    if (!chihiro_dimm_sys || chihiro_dimm_sys_end == 0) return false;
+    if (!chihiro_dimm_sys_path(path, sizeof(path))) return false;
+    uint32_t hdr[4] = { CHIHIRO_DIMM_SYS_MAGIC, CHIHIRO_DIMM_SYS_VERSION,
+                        chihiro_dimm_sys_first,
+                        chihiro_dimm_sys_end - chihiro_dimm_sys_first };
+    ChihiroFilePart parts[] = {
+        { hdr, sizeof(hdr) },
+        { chihiro_dimm_sys + (size_t)chihiro_dimm_sys_first * 512, (size_t)hdr[3] * 512 },
+    };
+    if (!chihiro_file_replace(path, parts, ARRAY_SIZE(parts))) return false;
+    chihiro_dimm_sys_dirty = false;
+    return true;
+}
 
 /* MemoryRegion-backed IDE interface.
  * Only FATX goes through the block device. Flash ROM and mbcom are
  * served via synchronous hooks in core.c (chihiro_rom_io/chihiro_mbcom_io). */
-#define CHIHIRO_FS_SIZE         ((uint64_t)CHIHIRO_MBCOM_BASE * 512)  /* 496 MB */
+static uint64_t chihiro_fs_size(void)
+{
+    return (uint64_t)chihiro_mbcom_base() * 512;
+}
+
+/* boot.id, found as the kernel finds it (FatxMountVolume): in mbfs, a FAT of
+ * one entry per cluster plus one (16-bit below 0xFFF0 entries, else 32-bit),
+ * rounded up to a page, then the root directory; 64-byte entries (name
+ * length, attributes, name, first cluster at 0x2C, size at 0x30). A game
+ * launched from a directory carries it as a file. */
+static bool chihiro_read_image_bootid(uint8_t *bid)
+{
+    const char *path = g_config.sys.files.dvd_path;
+    if (!path || !path[0]) {
+        return false;
+    }
+    if (g_file_test(path, G_FILE_TEST_IS_DIR)) {
+        char *bootid_path = g_strdup_printf("%s/boot.id", path);
+        FILE *f = qemu_fopen(bootid_path, "rb");
+        g_free(bootid_path);
+        if (!f) {
+            return false;
+        }
+        bool ok = fread(bid, 1, CHIHIRO_BOOTID_LEN, f) == CHIHIRO_BOOTID_LEN;
+        fclose(f);
+        return ok && memcmp(bid, "BTID", 4) == 0;
+    }
+
+    FILE *f = qemu_fopen(path, "rb");
+    if (!f) {
+        return false;
+    }
+    bool ok = false;
+    uint8_t hdr[16];
+    if (fread(hdr, 1, sizeof(hdr), f) != sizeof(hdr) ||
+        memcmp(hdr, "FATX", 4) != 0) {
+        goto out;
+    }
+    uint32_t spc = ldl_le_p(hdr + 8);
+    uint32_t root = ldl_le_p(hdr + 12);
+    if (spc == 0 || spc > 128 || (spc & (spc - 1)) || root == 0) {
+        goto out;
+    }
+    uint32_t cluster = spc * 512;
+    uint64_t entries = chihiro_fs_size() / cluster + 1;
+    uint64_t data = 4096 + ROUND_UP(entries * (entries < 0xFFF0 ? 2 : 4), 4096);
+    uint8_t *dir = g_malloc(cluster);
+    if (fseeko(f, data + (uint64_t)(root - 1) * cluster, SEEK_SET) == 0 &&
+        fread(dir, 1, cluster, f) == cluster) {
+        for (uint32_t i = 0; i + 64 <= cluster; i += 64) {
+            const uint8_t *e = dir + i;
+            if (e[0] == 0 || e[0] == 0xFF) {
+                break;
+            }
+            if (e[0] != 7 ||
+                g_ascii_strncasecmp((const char *)e + 2, "boot.id", 7) != 0) {
+                continue;
+            }
+            uint32_t first = ldl_le_p(e + 0x2C);
+            ok = first != 0 &&
+                 fseeko(f, data + (uint64_t)(first - 1) * cluster, SEEK_SET) == 0 &&
+                 fread(bid, 1, CHIHIRO_BOOTID_LEN, f) == CHIHIRO_BOOTID_LEN &&
+                 memcmp(bid, "BTID", 4) == 0;
+            break;
+        }
+    }
+    g_free(dir);
+out:
+    fclose(f);
+    return ok;
+}
+
+/* The cabinet's region, the byte at EEPROM 0x1F00: 1 Japan, 2 USA, 3 Export.
+ * SEGABOOT tests bit (1 << byte) of the mask at boot.id + 0x38 and stops on
+ * Error 05 when it is clear (fpr21042, verifier at 0x0002EAE0). Auto takes
+ * Export, then USA, then Japan, as the mask allows; a region set by hand
+ * stays. */
+uint8_t chihiro_region_byte(void)
+{
+    static const char *const names[] = { "", "Japan", "USA", "Export" };
+    static uint8_t region;
+    static char *for_path;
+    int set = g_config.chihiro.settings.region;
+    const char *path = g_config.sys.files.dvd_path;
+
+    if (set != CONFIG_CHIHIRO_SETTINGS_REGION_AUTO) {
+        return (uint8_t)set;    /* the enum index is the byte */
+    }
+    if (for_path && g_strcmp0(for_path, path) == 0) {
+        return region;
+    }
+    g_free(for_path);
+    for_path = g_strdup(path ? path : "");
+
+    uint8_t bid[CHIHIRO_BOOTID_LEN];
+    uint8_t mask = chihiro_read_image_bootid(bid) ? bid[0x38] : 0;
+    region = CONFIG_CHIHIRO_SETTINGS_REGION_JP;
+    for (uint8_t r = CONFIG_CHIHIRO_SETTINGS_REGION_EX;
+         r >= CONFIG_CHIHIRO_SETTINGS_REGION_JP; r--) {
+        if (mask & (1u << r)) {
+            region = r;
+            break;
+        }
+    }
+    if (mask == 0) {
+        fprintf(stderr, "Chihiro: region %s, no boot.id to read the game's "
+                "list from\n", names[region]);
+    } else if ((mask & 0x0E) == (1u << region)) {
+        fprintf(stderr, "Chihiro: region %s, the only one %.4s accepts\n",
+                names[region], (const char *)bid + 0x30);
+    } else {
+        fprintf(stderr, "Chihiro: region %s, from the list %.4s accepts\n",
+                names[region], (const char *)bid + 0x30);
+    }
+    return region;
+}
 #define CHIHIRO_ROM_SIZE        (2 * 1024 * 1024)  /* 2MB */
 
 static MemoryRegion chihiro_interface_container;
@@ -2431,17 +3949,18 @@ static const VMStateDescription vmstate_chihiro_dimm = {
 void chihiro_ide_interface_init(void)
 {
     printf("Chihiro: IDE interface init START (fs=%llu)\n",
-           (unsigned long long)CHIHIRO_FS_SIZE);
+           (unsigned long long)chihiro_fs_size());
     fflush(stdout);
 
     memory_region_init(&chihiro_interface_container, NULL,
-                       "chihiro.interface", CHIHIRO_FS_SIZE);
+                       "chihiro.interface", chihiro_fs_size());
 
     /* Serialized by chihiro-dimm as a delta, not by the RAM stream. */
     memory_region_init_ram_nomigrate(&chihiro_interface_fs, NULL,
                                      "chihiro.interface.filesystem",
-                                     CHIHIRO_FS_SIZE, &error_fatal);
+                                     chihiro_fs_size(), &error_fatal);
     vmstate_register(NULL, 0, &vmstate_chihiro_dimm, &chihiro_dimm_mig);
+    vmstate_register(NULL, 0, &vmstate_chihiro_hw210, &hw210);
 
     memory_region_add_subregion(&chihiro_interface_container,
                                 0, &chihiro_interface_fs);
@@ -2453,7 +3972,7 @@ void chihiro_ide_interface_init(void)
     fflush(stdout);
 
     BlockDriverState *bs = bdrv_new();
-    bdrv_memory_open(bs, &chihiro_interface_as, CHIHIRO_FS_SIZE);
+    bdrv_memory_open(bs, &chihiro_interface_as, chihiro_fs_size());
     bdrv_set_monitor_owned(bs);
     printf("Chihiro: IDE interface — BDS created\n");
     fflush(stdout);
@@ -2475,7 +3994,7 @@ void chihiro_ide_interface_init(void)
 
     chihiro_interface_ready = true;
     printf("Chihiro: IDE interface initialized (%u MB fs, ROM via hook)\n",
-           (uint32_t)(CHIHIRO_FS_SIZE / (1024 * 1024)));
+           (uint32_t)(chihiro_fs_size() / (1024 * 1024)));
     fflush(stdout);
 }
 
@@ -2524,10 +4043,11 @@ uint8_t *chihiro_fatx_get_buffer(uint32_t *out_size)
         fprintf(stderr, "Chihiro: ERROR — fatx_get_buffer called before interface_init\n");
         return NULL;
     }
-    *out_size = (uint32_t)CHIHIRO_FS_SIZE;
+    *out_size = (uint32_t)chihiro_fs_size();
     return (uint8_t *)memory_region_get_ram_ptr(&chihiro_interface_fs);
 }
 
+/* Copies len bytes into the guest's scatter-gather list, from its start. */
 static void sg_write(QEMUSGList *sg, const void *src, int len)
 {
     int sg_idx = 0, done = 0;
@@ -2541,16 +4061,45 @@ static void sg_write(QEMUSGList *sg, const void *src, int len)
     }
 }
 
+/* The other way: len bytes out of the guest's list, from its start. */
+static void sg_read(QEMUSGList *sg, void *dst, int len)
+{
+    int sg_idx = 0, done = 0;
+    while (done < len && sg_idx < sg->nsg) {
+        int chunk = MIN(len - done, (int)sg->sg[sg_idx].len);
+        dma_memory_read(&address_space_memory, sg->sg[sg_idx].base,
+                        (uint8_t *)dst + done, chunk, MEMTXATTRS_UNSPECIFIED);
+        done += chunk;
+        sg_idx++;
+    }
+}
+
+/* Whether the n sectors from lba lie within the count sectors from first,
+ * without the sum wrapping round 2^32. */
+static bool chihiro_lba_in(uint32_t lba, int n, uint32_t first, uint32_t count)
+{
+    return lba >= first && (uint32_t)n <= count &&
+           lba - first <= count - (uint32_t)n;
+}
+
 bool chihiro_ide_serve(int dma_cmd, uint32_t lba, int n,
                        QEMUSGList *sg, bool *irq)
 {
+    const uint32_t mbcom = chihiro_mbcom_base();
+    const uint32_t mbcom_resp = mbcom + 0x4800, mbcom_cmd = mbcom + 0x4801;
+
+    /* A command moves 65536 sectors at most; a count restored from a snapshot
+     * can say anything, and n * 512 must not wrap. */
+    if (n <= 0 || n > 65536) {
+        return false;
+    }
     *irq = true;
 
     if (dma_cmd == 0) { /* IDE_DMA_READ */
         /* FATX: synchronous from MemoryRegion RAM (timing-critical) */
-        if (lba < CHIHIRO_MBCOM_BASE && chihiro_interface_ready) {
+        if (lba < mbcom && chihiro_interface_ready) {
             uint64_t offset = (uint64_t)lba * 512;
-            if (offset < CHIHIRO_FS_SIZE) {
+            if (offset < chihiro_fs_size()) {
                 void *src = (uint8_t *)memory_region_get_ram_ptr(
                     &chihiro_interface_fs) + offset;
                 sg_write(sg, src, n * 512);
@@ -2559,12 +4108,43 @@ bool chihiro_ide_serve(int dma_cmd, uint32_t lba, int n,
         }
         /* mbcom response/command */
         if (chihiro_mbcom_enabled &&
-            (lba == CHIHIRO_MBCOM_RESPONSE || lba == CHIHIRO_MBCOM_COMMAND)) {
+            (lba == mbcom_resp || lba == mbcom_cmd)) {
             uint8_t buf[512] = {0};
-            const uint8_t *src = (lba == CHIHIRO_MBCOM_RESPONSE)
+            const uint8_t *src = (lba == mbcom_resp)
                 ? chihiro_mbcom_response : chihiro_mbcom_command;
             memcpy(buf, src, 32);
             sg_write(sg, buf, 512);
+            return true;
+        }
+        /* The network board's window by its IDE door: the mailbox in its first two
+         * sectors, the link slots further in, read whole. */
+        if (chihiro_netboard_present() &&
+            chihiro_lba_in(lba, n, NETDIMM_WINDOW_LBA,
+                           NETDIMM_WINDOW_SECTORS)) {
+            int len = n * 512;
+            uint8_t *buf = g_malloc(len);
+            chihiro_netboard_host_window_read((lba - NETDIMM_WINDOW_LBA) * 512, buf, len);
+            sg_write(sg, buf, len);
+            g_free(buf);
+            return true;
+        }
+        if (lba == NETDIMM_RESP_LBA || lba == NETDIMM_CMD_LBA) {
+            int len = n * 512;
+            uint8_t *buf = g_malloc0(len);
+            if (lba == NETDIMM_RESP_LBA) {
+                memcpy(buf, chihiro_netdimm_resp, sizeof(chihiro_netdimm_resp));
+            }
+            sg_write(sg, buf, len);
+            g_free(buf);
+            return true;
+        }
+        /* the DIMM's system area */
+        if (chihiro_lba_in(lba, n, mbcom, CHIHIRO_DIMM_SYS_SECTORS)) {
+            int len = n * 512;
+            uint8_t *buf = g_malloc(len);
+            chihiro_dimm_sys_read(lba - mbcom, buf, n);
+            sg_write(sg, buf, len);
+            g_free(buf);
             return true;
         }
         /* flash ROM */
@@ -2578,18 +4158,59 @@ bool chihiro_ide_serve(int dma_cmd, uint32_t lba, int n,
     }
 
     if (dma_cmd == 1) { /* IDE_DMA_WRITE */
+        if (chihiro_netboard_present() &&
+            chihiro_lba_in(lba, n, NETDIMM_WINDOW_LBA,
+                           NETDIMM_WINDOW_SECTORS)) {
+            /* Straight into the board's window; the doorbell is the read of
+             * 0x90000000 that follows a command. */
+            int len = n * 512;
+            uint8_t *buf = g_malloc(len);
+            sg_read(sg, buf, len);
+            if (lba == NETDIMM_CMD_LBA)
+                chihiro_link_watch_command((const uint32_t *)buf);
+            chihiro_netboard_host_window_write((lba - NETDIMM_WINDOW_LBA) * 512,
+                                               buf, len);
+            g_free(buf);
+            return true;
+        }
+        if (lba == NETDIMM_RESP_LBA || lba == NETDIMM_CMD_LBA) {
+            uint8_t buf[512];
+            sg_read(sg, buf, sizeof(buf));
+            if (lba == NETDIMM_RESP_LBA) {
+                /* the game clears the answer block to release it */
+                memset(chihiro_netdimm_resp, 0, sizeof(chihiro_netdimm_resp));
+                chihiro_netdimm_resp_idx = 0;
+            } else {
+                memcpy(chihiro_netdimm_cmd, buf, sizeof(chihiro_netdimm_cmd));
+                chihiro_netdimm_cmd_idx = 0;
+                /* a zeroed block is the game clearing the slot, not a command */
+                if (chihiro_netdimm_cmd[0] & 0xFFFF0000)
+                    chihiro_netdimm_answer();
+            }
+            return true;
+        }
         if (chihiro_mbcom_enabled &&
-            (lba == CHIHIRO_MBCOM_RESPONSE || lba == CHIHIRO_MBCOM_COMMAND)) {
+            (lba == mbcom_resp || lba == mbcom_cmd)) {
             uint8_t buf[512];
             dma_memory_read(&address_space_memory,
                             sg->sg[0].base, buf, 512,
                             MEMTXATTRS_UNSPECIFIED);
-            if (lba == CHIHIRO_MBCOM_RESPONSE) {
+            if (lba == mbcom_resp) {
                 if (!chihiro_game_running)
                     memcpy(chihiro_mbcom_response, buf, 32);
             } else {
                 memcpy(chihiro_mbcom_command, buf, 32);
-                if (chihiro_game_running &&
+                if (chihiro_is_type3() &&
+                    (chihiro_mbcom_command[0] || chihiro_mbcom_command[1])) {
+                    /* Only a Type-1's board answers this mailbox; on a
+                     * Type-3 the V850 talks through the SADDR window. */
+                    static bool said;
+                    if (!said) {
+                        said = true;
+                        CHIHIRO_ERRF("a Type-1 media board command on a "
+                                     "Type-3: left unanswered\n");
+                    }
+                } else if (chihiro_game_running &&
                     (chihiro_mbcom_command[0] || chihiro_mbcom_command[1])) {
                     chihiro_mbcom_process();
                     memset(chihiro_mbcom_command, 0, 32);
@@ -2603,6 +4224,16 @@ bool chihiro_ide_serve(int dma_cmd, uint32_t lba, int n,
             }
             return true;
         }
+    }
+
+    if (dma_cmd == 1 &&
+        chihiro_lba_in(lba, n, mbcom, CHIHIRO_DIMM_SYS_SECTORS)) {
+        int len = n * 512;
+        uint8_t *buf = g_malloc(len);
+        sg_read(sg, buf, len);
+        chihiro_dimm_sys_write(lba - mbcom, buf, n);
+        g_free(buf);
+        return true;
     }
 
     /* Any unhandled LBA: return zeros (read) or discard (write).

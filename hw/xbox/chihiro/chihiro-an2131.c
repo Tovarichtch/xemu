@@ -28,11 +28,35 @@
 #include "qemu/timer.h"
 #include "chihiro-an2131.h"
 #include "chihiro-jvs.h"
-#include "chihiro-driveboard.h"
-#include "chihiro-card-reader.h"
+#include "chihiro-driveboard-sega838.h"
+#include "chihiro-driveboard-v257.h"
+#include "chihiro-cardreader-crp1231.h"
+#include "chihiro.h"
+#include "chihiro-cardreader-hw210.h"
+#include "chihiro-cabinet.h"
+#include "chihiro-log.h"
 #include <string.h>
 #include <stdio.h>
 #include <time.h>
+
+/* SC UART1 reaches whichever board the cabinet hangs off it. */
+static void    midi_peer_send(uint8_t val);
+static bool    midi_peer_has_response(void);
+static uint8_t midi_peer_get_response(void);
+
+/* A card reader on the SC's UARTs with bytes still to give: work pending for
+ * the firmware, whichever reader the cabinet has. */
+static bool sc_reader_pending(AN2131State *s)
+{
+    if (s->is_qc)
+        return false;
+    if (chihiro_hw210_enabled && chihiro_card_reader_global &&
+        (card_reader_has_response(&chihiro_card_reader_global[0]) ||
+         card_reader_has_response(&chihiro_card_reader_global[1])))
+        return true;
+    return chihiro_crp1231_enabled && chihiro_crp1231_global &&
+           crp1231_has_response(chihiro_crp1231_global);
+}
 
 /* ── helpers ──────────────────────────────────────────────────────── */
 
@@ -48,6 +72,16 @@ static inline uint16_t canon(uint16_t addr)
     return addr;
 }
 
+/* Where an external address lands in the SRAM: in the half the QC's port C
+ * bit 3 selects, when the pin is a driven output (see extmem). */
+static inline uint32_t extmem_index(AN2131State *s, uint16_t addr)
+{
+    bool high = s->is_qc && (s->oec & 0x08) && !(s->portccfg & 0x08) &&
+                (s->outc & 0x08);
+
+    return (high ? 0x10000u : 0) | addr;
+}
+
 /* ── I2C state machine ────────────────────────────────────────────── */
 
 static void i2c_fire_done(AN2131State *s, bool ack)
@@ -55,6 +89,7 @@ static void i2c_fire_done(AN2131State *s, bool ack)
     s->i2cs = I2CS_DONE | (ack ? I2CS_ACK : 0);
     if (s->i2c_lastrd) s->i2cs |= I2CS_LASTRD;
     s->i2c_irq_pending = true;
+    s->cpu.irq_recheck = true;
 }
 
 static void i2c_select_device(AN2131State *s, uint8_t addr7)
@@ -128,6 +163,7 @@ static void i2c_dat_write(AN2131State *s, uint8_t val)
     case I2C_DATA:
         if (s->i2c.eeprom && s->i2c.mem_addr < (uint16_t)s->i2c.eeprom_size) {
             s->i2c.eeprom[s->i2c.mem_addr] = val;
+            s->backup_dirty = true;
         }
         s->i2c.mem_addr++;
         i2c_fire_done(s, true);
@@ -185,7 +221,14 @@ static uint8_t an2131_xdata_read(Cpu8051State *cpu, uint16_t addr)
         case AN_OUTA:     return s->outa;
         case AN_OUTB:     return s->outb;
         case AN_OUTC:     return s->outc;
-        case AN_PINSA:    return s->pinsa;
+        case AN_PINSA: {
+            /* Port A: the baseboard DIP switches, read by this chip's firmware
+             * at 0x06CA into byte 1 of a control reply; bits 1 and 2 are the
+             * monitor's scan frequency, from the cabinet (chihiro-cabinet.h). */
+            uint8_t freq = chihiro_cabinet_monitor() == CHIHIRO_MONITOR_31KHZ
+                           ? 0x04 : 0x02;
+            return (s->pinsa & (uint8_t)~0x06u) | freq;
+        }
         case AN_PINSB: {
             /* JVS sense is on bit 0 only. Bit 1 is a separate hardware pin (always high). */
             uint8_t sense = chihiro_jvs_global ? (chihiro_jvs_global->sense & 0x01) : 0x01;
@@ -197,7 +240,7 @@ static uint8_t an2131_xdata_read(Cpu8051State *cpu, uint16_t addr)
         case AN_OEC:      return s->oec;
 
         case AN_I2CS:     return s->i2cs;
-        case AN_I2DAT:    return i2c_dat_read(s);
+        case AN_I2DAT:    cpu->events++; return i2c_dat_read(s);
 
         case AN_IVEC:     return s->ivec;
         case AN_IN07IRQ:  return s->in07irq;
@@ -225,6 +268,7 @@ static uint8_t an2131_xdata_read(Cpu8051State *cpu, uint16_t addr)
         case AN_AUTOPTRH: return (uint8_t)(s->autoptr >> 8);
         case AN_AUTOPTRL: return (uint8_t)s->autoptr;
         case AN_AUTODATA: {
+            cpu->events++;
             uint8_t v = an2131_xdata_read(cpu, s->autoptr);
             s->autoptr++;
             return v;
@@ -255,7 +299,7 @@ static uint8_t an2131_xdata_read(Cpu8051State *cpu, uint16_t addr)
 
     /* External SRAM: 0x2000-0x7B3F and 0x8000-0xFFFF */
     if (s->extmem)
-        return s->extmem[addr];
+        return s->extmem[extmem_index(s, addr)];
     return 0xFF;
 }
 
@@ -265,18 +309,27 @@ static void an2131_xdata_write(Cpu8051State *cpu, uint16_t addr, uint8_t val)
 {
     AN2131State *s = (AN2131State *)cpu->opaque;
 
-    if (addr < 0x1B40) { s->ram[addr] = val; return; }
+    if (addr < 0x1B40) {
+        cpu->events += s->ram[addr] != val;
+        s->ram[addr] = val;
+        return;
+    }
 
     uint16_t ca = canon(addr);
 
     /* Endpoint buffers */
     if (ca >= 0x7B40 && ca < 0x7F40) {
+        cpu->events += s->ram[ca - 0x6000] != val;
         s->ram[ca - 0x6000] = val;
         return;
     }
 
-    /* Register space: 0x7F40-0x7FFF */
+    /* Register space: 0x7F40-0x7FFF. Every write counts as an event, many
+     * of them having one beyond the byte stored, and may enable an
+     * interrupt already pending (USBIEN, IN07IEN, OUT07IEN). */
     if (ca >= 0x7F40 && ca <= 0x7FFF) {
+        cpu->events++;
+        cpu->irq_recheck = true;
         switch (ca) {
         case AN_CPUCS:    s->cpucs = val; return;
 
@@ -386,12 +439,17 @@ static void an2131_xdata_write(Cpu8051State *cpu, uint16_t addr, uint8_t val)
         return;
     }
 
-    /* External SRAM: 0x2000-0x7B3F and 0x8000-0xFFFF */
+    /* External SRAM: 0x2000-0x7B3F and 0x8000-0xFFFF. Only the game's
+     * backup half is what the save file keeps. */
     if (s->extmem) {
-        if (s->sbfy_reading && addr >= s->sbfy_pay_off && addr < s->sbfy_pay_end
-            && s->cpu.iram[0x2D] != 0)
-            return;
-        s->extmem[addr] = val;
+        uint32_t i = extmem_index(s, addr);
+
+        if (s->extmem[i] != val) {
+            cpu->events++;
+            if (i >= 0x10000)
+                s->backup_dirty = true;
+        }
+        s->extmem[i] = val;
     }
 }
 
@@ -400,6 +458,9 @@ static void an2131_xdata_write(Cpu8051State *cpu, uint16_t addr, uint8_t val)
 static uint8_t an2131_sfr_read(Cpu8051State *cpu, uint8_t addr)
 {
     AN2131State *s = (AN2131State *)cpu->opaque;
+    if (addr >= SFR_TL0 && addr <= SFR_TH1) {
+        cpu->events++;    /* a timer count, which an idle skip computes */
+    }
     switch (addr) {
     case SFR_EXIF:  return s->exif;
     case SFR_MPAGE: return s->mpage;
@@ -413,6 +474,10 @@ static uint8_t an2131_sfr_read(Cpu8051State *cpu, uint8_t addr)
 static void an2131_sfr_write(Cpu8051State *cpu, uint8_t addr, uint8_t val)
 {
     AN2131State *s = (AN2131State *)cpu->opaque;
+    if ((addr >= SFR_TL0 && addr <= SFR_TH1) ||
+        addr == 0x99 || addr == 0xC0 || addr == 0xC1) {
+        cpu->events++;    /* timer counts, the UARTs' data and SCON1 */
+    }
     switch (addr) {
     case SFR_EXIF:
         s->exif = val;
@@ -438,7 +503,13 @@ static void an2131_sfr_write(Cpu8051State *cpu, uint8_t addr, uint8_t val)
         return;
     case 0x99: /* SBUF0 — UART0 TX = RS-232C card reader (slot 1) */
         cpu->sfr[addr - 0x80] = val;
-        if (!s->is_qc && chihiro_card_reader_enabled &&
+        if (!s->is_qc && chihiro_crp1231_enabled && chihiro_crp1231_global) {
+            /* The Maximum Tune cabinet has its CRP-1231 here instead. */
+            crp1231_receive_byte(chihiro_crp1231_global, val);
+            s->card_ti_cycles[0] = s->total_cycles | 1;
+            return;
+        }
+        if (!s->is_qc && chihiro_hw210_enabled &&
             chihiro_card_reader_global) {
             card_reader_write_byte(&chihiro_card_reader_global[1], val);
             /* Real UART: TI rises when the byte finishes shifting out.
@@ -461,10 +532,10 @@ static void an2131_sfr_write(Cpu8051State *cpu, uint8_t addr, uint8_t val)
     }
     case 0xC1: /* SBUF1 — serial TX (channel 1) */
     {
-        if (!s->is_qc && chihiro_card_reader_enabled) {
-            /* A card game owns the MIDI channel: the drive board must NOT see
-             * these bytes (only OutRun 2 uses the drive board, and it has no
-             * card reader). TI deferred — see the SBUF0 case. */
+        if (!s->is_qc)
+            CHIHIRO_LOGF(FFB, "SC UART1 TX %02X\n", val);
+        if (!s->is_qc && chihiro_hw210_enabled) {
+            /* The card readers own this channel here; TI deferred as SBUF0. */
             if (chihiro_card_reader_global)
                 card_reader_write_byte(&chihiro_card_reader_global[0], val);
             s->card_ti_cycles[1] = s->total_cycles | 1;
@@ -473,14 +544,11 @@ static void an2131_sfr_write(Cpu8051State *cpu, uint8_t addr, uint8_t val)
         cpu->sfr[0xC0 - 0x80] |= 0x02;  /* set TI1 — byte "sent" */
 
         if (!s->is_qc) {
-            /* SC: plain MIDI to drive board (OutRun 2 FFB) */
-            if (chihiro_driveboard_global) {
-                driveboard_receive_byte(chihiro_driveboard_global, val);
-                if (!s->midi_response_ready &&
-                    driveboard_has_response(chihiro_driveboard_global)) {
-                    s->midi_response_ready = true;
-                    s->midi_response_set_cycles = s->total_cycles;
-                }
+            /* SC: plain MIDI to whatever board this cabinet carries */
+            midi_peer_send(val);
+            if (!s->midi_response_ready && midi_peer_has_response()) {
+                s->midi_response_ready = true;
+                s->midi_response_set_cycles = s->total_cycles;
             }
             return;
         }
@@ -643,8 +711,8 @@ static void check_interrupts(AN2131State *s)
 
 /* ── Public API ───────────────────────────────────────────────────── */
 
-/* Re-attach pointers/callbacks after a migration load; an in-flight i2c
- * transaction (µs-scale) is dropped back to idle. */
+/* Re-attach pointers and callbacks after a load; an in-flight I2C transaction
+ * drops to idle, and pending interrupts are looked at again. */
 void an2131_relink(AN2131State *s)
 {
     s->cpu.code = s->ram;
@@ -654,8 +722,10 @@ void an2131_relink(AN2131State *s)
     s->cpu.sfr_read_cb = an2131_sfr_read;
     s->cpu.sfr_write_cb = an2131_sfr_write;
     s->cpu.opaque = s;
+    s->cpu.irq_recheck = true;
     s->i2c.phase = I2C_IDLE;
     s->i2c.eeprom = NULL;
+    memset(&s->idle, 0, sizeof(s->idle));
 }
 
 void an2131_init(AN2131State *s)
@@ -677,6 +747,7 @@ void an2131_init(AN2131State *s)
 void an2131_reset(AN2131State *s)
 {
     cpu8051_reset(&s->cpu);
+    memset(&s->idle, 0, sizeof(s->idle));
 
     s->cpu.code = s->ram;
     s->cpu.code_size = AN2131_RAM_SIZE;
@@ -711,8 +782,8 @@ void an2131_reset(AN2131State *s)
     memset(&s->i2c, 0, sizeof(s->i2c));
     s->i2c.phase = I2C_IDLE;
 
-    /* DIP switch / baseboard port defaults for Chihiro */
-    s->pinsa = 0xCB;
+    /* Baseboard port defaults; the monitor bits come from AN_PINSA. */
+    s->pinsa = 0xC9;
     s->pinsb = 0x52;
     s->pinsc = 0x00;
     s->outa = 0;
@@ -785,28 +856,6 @@ void an2131_anchor_load(AN2131State *s, uint16_t addr,
         s->ram[addr + i] = data[i];
 }
 
-void an2131_detect_sbfy(AN2131State *s)
-{
-    if (!s->extmem) return;
-    s->sbfy_pay_off = 0;
-    for (uint32_t off = 0x8000; off < 0xFFF0; off += 0x200) {
-        if (memcmp(s->extmem + off, "SBFY002", 7) == 0) {
-            uint16_t sz = s->extmem[off + 8] | (s->extmem[off + 9] << 8);
-            uint16_t pay = sz * 4;
-            if (pay > 0 && off + 12 + pay <= 0x10000) {
-                s->sbfy_pay_off = off + 12;
-                s->sbfy_pay_end = off + 12 + pay;
-                s->sbfy_chk_off = off + 10;
-                fprintf(stderr, "[SBFY-FIX] detected at 0x%04X payload=%u(0x%X) "
-                        "chk@0x%04X range [0x%04X,0x%04X)\n",
-                        off, pay, pay, s->sbfy_chk_off,
-                        s->sbfy_pay_off, s->sbfy_pay_end);
-                return;
-            }
-        }
-    }
-}
-
 void an2131_set_cpucs(AN2131State *s, uint8_t val)
 {
     bool was_reset = s->cpucs & CPUCS_8051RES;
@@ -845,23 +894,6 @@ int an2131_setup_packet(AN2131State *s, const uint8_t setup[8],
 {
     if (!s->cpu_running) return -1;
 
-
-    /* v0x18 SBFY: recalculate checksum then freeze payload for consistent
-     * EP3 IN transfer. v0x19/v0x20 interleave — only v0x18/v0x1F touch flag. */
-    if (setup[1] == 0x1F)
-        s->sbfy_reading = false;
-    if (setup[1] == 0x18 && s->sbfy_pay_off) {
-        uint16_t wVal = setup[2] | (setup[3] << 8);
-        if (wVal >= 0x8400) {
-            uint16_t calc = 0;
-            for (uint32_t i = s->sbfy_pay_off; i < s->sbfy_pay_end; i++)
-                calc += s->extmem[i];
-            s->extmem[s->sbfy_chk_off]     = calc & 0xFF;
-            s->extmem[s->sbfy_chk_off + 1] = (calc >> 8) & 0xFF;
-            s->sbfy_reading = true;
-        }
-    }
-
     /* Force-clear stale interrupt state */
     s->cpu.in_interrupt = false;
 
@@ -874,9 +906,11 @@ int an2131_setup_packet(AN2131State *s, const uint8_t setup[8],
         s->ep[0].bc_out = copy;
         s->ep0cs |= EP0CS_OUTBSY;
         s->out07irq |= 0x01;
+        s->cpu.irq_recheck = true;
     }
 
     s->usbirq |= USBIRQ_SUDAV;
+    s->cpu.irq_recheck = true;
     s->ep[0].in_armed = false;
     /* Hold card RX delivery only while a card drain (0x1A/0x1B) runs. */
     s->in_setup = !s->is_qc && (setup[0] & 0x80) &&
@@ -885,19 +919,22 @@ int an2131_setup_packet(AN2131State *s, const uint8_t setup[8],
     bool is_in = setup[0] & 0x80;
     bool need_ep4 = (setup[1] == 0x19 && is_in);
     bool need_ep2 = (setup[1] == 0x17 && is_in);
-    /* SC card-RX polls (0x1A/0x1B): draining a 64-byte chunk plus the bulk
-     * feeder hand-off can exceed the default window, so the reply would be
-     * armed only after we returned (and lost). Give them a long window like
-     * the 0x17 EEPROM read gets. */
-    bool need_card = !s->is_qc && chihiro_card_reader_enabled &&
+    /* SC card polls (0x1A/0x1B in, 0x22/0x23 out) take long, like the 0x17
+     * EEPROM read, whichever reader answers them. */
+    bool need_card = !s->is_qc &&
+                     (chihiro_hw210_enabled || chihiro_crp1231_enabled) &&
                      (((setup[1] == 0x1A || setup[1] == 0x1B) && is_in) ||
                       /* card SENDs too: ingesting a long write command
                        * exceeds the default window and the unanswered setup
                        * is fake-completed, wedging the exchange */
                       setup[1] == 0x22 || setup[1] == 0x23);
 
+    /* On the bus the device NAKs the data stage until the firmware arms EP0
+     * IN, however long that takes; here the request runs until the firmware
+     * answers. HEURISTIC: the cap, 100000 cycles (17 ms of 8051 time), past
+     * any exchange of the firmware's own (a JVS round trip is under 45000). */
     int cycles = 0;
-    int limit = need_ep2 ? 30000 : (need_card ? 60000 : 10000);
+    int limit = 100000;
     int drain = 0;
     bool mainloop_hit = false;
 
@@ -909,13 +946,13 @@ int an2131_setup_packet(AN2131State *s, const uint8_t setup[8],
         int c = cpu8051_step(&s->cpu);
         if (c <= 0) {
             s->total_cycles++;
+            /* A reader with bytes still to give is work pending, whichever
+             * reader the cabinet has: the firmware that idles here has to be
+             * woken to finish the answer, or the drain stops mid-frame and
+             * only the next host poll restarts it. */
             if (usb_irq_pending(s) || s->i2c_irq_pending ||
                 s->jvs_response_ready || s->jvs_rx_pending ||
-                s->midi_response_ready ||
-                (!s->is_qc && chihiro_card_reader_enabled &&
-                 chihiro_card_reader_global &&
-                 (card_reader_has_response(&chihiro_card_reader_global[0]) ||
-                  card_reader_has_response(&chihiro_card_reader_global[1])))) {
+                s->midi_response_ready || sc_reader_pending(s)) {
                 s->cpu.halted = false;
                 continue;
             }
@@ -1012,6 +1049,14 @@ int an2131_ep_in_read(AN2131State *s, int ep_nr,
     if (buf_off + copy <= AN2131_RAM_SIZE)
         memcpy(buf, &s->ram[buf_off], copy);
 
+    /* HEURISTIC: a short host read leaves the rest armed for the next one
+     * (OHCI would report an overrun). */
+    if (copy < bc) {
+        memmove(&s->ram[buf_off], &s->ram[buf_off + copy], bc - copy);
+        s->ep[ep_nr].bc_in = bc - copy;
+        return copy;
+    }
+
     s->ep[ep_nr].in_armed = false;
     s->ep[ep_nr].bc_in = 0;
     if (ep_nr == 0)
@@ -1021,6 +1066,7 @@ int an2131_ep_in_read(AN2131State *s, int ep_nr,
 
     /* Notify firmware: IN data was sent to host */
     s->in07irq |= (1 << ep_nr);
+    s->cpu.irq_recheck = true;
 
     return copy;
 }
@@ -1045,6 +1091,7 @@ void an2131_ep_out_write(AN2131State *s, int ep_nr,
         s->ep[ep_nr].cs_out |= EPCS_BSY;
 
     s->out07irq |= (1 << ep_nr);
+    s->cpu.irq_recheck = true;
 
     an2131_run(s, 2000);
 }
@@ -1060,9 +1107,11 @@ static void jvs_rx_deliver(AN2131State *s)
         uint64_t elapsed = s->total_cycles - s->jvs_response_set_cycles;
         if (elapsed < 15000) return;
         if (cpu->sfr[0xC0 - 0x80] & 0x02) return;  /* TI1 still set */
+        cpu->events++;
         cpu->sfr[0xC1 - 0x80] = s->jvs_rx_buf[0];
         s->jvs_rx_pos = 1;
         cpu->sfr[0xC0 - 0x80] |= 0x01;  /* set RI1 */
+        cpu->irq_recheck = true;
         s->jvs_response_ready = false;
         s->jvs_rx_pending = false;
         return;
@@ -1072,19 +1121,67 @@ static void jvs_rx_deliver(AN2131State *s)
     if (s->jvs_rx_pending) {
         if (s->jvs_rx_pos < s->jvs_rx_len) {
             uint8_t rxbyte = s->jvs_rx_buf[s->jvs_rx_pos];
+            cpu->events++;
             cpu->sfr[0xC1 - 0x80] = rxbyte;
             s->jvs_rx_pos++;
             cpu->sfr[0xC0 - 0x80] |= 0x01;  /* set RI1 */
+            cpu->irq_recheck = true;
         }
         s->jvs_rx_pending = false;
     }
 }
 
+/* The board on the MIDI line is the cabinet's; a cabinet without one leaves
+ * the line unanswered. */
+static void midi_peer_send(uint8_t val)
+{
+    switch (chihiro_cabinet_drive_board()) {
+    case CHIHIRO_DRIVE_V257:
+        if (chihiro_v257_global)
+            v257_receive_byte(chihiro_v257_global, val);
+        break;
+    case CHIHIRO_DRIVE_SEGA838:
+        if (chihiro_driveboard_global)
+            driveboard_receive_byte(chihiro_driveboard_global, val);
+        break;
+    default:
+        break;
+    }
+}
+
+static bool midi_peer_has_response(void)
+{
+    switch (chihiro_cabinet_drive_board()) {
+    case CHIHIRO_DRIVE_V257:
+        return chihiro_v257_global &&
+               v257_has_response(chihiro_v257_global);
+    case CHIHIRO_DRIVE_SEGA838:
+        return chihiro_driveboard_global &&
+               driveboard_has_response(chihiro_driveboard_global);
+    default:
+        return false;
+    }
+}
+
+static uint8_t midi_peer_get_response(void)
+{
+    if (chihiro_cabinet_drive_board() == CHIHIRO_DRIVE_V257)
+        return v257_get_response(chihiro_v257_global);
+    return driveboard_get_response(chihiro_driveboard_global);
+}
+
 static void midi_rx_deliver(AN2131State *s)
 {
-    if (s->is_qc || !s->midi_response_ready) return;
-    if (chihiro_card_reader_enabled) return;  /* MIDI belongs to the card reader */
-    if (!chihiro_driveboard_global) return;
+    if (s->is_qc) return;
+    if (chihiro_hw210_enabled) return;  /* MIDI belongs to the card reader */
+    if (!midi_peer_has_response()) return;
+
+    /* A board may speak unasked (the V257 reports its motor line), so pacing
+     * starts from what is queued. */
+    if (!s->midi_response_ready) {
+        s->midi_response_ready = true;
+        s->midi_response_set_cycles = s->total_cycles;
+    }
 
     Cpu8051State *cpu = &s->cpu;
     if (cpu->in_interrupt) return;
@@ -1092,15 +1189,42 @@ static void midi_rx_deliver(AN2131State *s)
 
     if (s->total_cycles - s->midi_response_set_cycles < 5000) return;
 
-    uint8_t byte = driveboard_get_response(chihiro_driveboard_global);
+    uint8_t byte = midi_peer_get_response();
+    CHIHIRO_LOGF(FFB, "SC UART1 RX %02X\n", byte);
+    cpu->events++;
     cpu->sfr[0xC1 - 0x80] = byte;
     cpu->sfr[0xC0 - 0x80] |= 0x01;  /* set RI1 */
+    cpu->irq_recheck = true;
 
-    if (driveboard_has_response(chihiro_driveboard_global)) {
+    if (midi_peer_has_response()) {
         s->midi_response_set_cycles = s->total_cycles;
     } else {
         s->midi_response_ready = false;
     }
+}
+
+/* HEURISTIC: a card reader's turnaround before the first byte of an answer,
+ * then a serial byte rate; no HW210 or CRP-1231 datasheet gives them. */
+#define CARD_TURNAROUND_CYCLES 60000
+#define CARD_BYTE_CYCLES       1500
+
+/* A byte from a card reader lands in a SC UART: SBUF, the even parity in RB8
+ * (the 9-bit mode's ninth bit), RI, and the serial interrupt looked at again. */
+static void sc_uart_post_rx(AN2131State *s, uint8_t sbuf, uint8_t scon,
+                            uint8_t b)
+{
+    Cpu8051State *cpu = &s->cpu;
+    uint8_t par = b;
+
+    cpu->events++;
+    cpu->sfr[sbuf - 0x80] = b;
+    par ^= par >> 4; par ^= par >> 2; par ^= par >> 1;
+    if (par & 1)
+        cpu->sfr[scon - 0x80] |= 0x04;
+    else
+        cpu->sfr[scon - 0x80] &= ~0x04;
+    cpu->sfr[scon - 0x80] |= 0x01;
+    cpu->irq_recheck = true;
 }
 
 /* Deliver one pending card-response byte into a SC UART RX register: wait a
@@ -1131,12 +1255,9 @@ static void card_rx_deliver_ch(AN2131State *s, int slot,
         s->card_resp_cycles[idx] = s->total_cycles;
         s->card_delivering[idx] = false;
     }
-    {
-        /* Real CRP-1231LR-10NAB command turnaround is tens of ms (magnetic I/O). */
-        uint64_t need = (c->tx_pos == 0) ? 60000 : 1500;
-        if (s->total_cycles - s->card_resp_cycles[idx] < need)
-            return;
-    }
+    uint64_t need = c->tx_pos == 0 ? CARD_TURNAROUND_CYCLES : CARD_BYTE_CYCLES;
+    if (s->total_cycles - s->card_resp_cycles[idx] < need)
+        return;
     if (cpu->sfr[scon - 0x80] & 0x01)
         return;                                     /* RI set: previous byte unread */
 
@@ -1144,27 +1265,53 @@ static void card_rx_deliver_ch(AN2131State *s, int slot,
     if (card_reader_read(c, &b, 1) == 1) {
         s->card_resp_cycles[idx] = s->total_cycles; /* pace the next byte */
         s->card_delivering[idx] = true;
-        cpu->sfr[sbuf - 0x80] = b;
-        uint8_t par = b;
-        par ^= par >> 4; par ^= par >> 2; par ^= par >> 1;
-        if (par & 1)
-            cpu->sfr[scon - 0x80] |= 0x04;          /* RB8 = even parity */
-        else
-            cpu->sfr[scon - 0x80] &= ~0x04;
-        cpu->sfr[scon - 0x80] |= 0x01;              /* set RI */
+        sc_uart_post_rx(s, sbuf, scon, b);
+    }
+}
+
+/* The CRP-1231 on the RS-232C line: same wire, framing and pacing as
+ * card_rx_deliver_ch. */
+static void crp1231_rx_deliver(AN2131State *s)
+{
+    Cpu8051State *cpu = &s->cpu;
+    CRP1231State *r = chihiro_crp1231_global;
+
+    if (!r || !crp1231_has_response(r)) {
+        s->card_resp_cycles[0] = 0;
+        return;
+    }
+    if (s->card_resp_cycles[0] == 0)
+        s->card_resp_cycles[0] = s->total_cycles;
+
+    uint64_t need = crp1231_mid_response(r) ? CARD_BYTE_CYCLES
+                                             : CARD_TURNAROUND_CYCLES;
+    if (s->total_cycles - s->card_resp_cycles[0] < need)
+        return;
+    if (cpu->sfr[SFR_SCON - 0x80] & 0x01)
+        return;                                     /* RI set: byte unread */
+
+    uint8_t b;
+    if (crp1231_read(r, &b)) {
+        s->card_resp_cycles[0] = s->total_cycles;
+        sc_uart_post_rx(s, SFR_SBUF, SFR_SCON, b);
     }
 }
 
 static void card_rx_deliver(AN2131State *s)
 {
-    if (s->is_qc || !chihiro_card_reader_enabled || !chihiro_card_reader_global)
+    if (s->is_qc)
+        return;
+    bool mt = chihiro_crp1231_enabled;
+    if (!mt && (!chihiro_hw210_enabled || !chihiro_card_reader_global))
         return;
     /* Deferred TX-complete: raise TI one UART byte-time after the SBUF
      * write, as the silicon does. */
     for (int i = 0; i < 2; i++) {
         if (s->card_ti_cycles[i] &&
             s->total_cycles - s->card_ti_cycles[i] >= 200) {
+            s->cpu.events++;
             s->cpu.sfr[(i == 0 ? 0x98 : 0xC0) - 0x80] |= 0x02;
+            s->cpu.irq_recheck = true;
             s->card_ti_cycles[i] = 0;
         }
     }
@@ -1174,8 +1321,232 @@ static void card_rx_deliver(AN2131State *s)
      * pointers and the game receives zeros. */
     if (s->in_setup && !s->ep[0].in_armed) return;
     if (s->cpu.in_interrupt) return;
+    if (mt) {
+        crp1231_rx_deliver(s);
+        return;
+    }
     card_rx_deliver_ch(s, 1, 0x99, 0x98, 0);   /* RS-232C: SBUF0/SCON0 */
     card_rx_deliver_ch(s, 0, 0xC1, 0xC0, 1);   /* MIDI:    SBUF1/SCON1 */
+}
+
+/* ── The main loop at rest ─────────────────────────────────────────── */
+
+/* Both firmwares idle in a polling loop, never in the 8051's IDLE mode. A
+ * turn that leaves the chip as it found it repeats, so such turns are charged
+ * at the chip's rate and not run. Exact: the fingerprint (registers, internal
+ * RAM, SFRs but the timer counts) must repeat AND nothing outside it moved
+ * during the turn (cpu.events: an XDATA byte changed, a register write, a
+ * read with a side effect, a UART byte, a timer count touched, anything from
+ * outside the program). Timers advance by arithmetic, and a skip stops short
+ * of an overflow that would raise a flag, of the budget, and of a turn begun
+ * in an earlier call. */
+/* Eight bytes at a time; each step is a bijection of the running value, so
+ * two inputs that differ in a single word never fingerprint alike. */
+static uint64_t an2131_mix(uint64_t h, const uint8_t *p, size_t n)
+{
+    for (size_t i = 0; i < n; i += 8) {
+        uint64_t w;
+
+        memcpy(&w, p + i, 8);
+        h = (h ^ w) * 0x9E3779B97F4A7C15ull;
+        h ^= h >> 29;
+    }
+    return h;
+}
+
+/* The chip at one point of its program, the timer counts aside. */
+static uint64_t an2131_idle_hash(AN2131State *s)
+{
+    Cpu8051State *c = &s->cpu;
+    uint8_t sfr[128];
+    const uint8_t regs[16] = {
+        c->sp, c->acc, c->b, c->psw, c->in_interrupt, c->halted,
+        (uint8_t)c->dptr, (uint8_t)(c->dptr >> 8),
+        (uint8_t)c->dptr_alt, (uint8_t)(c->dptr_alt >> 8),
+        s->exif, s->eie, s->eip, s->dps, s->mpage,
+    };
+    uint64_t h = 0x243F6A8885A308D3ull;
+
+    memcpy(sfr, c->sfr, sizeof(sfr));
+    sfr[SFR_TL0 - 0x80] = sfr[SFR_TH0 - 0x80] = 0;
+    sfr[SFR_TL1 - 0x80] = sfr[SFR_TH1 - 0x80] = 0;
+    /* an2131_mix takes whole eight-byte words. */
+    QEMU_BUILD_BUG_ON(sizeof(regs) % 8 || sizeof(c->iram) % 8 ||
+                      sizeof(sfr) % 8);
+    h = an2131_mix(h, regs, sizeof(regs));
+    h = an2131_mix(h, c->iram, sizeof(c->iram));
+    return an2131_mix(h, sfr, sizeof(sfr));
+}
+
+/* Whether the chip is left alone while the turns last: nothing on its way
+ * in, no transmitter finishing, no USB or I2C request, no interrupt it would
+ * take now -- what the run loop and its wake-up already test. */
+static bool an2131_idle_quiet(AN2131State *s)
+{
+    Cpu8051State *c = &s->cpu;
+    uint8_t ie = c->sfr[SFR_IE - 0x80], tcon = c->sfr[SFR_TCON - 0x80];
+
+    if (c->halted || c->in_interrupt) {
+        return false;
+    }
+    if (s->jvs_response_ready || s->jvs_rx_pending || s->midi_response_ready ||
+        s->card_ti_cycles[0] || s->card_ti_cycles[1] ||
+        usb_irq_pending(s) || s->i2c_irq_pending ||
+        (s->ep[0].in_armed && (s->ep0cs & EP0CS_INBSY))) {
+        return false;
+    }
+    if ((!s->is_qc && !chihiro_hw210_enabled && midi_peer_has_response()) ||
+        sc_reader_pending(s)) {
+        return false;
+    }
+    /* An interrupt check_interrupts would take now. */
+    return !((ie & 0x80) &&
+             (((ie & 0x02) && (tcon & 0x20)) || ((ie & 0x08) && (tcon & 0x80)) ||
+              ((ie & 0x10) && (c->sfr[SFR_SCON - 0x80] & 0x03)) ||
+              ((ie & 0x40) && (c->sfr[SFR_SCON1 - 0x80] & 0x03))));
+}
+
+/* `ticks` counts on an 8-bit auto-reload counter; returns the overflows. */
+static uint64_t an2131_count8(uint8_t *tl, uint8_t th, uint64_t ticks)
+{
+    uint64_t first = 256 - *tl, period = 256 - th;
+
+    if (ticks < first) {
+        *tl += ticks;
+        return 0;
+    }
+    ticks -= first;
+    *tl = th + ticks % period;
+    return 1 + ticks / period;
+}
+
+/* `ticks` counts on a 16-bit counter; returns the overflows. */
+static uint64_t an2131_count16(uint8_t *tl, uint8_t *th, uint64_t ticks)
+{
+    uint64_t t = *tl | (*th << 8), first = 0x10000 - t, overflows = 0;
+
+    if (ticks < first) {
+        t += ticks;
+    } else {
+        ticks -= first;
+        overflows = 1 + ticks / 0x10000;
+        t = ticks % 0x10000;
+    }
+    *tl = (uint8_t)t;
+    *th = (uint8_t)(t >> 8);
+    return overflows;
+}
+
+/* Instructions before a timer overflow that would raise a flag still clear,
+ * the one thing a skip must not step over; UINT64_MAX when there is none.
+ * Timer 0 counts one instruction in three unless CKCON.3 is set, timer 1
+ * every one -- as timer_tick does, modes 1 and 2 only. */
+static uint64_t an2131_steps_to_overflow(AN2131State *s)
+{
+    Cpu8051State *c = &s->cpu;
+    uint8_t tcon = c->sfr[SFR_TCON - 0x80], tmod = c->sfr[SFR_TMOD - 0x80];
+    uint8_t m0 = tmod & 3, m1 = (tmod >> 4) & 3;
+    uint64_t limit = UINT64_MAX;
+
+    if ((tcon & 0x10) && !(tcon & 0x20) && (m0 == 1 || m0 == 2)) {
+        uint64_t ticks = m0 == 1
+            ? 0x10000 - (c->sfr[SFR_TL0 - 0x80] | (c->sfr[SFR_TH0 - 0x80] << 8))
+            : 256 - c->sfr[SFR_TL0 - 0x80];
+        limit = (c->sfr[SFR_CKCON - 0x80] & 0x08) ? ticks
+                                              : 3 * ticks - c->timer0_prescale;
+    }
+    if ((tcon & 0x40) && !(tcon & 0x80) && !(tmod & 0x40) &&
+        (m1 == 1 || m1 == 2)) {
+        uint64_t ticks = m1 == 1
+            ? 0x10000 - (c->sfr[SFR_TL1 - 0x80] | (c->sfr[SFR_TH1 - 0x80] << 8))
+            : 256 - c->sfr[SFR_TL1 - 0x80];
+        limit = MIN(limit, ticks);
+    }
+    return limit;
+}
+
+/* Moves the timers on by `steps` instructions, as timer_tick would have. */
+static void an2131_advance_timers(AN2131State *s, uint64_t steps)
+{
+    Cpu8051State *c = &s->cpu;
+    uint8_t *sfr = c->sfr;
+    uint8_t tcon = sfr[SFR_TCON - 0x80], tmod = sfr[SFR_TMOD - 0x80];
+    uint8_t m0 = tmod & 3, m1 = (tmod >> 4) & 3;
+    uint64_t overflows;
+
+    if (tcon & 0x10) {
+        uint64_t ticks = steps;
+        if (!(sfr[SFR_CKCON - 0x80] & 0x08)) {
+            ticks = (c->timer0_prescale + steps) / 3;
+            c->timer0_prescale = (c->timer0_prescale + steps) % 3;
+        }
+        overflows = m0 == 1 ? an2131_count16(&sfr[SFR_TL0 - 0x80],
+                                             &sfr[SFR_TH0 - 0x80], ticks)
+                  : m0 == 2 ? an2131_count8(&sfr[SFR_TL0 - 0x80],
+                                            sfr[SFR_TH0 - 0x80], ticks)
+                  : 0;
+        if (overflows) {
+            tcon |= 0x20;
+            c->irq_recheck = true;
+        }
+    }
+    if ((tcon & 0x40) && !(tmod & 0x40)) {
+        overflows = m1 == 1 ? an2131_count16(&sfr[SFR_TL1 - 0x80],
+                                             &sfr[SFR_TH1 - 0x80], steps)
+                  : m1 == 2 ? an2131_count8(&sfr[SFR_TL1 - 0x80],
+                                            sfr[SFR_TH1 - 0x80], steps)
+                  : 0;
+        if (overflows) {
+            tcon |= 0x80;
+            c->irq_recheck = true;
+        }
+    }
+    sfr[SFR_TCON - 0x80] = tcon;
+}
+
+/* Called after every instruction an2131_run steps; returns the cycles of the
+ * turns it charged without running them. */
+static int an2131_idle_turn(AN2131State *s, int budget_left)
+{
+    uint64_t hash, turn_c, turn_s, k, limit;
+    bool same;
+
+    if (s->cpu.pc != s->idle.pc) {
+        /* Take a new candidate now and then: whichever point the chip is at
+         * when it goes idle will come round again a turn later. */
+        if (++s->idle.sample >= 4096) {
+            s->idle.sample = 0;
+            s->idle.pc = s->cpu.pc;
+            s->idle.hash = 0;
+        }
+        return 0;
+    }
+    hash = an2131_idle_hash(s);
+    turn_c = s->total_cycles - s->idle.cycles;
+    turn_s = s->steps - s->idle.steps;
+    same = hash == s->idle.hash && s->cpu.events == s->idle.events &&
+           turn_c > 0 && turn_s > 0;
+    s->idle.hash = hash;
+    s->idle.cycles = s->total_cycles;
+    s->idle.steps = s->steps;
+    s->idle.events = s->cpu.events;
+    if (!same || budget_left <= 0 || !an2131_idle_quiet(s)) {
+        return 0;
+    }
+    k = (uint64_t)budget_left / turn_c;
+    limit = an2131_steps_to_overflow(s);
+    if (limit != UINT64_MAX) {
+        k = MIN(k, (limit - 1) / turn_s);
+    }
+    if (k == 0) {
+        return 0;
+    }
+    an2131_advance_timers(s, k * turn_s);
+    s->total_cycles += k * turn_c;
+    s->steps += k * turn_s;
+    s->idle.cycles = s->total_cycles;
+    s->idle.steps = s->steps;
+    return (int)(k * turn_c);
 }
 
 int an2131_run(AN2131State *s, int max_cycles)
@@ -1183,11 +1554,20 @@ int an2131_run(AN2131State *s, int max_cycles)
     if (!s->cpu_running) return 0;
 
     int total = 0;
+    /* A turn is only trusted if it ran whole within this call. */
+    s->idle.hash = 0;
     while (total < max_cycles) {
-        jvs_rx_deliver(s);
+        /* Both are no-ops unless something is queued, so the guards are
+         * exact rather than heuristic. */
+        if (s->jvs_response_ready || s->jvs_rx_pending) {
+            jvs_rx_deliver(s);
+        }
         midi_rx_deliver(s);
         card_rx_deliver(s);
-        check_interrupts(s);
+        if (s->cpu.irq_recheck) {
+            s->cpu.irq_recheck = false;
+            check_interrupts(s);
+        }
         /* If the firmware arms an EP0-IN reply after the setup window already
          * returned (e.g. a vendor dispatch delayed by serial ISR load), it
          * spins on the EP0CS busy bit waiting for a host read that will never
@@ -1195,6 +1575,7 @@ int an2131_run(AN2131State *s, int max_cycles)
          * model that here so the late (already-missed) reply is consumed and
          * the firmware returns to its main loop. */
         if (s->ep[0].in_armed && (s->ep0cs & EP0CS_INBSY)) {
+            s->cpu.events++;
             s->ep0cs &= ~EP0CS_INBSY;
             s->ep[0].in_armed = false;
         }
@@ -1203,11 +1584,7 @@ int an2131_run(AN2131State *s, int max_cycles)
             s->total_cycles++;
             if (usb_irq_pending(s) || s->i2c_irq_pending ||
                 s->jvs_response_ready || s->jvs_rx_pending ||
-                s->midi_response_ready ||
-                (!s->is_qc && chihiro_card_reader_enabled &&
-                 chihiro_card_reader_global &&
-                 (card_reader_has_response(&chihiro_card_reader_global[0]) ||
-                  card_reader_has_response(&chihiro_card_reader_global[1])))) {
+                s->midi_response_ready || sc_reader_pending(s)) {
                 s->cpu.halted = false;
                 continue;
             }
@@ -1215,6 +1592,8 @@ int an2131_run(AN2131State *s, int max_cycles)
         }
         total += c;
         s->total_cycles += c;
+        s->steps++;
+        total += an2131_idle_turn(s, max_cycles - total);
     }
     return total;
 }

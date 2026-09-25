@@ -4,6 +4,7 @@
  * Wrapper functions to configure network settings at runtime.
  *
  * Copyright (C) 2020-2021 Matt Borgerson
+ * Copyright (c) 2026 Réda Chérif-Touil
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -35,6 +36,7 @@
 #include "net/net.h"
 #include "net/hub.h"
 #include "net/slirp.h"
+#include "qemu/timer.h"
 #include <libslirp.h>
 #if defined(_WIN32)
 #include <pcap/pcap.h>
@@ -200,4 +202,124 @@ int xemu_net_is_enabled(void)
     nc = qemu_find_netdev(id);
     g_config.net.enable = (nc != NULL);
     return g_config.net.enable;
+}
+
+/*
+ * The cabinet link: socket netdevs on hub 0, beside the network board. The
+ * host listens on port + each other cabinet's number and its hub relays every
+ * frame; a joining cabinet connects on port + its own number until it answers.
+ */
+
+static QEMUTimer *link_retry_timer;
+
+/* Makes the netdev the qdict describes, and drops the qdict. */
+static bool link_netdev_add(QDict *qdict, Error **errp)
+{
+    QemuOpts *opts = qemu_opts_from_qdict(qemu_find_opts("netdev"), qdict,
+                                          &error_abort);
+    Error *err = NULL;
+
+    qobject_unref(qdict);
+    netdev_add(opts, &err);
+    if (err) {
+        qemu_opts_del(opts);
+        error_propagate(errp, err);
+        return false;
+    }
+    return true;
+}
+
+/* One socket netdev and its port on hub 0. Returns false when the netdev
+ * could not be made (a connection refused, a port already taken). */
+static bool link_add_socket(const char *name, const char *how, const char *where)
+{
+    Error *local_err = NULL;
+    char hub_name[64];
+    QDict *qdict = qdict_new();
+
+    qdict_put_str(qdict, "id", name);
+    qdict_put_str(qdict, "type", "socket");
+    qdict_put_str(qdict, how, where);
+    if (!link_netdev_add(qdict, NULL)) {
+        return false;
+    }
+
+    snprintf(hub_name, sizeof(hub_name), "%s-hub", name);
+    qdict = qdict_new();
+    qdict_put_str(qdict, "id", hub_name);
+    qdict_put_str(qdict, "type", "hubport");
+    qdict_put_int(qdict, "hubid", 0);
+    qdict_put_str(qdict, "netdev", name);
+    if (!link_netdev_add(qdict, &local_err)) {
+        xemu_queue_error_message(error_get_pretty(local_err));
+        error_report_err(local_err);
+        remove_netdev(name);
+        return false;
+    }
+    return true;
+}
+
+/* Every three seconds: a refused or dropped connection leaves a dead netdev
+ * behind, so it is taken down and made again until the host answers, and a
+ * host that restarts is joined again. */
+static void link_connect_retry(void *opaque)
+{
+    static bool connected;
+    char where[300];
+    NetClientState *nc = qemu_find_netdev("xemu-link");
+
+    if (nc && net_socket_is_connected(nc)) {
+        if (!connected)
+            xemu_queue_notification("Cabinet link: connected to the host");
+        connected = true;
+    } else {
+        connected = false;
+        if (nc) {
+            remove_netdev("xemu-link-hub");
+            remove_netdev("xemu-link");
+        }
+        snprintf(where, sizeof(where), "%s:%d", g_config.chihiro.link.host,
+                 g_config.chihiro.link.port + g_config.chihiro.link.cabinet);
+        link_add_socket("xemu-link", "connect", where);
+    }
+    timer_mod(link_retry_timer, qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 3000);
+}
+
+void xemu_link_enable(void)
+{
+    int me = g_config.chihiro.link.cabinet;
+    int cabinets = g_config.chihiro.link.cabinets;
+    int port = g_config.chihiro.link.port;
+    const char *host = g_config.chihiro.link.host;
+
+    if (!g_config.chihiro.link.enable || !xemu_chihiro_mode()) {
+        return;
+    }
+    if (me < 1 || me > 4 || cabinets < 2 || cabinets > 4 || me > cabinets) {
+        xemu_queue_error_message("Cabinet link: this cabinet must be 1 to 4 and "
+                                 "within the number of cabinets (2 to 4)");
+        return;
+    }
+
+    if (host == NULL || host[0] == '\0') {
+        /* The host: a door for every other cabinet. */
+        for (int other = 1; other <= cabinets; other++) {
+            char name[32], where[32];
+            if (other == me) {
+                continue;
+            }
+            snprintf(name, sizeof(name), "xemu-link-%d", other);
+            snprintf(where, sizeof(where), ":%d", port + other);
+            if (!link_add_socket(name, "listen", where)) {
+                char msg[128];
+                snprintf(msg, sizeof(msg), "Cabinet link: cannot listen on port %d "
+                         "for cabinet %d", port + other, other);
+                xemu_queue_error_message(msg);
+            }
+        }
+        return;
+    }
+
+    link_retry_timer = timer_new_ms(QEMU_CLOCK_REALTIME, link_connect_retry, NULL);
+    link_connect_retry(NULL);
 }

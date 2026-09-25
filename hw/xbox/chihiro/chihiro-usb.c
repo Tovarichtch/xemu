@@ -2,6 +2,7 @@
  * QEMU Chihiro USB Devices
  *
  * Copyright (c) 2016 espes
+ * Copyright (c) 2026 Réda Chérif-Touil
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -27,11 +28,14 @@
 #include "qemu/timer.h"
 #include "chihiro.h"
 #include "chihiro-jvs.h"
-#include "chihiro-driveboard.h"
+#include "chihiro-driveboard-sega838.h"
+#include "chihiro-driveboard-v257.h"
+#include "chihiro-cardreader-crp1231.h"
+#include "chihiro-log.h"
 #include "chihiro-an2131.h"
 #include "migration/vmstate.h"
+#include "ui/xemu-settings.h"
 #define TS_MS ((long long)(qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL)))
-extern bool chihiro_game_running;
 extern bool lpc_log_verbose;
 
 typedef struct ChihiroUSBState {
@@ -53,8 +57,11 @@ typedef struct ChihiroUSBState {
     /* ic11 EEPROM (512 bytes) — baseboard config, "ACBU0001" + game ID */
     uint8_t ic11[512];
 
-    /* External memory (64KB, mapped at 0x0000–0xFFFF on the AN2131 8051) */
-    uint8_t extmem[65536];
+    /* The baseboard SRAM behind the 8051, two halves of 64 KB: [0] the
+     * firmware's work RAM, [1] the game's backup (see AN2131State.extmem).
+     * The save file keeps [1]. */
+    uint8_t extmem[2][65536];
+    bool extmem_backup_loaded;  /* a snapshot being loaded carried [1] */
 
     /* Real AN2131 loads firmware from EEPROM after initial enumeration,
      * then disconnects and reconnects. SEGABOOT waits for the CSC
@@ -328,17 +335,115 @@ static void chihiro_apply_freeplay(ChihiroUSBState *s)
     }
 }
 
+/* ── The cabinet link's numbers in the game's backup ─────────────────────
+ * How many cabinets are linked and which one this is live in the game's
+ * backup (set in its test menu). For these titles, Settings > Network >
+ * Cabinet Link writes them as the game does, checksums included.
+ *
+ * acLib backup records are tag(8), a 2-byte field, byte-sum(2), data:
+ *   Ollie King    "SBHF", twice in ic11: data +5 cabinets, +6 cabinet (0-based)
+ *   OutRun 2      "OUTRUN2" in ic11: +6 TOTAL MACHINE, +7 LINK_ID (1-based),
+ *   OutRun 2 SP   "SBJE", twice: the same, its structure two bytes longer; the
+ *                 game's own checksum (the Internet one, over the first 0x2C
+ *                 bytes) sits at +0x2C (OutRun 2) or +0x2E (SP)
+ *   Maximum Tune  "SBKD0000" (2) / "SBHQ0000" (1) in the backup memory:
+ *                 +0xA PCB ID (0-based), +0 the u32 byte sum of the rest of
+ *                 the block; the game counts its machines itself */
+
+static uint16_t internet_checksum(const uint8_t *b, size_t len)
+{
+    uint32_t sum = 0;
+    for (size_t i = 0; i + 1 < len; i += 2) sum += b[i] | (b[i + 1] << 8);
+    if (len & 1) sum += b[len - 1];
+    while (sum >> 16) sum = (sum & 0xFFFF) + (sum >> 16);
+    return sum == 0xFFFF ? 0xFFFF : (uint16_t)~sum;
+}
+
+static uint16_t byte_sum16(const uint8_t *b, size_t len)
+{
+    uint32_t sum = 0;
+    for (size_t i = 0; i < len; i++) sum += b[i];
+    return (uint16_t)sum;
+}
+
+/* The next record with that 8-byte tag and kind at or after `from` whose
+ * `need` bytes of data fit before `len`, or -1. */
+static int record_find(const uint8_t *mem, size_t len, const char *tag,
+                       uint16_t kind, size_t need, size_t from)
+{
+    for (size_t pos = from; pos + 12 + need <= len; pos++) {
+        if (memcmp(mem + pos, tag, 8) == 0 && lduw_le_p(mem + pos + 8) == kind)
+            return (int)pos;
+    }
+    return -1;
+}
+
+static void link_write_ollie_king(uint8_t *ic11, int cabinets, int cabinet)
+{
+    for (int pos = record_find(ic11, 512, "SBHF\0\0\0\0", 3, 12, 0); pos >= 0;
+         pos = record_find(ic11, 512, "SBHF\0\0\0\0", 3, 12, pos + 12)) {
+        uint8_t *data = ic11 + pos + 12;
+        data[5] = cabinets;
+        data[6] = cabinet - 1;
+        stw_le_p(ic11 + pos + 10, byte_sum16(data, 12));
+    }
+}
+
+static void link_write_outrun2(uint8_t *ic11, const char *tag, int own_checksum_at,
+                               int cabinets, int cabinet)
+{
+    for (int pos = record_find(ic11, 512, tag, 12, 52, 0); pos >= 0;
+         pos = record_find(ic11, 512, tag, 12, 52, pos + 12)) {
+        uint8_t *data = ic11 + pos + 12;
+        data[6] = cabinets;
+        data[7] = cabinet;
+        stw_le_p(data + own_checksum_at, internet_checksum(data, 0x2C));
+        stw_le_p(ic11 + pos + 10, byte_sum16(data, 52));
+    }
+}
+
+static void link_write_maximum_tune(uint8_t *extmem, const char *tag, int cabinet)
+{
+    for (size_t pos = 0x8000; pos + 12 <= 0x10000; pos++) {
+        if (memcmp(extmem + pos, tag, 8) != 0) continue;
+        size_t size = (size_t)lduw_le_p(extmem + pos + 8) * 4;
+        uint8_t *data = extmem + pos + 12;
+        if (size < 0x10 || pos + 12 + size > 0x10000) return;
+        data[0xA] = cabinet - 1;
+        uint32_t sum = 0;
+        for (size_t i = 4; i < size; i++) sum += data[i];
+        stl_le_p(data, sum);
+        return;
+    }
+}
+
+static void chihiro_apply_link_settings(ChihiroUSBState *s)
+{
+    int cabinets = g_config.chihiro.link.cabinets;
+    int cabinet = g_config.chihiro.link.cabinet;
+
+    if (!g_config.chihiro.link.enable) return;
+    if (cabinets < 2 || cabinets > 4 || cabinet < 1 || cabinet > cabinets) return;
+    link_write_ollie_king(s->ic11, cabinets, cabinet);
+    link_write_outrun2(s->ic11, "OUTRUN2\0", 0x2C, cabinets, cabinet);
+    link_write_outrun2(s->ic11, "SBJE\0\0\0\0", 0x2E, cabinets, cabinet);
+    link_write_maximum_tune(s->extmem[1], "SBKD0000", cabinet);
+    link_write_maximum_tune(s->extmem[1], "SBHQ0000", cabinet);
+}
+
 static void handle_reset(USBDevice *dev)
 {
     ChihiroUSBState *s = (ChihiroUSBState *)dev;
     const char *id = s->is_qc ? "QC" : "SC";
     fprintf(stderr, "[%07lld] chihiro-usb [%s]: USB RESET (lle=%d)\n", TS_MS, id, s->use_lle);
     if (s->is_qc) {
-        s->eeprom[0x1F00] = (uint8_t)(chihiro_region_setting + 1);
+        s->eeprom[0x1F00] = chihiro_region_byte();
         chihiro_apply_freeplay(s);
+        chihiro_apply_link_settings(s);
     }
     if (s->use_lle) {
         s->an2131.usbirq |= USBIRQ_URES;
+        s->an2131.cpu.irq_recheck = true;
         an2131_run(&s->an2131, 10000);
     }
 }
@@ -532,6 +637,7 @@ static void handle_control(USBDevice *dev, USBPacket *p,
 static void handle_data(USBDevice *dev, USBPacket *p)
 {
     ChihiroUSBState *s = (ChihiroUSBState *)dev;
+    const char *id = s->is_qc ? "QC" : "SC";
     int ep = p->ep->nr;
 
     /* LLE path: route bulk transfers through AN2131 firmware */
@@ -574,6 +680,10 @@ static void handle_data(USBDevice *dev, USBPacket *p)
                 return;
             }
             usb_packet_copy(p, buf, chunk);
+            if (!s->is_qc) {
+                CHIHIRO_LOG_HEX(USB, buf, MIN(chunk, 32),
+                                "%s BULK EP%d OUT: %d bytes:", id, ep, chunk);
+            }
             an2131_ep_out_write(&s->an2131, ep, buf, chunk);
             an2131_run(&s->an2131, 2000);
 
@@ -617,12 +727,9 @@ static void chihiro_an2131qc_realize(USBDevice *dev, Error **errp)
     s->runtime_desc.id = s->runtime_id;
     dev->usb_desc = &s->runtime_desc;
     usb_desc_init(dev);
-    /* Region byte at eeprom[0x1F00]: SEGABOOT checks boot.id[0x38] bitmask
-     * against (1 << region). JPN-only games (e.g. Golf SBLF, bitmask=0x02)
-     * fail with ERROR 05 if region=2. Region=1 (JPN) works for all known
-     * games since all bitmasks include bit 1.
-     * Values: 01=JPN, 02=USA, 03=EXP. Comes from ic10 dump natively. */
-    s->eeprom[0x1F00] = (uint8_t)(chihiro_region_setting + 1);
+    /* The cabinet's region at eeprom[0x1F00], 1 Japan, 2 USA, 3 Export,
+     * over whatever the ic10 dump carried: see chihiro_region_byte(). */
+    s->eeprom[0x1F00] = chihiro_region_byte();
 
     /* Load ic11 baseboard EEPROM (256 bytes, 24LC024) */
     memset(s->ic11, 0, sizeof(s->ic11));
@@ -633,8 +740,9 @@ static void chihiro_an2131qc_realize(USBDevice *dev, Error **errp)
         return;
     }
 
-    chihiro_apply_freeplay(s);
     memset(s->extmem, 0, sizeof(s->extmem));
+    chihiro_apply_freeplay(s);
+    chihiro_apply_link_settings(s);
 
     /* Initialize EZ-USB firmware state */
     s->fw_bytes_written = 0;
@@ -650,7 +758,7 @@ static void chihiro_an2131qc_realize(USBDevice *dev, Error **errp)
     s->an2131.ic10_size = sizeof(s->eeprom);
     s->an2131.ic11_eeprom = s->ic11;
     s->an2131.ic11_size = 256;
-    s->an2131.extmem = s->extmem;
+    s->an2131.extmem = s->extmem[0];
     s->an2131.extmem_size = sizeof(s->extmem);
     s->an2131.usb_dev = s;
 
@@ -734,10 +842,9 @@ static const VMStateDescription vmstate_an2131 = {
         VMSTATE_BOOL(i2c_irq_pending, AN2131State),
         VMSTATE_BOOL(i2c_lastrd, AN2131State),
         VMSTATE_UINT8_ARRAY(rtc_regs, AN2131State, 16),
-        VMSTATE_UINT16(sbfy_pay_off, AN2131State),
-        VMSTATE_UINT16(sbfy_pay_end, AN2131State),
-        VMSTATE_UINT16(sbfy_chk_off, AN2131State),
-        VMSTATE_BOOL(sbfy_reading, AN2131State),
+        /* Where a Crazy Taxi backup workaround kept its range and flag, gone
+         * with the SRAM's second half. */
+        VMSTATE_UNUSED(7),
         VMSTATE_UINT8(cpucs, AN2131State),
         VMSTATE_UINT8(usbcs, AN2131State),
         VMSTATE_UINT8(fnaddr, AN2131State),
@@ -799,16 +906,29 @@ static const VMStateDescription vmstate_chihiro_jvs = {
     }
 };
 
+static int chihiro_usb_pre_load(void *opaque)
+{
+    ChihiroUSBState *s = opaque;
+
+    s->extmem_backup_loaded = false;
+    return 0;
+}
+
 static int chihiro_usb_post_load(void *opaque, int version_id)
 {
     ChihiroUSBState *s = opaque;
+
+    /* A snapshot from before the SRAM had two halves carries one, which
+     * held the firmware's work and the game's backup at once: it is both. */
+    if (s->is_qc && !s->extmem_backup_loaded)
+        memcpy(s->extmem[1], s->extmem[0], sizeof(s->extmem[1]));
 
     an2131_relink(&s->an2131);
     s->an2131.ic10_eeprom = s->eeprom;
     s->an2131.ic10_size = sizeof(s->eeprom);
     s->an2131.ic11_eeprom = s->ic11;
     s->an2131.ic11_size = 256;
-    s->an2131.extmem = s->extmem;
+    s->an2131.extmem = s->extmem[0];
     s->an2131.extmem_size = sizeof(s->extmem);
     s->an2131.usb_dev = s;
 
@@ -819,10 +939,40 @@ static int chihiro_usb_post_load(void *opaque, int version_id)
     return 0;
 }
 
+static bool chihiro_usb_backup_half_needed(void *opaque)
+{
+    ChihiroUSBState *s = opaque;
+
+    return s->is_qc;
+}
+
+static int chihiro_usb_backup_half_post_load(void *opaque, int version_id)
+{
+    ChihiroUSBState *s = opaque;
+
+    s->extmem_backup_loaded = true;
+    return 0;
+}
+
+/* The SRAM half with the game's backup, which snapshots from before it had
+ * two halves do not carry. */
+static const VMStateDescription vmstate_chihiro_usb_backup_half = {
+    .name = "chihiro-usb/backup-half",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = chihiro_usb_backup_half_needed,
+    .post_load = chihiro_usb_backup_half_post_load,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT8_ARRAY(extmem[1], ChihiroUSBState, 65536),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
 static const VMStateDescription vmstate_chihiro_usb = {
     .name = "chihiro-usb",
     .version_id = 1,
     .minimum_version_id = 1,
+    .pre_load = chihiro_usb_pre_load,
     .post_load = chihiro_usb_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_USB_DEVICE(dev, ChihiroUSBState),
@@ -832,13 +982,17 @@ static const VMStateDescription vmstate_chihiro_usb = {
         VMSTATE_BOOL(fw_loaded, ChihiroUSBState),
         VMSTATE_BOOL(eeprom_reloaded, ChihiroUSBState),
         VMSTATE_UINT8_ARRAY(ic11, ChihiroUSBState, 512),
-        VMSTATE_UINT8_ARRAY(extmem, ChihiroUSBState, 65536),
+        VMSTATE_UINT8_ARRAY(extmem[0], ChihiroUSBState, 65536),
         VMSTATE_STRUCT(jvs, ChihiroUSBState, 1,
                        vmstate_chihiro_jvs, ChihiroJVSState),
         VMSTATE_STRUCT(an2131, ChihiroUSBState, 1,
                        vmstate_an2131, AN2131State),
         VMSTATE_BOOL(use_lle, ChihiroUSBState),
         VMSTATE_END_OF_LIST()
+    },
+    .subsections = (const VMStateDescription * const []) {
+        &vmstate_chihiro_usb_backup_half,
+        NULL
     }
 };
 
@@ -865,6 +1019,123 @@ static const TypeInfo chihiro_an2131qc_info = {
     .parent        = TYPE_USB_DEVICE,
     .instance_size = sizeof(ChihiroUSBState),
     .class_init    = chihiro_an2131qc_class_init,
+};
+
+/* The card that comes back may be an older state of a card whose file has
+ * moved on since, and writing it there would undo those games. It comes back
+ * with no file, so its next write makes a new one. */
+static int crp1231_pre_load(void *opaque)
+{
+    CRP1231State *r = opaque;
+
+    r->card_path[0] = '\0';
+    return 0;
+}
+
+/* A snapshot file comes from outside: positions that would reach past the
+ * reader's buffers refuse it. */
+static int crp1231_post_load(void *opaque, int version_id)
+{
+    CRP1231State *r = opaque;
+
+    if (r->cmd_len < 0 || r->cmd_len > CRP1231_CMD_MAX ||
+        (r->cmd_expect != 0 &&
+         (r->cmd_expect < 4 || r->cmd_expect > CRP1231_CMD_MAX)) ||
+        r->resp_len < 0 || r->resp_len > CRP1231_RESP_MAX ||
+        r->resp_pos < 0 || r->resp_pos > r->resp_len ||
+        r->last_len < 0 || r->last_len > (int)sizeof(r->last_frame)) {
+        /* Cleared too: a failed load can still be resumed. */
+        r->cmd_len = r->cmd_expect = 0;
+        r->resp_len = r->resp_pos = 0;
+        r->last_len = 0;
+        return -EINVAL;
+    }
+    return 0;
+}
+
+/* Half a command in and half an answer out: a snapshot that loses either
+ * leaves the reader and the game waiting on each other. */
+static const VMStateDescription vmstate_chihiro_cardreader_crp1231 = {
+    .name = "chihiro-cardreader-crp1231",
+    .version_id = 5,
+    .minimum_version_id = 5,
+    .pre_load = crp1231_pre_load,
+    .post_load = crp1231_post_load,
+    .fields = (const VMStateField[]) {
+        /* card_path is dropped on load (crp1231_pre_load). */
+        VMSTATE_UINT8_ARRAY(cmd, CRP1231State, CRP1231_CMD_MAX),
+        VMSTATE_INT32(cmd_len, CRP1231State),
+        VMSTATE_INT32(cmd_expect, CRP1231State),
+        VMSTATE_UINT8_ARRAY(resp, CRP1231State, CRP1231_RESP_MAX),
+        VMSTATE_INT32(resp_len, CRP1231State),
+        VMSTATE_INT32(resp_pos, CRP1231State),
+        VMSTATE_UINT8_ARRAY(last_frame, CRP1231State, 80),
+        VMSTATE_INT32(last_len, CRP1231State),
+        VMSTATE_BOOL(have_frame, CRP1231State),
+        /* An answer still waiting for its ENQ. */
+        VMSTATE_BOOL(answer_pending, CRP1231State),
+        /* The card travels with the snapshot. */
+        VMSTATE_UINT8_ARRAY(card, CRP1231State, CRP1231_CARD_BYTES),
+        VMSTATE_INT32(card_pos, CRP1231State),
+        VMSTATE_UINT8(last_cmd, CRP1231State),
+        VMSTATE_UINT8(last_param, CRP1231State),
+        VMSTATE_BOOL(card_written, CRP1231State),
+        /* A take-in the game is still waiting on: the answer to its next
+         * ENQ depends on it. */
+        VMSTATE_BOOL(waiting, CRP1231State),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
+/* Positions out of a snapshot file that would reach past the steering
+ * board's command and queues refuse it too. */
+static int v257_post_load(void *opaque, int version_id)
+{
+    V257DriveBoard *db = opaque;
+
+    if (db->cmd_pos < 0 || db->cmd_pos >= V257_CMD_LEN ||
+        db->resp_head < 0 || db->resp_head >= V257_RESP_SIZE ||
+        db->resp_tail < 0 || db->resp_tail >= V257_RESP_SIZE ||
+        db->pending_head < 0 || db->pending_head >= V257_MSG_SLOTS ||
+        db->pending_tail < 0 || db->pending_tail >= V257_MSG_SLOTS) {
+        db->cmd_pos = 0;
+        db->resp_head = db->resp_tail = 0;
+        db->pending_head = db->pending_tail = 0;
+        return -EINVAL;
+    }
+    return 0;
+}
+
+/* A snapshot taken mid-frame has half a command on the wire and an answer
+ * still queued; losing either stalls the game's send-then-wait loop. */
+static const VMStateDescription vmstate_chihiro_driveboard_v257 = {
+    .name = "chihiro-driveboard-v257",
+    .version_id = 3,
+    .minimum_version_id = 3,
+    .post_load = v257_post_load,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT8_ARRAY(cmd, V257DriveBoard, V257_CMD_LEN),
+        VMSTATE_INT32(cmd_pos, V257DriveBoard),
+        VMSTATE_UINT8_ARRAY(resp, V257DriveBoard, V257_RESP_SIZE),
+        VMSTATE_INT32(resp_head, V257DriveBoard),
+        VMSTATE_INT32(resp_tail, V257DriveBoard),
+        VMSTATE_UINT16(position, V257DriveBoard),
+        VMSTATE_UINT16(wheel, V257DriveBoard),
+        VMSTATE_UINT8(force_a, V257DriveBoard),
+        VMSTATE_UINT8(force_b, V257DriveBoard),
+        VMSTATE_INT8(torque, V257DriveBoard),
+        VMSTATE_BOOL(motor_on, V257DriveBoard),
+        VMSTATE_BOOL(motor_known, V257DriveBoard),
+        VMSTATE_UINT8_2DARRAY(pending, V257DriveBoard, V257_MSG_SLOTS,
+                              V257_MSG_LEN),
+        VMSTATE_INT32(pending_head, V257DriveBoard),
+        VMSTATE_INT32(pending_tail, V257DriveBoard),
+        VMSTATE_BOOL_ARRAY(pending_twice, V257DriveBoard, V257_MSG_SLOTS),
+        VMSTATE_UINT8(state, V257DriveBoard),
+        VMSTATE_INT32(countdown, V257DriveBoard),
+        VMSTATE_INT32(torque_ticks, V257DriveBoard),
+        VMSTATE_END_OF_LIST()
+    }
 };
 
 /* The game uploads its SUD effect packages once at boot; without this
@@ -947,6 +1218,18 @@ static void chihiro_an2131sc_realize(USBDevice *dev, Error **errp)
     chihiro_driveboard_global = &driveboard_instance;
     vmstate_register(NULL, 0, &vmstate_chihiro_driveboard, &driveboard_instance);
 
+    static CRP1231State crp1231_instance;
+    crp1231_init(&crp1231_instance);
+    chihiro_crp1231_global = &crp1231_instance;
+    vmstate_register(NULL, 0, &vmstate_chihiro_cardreader_crp1231,
+                     &crp1231_instance);
+
+    static V257DriveBoard v257_instance;
+    v257_init(&v257_instance);
+    chihiro_v257_global = &v257_instance;
+    vmstate_register(NULL, 0, &vmstate_chihiro_driveboard_v257,
+                     &v257_instance);
+
     /* AN2131 LLE: init 8051 CPU + register layer, wire EEPROMs + extmem */
     an2131_init(&s->an2131);
     s->an2131.is_qc = false;
@@ -954,7 +1237,7 @@ static void chihiro_an2131sc_realize(USBDevice *dev, Error **errp)
     s->an2131.ic10_size = sizeof(s->eeprom);
     s->an2131.ic11_eeprom = s->ic11;
     s->an2131.ic11_size = 256;
-    s->an2131.extmem = s->extmem;
+    s->an2131.extmem = s->extmem[0];
     s->an2131.extmem_size = sizeof(s->extmem);
     s->an2131.usb_dev = s;
 
@@ -1008,48 +1291,84 @@ static const TypeInfo chihiro_an2131sc_info = {
     .class_init    = chihiro_an2131sc_class_init,
 };
 
+/* The save file: magic, version, ic11, then the SRAM's backup half in its
+ * two windows. The game's logical backup addresses 0 to 0x7FFF are the
+ * window at 0x8000, and from 0x8000 on it spills into the one at 0x2000
+ * (V307.xbe JvsBACKUP_Read 0x001AE703, JvsBACKUP_Write 0x001AE853).
+ * Version 1 files kept the first window only. */
 #define CHIHIRO_SAVE_MAGIC 0x56534843  /* "CHSV" LE */
-#define CHIHIRO_SAVE_VERSION 1
+#define CHIHIRO_SAVE_VERSION 2
 #define CHIHIRO_SAVE_IC11_SIZE 512
 #define CHIHIRO_SAVE_EXTMEM_OFF 0x8000
 #define CHIHIRO_SAVE_EXTMEM_SIZE 0x8000
+#define CHIHIRO_SAVE_LOW_OFF 0x2000
+#define CHIHIRO_SAVE_LOW_SIZE 0x5B40
+
+/* A save file: "CHSV", its version, the ic11 EEPROM, then the backup half
+ * from 0x8000 and, since version 2, from 0x2000 too. */
+static bool chihiro_usb_save_read(const char *path, uint8_t *ic11,
+                                  uint8_t *backup, uint32_t *version)
+{
+    FILE *f = qemu_fopen(path, "rb");
+    uint32_t magic;
+    bool ok;
+
+    if (!f) return false;
+    ok = fread(&magic, 4, 1, f) == 1 && magic == CHIHIRO_SAVE_MAGIC &&
+         fread(version, 4, 1, f) == 1 &&
+         (*version == 1 || *version == CHIHIRO_SAVE_VERSION) &&
+         fread(ic11, 1, CHIHIRO_SAVE_IC11_SIZE, f) == CHIHIRO_SAVE_IC11_SIZE &&
+         fread(backup + CHIHIRO_SAVE_EXTMEM_OFF, 1, CHIHIRO_SAVE_EXTMEM_SIZE,
+               f) == CHIHIRO_SAVE_EXTMEM_SIZE;
+    if (ok) {
+        /* A version 1 file had one SRAM window: what lies past 0x7FFF starts
+         * empty, and the games' checksums discard the blocks it had
+         * overwritten. */
+        memset(backup + CHIHIRO_SAVE_LOW_OFF, 0, CHIHIRO_SAVE_LOW_SIZE);
+        ok = *version != CHIHIRO_SAVE_VERSION ||
+             fread(backup + CHIHIRO_SAVE_LOW_OFF, 1, CHIHIRO_SAVE_LOW_SIZE,
+                   f) == CHIHIRO_SAVE_LOW_SIZE;
+    }
+    fclose(f);
+    return ok;
+}
+
+bool chihiro_usb_save_read_backup(const char *path, uint8_t *backup)
+{
+    uint8_t ic11[CHIHIRO_SAVE_IC11_SIZE];
+    uint32_t version;
+
+    return chihiro_usb_save_read(path, ic11, backup, &version);
+}
 
 bool chihiro_usb_save_load(const char *path)
 {
-    if (!chihiro_qc_instance || !path) return false;
-
-    FILE *f = fopen(path, "rb");
-    if (!f) return false;
-
-    uint32_t magic, version;
-    if (fread(&magic, 4, 1, f) != 1 || magic != CHIHIRO_SAVE_MAGIC) {
-        fclose(f);
-        return false;
-    }
-    if (fread(&version, 4, 1, f) != 1 || version != CHIHIRO_SAVE_VERSION) {
-        fclose(f);
-        return false;
-    }
-
     ChihiroUSBState *s = chihiro_qc_instance;
-    if (fread(s->ic11, 1, CHIHIRO_SAVE_IC11_SIZE, f) != CHIHIRO_SAVE_IC11_SIZE) {
-        fclose(f);
-        return false;
-    }
-    if (fread(s->extmem + CHIHIRO_SAVE_EXTMEM_OFF, 1, CHIHIRO_SAVE_EXTMEM_SIZE, f)
-        != CHIHIRO_SAVE_EXTMEM_SIZE) {
-        fclose(f);
-        return false;
-    }
+    uint32_t version;
 
-    fclose(f);
-    fprintf(stderr, "Chihiro: save loaded from %s\n", path);
+    if (!s || !path ||
+        !chihiro_usb_save_read(path, s->ic11, s->extmem[1], &version))
+        return false;
+    fprintf(stderr, "Chihiro: save (version %u) loaded from %s\n", version,
+            path);
 
     chihiro_apply_freeplay(s);
-
-    an2131_detect_sbfy(&s->an2131);
+    chihiro_apply_link_settings(s);
 
     return true;
+}
+
+/* The baseboard's backup half as it stands right now, 64 KB, or NULL before
+ * the board exists. Read-only to callers. */
+const uint8_t *chihiro_usb_backup_live(void)
+{
+    return chihiro_qc_instance ? chihiro_qc_instance->extmem[1] : NULL;
+}
+
+/* Whether the game has written its backup since the file last caught up. */
+bool chihiro_usb_save_dirty(void)
+{
+    return chihiro_qc_instance && chihiro_qc_instance->an2131.backup_dirty;
 }
 
 bool chihiro_usb_save_flush(const char *path)
@@ -1058,19 +1377,19 @@ bool chihiro_usb_save_flush(const char *path)
 
     ChihiroUSBState *s = chihiro_qc_instance;
 
-    FILE *f = fopen(path, "wb");
-    if (!f) return false;
-
     uint32_t magic = CHIHIRO_SAVE_MAGIC;
     uint32_t version = CHIHIRO_SAVE_VERSION;
-    fwrite(&magic, 4, 1, f);
-    fwrite(&version, 4, 1, f);
-    fwrite(s->ic11, 1, CHIHIRO_SAVE_IC11_SIZE, f);
-    fwrite(s->extmem + CHIHIRO_SAVE_EXTMEM_OFF, 1, CHIHIRO_SAVE_EXTMEM_SIZE, f);
-
-    fclose(f);
-    fprintf(stderr, "Chihiro: save flushed to %s\n", path);
-
+    ChihiroFilePart parts[] = {
+        { &magic, 4 },
+        { &version, 4 },
+        { s->ic11, CHIHIRO_SAVE_IC11_SIZE },
+        { s->extmem[1] + CHIHIRO_SAVE_EXTMEM_OFF, CHIHIRO_SAVE_EXTMEM_SIZE },
+        { s->extmem[1] + CHIHIRO_SAVE_LOW_OFF, CHIHIRO_SAVE_LOW_SIZE },
+    };
+    if (!chihiro_file_replace(path, parts, ARRAY_SIZE(parts))) {
+        return false;
+    }
+    s->an2131.backup_dirty = false;
     return true;
 }
 

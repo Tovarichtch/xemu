@@ -27,6 +27,8 @@ extern "C" {
 #endif
 
 void xemu_net_enable(void);
+/* The cabinets' link (Settings > Network > Cabinet Link); once, at boot. */
+void xemu_link_enable(void);
 void xemu_net_disable(void);
 int xemu_net_is_enabled(void);
 

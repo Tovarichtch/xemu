@@ -45,6 +45,7 @@
 #include "exec/watchpoint.h"
 #include "ide-internal.h"
 #include "trace.h"
+#include "hw/xbox/chihiro/chihiro.h"
 
 /* These values were based on a Seagate ST3500418AS but have been modified
    to make more sense in QEMU */
@@ -955,8 +956,6 @@ static void ide_dma_cb(void *opaque, int ret)
     trace_ide_dma_cb(s, sector_num, n, IDE_DMA_CMD_str(s->dma_cmd));
 
     if (s->unit == 1 && n > 0) {
-        extern bool chihiro_ide_serve(int, uint32_t, int,
-                                      QEMUSGList *, bool *);
         bool irq = false;
         if (chihiro_ide_serve(s->dma_cmd, (uint32_t)sector_num, n,
                               &s->sg, &irq)) {
@@ -1485,11 +1484,10 @@ static bool cmd_identify(IDEState *s, uint8_t cmd)
             put_le16(p + 55, 255);   /* current heads */
             put_le16(p + 56, 255);   /* current sectors */
             padstr((char *)(p + 27), "SEGA CHIHIRO BASEBOARD", 40);
-            /* Report 512MB capacity (0x100000 sectors) so kernel can map
-             * all MediaBoard partitions: mbfs (0xF8000 sectors) + mbcom.
-             * The stub backing file is only 1MB but our IDE hooks intercept
-             * all reads/writes to mbcom/mbrom LBAs beyond the real file. */
-            int64_t bb_sectors = 0x100000;  /* 512MB */
+            /* The DIMM's capacity, so the kernel maps every MediaBoard partition
+             * (mbcom is the last 0x8000 sectors); the Chihiro IDE hooks serve the
+             * reads and writes themselves. */
+            int64_t bb_sectors = (int64_t)0x40000 << chihiro_dimm_factor();
             put_le16(p + 60, bb_sectors);
             put_le16(p + 61, bb_sectors >> 16);
             put_le16(p + 100, bb_sectors);

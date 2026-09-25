@@ -2941,6 +2941,7 @@ void qmp_x_exit_preconfig(Error **errp)
     } else {
         xemu_net_disable();
     }
+    xemu_link_enable();
 #endif
 
     if (!qemu_machine_creation_done(errp)) {

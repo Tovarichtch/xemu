@@ -162,8 +162,10 @@
 /* ── AN2131-specific SFR addresses ──────────────────────────────────── */
 
 #define SFR_DPS        0x86    /* Data Pointer Select (bit 0) */
+#define SFR_CKCON      0x8E    /* Clock Control; bit 3: timer 0 at CLK/4, not /12 */
 #define SFR_EXIF       0x91    /* External Interrupt Flags */
 #define SFR_MPAGE      0x92    /* MOVX @Ri high byte */
+#define SFR_SCON1      0xC0    /* Serial Port 1 Control */
 #define SFR_EIE        0xE8    /* Extended Interrupt Enable */
 #define SFR_EIP        0xF8    /* Extended Interrupt Priority */
 
@@ -235,32 +237,12 @@ typedef struct AN2131State {
     /* I2C RTC (address 0x32) */
     uint8_t  rtc_regs[16];
 
-    /* External SRAM on baseboard (64KB, owned by caller) */
+    /* The baseboard SRAM (ST M68AF127B, 128 KB on a battery), owned by the
+     * caller: two 64 KB halves. On the QC, port C bit 3 (set up at 0x055A)
+     * picks one: half 0 is the firmware's work RAM, half 1 the game's backup,
+     * reached only for backup requests 0x18 and 0x1F (0x0D48, 0x0DBF). */
     uint8_t *extmem;
     int      extmem_size;
-
-    /*
-     * SBFY backup workaround (Crazy Taxi only):
-     *
-     * The game's SBFY backup payload (extmem 0x840C-0xB1E7) overlaps the
-     * firmware's JVS TX buffer at 0xB000+. On real hardware the JVS bytes
-     * are deterministic (same inputs = same frames), so the checksum is
-     * stable. In emulation, timing differences cause byte-level drift.
-     *
-     * The v0x18 read transfer is non-atomic (184 EP3-IN chunks). JVS
-     * v0x19/v0x20 requests interleave during the transfer, modifying
-     * 0xB000+ mid-read. The game validates header checksum against the
-     * received payload — any drift causes validation failure and a
-     * silent reset to factory defaults.
-     *
-     * Fix: (1) recalculate the checksum from scratch before each v0x18
-     * SBFY read, and (2) freeze the payload range during the slot-2
-     * deferred dispatch so EP3-IN chunks are consistent.
-     */
-    uint16_t sbfy_pay_off;   /* first payload byte (0 = not detected) */
-    uint16_t sbfy_pay_end;   /* one past last payload byte */
-    uint16_t sbfy_chk_off;   /* checksum field in header */
-    bool     sbfy_reading;   /* v0x18 SBFY in progress — freeze payload */
 
     /* ── USB global registers ───────────────────────────────────── */
     uint8_t  cpucs;
@@ -307,6 +289,9 @@ typedef struct AN2131State {
     bool     card_delivering[2];       /* a response byte has been delivered */
     uint64_t card_ti_cycles[2];        /* pending TX-complete: SBUF write time (0=none) */
     bool     in_setup;                 /* inside an2131_setup_packet's window */
+    /* The battery-backed half of the baseboard SRAM, or the settings EEPROM,
+     * holds something the game wrote since the save file last did. */
+    bool     backup_dirty;
 
     /* ── Runtime state ──────────────────────────────────────────── */
     bool cpu_running;       /* true after CPUCS release */
@@ -315,6 +300,18 @@ typedef struct AN2131State {
     bool jvs_rx_pending;      /* RI1 cleared, next byte deferred until after RETI */
     uint64_t total_cycles;             /* cumulative CPU cycles (advances during bursts) */
     uint64_t jvs_response_set_cycles;  /* total_cycles when JVS response was generated */
+
+    /* The firmware's main loop at rest, recognised while it runs (see
+     * an2131_idle_turn). Not migrated: a restored chip learns it again. */
+    struct {
+        uint16_t pc;        /* the turn's starting point, sampled */
+        int      sample;    /* steps since the last candidate was taken */
+        uint64_t hash;      /* what the chip looked like there last time */
+        uint64_t cycles;    /* total_cycles then */
+        uint64_t steps;     /* steps then */
+        uint32_t events;    /* cpu.events then */
+    } idle;
+    uint64_t steps;         /* instructions an2131_run has stepped */
 
 
 } AN2131State;
@@ -328,7 +325,6 @@ void an2131_b2_boot(AN2131State *s, const uint8_t *eeprom, int eeprom_size);
 
 void an2131_anchor_load(AN2131State *s, uint16_t addr,
                         const uint8_t *data, int len);
-void an2131_detect_sbfy(AN2131State *s);
 void an2131_set_cpucs(AN2131State *s, uint8_t val);
 
 int  an2131_setup_packet(AN2131State *s, const uint8_t setup[8],

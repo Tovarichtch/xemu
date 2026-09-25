@@ -917,7 +917,23 @@ static const char *const chihiro_game_titles[] = {
     [CONFIG_CHIHIRO_JVS_PROFILE_CTX] = "Crazy Taxi: High Roller",
     [CONFIG_CHIHIRO_JVS_PROFILE_OR2] = "OutRun 2",
     [CONFIG_CHIHIRO_JVS_PROFILE_OK] = "Ollie King",
+    [CONFIG_CHIHIRO_JVS_PROFILE_WMMT2] = "Wangan Midnight Maximum Tune 2",
+    [CONFIG_CHIHIRO_JVS_PROFILE_GUNDAM] = "Gundam Battle Operating Simulator",
 };
+
+/* The settings picker builds its list from this table, so a profile added to
+ * the enum can never be missing from the menu. */
+int xemu_chihiro_profile_count(void)
+{
+    return (int)ARRAY_SIZE(chihiro_game_titles);
+}
+
+const char *xemu_chihiro_profile_title(int profile)
+{
+    if (profile < 0 || profile >= xemu_chihiro_profile_count())
+        return "";
+    return chihiro_game_titles[profile] ? chihiro_game_titles[profile] : "";
+}
 
 static void window_title(char *title, size_t n)
 {

@@ -28,9 +28,9 @@ NotificationManager::NotificationManager()
     m_active = false;
 }
 
-void NotificationManager::QueueNotification(const char *msg)
+void NotificationManager::QueueNotification(const char *msg, bool warning)
 {
-    m_notification_queue.push_back(strdup(msg));
+    m_notification_queue.push_back({ strdup(msg), warning });
 }
 
 void NotificationManager::QueueError(const char *msg)
@@ -48,16 +48,16 @@ void NotificationManager::Draw()
             (m_notification_end_time - now) / (float)kNotificationDuration;
         if (t > 1.0) {
             // Notification delivered, free it
-            free((void *)m_msg);
+            free((void *)m_current.msg);
             m_active = false;
         } else {
             // Notification should be displayed
-            DrawNotification(t, m_msg);
+            DrawNotification(t, m_current);
         }
     } else {
         // Check to see if a notification is pending
         if (m_notification_queue.size() > 0) {
-            m_msg = m_notification_queue[0];
+            m_current = m_notification_queue[0];
             m_active = true;
             m_notification_end_time = now + kNotificationDuration;
             m_notification_queue.pop_front();
@@ -87,7 +87,7 @@ void NotificationManager::Draw()
     }
 }
 
-void NotificationManager::DrawNotification(float t, const char *msg)
+void NotificationManager::DrawNotification(float t, const Notification &n)
 {
     if (!g_config.display.ui.show_notifications) {
         return;
@@ -119,7 +119,10 @@ void NotificationManager::DrawNotification(float t, const char *msg)
         fade = 1.0;
     }
 
-    ImVec4 color = ImGui::GetStyle().Colors[ImGuiCol_ButtonActive];
+    // The theme's green says "done"; a warning is amber, so the eye tells
+    // the two apart before reading.
+    ImVec4 color = n.warning ? ImVec4(0.95f, 0.72f, 0.20f, 1.00f)
+                             : ImGui::GetStyle().Colors[ImGuiCol_ButtonActive];
     color.w *= fade;
     ImGui::PushStyleVar(ImGuiStyleVar_PopupBorderSize, 1);
     ImGui::PushStyleColor(ImGuiCol_PopupBg, ImVec4(0,0,0,fade*0.9f));
@@ -137,7 +140,7 @@ void NotificationManager::DrawNotification(float t, const char *msg)
         ImGuiWindowFlags_NoInputs
         ))
     {
-        ImGui::Text("%s", msg);
+        ImGui::Text("%s", n.msg);
     }
     ImGui::PopStyleColor();
     ImGui::PopStyleColor();
@@ -151,6 +154,11 @@ void NotificationManager::DrawNotification(float t, const char *msg)
 void xemu_queue_notification(const char *msg)
 {
     notification_manager.QueueNotification(msg);
+}
+
+void xemu_queue_notification_warning(const char *msg)
+{
+    notification_manager.QueueNotification(msg, true);
 }
 
 void xemu_queue_error_message(const char *msg)

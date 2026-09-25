@@ -55,6 +55,14 @@ typedef struct {
 } ChihiroJVSState;
 
 extern ChihiroJVSState *chihiro_jvs_global;
+/* The card drawers' solenoids on an HW210 cabinet, one per slot: while one
+ * is on its card cannot come out, and the game ejects the card by turning
+ * it off (the drawer's spring pushes it out). */
+extern bool chihiro_jvs_card_lock[2];
+/* How many times the game has read the switches: the card slots count in
+ * these rather than in time, so a slow host gives the game the same number
+ * of looks at a card. */
+extern uint32_t chihiro_jvs_switch_reads;
 
 void chihiro_jvs_init(ChihiroJVSState *s);
 

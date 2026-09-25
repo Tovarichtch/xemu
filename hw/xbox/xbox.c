@@ -359,7 +359,6 @@ void xbox_init_common(MachineState *machine,
         gint64 init_t0 = g_get_monotonic_time();
         printf("Chihiro: enabling the media board\n");
 
-        chihiro_region_setting = g_config.chihiro.settings.region;
         chihiro_freeplay_setting = g_config.chihiro.settings.freeplay;
 
         /* The media board files were loaded with the BIOS (vl.c): the paths

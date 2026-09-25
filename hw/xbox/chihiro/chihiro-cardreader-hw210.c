@@ -1,5 +1,5 @@
 /*
- * Chihiro card reader (Sanwa CRP-1231LR-10NAB) emulation
+ * Tamura (SAXA) HW210 IC card reader (see chihiro-cardreader-hw210.h)
  *
  * Copyright (c) 2026 Réda Chérif-Touil
  *
@@ -16,10 +16,14 @@
  * You should have received a copy of the GNU Lesser General Public
  * License along with this library; if not, see <http://www.gnu.org/licenses/>.
  */
+#include "qemu/osdep.h"
+#include "qemu/timer.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include "chihiro-card-reader.h"
+#include "chihiro-cardreader-hw210.h"
+#include "chihiro-log.h"
+#include "chihiro.h"
 
 static uint8_t compute_checksum(const uint8_t *buf, int len)
 {
@@ -48,7 +52,7 @@ static void build_response(CardReaderState *s, uint8_t cmd)
         s->tx_buf[5] = 0x20;
         break;
 
-    case 0x14: /* EJECT */
+    case 0x14: /* reader init, second step (vsg.xbe FUN_000d2a50) */
     case 0x15: /* STANDBY */
     case 0x26:
     case 0x27:
@@ -127,39 +131,53 @@ void card_reader_init(CardReaderState *s)
     memset(s, 0, sizeof(*s));
 }
 
-void card_reader_insert(CardReaderState *s, const char *path)
+void card_reader_insert(CardReaderState *s, const char *path,
+                        const CardStock *stock)
 {
     if (!path || !path[0]) return;
 
     snprintf(s->card_path, sizeof(s->card_path), "%s", path);
 
-    FILE *f = fopen(path, "rb");
+    FILE *f = qemu_fopen(path, "rb");
     if (f) {
-        size_t n = fread(s->card_data, 1, CARD_TOTAL_SIZE, f);
+        fseek(f, 0, SEEK_END);
+        long size = ftell(f);
+        rewind(f);
+        size_t n = size == CARD_TOTAL_SIZE
+                       ? fread(s->card_data, 1, CARD_TOTAL_SIZE, f) : 0;
         fclose(f);
         if (n == CARD_TOTAL_SIZE) {
             s->card_present = true;
             s->dirty = false;
             return;
         }
+        /* Any other size is not a card: taking it in would overwrite it with
+         * a 2 KB card. Only an empty file, or none, is a blank. */
+        if (size != 0) {
+            fprintf(stderr, "Chihiro: not a card, %ld bytes where a card is "
+                    "%d: %s\n", size, CARD_TOTAL_SIZE, path);
+            s->card_path[0] = '\0';
+            return;
+        }
     }
 
-    /* Assigned file missing or short: insert a fresh card and create the
-     * file. A fresh card from the reader's stock carries the factory
-     * metadata header (blocks 4-7, big-endian) with an empty game-data
-     * area: the game validates that header first, then finds no game
-     * structure and treats the card as NEW, offering registration. An
-     * all-zero card would fail the header check and be rejected. */
+    /* Missing or empty file: a fresh card from the cabinet's stock, which the
+     * game takes as NEW (an all-zero card fails its header check). */
     memset(s->card_data, 0, CARD_TOTAL_SIZE);
-    s->card_data[32] = 0x95;
-    s->card_data[33] = 0x71;
-    s->card_data[34] = 0x36;
-    s->card_data[35] = 0x40;
-    s->card_data[54] = 0x03;
-    s->card_data[55] = 0xF2;
+    if (stock) {
+        memcpy(&s->card_data[CARD_STOCK_OFFSET], stock->header,
+               CARD_STOCK_BYTES);
+        if (stock->numbered) {
+            /* HEURISTIC: the card number is its creation time in
+             * microseconds; the game only asks that no two cards share it. */
+            uint64_t number = (uint64_t)g_get_real_time();
+            memcpy(&s->card_data[0], &number, sizeof(number));
+        }
+    }
     s->card_present = true;
     s->dirty = true;
     card_reader_flush(s);
+    CHIHIRO_LOGF(CARD, "HW210: fresh card written to %s\n", path);
 }
 
 void card_reader_remove(CardReaderState *s)
@@ -180,7 +198,7 @@ void card_reader_write_byte(CardReaderState *s, uint8_t byte)
 
 void card_reader_tap_byte(CardReaderState *s, uint8_t byte)
 {
-    /* SC firmware uses 0x00 as sync byte (not 0x10 like a standalone CRP-1231LR-10NAB) */
+    /* A command opens with 0x00; the reader answers with 0x10. */
     if (s->rx_pos == 0 && byte != 0x00)
         return;
 
@@ -202,6 +220,9 @@ void card_reader_tap_byte(CardReaderState *s, uint8_t byte)
 
     if (s->rx_pos >= 5 && s->rx_pos == s->rx_expected) {
         build_response(s, s->rx_buf[1]);
+        CHIHIRO_LOGF(CARD, "HW210: <- %02X (%d bytes) -> status %02X%02X, "
+                     "%d bytes\n", s->rx_buf[1], s->rx_expected,
+                     s->tx_buf[4], s->tx_buf[5], s->tx_len);
 
         s->rx_pos = 0;
         s->rx_expected = 0;
@@ -227,14 +248,21 @@ bool card_reader_has_response(CardReaderState *s)
     return s->tx_pos < s->tx_len;
 }
 
-void card_reader_flush(CardReaderState *s)
+bool card_reader_flush(CardReaderState *s)
 {
-    if (!s->card_path[0]) return;
-
-    FILE *f = fopen(s->card_path, "wb");
-    if (f) {
-        fwrite(s->card_data, 1, CARD_TOTAL_SIZE, f);
-        fclose(f);
+    /* A card a snapshot brought back has no file: it becomes a card of its
+     * own the first time it is written. With no card in the slot there is
+     * nothing to keep. */
+    if (!s->card_path[0] && !s->card_present) {
         s->dirty = false;
+        return true;
     }
+    if (!s->card_path[0] &&
+        !chihiro_hw210_card_issue(s, s->card_path, sizeof(s->card_path)))
+        return false;
+
+    ChihiroFilePart part = { s->card_data, CARD_TOTAL_SIZE };
+    if (!chihiro_file_replace(s->card_path, &part, 1)) return false;
+    s->dirty = false;
+    return true;
 }

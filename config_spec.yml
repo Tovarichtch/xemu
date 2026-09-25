@@ -390,7 +390,7 @@ chihiro:
   jvs:
     profile:
       type: enum
-      values: [hotd3, vc3, gs, ctx, or2, ok]
+      values: [hotd3, vc3, gs, ctx, or2, ok, wmmt2, gundam]
       default: hotd3
     # Pointer: "mouse" = system cursor, "" = none, else the identity of a
     # pointer device (chihiro.settings.pointer_devices)
@@ -462,6 +462,11 @@ chihiro:
       reload:
         type: integer
         default: 0
+      # The card slot: one press pushes the card in hand (or a blank one
+      # when none is chosen) into it; the game ejects it.
+      card:
+        type: integer
+        default: 6
     ctx:
       drive_gear:
         type: integer
@@ -482,6 +487,35 @@ chihiro:
       view_change:
         type: integer
         default: 224
+    # Maximum Tune reads its shifter and its two wheel buttons from the
+    # SECOND switch byte of player 1 (V322.xbe 0x00055950 and 0x000559B0):
+    # bits 4/5 are the shifter's up/down gate, bits 7/6 its left/right one,
+    # and bits 1/0 the two buttons.
+    wmmt2:
+      shift_up:
+        type: integer
+        default: 26
+      shift_down:
+        type: integer
+        default: 22
+      shift_left:
+        type: integer
+        default: 4
+      shift_right:
+        type: integer
+        default: 7
+      view_change:
+        type: integer
+        default: 224
+      intrude_change:
+        type: integer
+        default: 225
+      # The card slot, which the game's first screen asks for: one press
+      # pushes the card in hand (or a blank one) into the reader's mouth,
+      # a second press takes it back before the reader draws it in.
+      card:
+        type: integer
+        default: 6
     ok:
       swing_left:
         type: integer
@@ -501,6 +535,54 @@ chihiro:
       right_grab:
         type: integer
         default: 27
+    # Gundam Battle Operating Simulator's twin-stick cockpit, named as its
+    # INPUT TEST names it. Keyboard: W A S D + Q E left, the arrows + right
+    # Shift and Ctrl right, Space the pedal.
+    gundam:
+      l_up:
+        type: integer
+        default: 26
+      l_down:
+        type: integer
+        default: 22
+      l_left:
+        type: integer
+        default: 4
+      l_right:
+        type: integer
+        default: 7
+      l_trigger:
+        type: integer
+        default: 20
+      l_button:
+        type: integer
+        default: 8
+      r_up:
+        type: integer
+        default: 82
+      r_down:
+        type: integer
+        default: 81
+      r_left:
+        type: integer
+        default: 80
+      r_right:
+        type: integer
+        default: 79
+      r_trigger:
+        type: integer
+        default: 229
+      r_button:
+        type: integer
+        default: 228
+      pedal:
+        type: integer
+        default: 44
+      # The card slot's insertion switch (INPUT TEST: CARD IN). One press
+      # pushes the card in hand (or a blank one) in; the game ejects it.
+      card:
+        type: integer
+        default: 6
   jvs_p2:
     pointer_device:
       type: string
@@ -547,6 +629,10 @@ chihiro:
     gs_reload:
       type: integer
       default: 0
+    # Player 2's card slot at a Ghost Squad cabinet (V), as player 1's.
+    gs_card:
+      type: integer
+      default: 25
   settings:
     lightgun_mode:
       type: bool
@@ -554,10 +640,26 @@ chihiro:
     freeplay:
       type: bool
       default: false
+    # The cabinet's region, the byte SEGABOOT reads at EEPROM 0x1F00 (the enum
+    # index: 1 Japan, 2 USA, 3 Export); a game outside its boot.id mask (0x38)
+    # stops on Error 05. Auto takes Export, then USA, then Japan, as the game
+    # allows.
     region:
       type: enum
-      values: [jp, us, ex]
-      default: jp
+      values: [auto, jp, us, ex]
+      default: auto
+    # The media board's DIMM: the JP1/JP2 jumper value (the enum index), for
+    # the host side and the board's own SPD alike (a mismatch is SEGABOOT's
+    # Caution 53). Gundam's 603 MB image needs 1024 MB.
+    dimm_size:
+      type: enum
+      values: ['128', '256', '512', '1024', 'auto']
+      default: 'auto'
+    # Which media board the machine presents; Auto follows the cabinet table.
+    board_type:
+      type: enum
+      values: [auto, type1, type3]
+      default: auto
     force_feedback:
       type: bool
       default: false
@@ -572,6 +674,13 @@ chihiro:
     ffb_invert:
       type: bool
       default: false
+    # How heavy the wheel turns while a game drives it: the damping the
+    # Maximum Tune drive board asks for, as a share of the wheel's own damper,
+    # percent. Heavy without hiding the knocks on a geared wheel by default; a
+    # stronger wheel can take more.
+    wheel_weight:
+      type: integer
+      default: 40
     # Degrees of physical wheel rotation that reach full in-game lock (Sega Rally
     # Model 2 wrapper convention). Default 270 = a 270 deg turn covers the game's
     # whole steering range (OutRun 2 cabinet). 0 = "Full range": the whole wheel
@@ -608,10 +717,54 @@ chihiro:
     sinden_border_size:
       type: integer
       default: 2
+  link:
+    # Linked cabinets share a private Ethernet between xemu instances. The
+    # host cabinet listens once per other cabinet, on port + that cabinet's
+    # number, and relays every frame; the others connect to it. The game's
+    # own cabinet number is written into its backup for the titles whose
+    # layout is known (Ollie King, OutRun 2, OutRun 2 SP, Maximum Tune).
+    enable: bool
+    cabinets:
+      type: integer
+      default: 2
+    cabinet:
+      type: integer
+      default: 1
+    host:
+      type: string
+      default: ""
+    port:
+      type: integer
+      default: 9100
   card_reader:
+    # Answer the cabinet's card reader; each reader has its own slots.
     enable:
       type: bool
       default: true
+    # Tamura (SAXA) HW210, two slots: Ghost Squad. Gundam Battle Operating
+    # Simulator carries one reader of the same family on the same wire, but
+    # it takes Banpresto cards, not Sega ones, so its card has its own slot.
+    hw210:
+      slot1:
+        type: string
+        default: ""
+      slot2:
+        type: string
+        default: ""
+      gundam:
+        type: string
+        default: ""
+    # Sanwa CRP-1231LR-10NAB: Maximum Tune 1 and 2 share the reader, not
+    # the card, so each game has its own slot.
+    crp1231:
+      mt1:
+        type: string
+        default: ""
+      mt2:
+        type: string
+        default: ""
+    # The names the HW210 slots had before the readers were told apart. Moved
+    # into hw210 above on the first run and left empty.
     card1_path:
       type: string
       default: ""
@@ -632,6 +785,14 @@ chihiro:
       type: string
       default: ""
     pc20_path:
+      type: string
+      default: ""
+    # OPTIONAL: the DIMM board's network firmware (Au1500, VxWorks). Linked
+    # cabinets run it on the network board. The version the board reports is
+    # read from it: the word after "FIRM_VERSION is here!", 0x13050621 = 13.05
+    # in ver1305.bin. Network titles check it (OutRun 2 SP 11.01, MJ2 12.06,
+    # MJ3 13.05, Gundam 12.09 or 13.09 and later). Empty: 3.17.
+    net_firmware_path:
       type: string
       default: ""
     # The qcow2 that holds the Chihiro VM snapshots. Empty: chihiro_snapshots.qcow2

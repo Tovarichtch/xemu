@@ -27,11 +27,12 @@
 enum {
     CHIHIRO_LOG_BOOT    = 1 << 0,  /* SEGABOOT state machine, boot handoff */
     CHIHIRO_LOG_JVS     = 1 << 1,  /* JVS frames and I/O board */
-    CHIHIRO_LOG_CARD    = 1 << 2,  /* Sanwa CRP-1231LR-10NAB card reader */
-    CHIHIRO_LOG_FFB     = 1 << 3,  /* OutRun 2 drive board */
+    CHIHIRO_LOG_CARD    = 1 << 2,  /* card readers (HW210, CRP-1231) */
+    CHIHIRO_LOG_FFB     = 1 << 3,  /* drive boards (Sega 838, V257) */
     CHIHIRO_LOG_MBCOM   = 1 << 4,  /* media board mailbox commands */
     CHIHIRO_LOG_USB     = 1 << 5,  /* AN2131 vendor requests, endpoints */
     CHIHIRO_LOG_VERBOSE = 1 << 6,  /* legacy firehose: LPC/SADDR traffic */
+    CHIHIRO_LOG_NET     = 1 << 7,  /* network board: console, rare commands */
 };
 
 static const struct {
@@ -45,6 +46,7 @@ static const struct {
     { "mbcom",   CHIHIRO_LOG_MBCOM   },
     { "usb",     CHIHIRO_LOG_USB     },
     { "verbose", CHIHIRO_LOG_VERBOSE },
+    { "net",     CHIHIRO_LOG_NET     },
 };
 
 extern unsigned chihiro_log_mask;
@@ -62,6 +64,21 @@ extern unsigned chihiro_log_mask;
 #define CHIHIRO_ERRF(fmt, ...)                                               \
     fprintf(stderr, "[%07lld][chihiro] " fmt,                                \
             (long long)qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL), ##__VA_ARGS__)
+
+/* A CHIHIRO_LOGF line (fmt without its newline) followed by n bytes. */
+#define CHIHIRO_LOG_HEX(cat, data, n, fmt, ...)                              \
+    do {                                                                     \
+        if (chihiro_log_mask & (CHIHIRO_LOG_##cat)) {                        \
+            const uint8_t *hex_ = (const uint8_t *)(data);                   \
+            fprintf(stderr, "[%07lld][chihiro] " fmt,                        \
+                    (long long)qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL),        \
+                    ##__VA_ARGS__);                                          \
+            for (int i_ = 0; i_ < (n); i_++) {                               \
+                fprintf(stderr, " %02X", hex_[i_]);                          \
+            }                                                                \
+            fprintf(stderr, "\n");                                           \
+        }                                                                    \
+    } while (0)
 
 static inline void chihiro_log_init(void)
 {
@@ -90,7 +107,7 @@ static inline void chihiro_log_init(void)
                 }
                 if (!found) {
                     fprintf(stderr, "Chihiro: unknown log category '%.*s' "
-                            "(known: boot jvs card ffb mbcom usb verbose all)\n",
+                            "(known: boot jvs card ffb mbcom usb verbose net all)\n",
                             (int)len, p);
                 }
             }

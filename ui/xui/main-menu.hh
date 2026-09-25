@@ -128,6 +128,7 @@ public:
     void DrawPcapOptions(bool appearing);
     void DrawNatOptions(bool appearing);
     void DrawUdpOptions(bool appearing);
+    void DrawCabinetLink(void);
 };
 
 class MainMenuSnapshotsView : public virtual MainMenuTabView

@@ -1,5 +1,5 @@
 /*
- * OutRun 2 drive board (force feedback) emulation
+ * Sega 838-13683 drive board (OutRun 2 force feedback)
  *
  * Copyright (c) 2026 Réda Chérif-Touil
  *
@@ -16,8 +16,8 @@
  * You should have received a copy of the GNU Lesser General Public
  * License along with this library; if not, see <http://www.gnu.org/licenses/>.
  */
-#ifndef CHIHIRO_DRIVEBOARD_H
-#define CHIHIRO_DRIVEBOARD_H
+#ifndef CHIHIRO_DRIVEBOARD_SEGA838_H
+#define CHIHIRO_DRIVEBOARD_SEGA838_H
 
 #include <stdint.h>
 #include <stdbool.h>
@@ -34,8 +34,8 @@ typedef struct DriveBoardState {
 
     /* Sega drive-board FFB state. Command byte = wire & 0x7F (e.g. wire 0x87
      * SPRING -> 0x07, wire 0x8B VIBRATION -> 0x0B, wire 0xFB playback -> 0x7B).
-     * Mapping is from docs/chihiro-force-feedback.md, re-confirmed by register-
-     * level disassembly of outrun2.xbe (db_dispatch_effects / db_dispatch_mode).
+     * Mapping read from the disassembly of outrun2.xbe (db_dispatch_effects /
+     * db_dispatch_mode).
      * SPRING, damper and torque are PERSISTENT (held until changed); vibration
      * and the package pulse are transients. */
     bool    initializing;      /* from RESET (0xFF) to the first poll (0xFD) or start (0xFC): status 1 */

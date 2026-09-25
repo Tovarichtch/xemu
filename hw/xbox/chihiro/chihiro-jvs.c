@@ -24,9 +24,17 @@
 #include "qemu/osdep.h"
 #include "qemu/timer.h"
 #include "chihiro-jvs.h"
+#include "chihiro-driveboard-v257.h"
+#include "chihiro.h"
+#include "chihiro-cabinet.h"
+#include "chihiro-log.h"
 #include <string.h>
 
 #define TS_MS ((long long)(qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL)))
+
+/* The card drawers' solenoids, as the game last set them. */
+bool chihiro_jvs_card_lock[2];
+uint32_t chihiro_jvs_switch_reads;
 
 ChihiroJVSState *chihiro_jvs_global = NULL;
 
@@ -75,6 +83,12 @@ static int jvs_handle_command(ChihiroJVSState *s,
             s->device_id = 0;
             s->sense = 3;
             s->reset_count = 0;
+            /* A reset drops the board's outputs with its address: the card
+             * locks, and the steering motor's relay. */
+            chihiro_jvs_card_lock[0] = chihiro_jvs_card_lock[1] = false;
+            if (chihiro_v257_global &&
+                chihiro_cabinet_drive_board() == CHIHIRO_DRIVE_V257)
+                v257_set_motor(chihiro_v257_global, false);
             fprintf(stderr, "[%07lld] JVS RESET: applied → sense=3 id=0\n", TS_MS);
         }
         *rpos = rp;
@@ -146,6 +160,7 @@ static int jvs_handle_command(ChihiroJVSState *s,
         if (cmd_len < 3) return 1;
         int players = cmd[1];
         int bytes_per = cmd[2];
+        chihiro_jvs_switch_reads++;
         PUT(JVS_REPORT_OK);
         PUT(s->system_switches);
         for (int p = 0; p < players && p < JVS_MAX_PLAYERS; p++) {
@@ -224,11 +239,34 @@ static int jvs_handle_command(ChihiroJVSState *s,
         return 4;
     }
 
-    case 0x32: { /* General Purpose Output — accept and consume bank data */
+    case 0x32: { /* General Purpose Output */
         if (cmd_len < 2) return 1;
         int banks = cmd[1];
         int consumed = 2 + banks;
         if (consumed > cmd_len) consumed = cmd_len;
+        /* Bank 0 bit 7 is the steering motor relay in a Maximum Tune cabinet
+         * (V322.xbe builds the byte at 0x000558C0). The board has to see it:
+         * its answer is what the boot wheel check waits for. */
+        if (banks >= 1 && cmd_len >= 3 && chihiro_v257_global &&
+            chihiro_cabinet_drive_board() == CHIHIRO_DRIVE_V257) {
+            v257_set_motor(chihiro_v257_global,
+                                    (cmd[2] & 0x80) != 0);
+        }
+        /* The card drawers' solenoids, one output per slot, which the
+         * cabinet table names. The game holds a card it finds in a slot
+         * and lets go to eject it. */
+        if (banks >= 1 && cmd_len >= 3 &&
+            chihiro_cabinet_card_reader() == CHIHIRO_CARD_HW210) {
+            for (int p = 0; p < 2; p++) {
+                uint8_t bit = chihiro_cabinet_card_lock(p);
+                bool now = bit && (cmd[2] & bit);
+                if (now != chihiro_jvs_card_lock[p]) {
+                    chihiro_jvs_card_lock[p] = now;
+                    CHIHIRO_LOGF(CARD, "P%d card lock %s\n", p + 1,
+                                 now ? "on" : "off");
+                }
+            }
+        }
         PUT(JVS_REPORT_OK);
         *rpos = rp;
         return consumed;
