@@ -4008,7 +4008,8 @@ static void chihiro_segaboot_identify(void)
 
     const uint8_t *half = chihiro_flash_rom + 0x100000;
     const char *tag = "SegaBoot Ver.";
-    const uint8_t *p = chihiro_mem_find(half, 0x100000, tag);
+    /* The version's six characters follow the tag inside the dump. */
+    const uint8_t *p = chihiro_mem_find(half, 0x100000 - 6, tag);
     if (!p) {
         printf("Chihiro: no SEGABOOT in this flash dump\n");
         return;
@@ -4090,10 +4091,19 @@ bool chihiro_ide_serve(int dma_cmd, uint32_t lba, int n,
         /* FATX: synchronous from MemoryRegion RAM (timing-critical) */
         if (lba < mbcom && chihiro_interface_ready) {
             uint64_t offset = (uint64_t)lba * 512;
-            if (offset < chihiro_fs_size()) {
-                void *src = (uint8_t *)memory_region_get_ram_ptr(
+            uint64_t fs_size = chihiro_fs_size();
+            if (offset < fs_size) {
+                uint8_t *src = (uint8_t *)memory_region_get_ram_ptr(
                     &chihiro_interface_fs) + offset;
-                sg_write(sg, src, n * 512);
+                if ((uint64_t)n * 512 <= fs_size - offset) {
+                    sg_write(sg, src, n * 512);
+                } else {
+                    /* Across the end of the filesystem: zeros past it. */
+                    uint8_t *buf = g_malloc0(n * 512);
+                    memcpy(buf, src, fs_size - offset);
+                    sg_write(sg, buf, n * 512);
+                    g_free(buf);
+                }
                 return true;
             }
         }
@@ -4140,8 +4150,8 @@ bool chihiro_ide_serve(int dma_cmd, uint32_t lba, int n,
         }
         /* flash ROM */
         if (lba >= CHIHIRO_MBROM0 && chihiro_flash_rom) {
-            uint32_t rom_off = (lba - CHIHIRO_MBROM0) * 512;
-            if (rom_off + (uint32_t)n * 512 <= chihiro_flash_rom_size) {
+            uint64_t rom_off = (uint64_t)(lba - CHIHIRO_MBROM0) * 512;
+            if (rom_off + (uint64_t)n * 512 <= chihiro_flash_rom_size) {
                 sg_write(sg, chihiro_flash_rom + rom_off, n * 512);
                 return true;
             }

@@ -380,7 +380,7 @@ int chihiro_jvs_process(ChihiroJVSState *s,
 
     /* Build framed response: SYNC + host_addr + count + payload + checksum
      * No escape encoding — USB transport uses raw bytes. */
-    uint8_t frame[256];
+    uint8_t frame[sizeof(payload) + 4];     /* SYNC, address, count, sum */
     int fpos = 0;
     uint8_t resp_count = ppos + 1; /* payload + checksum */
 

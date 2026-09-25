@@ -640,6 +640,12 @@ static void handle_data(USBDevice *dev, USBPacket *p)
     const char *id = s->is_qc ? "QC" : "SC";
     int ep = p->ep->nr;
 
+    /* The AN2131 has EP0-EP7 only. */
+    if (ep >= AN2131_EP_COUNT) {
+        p->status = USB_RET_STALL;
+        return;
+    }
+
     /* LLE path: route bulk transfers through AN2131 firmware */
     if (s->use_lle) {
         if (p->pid == USB_TOKEN_IN) {
@@ -917,6 +923,18 @@ static int chihiro_usb_pre_load(void *opaque)
 static int chihiro_usb_post_load(void *opaque, int version_id)
 {
     ChihiroUSBState *s = opaque;
+    AN2131State *a = &s->an2131;
+
+    /* A snapshot file comes from outside: JVS positions that would reach
+     * past their buffers refuse it. */
+    if (a->jvs_tx_len < 0 || a->jvs_tx_len > (int)sizeof(a->jvs_tx_buf) ||
+        a->jvs_rx_len < 0 || a->jvs_rx_len > (int)sizeof(a->jvs_rx_buf) ||
+        a->jvs_rx_pos < 0 || a->jvs_rx_pos > a->jvs_rx_len) {
+        /* Cleared too: a failed load can still be resumed. */
+        a->jvs_tx_len = a->jvs_tx_expected = 0;
+        a->jvs_rx_len = a->jvs_rx_pos = 0;
+        return -EINVAL;
+    }
 
     /* A snapshot from before the SRAM had two halves carries one, which
      * held the firmware's work and the game's backup at once: it is both. */
@@ -1138,12 +1156,29 @@ static const VMStateDescription vmstate_chihiro_driveboard_v257 = {
     }
 };
 
+/* Positions out of a snapshot file that would reach past the drive board's
+ * frame and answer queue refuse it too. */
+static int driveboard_post_load(void *opaque, int version_id)
+{
+    DriveBoardState *db = opaque;
+
+    if (db->tx_pos < 0 || db->tx_pos >= (int)sizeof(db->tx_buf) ||
+        db->resp_head < 0 || db->resp_head >= DRIVEBOARD_RESP_SIZE ||
+        db->resp_tail < 0 || db->resp_tail >= DRIVEBOARD_RESP_SIZE) {
+        db->tx_pos = 0;
+        db->resp_head = db->resp_tail = 0;
+        return -EINVAL;
+    }
+    return 0;
+}
+
 /* The game uploads its SUD effect packages once at boot; without this
  * section a loaded snapshot plays every impact as silence. */
 static const VMStateDescription vmstate_chihiro_driveboard = {
     .name = "chihiro-driveboard",
     .version_id = 1,
     .minimum_version_id = 1,
+    .post_load = driveboard_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT8_ARRAY(tx_buf, DriveBoardState, 4),
         VMSTATE_INT32(tx_pos, DriveBoardState),

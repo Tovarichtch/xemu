@@ -269,7 +269,9 @@ static uint8_t an2131_xdata_read(Cpu8051State *cpu, uint16_t addr)
         case AN_AUTOPTRL: return (uint8_t)s->autoptr;
         case AN_AUTODATA: {
             cpu->events++;
-            uint8_t v = an2131_xdata_read(cpu, s->autoptr);
+            /* Pointed at itself, it would read itself forever. */
+            uint8_t v = canon(s->autoptr) == AN_AUTODATA
+                            ? 0xFF : an2131_xdata_read(cpu, s->autoptr);
             s->autoptr++;
             return v;
         }
@@ -398,7 +400,9 @@ static void an2131_xdata_write(Cpu8051State *cpu, uint16_t addr, uint8_t val)
         case AN_AUTOPTRH: s->autoptr = (s->autoptr & 0x00FF) | ((uint16_t)val << 8); return;
         case AN_AUTOPTRL: s->autoptr = (s->autoptr & 0xFF00) | val; return;
         case AN_AUTODATA:
-            an2131_xdata_write(cpu, s->autoptr, val);
+            if (canon(s->autoptr) != AN_AUTODATA) {
+                an2131_xdata_write(cpu, s->autoptr, val);
+            }
             s->autoptr++;
             return;
 
@@ -1000,7 +1004,7 @@ int an2131_setup_packet(AN2131State *s, const uint8_t setup[8],
         uint16_t ptr = s->sudptr;
         if (ptr < AN2131_RAM_SIZE) {
             int desc_len = s->ram[ptr];
-            if (ptr + 1 < AN2131_RAM_SIZE && s->ram[ptr + 1] == 0x02) {
+            if (ptr + 3 < AN2131_RAM_SIZE && s->ram[ptr + 1] == 0x02) {
                 desc_len = s->ram[ptr + 2] | (s->ram[ptr + 3] << 8);
             }
             int wLength = s->setupdat[6] | (s->setupdat[7] << 8);
