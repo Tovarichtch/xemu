@@ -20,9 +20,10 @@
  * License along with this library; if not, see <http://www.gnu.org/licenses/>.
  */
 
+#include "hw/xbox/nv2a-stock/stock-names.h"
 #include <math.h>
 
-#include "hw/xbox/nv2a/nv2a_int.h"
+#include "hw/xbox/nv2a-stock/nv2a_int.h"
 #include "ui/xemu-notifications.h"
 #include "ui/xemu-settings.h"
 #include "util.h"
@@ -226,15 +227,6 @@ void pgraph_renderer_register(const PGRAPHRenderer *renderer)
     renderers[renderer->type] = renderer;
 }
 
-bool pgraph_gpu_boost(void)
-{
-    static int on = -1;
-    if (on < 0) {
-        on = g_config.perf.optimizations;
-    }
-    return on;
-}
-
 void pgraph_init(NV2AState *d)
 {
     g_nv2a = d;
@@ -290,10 +282,6 @@ static CONFIG_DISPLAY_RENDERER get_default_renderer(void)
 
 void nv2a_context_init(void)
 {
-    if (nv2a_stock_active()) {
-        stock_nv2a_context_init();
-        return;
-    }
     if (!renderers[g_config.display.renderer]) {
         g_config.display.renderer = get_default_renderer();
         fprintf(stderr,
@@ -381,9 +369,6 @@ void pgraph_destroy(PGRAPHState *pg)
 
 int nv2a_get_framebuffer_surface(void)
 {
-    if (nv2a_stock_active()) {
-        return stock_nv2a_get_framebuffer_surface();
-    }
     NV2AState *d = g_nv2a;
     PGRAPHState *pg = &d->pgraph;
     int s = 0;
@@ -401,10 +386,6 @@ int nv2a_get_framebuffer_surface(void)
 
 void nv2a_release_framebuffer_surface(void)
 {
-    if (nv2a_stock_active()) {
-        stock_nv2a_release_framebuffer_surface();
-        return;
-    }
     NV2AState *d = g_nv2a;
     PGRAPHState *pg = &d->pgraph;
     qemu_mutex_lock(&pg->renderer_lock);
@@ -415,10 +396,6 @@ void nv2a_release_framebuffer_surface(void)
 
 void nv2a_set_surface_scale_factor(unsigned int scale)
 {
-    if (nv2a_stock_active()) {
-        stock_nv2a_set_surface_scale_factor(scale);
-        return;
-    }
     NV2AState *d = g_nv2a;
 
     bql_unlock();
@@ -432,9 +409,6 @@ void nv2a_set_surface_scale_factor(unsigned int scale)
 
 unsigned int nv2a_get_surface_scale_factor(void)
 {
-    if (nv2a_stock_active()) {
-        return stock_nv2a_get_surface_scale_factor();
-    }
     NV2AState *d = g_nv2a;
     int s = 1;
 

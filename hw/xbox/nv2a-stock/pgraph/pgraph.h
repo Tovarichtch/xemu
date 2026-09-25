@@ -61,11 +61,6 @@ typedef struct VertexAttribute {
     bool inline_buffer_populated;
 } VertexAttribute;
 
-/* GPU boost (perf.optimizations), read once: its menu toggle takes effect at
- * the next start. Off, the stock GPU runs instead of this one
- * (nv2a_stock_active). */
-bool pgraph_gpu_boost(void);
-
 /* Inline-array footprint of one attribute: the NV2A packs every attribute of
  * an inline vertex into whole dwords (PROVEN: the XDK's CDevice_SetStateUP
  * pushes (count * size + 3) >> 2 dwords per attribute). DMA arrays keep their

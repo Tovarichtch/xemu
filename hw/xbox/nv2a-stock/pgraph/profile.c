@@ -2,6 +2,7 @@
  * QEMU Geforce NV2A profiling helpers
  *
  * Copyright (c) 2020-2024 Matt Borgerson
+ * Copyright (c) 2026 Réda Chérif-Touil
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -17,9 +18,8 @@
  * License along with this library; if not, see <http://www.gnu.org/licenses/>.
  */
 
-#include "hw/xbox/nv2a/nv2a_int.h"
-
-NV2AStats g_nv2a_stats;
+#include "hw/xbox/nv2a-stock/stock-names.h"
+#include "hw/xbox/nv2a-stock/nv2a_int.h"
 
 void nv2a_profile_increment(void)
 {
@@ -46,10 +46,6 @@ void nv2a_profile_increment(void)
  * truncating division reads 56-59 at a true 60. */
 void nv2a_profile_present(void)
 {
-    if (nv2a_stock_active()) {
-        stock_nv2a_profile_present();
-        return;
-    }
     static unsigned int last_id = (unsigned int)-1;
     static int64_t ring[128];
     static unsigned ring_n, ring_w;
@@ -95,9 +91,6 @@ void nv2a_profile_flip_stall(void)
 
 const char *nv2a_profile_get_counter_name(unsigned int cnt)
 {
-    if (nv2a_stock_active()) {
-        return stock_nv2a_profile_get_counter_name(cnt);
-    }
     const char *default_names[NV2A_PROF__COUNT] = {
         #define _X(x) stringify(x),
         NV2A_PROF_COUNTERS_XMAC
@@ -110,9 +103,6 @@ const char *nv2a_profile_get_counter_name(unsigned int cnt)
 
 int nv2a_profile_get_counter_value(unsigned int cnt)
 {
-    if (nv2a_stock_active()) {
-        return stock_nv2a_profile_get_counter_value(cnt);
-    }
     assert(cnt < NV2A_PROF__COUNT);
     unsigned int idx = (g_nv2a_stats.frame_ptr + NV2A_PROF_NUM_FRAMES - 1) %
                        NV2A_PROF_NUM_FRAMES;

@@ -1,0 +1,328 @@
+/*
+ * The stock NV2A: the emulator's own GPU, next to the tuned one
+ *
+ * Copyright (c) 2026 Réda Chérif-Touil
+ *
+ * This library is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2 of the License, or (at your option) any later version.
+ *
+ * This library is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with this library; if not, see <http://www.gnu.org/licenses/>.
+ */
+
+/*
+ * hw/xbox/nv2a-stock is the main branch's hw/xbox/nv2a, the emulator's GPU
+ * without the performance work that hw/xbox/nv2a carries. "GPU boost" off at
+ * start-up plugs it in instead (hw/xbox/nv2a/nv2a.c, nv2a_init), so off runs
+ * the stock code and nothing else. To see every change of the tuned GPU:
+ *     diff -ru hw/xbox/nv2a-stock hw/xbox/nv2a
+ *
+ * The folder differs from the main branch's hw/xbox/nv2a in seven ways only:
+ *   - its includes point here;
+ *   - each .c includes this header first: every global name gets the stock_
+ *     prefix, so both GPUs link into one binary;
+ *   - the device type is "nv2a-stock" (the snapshot sections keep their
+ *     names: a snapshot loads with either GPU);
+ *   - both GPUs share g_nv2a_stats, defined by hw/xbox/nv2a: its definition
+ *     leaves pgraph/profile.c, and debug.h includes the one of hw/xbox/nv2a,
+ *     whose profiler counters are a superset (one layout);
+ *   - the thirdparty libraries are hw/xbox/nv2a's, shared: the tuned GPU
+ *     adds to gloffscreen (glo_context_create_4_1) and changes nothing the
+ *     stock one calls;
+ *   - the trace events are hw/xbox/nv2a's: trace-events is not copied, and
+ *     trace.h includes the header generated from that file;
+ *   - the copies that hold this fork's own changes carry its author's
+ *     copyright line too, under the upstream ones.
+ * It is regenerated from the main branch whenever that NV2A changes.
+ */
+
+#ifndef HW_XBOX_NV2A_STOCK_NAMES_H
+#define HW_XBOX_NV2A_STOCK_NAMES_H
+
+#define MAX_UNIFORM_ATTR_VALUES_SIZE stock_MAX_UNIFORM_ATTR_VALUES_SIZE
+#define PshUniformInfo stock_PshUniformInfo
+#define VshUniformInfo stock_VshUniformInfo
+#define blocktable stock_blocktable
+#define finish_reason_to_counter_enum stock_finish_reason_to_counter_enum
+#define g_nv2a stock_g_nv2a
+#define g_nv2a_context_display stock_g_nv2a_context_display
+#define g_nv2a_context_render stock_g_nv2a_context_render
+#define gl_debug_frame_terminator stock_gl_debug_frame_terminator
+#define gl_debug_group_begin stock_gl_debug_group_begin
+#define gl_debug_group_end stock_gl_debug_group_end
+#define gl_debug_initialize stock_gl_debug_initialize
+#define gl_debug_label stock_gl_debug_label
+#define gl_debug_message stock_gl_debug_message
+#define kelvin_color_format_info_map stock_kelvin_color_format_info_map
+#define max_surface_frame_time_delta stock_max_surface_frame_time_delta
+#define num_invalid_surfaces_to_keep stock_num_invalid_surfaces_to_keep
+#define nv2a_context_init stock_nv2a_context_init
+#define nv2a_dbg_renderdoc_available stock_nv2a_dbg_renderdoc_available
+#define nv2a_dbg_renderdoc_capture_frames stock_nv2a_dbg_renderdoc_capture_frames
+#define nv2a_dbg_renderdoc_get_api stock_nv2a_dbg_renderdoc_get_api
+#define nv2a_dbg_renderdoc_init stock_nv2a_dbg_renderdoc_init
+#define nv2a_get_dac_palette stock_nv2a_get_dac_palette
+#define nv2a_get_framebuffer_surface stock_nv2a_get_framebuffer_surface
+#define nv2a_get_screen_off stock_nv2a_get_screen_off
+#define nv2a_get_surface_scale_factor stock_nv2a_get_surface_scale_factor
+#define nv2a_init stock_nv2a_init
+#define nv2a_profile_flip_stall stock_nv2a_profile_flip_stall
+#define nv2a_profile_get_counter_name stock_nv2a_profile_get_counter_name
+#define nv2a_profile_get_counter_value stock_nv2a_profile_get_counter_value
+#define nv2a_profile_increment stock_nv2a_profile_increment
+#define nv2a_profile_present stock_nv2a_profile_present
+#define nv2a_release_framebuffer_surface stock_nv2a_release_framebuffer_surface
+#define nv2a_set_surface_scale_factor stock_nv2a_set_surface_scale_factor
+#define nv2a_update_irq stock_nv2a_update_irq
+#define nv2a_vk_dgroup_indent stock_nv2a_vk_dgroup_indent
+#define nv_clip_gpu_tile_blit stock_nv_clip_gpu_tile_blit
+#define nv_dma_load stock_nv_dma_load
+#define nv_dma_map stock_nv_dma_map
+#define pack_d24_unorm_s8_uint_to_z24s8_glsl stock_pack_d24_unorm_s8_uint_to_z24s8_glsl
+#define pack_d32_sfloat_s8_uint_to_z24s8_glsl stock_pack_d32_sfloat_s8_uint_to_z24s8_glsl
+#define pbus_read stock_pbus_read
+#define pbus_write stock_pbus_write
+#define pcounter_read stock_pcounter_read
+#define pcounter_write stock_pcounter_write
+#define pcrtc_read stock_pcrtc_read
+#define pcrtc_write stock_pcrtc_write
+#define pfb_read stock_pfb_read
+#define pfb_write stock_pfb_write
+#define pfifo_kick stock_pfifo_kick
+#define pfifo_read stock_pfifo_read
+#define pfifo_thread stock_pfifo_thread
+#define pfifo_write stock_pfifo_write
+#define pgraph_allocate_inline_buffer_vertices stock_pgraph_allocate_inline_buffer_vertices
+#define pgraph_check_within_begin_end_block stock_pgraph_check_within_begin_end_block
+#define pgraph_clear_dirty_reg_map stock_pgraph_clear_dirty_reg_map
+#define pgraph_context_switch stock_pgraph_context_switch
+#define pgraph_convert_texture_data stock_pgraph_convert_texture_data
+#define pgraph_destroy stock_pgraph_destroy
+#define pgraph_finish_inline_buffer_vertex stock_pgraph_finish_inline_buffer_vertex
+#define pgraph_get_clear_color stock_pgraph_get_clear_color
+#define pgraph_get_clear_depth_stencil_value stock_pgraph_get_clear_depth_stencil_value
+#define pgraph_get_inline_values stock_pgraph_get_inline_values
+#define pgraph_get_texture_length stock_pgraph_get_texture_length
+#define pgraph_get_texture_palette_phys_addr_length stock_pgraph_get_texture_palette_phys_addr_length
+#define pgraph_get_texture_phys_addr stock_pgraph_get_texture_phys_addr
+#define pgraph_get_texture_shape stock_pgraph_get_texture_shape
+#define pgraph_gl_bind_inline_array stock_pgraph_gl_bind_inline_array
+#define pgraph_gl_bind_shaders stock_pgraph_gl_bind_shaders
+#define pgraph_gl_bind_textures stock_pgraph_gl_bind_textures
+#define pgraph_gl_bind_vertex_attributes stock_pgraph_gl_bind_vertex_attributes
+#define pgraph_gl_check_surface_to_texture_compatibility stock_pgraph_gl_check_surface_to_texture_compatibility
+#define pgraph_gl_clear_report_value stock_pgraph_gl_clear_report_value
+#define pgraph_gl_clear_surface stock_pgraph_gl_clear_surface
+#define pgraph_gl_compile_shader stock_pgraph_gl_compile_shader
+#define pgraph_gl_determine_gpu_properties stock_pgraph_gl_determine_gpu_properties
+#define pgraph_gl_download_dirty_surfaces stock_pgraph_gl_download_dirty_surfaces
+#define pgraph_gl_draw_begin stock_pgraph_gl_draw_begin
+#define pgraph_gl_draw_end stock_pgraph_gl_draw_end
+#define pgraph_gl_finalize_buffers stock_pgraph_gl_finalize_buffers
+#define pgraph_gl_finalize_display stock_pgraph_gl_finalize_display
+#define pgraph_gl_finalize_reports stock_pgraph_gl_finalize_reports
+#define pgraph_gl_finalize_shaders stock_pgraph_gl_finalize_shaders
+#define pgraph_gl_finalize_surfaces stock_pgraph_gl_finalize_surfaces
+#define pgraph_gl_finalize_textures stock_pgraph_gl_finalize_textures
+#define pgraph_gl_flush_draw stock_pgraph_gl_flush_draw
+#define pgraph_gl_get_framebuffer_surface stock_pgraph_gl_get_framebuffer_surface
+#define pgraph_gl_get_gpu_properties stock_pgraph_gl_get_gpu_properties
+#define pgraph_gl_get_report stock_pgraph_gl_get_report
+#define pgraph_gl_get_surface_scale_factor stock_pgraph_gl_get_surface_scale_factor
+#define pgraph_gl_image_blit stock_pgraph_gl_image_blit
+#define pgraph_gl_init_buffers stock_pgraph_gl_init_buffers
+#define pgraph_gl_init_display stock_pgraph_gl_init_display
+#define pgraph_gl_init_reports stock_pgraph_gl_init_reports
+#define pgraph_gl_init_shaders stock_pgraph_gl_init_shaders
+#define pgraph_gl_init_surfaces stock_pgraph_gl_init_surfaces
+#define pgraph_gl_init_textures stock_pgraph_gl_init_textures
+#define pgraph_gl_mark_textures_possibly_dirty stock_pgraph_gl_mark_textures_possibly_dirty
+#define pgraph_gl_process_pending_downloads stock_pgraph_gl_process_pending_downloads
+#define pgraph_gl_process_pending_reports stock_pgraph_gl_process_pending_reports
+#define pgraph_gl_reload_surface_scale_factor stock_pgraph_gl_reload_surface_scale_factor
+#define pgraph_gl_render_surface_to_texture stock_pgraph_gl_render_surface_to_texture
+#define pgraph_gl_set_surface_dirty stock_pgraph_gl_set_surface_dirty
+#define pgraph_gl_set_surface_scale_factor stock_pgraph_gl_set_surface_scale_factor
+#define pgraph_gl_shader_cache_to_disk stock_pgraph_gl_shader_cache_to_disk
+#define pgraph_gl_shader_load_from_memory stock_pgraph_gl_shader_load_from_memory
+#define pgraph_gl_shader_write_cache_reload_list stock_pgraph_gl_shader_write_cache_reload_list
+#define pgraph_gl_surface_download_if_dirty stock_pgraph_gl_surface_download_if_dirty
+#define pgraph_gl_surface_flush stock_pgraph_gl_surface_flush
+#define pgraph_gl_surface_get stock_pgraph_gl_surface_get
+#define pgraph_gl_surface_get_within stock_pgraph_gl_surface_get_within
+#define pgraph_gl_surface_invalidate stock_pgraph_gl_surface_invalidate
+#define pgraph_gl_surface_update stock_pgraph_gl_surface_update
+#define pgraph_gl_sync stock_pgraph_gl_sync
+#define pgraph_gl_unbind_surface stock_pgraph_gl_unbind_surface
+#define pgraph_gl_update_entire_memory_buffer stock_pgraph_gl_update_entire_memory_buffer
+#define pgraph_gl_upload_surface_data stock_pgraph_gl_upload_surface_data
+#define pgraph_gl_wide_line_uniforms stock_pgraph_gl_wide_line_uniforms
+#define pgraph_glsl_check_shader_state_dirty stock_pgraph_glsl_check_shader_state_dirty
+#define pgraph_glsl_gen_geom stock_pgraph_glsl_gen_geom
+#define pgraph_glsl_gen_psh stock_pgraph_glsl_gen_psh
+#define pgraph_glsl_gen_vsh stock_pgraph_glsl_gen_vsh
+#define pgraph_glsl_gen_vsh_ff stock_pgraph_glsl_gen_vsh_ff
+#define pgraph_glsl_gen_vsh_prog stock_pgraph_glsl_gen_vsh_prog
+#define pgraph_glsl_get_shader_state stock_pgraph_glsl_get_shader_state
+#define pgraph_glsl_get_vtx_header stock_pgraph_glsl_get_vtx_header
+#define pgraph_glsl_need_geom stock_pgraph_glsl_need_geom
+#define pgraph_glsl_set_clip_range_uniform_value stock_pgraph_glsl_set_clip_range_uniform_value
+#define pgraph_glsl_set_geom_state stock_pgraph_glsl_set_geom_state
+#define pgraph_glsl_set_psh_state stock_pgraph_glsl_set_psh_state
+#define pgraph_glsl_set_psh_uniform_values stock_pgraph_glsl_set_psh_uniform_values
+#define pgraph_glsl_set_vsh_state stock_pgraph_glsl_set_vsh_state
+#define pgraph_glsl_set_vsh_uniform_values stock_pgraph_glsl_set_vsh_uniform_values
+#define pgraph_init stock_pgraph_init
+#define pgraph_init_thread stock_pgraph_init_thread
+#define pgraph_method stock_pgraph_method
+#define pgraph_pre_savevm_trigger stock_pgraph_pre_savevm_trigger
+#define pgraph_pre_savevm_wait stock_pgraph_pre_savevm_wait
+#define pgraph_pre_shutdown_trigger stock_pgraph_pre_shutdown_trigger
+#define pgraph_pre_shutdown_wait stock_pgraph_pre_shutdown_wait
+#define pgraph_process_pending stock_pgraph_process_pending
+#define pgraph_process_pending_reports stock_pgraph_process_pending_reports
+#define pgraph_rdi_read stock_pgraph_rdi_read
+#define pgraph_rdi_write stock_pgraph_rdi_write
+#define pgraph_read stock_pgraph_read
+#define pgraph_renderer_register stock_pgraph_renderer_register
+#define pgraph_reset_draw_arrays stock_pgraph_reset_draw_arrays
+#define pgraph_reset_inline_buffers stock_pgraph_reset_inline_buffers
+#define pgraph_update_inline_value stock_pgraph_update_inline_value
+#define pgraph_vk_append_to_buffer stock_pgraph_vk_append_to_buffer
+#define pgraph_vk_begin_command_buffer stock_pgraph_vk_begin_command_buffer
+#define pgraph_vk_begin_debug_marker stock_pgraph_vk_begin_debug_marker
+#define pgraph_vk_begin_nondraw_commands stock_pgraph_vk_begin_nondraw_commands
+#define pgraph_vk_begin_single_time_commands stock_pgraph_vk_begin_single_time_commands
+#define pgraph_vk_bind_shaders stock_pgraph_vk_bind_shaders
+#define pgraph_vk_bind_textures stock_pgraph_vk_bind_textures
+#define pgraph_vk_bind_vertex_attributes stock_pgraph_vk_bind_vertex_attributes
+#define pgraph_vk_bind_vertex_attributes_inline stock_pgraph_vk_bind_vertex_attributes_inline
+#define pgraph_vk_buffer_has_space_for stock_pgraph_vk_buffer_has_space_for
+#define pgraph_vk_check_memory_budget stock_pgraph_vk_check_memory_budget
+#define pgraph_vk_clear_report_value stock_pgraph_vk_clear_report_value
+#define pgraph_vk_clear_surface stock_pgraph_vk_clear_surface
+#define pgraph_vk_compile_glsl_to_spv stock_pgraph_vk_compile_glsl_to_spv
+#define pgraph_vk_compute_finish_complete stock_pgraph_vk_compute_finish_complete
+#define pgraph_vk_compute_needs_finish stock_pgraph_vk_compute_needs_finish
+#define pgraph_vk_create_shader_module_from_glsl stock_pgraph_vk_create_shader_module_from_glsl
+#define pgraph_vk_create_shader_module_from_spv stock_pgraph_vk_create_shader_module_from_spv
+#define pgraph_vk_debug_frame_terminator stock_pgraph_vk_debug_frame_terminator
+#define pgraph_vk_debug_init stock_pgraph_vk_debug_init
+#define pgraph_vk_destroy_shader_module stock_pgraph_vk_destroy_shader_module
+#define pgraph_vk_determine_gpu_properties stock_pgraph_vk_determine_gpu_properties
+#define pgraph_vk_download_dirty_surfaces stock_pgraph_vk_download_dirty_surfaces
+#define pgraph_vk_download_surfaces_in_range_if_dirty stock_pgraph_vk_download_surfaces_in_range_if_dirty
+#define pgraph_vk_draw_begin stock_pgraph_vk_draw_begin
+#define pgraph_vk_draw_end stock_pgraph_vk_draw_end
+#define pgraph_vk_end_debug_marker stock_pgraph_vk_end_debug_marker
+#define pgraph_vk_end_nondraw_commands stock_pgraph_vk_end_nondraw_commands
+#define pgraph_vk_end_single_time_commands stock_pgraph_vk_end_single_time_commands
+#define pgraph_vk_ensure_command_buffer stock_pgraph_vk_ensure_command_buffer
+#define pgraph_vk_ensure_not_in_render_pass stock_pgraph_vk_ensure_not_in_render_pass
+#define pgraph_vk_finalize_buffers stock_pgraph_vk_finalize_buffers
+#define pgraph_vk_finalize_command_buffers stock_pgraph_vk_finalize_command_buffers
+#define pgraph_vk_finalize_compute stock_pgraph_vk_finalize_compute
+#define pgraph_vk_finalize_display stock_pgraph_vk_finalize_display
+#define pgraph_vk_finalize_glsl_compiler stock_pgraph_vk_finalize_glsl_compiler
+#define pgraph_vk_finalize_instance stock_pgraph_vk_finalize_instance
+#define pgraph_vk_finalize_pipelines stock_pgraph_vk_finalize_pipelines
+#define pgraph_vk_finalize_reports stock_pgraph_vk_finalize_reports
+#define pgraph_vk_finalize_shaders stock_pgraph_vk_finalize_shaders
+#define pgraph_vk_finalize_surfaces stock_pgraph_vk_finalize_surfaces
+#define pgraph_vk_finalize_textures stock_pgraph_vk_finalize_textures
+#define pgraph_vk_find_queue_families stock_pgraph_vk_find_queue_families
+#define pgraph_vk_finish stock_pgraph_vk_finish
+#define pgraph_vk_flush_draw stock_pgraph_vk_flush_draw
+#define pgraph_vk_get_gpu_properties stock_pgraph_vk_get_gpu_properties
+#define pgraph_vk_get_memory_type stock_pgraph_vk_get_memory_type
+#define pgraph_vk_get_report stock_pgraph_vk_get_report
+#define pgraph_vk_get_surface_scale_factor stock_pgraph_vk_get_surface_scale_factor
+#define pgraph_vk_image_blit stock_pgraph_vk_image_blit
+#define pgraph_vk_init_buffers stock_pgraph_vk_init_buffers
+#define pgraph_vk_init_command_buffers stock_pgraph_vk_init_command_buffers
+#define pgraph_vk_init_compute stock_pgraph_vk_init_compute
+#define pgraph_vk_init_display stock_pgraph_vk_init_display
+#define pgraph_vk_init_glsl_compiler stock_pgraph_vk_init_glsl_compiler
+#define pgraph_vk_init_instance stock_pgraph_vk_init_instance
+#define pgraph_vk_init_pipelines stock_pgraph_vk_init_pipelines
+#define pgraph_vk_init_reports stock_pgraph_vk_init_reports
+#define pgraph_vk_init_shaders stock_pgraph_vk_init_shaders
+#define pgraph_vk_init_surfaces stock_pgraph_vk_init_surfaces
+#define pgraph_vk_init_textures stock_pgraph_vk_init_textures
+#define pgraph_vk_insert_debug_marker stock_pgraph_vk_insert_debug_marker
+#define pgraph_vk_mark_textures_possibly_dirty stock_pgraph_vk_mark_textures_possibly_dirty
+#define pgraph_vk_pack_depth_stencil stock_pgraph_vk_pack_depth_stencil
+#define pgraph_vk_process_pending_downloads stock_pgraph_vk_process_pending_downloads
+#define pgraph_vk_process_pending_reports stock_pgraph_vk_process_pending_reports
+#define pgraph_vk_process_pending_reports_internal stock_pgraph_vk_process_pending_reports_internal
+#define pgraph_vk_ref_shader_module stock_pgraph_vk_ref_shader_module
+#define pgraph_vk_reload_surface_scale_factor stock_pgraph_vk_reload_surface_scale_factor
+#define pgraph_vk_render_display stock_pgraph_vk_render_display
+#define pgraph_vk_set_surface_dirty stock_pgraph_vk_set_surface_dirty
+#define pgraph_vk_set_surface_scale_factor stock_pgraph_vk_set_surface_scale_factor
+#define pgraph_vk_spirv_1_6 stock_pgraph_vk_spirv_1_6
+#define pgraph_vk_surface_download_if_dirty stock_pgraph_vk_surface_download_if_dirty
+#define pgraph_vk_surface_flush stock_pgraph_vk_surface_flush
+#define pgraph_vk_surface_get stock_pgraph_vk_surface_get
+#define pgraph_vk_surface_get_within stock_pgraph_vk_surface_get_within
+#define pgraph_vk_surface_update stock_pgraph_vk_surface_update
+#define pgraph_vk_transition_image_layout stock_pgraph_vk_transition_image_layout
+#define pgraph_vk_trim_texture_cache stock_pgraph_vk_trim_texture_cache
+#define pgraph_vk_unpack_depth_stencil stock_pgraph_vk_unpack_depth_stencil
+#define pgraph_vk_unref_shader_module stock_pgraph_vk_unref_shader_module
+#define pgraph_vk_update_descriptor_sets stock_pgraph_vk_update_descriptor_sets
+#define pgraph_vk_update_index_buffer stock_pgraph_vk_update_index_buffer
+#define pgraph_vk_update_vertex_inline_buffer stock_pgraph_vk_update_vertex_inline_buffer
+#define pgraph_vk_update_vertex_ram_buffer stock_pgraph_vk_update_vertex_ram_buffer
+#define pgraph_vk_upload_surface_data stock_pgraph_vk_upload_surface_data
+#define pgraph_vk_wait_for_surface_download stock_pgraph_vk_wait_for_surface_download
+#define pgraph_write stock_pgraph_write
+#define pgraph_write_zpass_pixel_cnt_report stock_pgraph_write_zpass_pixel_cnt_report
+#define pmc_read stock_pmc_read
+#define pmc_write stock_pmc_write
+#define pramdac_read stock_pramdac_read
+#define pramdac_write stock_pramdac_write
+#define prma_read stock_prma_read
+#define prma_write stock_prma_write
+#define prmcio_read stock_prmcio_read
+#define prmcio_write stock_prmcio_write
+#define prmdio_read stock_prmdio_read
+#define prmdio_write stock_prmdio_write
+#define prmfb_read stock_prmfb_read
+#define prmfb_write stock_prmfb_write
+#define prmvio_read stock_prmvio_read
+#define prmvio_write stock_prmvio_write
+#define pstraps_read stock_pstraps_read
+#define pstraps_write stock_pstraps_write
+#define ptimer_read stock_ptimer_read
+#define ptimer_write stock_ptimer_write
+#define ptv_read stock_ptv_read
+#define ptv_write stock_ptv_write
+#define pvideo_read stock_pvideo_read
+#define pvideo_write stock_pvideo_write
+#define pvpe_read stock_pvpe_read
+#define pvpe_write stock_pvpe_write
+#define renderdoc_capture_frames stock_renderdoc_capture_frames
+#define renderdoc_trace_frames stock_renderdoc_trace_frames
+#define s3tc_decompress_2d stock_s3tc_decompress_2d
+#define s3tc_decompress_3d stock_s3tc_decompress_3d
+#define swizzle_box stock_swizzle_box
+#define swizzle_box_internal stock_swizzle_box_internal
+#define uniform_element_type_to_str stock_uniform_element_type_to_str
+#define unpack_z24s8_to_d24_unorm_s8_uint_glsl stock_unpack_z24s8_to_d24_unorm_s8_uint_glsl
+#define unpack_z24s8_to_d32_sfloat_s8_uint_glsl stock_unpack_z24s8_to_d32_sfloat_s8_uint_glsl
+#define unswizzle_box stock_unswizzle_box
+#define unswizzle_box_internal stock_unswizzle_box_internal
+#define user_read stock_user_read
+#define user_write stock_user_write
+#define vmstate_nv2a_pgraph_vertex_attributes stock_vmstate_nv2a_pgraph_vertex_attributes
+#define vsh_get_field stock_vsh_get_field
+
+#endif

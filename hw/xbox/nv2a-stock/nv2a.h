@@ -3,6 +3,7 @@
  *
  * Copyright (c) 2012 espes
  * Copyright (c) 2020-2021 Matt Borgerson
+ * Copyright (c) 2026 Réda Chérif-Touil
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -24,30 +25,11 @@
 void nv2a_init(PCIBus *bus, int devfn, MemoryRegion *ram);
 void nv2a_context_init(void);
 int nv2a_get_framebuffer_surface(void);
-void nv2a_profile_present(void);
 void nv2a_release_framebuffer_surface(void);
 void nv2a_set_surface_scale_factor(unsigned int scale);
 unsigned int nv2a_get_surface_scale_factor(void);
 const uint8_t *nv2a_get_dac_palette(void);
 int nv2a_get_screen_off(void);
-
-/* The stock GPU (hw/xbox/nv2a-stock) is plugged in instead of this one when
- * GPU boost is off at start-up; the first group of entry points above, the
- * profiler's counter names and values and the UI's RenderDoc calls
- * (debug.h) then hand every call over to its own. */
-bool nv2a_stock_active(void);
-void stock_nv2a_init(PCIBus *bus, int devfn, MemoryRegion *ram);
-void stock_nv2a_context_init(void);
-int stock_nv2a_get_framebuffer_surface(void);
-void stock_nv2a_profile_present(void);
-void stock_nv2a_release_framebuffer_surface(void);
-void stock_nv2a_set_surface_scale_factor(unsigned int scale);
-unsigned int stock_nv2a_get_surface_scale_factor(void);
-const uint8_t *stock_nv2a_get_dac_palette(void);
-int stock_nv2a_get_screen_off(void);
-const char *stock_nv2a_profile_get_counter_name(unsigned int cnt);
-int stock_nv2a_profile_get_counter_value(unsigned int cnt);
-bool stock_nv2a_dbg_renderdoc_available(void);
-void stock_nv2a_dbg_renderdoc_capture_frames(int num_frames, bool trace);
+void nv2a_profile_present(void);
 
 #endif

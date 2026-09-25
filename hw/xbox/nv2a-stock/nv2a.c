@@ -20,7 +20,8 @@
  * License along with this library; if not, see <http://www.gnu.org/licenses/>.
  */
 
-#include "hw/xbox/nv2a/nv2a_int.h"
+#include "hw/xbox/nv2a-stock/stock-names.h"
+#include "hw/xbox/nv2a-stock/nv2a_int.h"
 #include "qemu/main-loop.h"
 
 void nv2a_update_irq(NV2AState *d)
@@ -184,24 +185,13 @@ static void nv2a_get_params(VGACommonState *s, VGADisplayParams *params)
                            ((s->cr[VGA_CRTC_MAX_SCAN] & 0x40) << 3);
 }
 
-bool nv2a_stock_active(void)
-{
-    return !pgraph_gpu_boost();
-}
-
 const uint8_t *nv2a_get_dac_palette(void)
 {
-    if (nv2a_stock_active()) {
-        return stock_nv2a_get_dac_palette();
-    }
     return g_nv2a->puserdac.palette;
 }
 
 int nv2a_get_screen_off(void)
 {
-    if (nv2a_stock_active()) {
-        return stock_nv2a_get_screen_off();
-    }
     return g_nv2a->vga.sr[VGA_SEQ_CLOCK_MODE] & VGA_SR01_SCREEN_OFF;
 }
 
@@ -669,7 +659,7 @@ static void nv2a_class_init(ObjectClass *klass, const void *data)
 }
 
 static const TypeInfo nv2a_info = {
-    .name          = "nv2a",
+    .name          = "nv2a-stock",
     .parent        = TYPE_PCI_DEVICE,
     .instance_size = sizeof(NV2AState),
     .class_init    = nv2a_class_init,
@@ -687,12 +677,7 @@ type_init(nv2a_register);
 
 void nv2a_init(PCIBus *bus, int devfn, MemoryRegion *ram)
 {
-    if (nv2a_stock_active()) {
-        fprintf(stderr, "nv2a: GPU boost off, the stock GPU runs\n");
-        stock_nv2a_init(bus, devfn, ram);
-        return;
-    }
-    PCIDevice *dev = pci_create_simple(bus, devfn, "nv2a");
+    PCIDevice *dev = pci_create_simple(bus, devfn, "nv2a-stock");
     NV2AState *d = NV2A_DEVICE(dev);
     nv2a_init_memory(d, ram);
     nv2a_init_vga(d);
