@@ -755,8 +755,6 @@ static void psh_append_shadowmap(const struct PixelShader *ps, int i, bool compa
     }
 }
 
-// Adjust the s, t coordinates in the given VAR to account for the 4 texel
-// border supported by the hardware.
 static void psh_append_depth_range_test(const struct PixelShader *ps,
                                         MString *out)
 {
@@ -769,6 +767,8 @@ static void psh_append_depth_range_test(const struct PixelShader *ps,
     }
 }
 
+// Adjust the s, t coordinates in the given VAR to account for the 4 texel
+// border supported by the hardware.
 static void apply_border_adjustment(const struct PixelShader *ps, MString *vars, int tex_index, const char *var_template)
 {
     int i = tex_index;
