@@ -18,7 +18,9 @@
  *
  * Selected at run time with XEMU_CHIHIRO_LOG, e.g.
  *     XEMU_CHIHIRO_LOG=boot,card   XEMU_CHIHIRO_LOG=all
- * Nothing is logged unless a category is requested, except errors.
+ * The categories add detail. Without them the machine still prints its errors
+ * and one line for each notable event of a run (the board type, the firmware,
+ * a reset, a card).
  */
 
 #ifndef HW_XBOX_CHIHIRO_LOG_H

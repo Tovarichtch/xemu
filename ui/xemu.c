@@ -294,12 +294,11 @@ static void set_full_screen(struct xemu_console *scon, bool set)
         if (g_config.display.window.fullscreen_exclusive) {
             SDL_DisplayID display = SDL_GetDisplayForWindow(scon->real_window);
             /* The mode the player is already running, not the largest the
-             * screen will accept. A display that advertises 4096x2160 (a
-             * TV, or a panel with a DCI mode) had the game composited at
-             * 4K on a laptop iGPU while the desktop was far smaller:
-             * Crazy Taxi fell from 60 to a median of 54 on a Radeon Vega 7
-             * the moment exclusive fullscreen was switched on (measured,
-             * 10/09). Ask for the mode closest to the desktop instead. */
+             * screen will accept: a display that advertises 4096x2160 (a
+             * TV, or a panel with a DCI mode) would have the game
+             * composited at 4K, far above the desktop, which an integrated
+             * GPU cannot keep up with. Ask for the mode closest to the
+             * desktop instead. */
             const SDL_DisplayMode *desktop =
                 display ? SDL_GetDesktopDisplayMode(display) : NULL;
             if (desktop &&
@@ -1477,8 +1476,8 @@ int main(int argc, char **argv)
     /* The NVIDIA EGL DSO destructors -- registered when SDL created the
      * GL context, i.e. AFTER our atexit above, so they run FIRST in the
      * LIFO exit chain -- segfault inside the driver teardown on every UI
-     * quit (measured: repeating core dumps at libnvidia-eglcore+0xabe401,
-     * OpenGL and Vulkan alike, present in dumps back to 14/08), taking
+     * quit (repeated core dumps at libnvidia-eglcore+0xabe401, OpenGL and
+     * Vulkan alike), taking
      * the queued config save down with them and stalling the quit for
      * the seconds the 400 MB core dump takes to write. Everything useful
      * is already down at this point (guest state via qemu_cleanup, GL
@@ -1488,7 +1487,6 @@ int main(int argc, char **argv)
         /* The Chihiro arcade backup (coin bank, operator settings, scores)
          * normally flushes from an exit notifier — skipped by the _exit
          * below. Write it here, like the config. */
-        void chihiro_flush_save_now(void);
         chihiro_flush_save_now();
     }
     xemu_settings_save();

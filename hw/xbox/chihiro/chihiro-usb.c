@@ -692,10 +692,10 @@ static void handle_data(USBDevice *dev, USBPacket *p)
         return;
     }
 
-    /* Non-LLE fallback never reached (use_lle always true after B2 boot).
-     * Bulk IN/OUT for QC: vendor 0x16/0x17 → EP1/EP2, 0x1E/0x1F → EP2/EP3.
-     * Bulk IN/OUT for SC: UART data via EP1-EP3.
-     * All now handled natively by AN2131 firmware. */
+    /* Not reached once the AN2131s run their firmware (use_lle, set after
+     * the B2 boot), which serves the bulk endpoints: for the QC, vendor
+     * 0x16/0x17 → EP1/EP2 and 0x1E/0x1F → EP2/EP3; for the SC, UART data
+     * on EP1-EP3. */
     p->status = USB_RET_NAK;
 }
 

@@ -407,7 +407,7 @@ void xbox_init_common(MachineState *machine,
                 uint32_t fs_size = 0;
                 uint8_t *fs_buf = chihiro_fatx_get_buffer(&fs_size);
                 if (fs_buf) {
-                    FILE *f = fopen(dvd, "rb");
+                    FILE *f = qemu_fopen(dvd, "rb");
                     if (f) {
                         uint8_t magic[4];
                         if (fread(magic, 1, 4, f) == 4 &&

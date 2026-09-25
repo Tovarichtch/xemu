@@ -20,8 +20,8 @@
  * AN2131-specific register mapping is handled externally via callbacks.
  */
 
+#include "qemu/osdep.h"
 #include "chihiro-8051.h"
-#include <string.h>
 
 /* ── memory access helpers ─────────────────────────────────────────── */
 

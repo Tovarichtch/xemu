@@ -924,9 +924,6 @@ int an2131_setup_packet(AN2131State *s, const uint8_t setup[8],
     bool need_card = !s->is_qc &&
                      (chihiro_hw210_enabled || chihiro_crp1231_enabled) &&
                      (((setup[1] == 0x1A || setup[1] == 0x1B) && is_in) ||
-                      /* card SENDs too: ingesting a long write command
-                       * exceeds the default window and the unanswered setup
-                       * is fake-completed, wedging the exchange */
                       setup[1] == 0x22 || setup[1] == 0x23);
 
     /* On the bus the device NAKs the data stage until the firmware arms EP0
@@ -989,10 +986,6 @@ int an2131_setup_packet(AN2131State *s, const uint8_t setup[8],
         int bc = s->ep[0].bc_in;
         int copy = min_int(bc, resp_max);
         memcpy(resp_buf, &s->ram[AN_IN0BUF - 0x6000], copy);
-
-        /* v0x19 pending_len override — REMOVED for testing (session 26).
-         * Was needed when JVS RX delivery was broken (virtual-time delay).
-         * With cycle-based delay, firmware handles B000 correctly. */
 
         s->ep[0].in_armed = false;
         s->ep0cs &= ~EP0CS_INBSY;

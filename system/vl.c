@@ -3147,11 +3147,10 @@ void qemu_init(int argc, char **argv)
         "none",
     }[g_config.sys.avpack];
 
-    fake_argv[fake_argc++] = g_strdup_printf("xbox%s%s%s%s,avpack=%s",
+    fake_argv[fake_argc++] = g_strdup_printf("xbox%s%s%s,avpack=%s",
         (bootrom_arg != NULL) ? bootrom_arg : "",
         chihiro_machine ? ",chihiro=on" : "",
         g_config.general.skip_boot_anim ? ",short-animation=on" : "",
-        "", /* kernel-irqchip=off REMOVED for perf test v487 */
         avpack_str
         );
 
@@ -3273,11 +3272,11 @@ void qemu_init(int argc, char **argv)
          * -drive for index=1. The IDE slave is registered programmatically
          * by chihiro_ide_interface_init() with a MemoryRegion-backed device.
          * Sniff the FATX magic instead of trusting the extension: a renamed
-         * image (.bin_dec etc.) used to fall through here and add a second
-         * drive on index=1, colliding with the registered IDE slave and
-         * crashing at startup. Content decides, not the name. */
+         * image (.bin_dec etc.) would fall through here and add a second
+         * drive on index=1, which collides with the registered IDE slave and
+         * crashes at startup. Content decides, not the name. */
         bool dvd_is_fatx = false;
-        FILE *df = fopen(dvd_path, "rb");
+        FILE *df = qemu_fopen(dvd_path, "rb");
         if (df) {
             uint8_t dm[4];
             dvd_is_fatx = fread(dm, 1, 4, df) == 4 &&

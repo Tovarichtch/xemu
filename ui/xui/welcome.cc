@@ -58,7 +58,7 @@ void FirstBootWindow::Draw()
 
     /* CHIHIRO (not upstream): what a first-time player should expect, one
      * centred line each like the rest of the window, in the theme's accent
-     * so it stands out (green, orange with the doge). */
+     * colour so it stands out. */
     static const char *const notes[] = {
         "Experimental build, still under development.",
         "The first run of a game stutters while its shaders compile.",

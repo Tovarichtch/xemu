@@ -1295,9 +1295,8 @@ static int ohci_bus_start(OHCIState *ohci)
     printf("[%07lld] OHCI BUS START (HCFS -> OPERATIONAL)\n", TS_MS);
     trace_usb_ohci_start(ohci->name);
 
-    /* v205: Notify Chihiro to schedule USB device hotplug.
-     * Devices attach AFTER the kernel enables RHSC so fresh CSC
-     * events trigger full USB enumeration including SET_CONFIG. */
+    /* Chihiro: the USB devices attach after the kernel enables RHSC, so
+     * fresh CSC events trigger the full enumeration, SET_CONFIG included. */
     chihiro_on_ohci_bus_start();
 
     /*
@@ -1502,11 +1501,9 @@ static void ohci_port_set_status(OHCIState *ohci, int portnum, uint32_t val)
         port->ctrl &= ~(val & OHCI_PORT_WTC);
     }
     if (val & OHCI_PORT_CCS) {
-        /* v204: ClearPortEnable NO LONGER blocked for Chihiro.
-         * Previously blocked during SEGABOOT phase to keep devices enabled,
-         * but this prevented the kernel from completing USB enumeration
-         * (GET_DESC→SET_ADDRESS→ClearPortEnable→re-enable→SET_CONFIG).
-         * Now allowing normal OHCI port disable/enable flow. */
+        /* ClearPortEnable goes through on a Chihiro too: the kernel's USB
+         * enumeration disables and re-enables the port
+         * (GET_DESC→SET_ADDRESS→ClearPortEnable→re-enable→SET_CONFIG). */
         port->ctrl &= ~OHCI_PORT_PES;
         port->ctrl |= OHCI_PORT_PESC;
     }
@@ -1662,9 +1659,6 @@ static uint64_t ohci_mem_read(void *opaque,
         }
     }
 
-
-    /* v298: disabled — per-access monitoring too expensive */
-
     return retval;
 }
 
@@ -1680,9 +1674,6 @@ static void ohci_mem_write(void *opaque,
         trace_usb_ohci_mem_write_unaligned(addr);
         return;
     }
-
-
-    /* v298: disabled — per-access monitoring too expensive */
 
     if (addr >= 0x54 && addr < 0x54 + ohci->num_ports * 4) {
         /* HcRhPortStatus */

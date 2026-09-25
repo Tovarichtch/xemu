@@ -166,7 +166,7 @@ typedef struct ChihiroLPCState {
     /* Diagnostic: periodic state machine dump */
     QEMUTimer *diag_timer;
 
-    /* LPC port read counters for v136 instrumentation */
+    /* LPC port state kept between accesses */
     uint32_t lpc_401e_reads;   /* MbcomCommand (state 2) — port 0x401E (firmware) */
     uint32_t last_bootstate;   /* previous bootstate to detect changes */
     uint16_t lpc_scratch_4026;    /* Port 0x4026 read-write scratch register */
@@ -217,7 +217,7 @@ typedef struct ChihiroLPCState {
     OBJECT_CHECK(ChihiroLPCState, (obj), "chihiro-lpc")
 
 static bool chihiro_active;
-bool chihiro_game_running;  /* Set after QuickReboot — disables SEGABOOT DMA scan */
+bool chihiro_game_running;  /* the game has taken over: no SEGABOOT DMA scan */
 static int game_mode_bus_starts;  /* BUS START count since game_running became true */
 static void chihiro_patch_running_game(void);
 static bool chihiro_boot3_reached; /* Set when SEGABOOT reaches boot=3 (checks complete) */
@@ -606,7 +606,7 @@ static USBDevice *chihiro_usb_qc = NULL;
 static USBDevice *chihiro_usb_sc = NULL;
 
 /*
- * v205: Called from ohci_bus_start() when OHCI goes OPERATIONAL.
+ * Called from ohci_bus_start() when OHCI goes OPERATIONAL.
  * Schedule USB device attachment 150ms after BUS START so that:
  * 1. The kernel has already enabled RHSC interrupts
  * 2. Fresh CSC events will trigger the RHSC handler
@@ -1408,12 +1408,6 @@ static bool chihiro_executable_name_safe(const char *name)
     return true;
 }
 
-/*
- * SEGABOOT reached boot=3 (checks complete). Recover the game executable
- * name so the save file can be resolved: boot.id is loaded at PA 0x4F000
- * with magic "BTID", "XBAM" at +0x20 and the executable at +0xA0
- * (e.g. "\hod3xb.xbe"). Fall back to scanning SEGABOOT data for ".xbe".
- */
 /* Sega netboot boot.id: "BTID" at 0, "XBAM" at 0x20, game executable at
  * 0xA0 (31 chars, backslash-prefixed). The one parser for every source. */
 bool chihiro_bootid_executable(const uint8_t *bid, char *out, size_t out_len)
@@ -1454,7 +1448,7 @@ static void chihiro_capture_game_filename_from_dir(void)
     }
     char bootid_path[1100];
     snprintf(bootid_path, sizeof(bootid_path), "%s/boot.id", chihiro_game_dir);
-    FILE *f = fopen(bootid_path, "rb");
+    FILE *f = qemu_fopen(bootid_path, "rb");
     if (!f) {
         return;
     }
@@ -1505,8 +1499,8 @@ static void chihiro_on_boot3(void)
 }
 
 /*
- * Periodic tick: drives the card reader workaround while a game runs, and
- * watches the SEGABOOT state machine before that.
+ * Periodic tick: drives the cabinet's boards while a game runs, and watches
+ * the SEGABOOT state machine before that.
  */
 static void chihiro_diag_timer_cb(void *opaque)
 {
@@ -1584,9 +1578,9 @@ static void chihiro_diag_timer_start(ChihiroLPCState *s, int64_t ms)
  * Serial format: "%%%@-##@########" (e.g. "BEER-01A00000001")
  *   Main serial from ic10 EEPROM [0x1F10], media serial from mbcom CMD 0x0103.
  *
- * All former RAM patches have been removed — LLE handles everything natively.
- * The RE findings below document the SEGABOOT functions we had to understand
- * to reach full LLE. Preserved for reference.
+ * SEGABOOT runs unpatched. The map below gives the functions and data it goes
+ * through, by address in its two builds, and how the emulated machine answers
+ * each.
  *
  * === SEGABOOT Function Map (fpr-23887 / fpr-21042 variants) ===
  *
@@ -1640,16 +1634,16 @@ static void chihiro_diag_timer_start(ChihiroLPCState *s, int64_t ms)
  *   Main serial failure → Error 03, media serial failure → Error 04.
  *   LLE: valid serials provided from ic10 EEPROM [0x1F10] and mbcom CMD 0x0103.
  *
- * AV / video mode (v176 finding):
- *   SEGABOOT checks NV2A video mode. Fixed by setting EEPROM video_standard
- *   with AV_FLAGS_HDTV_480p (0x00080000) → kernel configures NV2A for
- *   progressive scan 31kHz → SEGABOOT's video check passes naturally.
+ * AV / video mode:
+ *   SEGABOOT checks the NV2A video mode. The EEPROM's video_standard carries
+ *   AV_FLAGS_HDTV_480p (0x00080000), so the kernel sets the NV2A up for
+ *   31 kHz progressive scan, which the check accepts.
  *
- * Error value diagnostic (VA 0x2E3AB):
+ * Error code store (VA 0x2E3AB):
  *   C7 07 14 00 00 00    mov [edi], 0x14             → error code 20 (decimal)
- *   Used to trace error injection path. Not reached with correct emulation.
+ *   Not reached when the machine is emulated correctly.
  *
- * === Byte Signatures (for future RE / other SEGABOOT versions) ===
+ * === Byte signatures (to find these functions in other SEGABOOT builds) ===
  *
  * UsbEnumPoll:          E8 64 F6 FF FF 85 C0 74 0F           (fpr-23887)
  *                       E8 EF F1 FF FF 85 C0 0F 85           (fpr-21042)
@@ -1703,13 +1697,13 @@ static void chihiro_diag_timer_start(ChihiroLPCState *s, int64_t ms)
  *   initPtr [0x896AC], slot META at [0x89740] stride 0x40, slot DATA at [0x89760] stride 0x40.
  *   Up to 4 slots. MbcomPollReady checks slot[index+2] for baseboard DMA response.
  *
- * === v274 Discovery: Why UsbEnumPoll Patches Broke USB ===
+ * === Why UsbEnumPoll must run ===
  *
- * NOPing UsbEnumPoll prevented the kernel from completing the USB enumeration
- * sequence (PortReset → GET_DESC → SET_ADDRESS → GET_CONFIG_DESC → SET_CONFIG).
- * Without SET_CONFIG, RegisterClassDriver never set bit 0x20 in baseboard_dev
- * flags → all JVS communication failed. Fix: let SEGABOOT run unmodified,
- * USB devices in chihiro-usb.c handle enumeration via OHCI natively.
+ * Without UsbEnumPoll the kernel never completes the USB enumeration
+ * (PortReset → GET_DESC → SET_ADDRESS → GET_CONFIG_DESC → SET_CONFIG). With no
+ * SET_CONFIG, RegisterClassDriver never sets bit 0x20 in the baseboard_dev
+ * flags and no JVS traffic flows: SEGABOOT runs unmodified, and the USB
+ * devices of chihiro-usb.c enumerate through OHCI.
  */
 static void chihiro_arm_diag_cb(void *opaque)
 {
@@ -1728,7 +1722,8 @@ static void chihiro_arm_diag_cb(void *opaque)
 /* Called from SMC SCRATCH write handler when value=0x04 (QuickReboot).
  * HalReturnToFirmware(QuickReboot) writes SCRATCH=0x04 before system reset.
  * Multiple QuickReboots happen: service menu exit, then game boot.
- * We DON'T set boot3_reached here — game_running is detected by XBE change. */
+ * game_running is set again when SEGABOOT tears the USB bus down
+ * (chihiro_on_ohci_bus_stop). */
 void chihiro_on_quickreboot_signal(void)
 {
     if (!chihiro_active) return;
@@ -1736,9 +1731,9 @@ void chihiro_on_quickreboot_signal(void)
     fprintf(stderr, "[%07lld] === QUICKREBOOT === game_running=%d boot3=%d\n",
             TS_MS, chihiro_game_running, chihiro_boot3_reached);
 
-    /* Ignore SCRATCH=0x04 during first kernel init — the kernel writes
-     * SCRATCH as part of normal boot before SEGABOOT even loads.
-     * Only react after SEGABOOT has been patched at least once. */
+    /* diag_armed drops for 50 ms after each QuickReboot, which folds a
+     * repeated SCRATCH=0x04 into one. The kernel's own write during its first
+     * boot (about 2 s) is not told apart: it comes through here too. */
     if (!chihiro_lpc_global || !chihiro_lpc_global->diag_armed) {
         return;
     }
@@ -1753,9 +1748,8 @@ void chihiro_on_quickreboot_signal(void)
     memset(chihiro_mbcom_command, 0, 32);
     memset(chihiro_mbcom_response, 0, 32);
 
-    /* Re-arm SEGABOOT patch scanner and reset ALL mbcom/DMA state.
-     * QuickReboot reloads SEGABOOT from flash ROM (patches lost).
-     * Kernel code stays patched (QuickReboot keeps kernel in RAM). */
+    /* Whatever the QuickReboot starts, SEGABOOT again or the game, the watch
+     * is armed again and the mbcom and DMA state starts over. */
     if (chihiro_lpc_global) {
         ChihiroLPCState *s = chihiro_lpc_global;
         s->diag_armed = false;
@@ -1787,15 +1781,14 @@ void chihiro_on_quickreboot_signal(void)
     }
 }
 
-/* Called from SMC handler when kernel writes SMC_REG_POWER (QuickReboot).
- * v209e: Let the reset happen! Combined with scratch_reg preservation
- * (smc_reset no longer clears scratch), the kernel will detect warm boot,
- * restore MmPersistContiguousMemory pages, and load the game from LDP.
- * Blocking the reset prevented the real QuickReboot from ever occurring. */
+/* Called from the SMC handler when the kernel writes SMC_REG_POWER
+ * (QuickReboot). The reset goes ahead: smc_reset keeps the scratch register,
+ * so the kernel sees a warm boot, restores its MmPersistContiguousMemory pages
+ * and loads the game from the LaunchDataPage. */
 bool chihiro_intercept_reset(void)
 {
-    /* DON'T set game_running here — 0x40F0 handler sets it
-     * AFTER applying kernel device patches. */
+    /* game_running is not set here: chihiro_on_ohci_bus_stop() sets it
+     * when SEGABOOT hands the machine over to the game. */
     return false;  /* Always allow qemu_system_reset_request */
 }
 
@@ -2511,7 +2504,7 @@ int chihiro_detected_game_profile(void)
 
 static bool chihiro_read_flash_rom(const char *path)
 {
-    FILE *f = fopen(path, "rb");
+    FILE *f = qemu_fopen(path, "rb");
     if (!f) return false;
 
     fseek(f, 0, SEEK_END);
@@ -2574,7 +2567,7 @@ static uint8_t *load_eeprom_file(const char *dir, const char *name,
 {
     char path[2048];
     snprintf(path, sizeof(path), "%s%s", dir, name);
-    FILE *f = fopen(path, "rb");
+    FILE *f = qemu_fopen(path, "rb");
     if (!f) return NULL;
     fseek(f, 0, SEEK_END);
     long sz = ftell(f);
@@ -2983,15 +2976,14 @@ static void chihiro_lpc_realize(DeviceState *dev, Error **errp)
     s->dimm_cmd_count = 0;
     s->dimm_next_seq = 1;
 
-    /* USB hotplug timers — v205: NO LONGER scheduled at fixed T+1500ms.
-     * Instead, timers are created but armed only when ohci_bus_start()
-     * fires (via chihiro_on_ohci_bus_start callback).
+    /* USB hotplug timers: created here, armed only when ohci_bus_start()
+     * fires (chihiro_on_ohci_bus_start).
      * This ensures devices attach AFTER the kernel has enabled RHSC,
      * so fresh CSC events trigger full enumeration including SET_CONFIG.
      *
      * On real hardware: AN2131 boot ~200ms, kernel OHCI ~600ms.
      * Kernel sees devices during first scan → SET_CONFIG → CONFIGURED.
-     * In our emulation: attach devices 150ms AFTER BUS START for same effect. */
+     * Here the devices attach 150 ms after BUS START, to the same effect. */
     s->usb_hotplug_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL,
                                          chihiro_usb_hotplug_qc_cb, s);
     /* Timer NOT armed yet — will be armed by chihiro_on_ohci_bus_start() */
@@ -3114,7 +3106,7 @@ static void chihiro_register_types(void)
 type_init(chihiro_register_types)
 
 /* ═══════════════════════════════════════════════════════════════════════
- * Save file persistence (Phase 2)
+ * Save file persistence
  *
  * Persists QC ic11 (512 B) and the baseboard SRAM's backup half (the two
  * windows the game's backup occupies, 55 KB) per game.
@@ -3259,8 +3251,7 @@ static bool chihiro_game_base_name(char *base, size_t base_len)
     chihiro_capture_game_filename_from_dir();
     if (!chihiro_game_filename[0]) return false;
 
-    strncpy(base, chihiro_game_filename, base_len - 1);
-    base[base_len - 1] = 0;
+    g_strlcpy(base, chihiro_game_filename, base_len);
     char *dot = strrchr(base, '.');
     if (dot) *dot = 0;
     return base[0] != 0;
@@ -3789,7 +3780,7 @@ static uint8_t *chihiro_dimm_read_image(uint64_t buf_size,
                                         uint64_t *file_size, uint32_t *crc)
 {
     const char *path = g_config.sys.files.dvd_path;
-    FILE *f = (path && path[0]) ? fopen(path, "rb") : NULL;
+    FILE *f = (path && path[0]) ? qemu_fopen(path, "rb") : NULL;
     if (!f) {
         return NULL;
     }
