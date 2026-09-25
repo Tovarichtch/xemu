@@ -381,8 +381,6 @@ void pgraph_vk_pack_depth_stencil(PGRAPHState *pg, SurfaceBinding *surface,
                                   VkCommandBuffer cmd, VkBuffer src,
                                   VkBuffer dst, bool downscale)
 {
-    PGRAPHVkState *r = pg->vk_renderer_state;
-
     unsigned int input_width = surface->width, input_height = surface->height;
     pgraph_apply_scaling_factor(pg, &input_width, &input_height);
 
@@ -390,6 +388,23 @@ void pgraph_vk_pack_depth_stencil(PGRAPHState *pg, SurfaceBinding *surface,
     if (!downscale) {
         pgraph_apply_scaling_factor(pg, &output_width, &output_height);
     }
+    pgraph_vk_pack_depth_stencil_dims(pg, surface, cmd, src, dst, input_width,
+                                      input_height, output_width,
+                                      output_height);
+}
+
+/* Explicit-dimension variant: the input buffer holds in_w x in_h texels
+ * (already native when the caller downsampled on the GPU). */
+void pgraph_vk_pack_depth_stencil_dims(PGRAPHState *pg,
+                                       SurfaceBinding *surface,
+                                       VkCommandBuffer cmd, VkBuffer src,
+                                       VkBuffer dst, unsigned int in_w,
+                                       unsigned int in_h, unsigned int out_w,
+                                       unsigned int out_h)
+{
+    PGRAPHVkState *r = pg->vk_renderer_state;
+    unsigned int input_width = in_w, input_height = in_h;
+    unsigned int output_width = out_w, output_height = out_h;
 
     size_t depth_bytes_per_pixel = 4;
     size_t depth_size = input_width * input_height * depth_bytes_per_pixel;

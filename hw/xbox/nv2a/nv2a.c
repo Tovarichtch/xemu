@@ -205,11 +205,17 @@ int nv2a_get_screen_off(void)
     return g_nv2a->vga.sr[VGA_SEQ_CLOCK_MODE] & VGA_SR01_SCREEN_OFF;
 }
 
+/* Modelled-GPU backlog deadline (see xemu_cost_flip_deadline). */
+int64_t xemu_gpu_free_ns;
+
 /* PCRTC VBlank driven by REALTIME wall clock at ~60Hz.
  * Decoupled from guest CPU speed — fires regardless of TCG load. */
 static void nv2a_realtime_vblank_cb(void *opaque)
 {
     NV2AState *d = opaque;
+
+    /* PCRTC_INTR_0 has one vblank bit: a vblank raised while the previous
+     * one is unacknowledged merges into it, as on hardware. */
     d->pcrtc.pending_interrupts |= NV_PCRTC_INTR_0_VBLANK;
 
     nv2a_update_irq(d);
@@ -478,6 +484,9 @@ static int nv2a_pre_load(void *opaque)
 static int nv2a_post_load(void *opaque, int version_id)
 {
     NV2AState *d = opaque;
+    /* The switch registers come back with the snapshot; the subchannel they
+     * were loaded for does not. */
+    d->pgraph.ctx_switch_subchannel = -1;
     qatomic_set(&d->pgraph.flush_pending, true);
     nv2a_unlock_fifo(d);
     return 0;

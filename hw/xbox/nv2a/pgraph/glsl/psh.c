@@ -11,6 +11,7 @@
  *                    Kingofc <kingofc@freenet.de>
  * Xeon, XBD3DPixelShader.cpp
  * Copyright (c) 2003 _SF_
+ * Copyright (c) 2026 Réda Chérif-Touil
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public License as
@@ -27,11 +28,135 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/fast-hash.h"
 #include "hw/xbox/nv2a/debug.h"
 #include "hw/xbox/nv2a/pgraph/pgraph.h"
+#include "shaders.h"
 #include "psh.h"
 
 DEF_UNIFORM_INFO_ARR(PshUniform, PSH_UNIFORM_DECL_X)
+
+static void psh_zero_combiner_fields(PshState *state)
+{
+    state->combiner_control = 0;
+    state->final_inputs_0 = 0;
+    state->final_inputs_1 = 0;
+    memset(state->rgb_inputs, 0, sizeof(state->rgb_inputs));
+    memset(state->rgb_outputs, 0, sizeof(state->rgb_outputs));
+    memset(state->alpha_inputs, 0, sizeof(state->alpha_inputs));
+    memset(state->alpha_outputs, 0, sizeof(state->alpha_outputs));
+}
+
+static void psh_zero_alpha_fields(PshState *state)
+{
+    state->alpha_test = false;
+    memset(state->alphakill, 0, sizeof(state->alphakill));
+}
+
+static uint64_t psh_family_hash(const PshState *state)
+{
+    PshState family = *state;
+    psh_zero_combiner_fields(&family);
+    psh_zero_alpha_fields(&family);
+    family.combiner_dynamic = false;
+    family.alpha_dynamic = false;
+    return fast_hash((const uint8_t *)&family, sizeof(family));
+}
+
+/* Combiner families (a state minus its combiner program and alpha state):
+ * specialising pays while the program stays put. From a family's third
+ * distinct program on, its dynamic sibling (combiner and alpha in uniforms)
+ * is queued for compile, as first-meet cover while exact programs build.
+ * HEURISTIC: the session's first 256 families are tracked; a later one stays
+ * specialised (performance only). */
+static struct {
+    uint64_t family, comb, comb2;
+    bool vary, queued, ready;
+} psh_seen[256];
+static unsigned psh_seen_n;
+
+static PshState psh_pending[8];
+static unsigned psh_pending_r, psh_pending_w;
+
+static int psh_family_note(const PshState *state)
+{
+    uint64_t fh = psh_family_hash(state);
+
+    uint32_t sig[35];
+    sig[0] = state->combiner_control;
+    sig[1] = state->final_inputs_0;
+    sig[2] = state->final_inputs_1;
+    memcpy(&sig[3], state->rgb_inputs, sizeof(state->rgb_inputs));
+    memcpy(&sig[11], state->rgb_outputs, sizeof(state->rgb_outputs));
+    memcpy(&sig[19], state->alpha_inputs, sizeof(state->alpha_inputs));
+    memcpy(&sig[27], state->alpha_outputs, sizeof(state->alpha_outputs));
+    uint64_t ch = fast_hash((const uint8_t *)sig, sizeof(sig));
+
+    for (unsigned i = 0; i < psh_seen_n; i++) {
+        if (psh_seen[i].family != fh) {
+            continue;
+        }
+        if (psh_seen[i].comb != ch) {
+            if (!psh_seen[i].comb2) {
+                psh_seen[i].comb2 = ch;
+            } else if (psh_seen[i].comb2 != ch && !psh_seen[i].vary) {
+                /* Bump on the transition only: each bump forces one state
+                 * rebuild past the NOTDIRTY fast path. */
+                psh_seen[i].vary = true;
+                pgraph_glsl_dynamic_gen++;
+            }
+        }
+        return i;
+    }
+
+    if (psh_seen_n < ARRAY_SIZE(psh_seen)) {
+        psh_seen[psh_seen_n].family = fh;
+        psh_seen[psh_seen_n].comb = ch;
+        psh_seen[psh_seen_n].comb2 = 0;
+        psh_seen[psh_seen_n].vary = false;
+        psh_seen[psh_seen_n].queued = false;
+        psh_seen[psh_seen_n].ready = false;
+        return psh_seen_n++;
+    }
+    return -1;
+}
+
+bool pgraph_glsl_psh_dynamic_pending_take(PshState *out)
+{
+    if (psh_pending_r == psh_pending_w) {
+        return false;
+    }
+    *out = psh_pending[psh_pending_r % ARRAY_SIZE(psh_pending)];
+    psh_pending_r++;
+    return true;
+}
+
+void pgraph_glsl_psh_dynamic_ready(const PshState *state)
+{
+    pgraph_glsl_dynamic_gen++;
+    uint64_t fh = psh_family_hash(state);
+    for (unsigned i = 0; i < psh_seen_n; i++) {
+        if (psh_seen[i].family == fh) {
+            psh_seen[i].ready = true;
+            return;
+        }
+    }
+}
+
+/* Canonical dynamic sibling of a state: same family, combiner and alpha
+ * carried in uniforms. Returns false when the state already is its own
+ * sibling (or the interpreter path is disabled). */
+bool pgraph_glsl_psh_canonicalize_dynamic(PshState *state)
+{
+    if (!pgraph_gpu_boost_gl() || state->combiner_dynamic) {
+        return false;
+    }
+    state->alpha_dynamic = true;
+    psh_zero_alpha_fields(state);
+    state->combiner_dynamic = true;
+    psh_zero_combiner_fields(state);
+    return true;
+}
 
 // TODO: https://github.com/xemu-project/xemu/issues/2260
 //   Investigate how color keying is handled for components with no alpha or
@@ -70,8 +195,6 @@ void pgraph_glsl_set_psh_state(PGRAPHState *pg, PshState *state)
 
     state->alpha_test = pgraph_reg_r(pg, NV_PGRAPH_CONTROL_0) &
                         NV_PGRAPH_CONTROL_0_ALPHATESTENABLE;
-    state->alpha_func = (enum PshAlphaFunc)GET_MASK(
-        pgraph_reg_r(pg, NV_PGRAPH_CONTROL_0), NV_PGRAPH_CONTROL_0_ALPHAFUNC);
 
     state->point_sprite = pgraph_reg_r(pg, NV_PGRAPH_SETUPRASTER) &
                           NV_PGRAPH_SETUPRASTER_POINTSMOOTHENABLE;
@@ -135,43 +258,10 @@ void pgraph_glsl_set_psh_state(PGRAPHState *pg, PshState *state)
             GET_MASK(tex_fmt, NV_PGRAPH_TEXFMT0_BORDER_SOURCE);
         bool cubemap = GET_MASK(tex_fmt, NV_PGRAPH_TEXFMT0_CUBEMAPENABLE);
         state->tex_cubemap[i] = cubemap;
-        state->border_logical_size[i][0] = 0.0f;
-        state->border_logical_size[i][1] = 0.0f;
-        state->border_logical_size[i][2] = 0.0f;
+        state->border_adjust[i] = false;
         if (border_source != NV_PGRAPH_TEXFMT0_BORDER_SOURCE_COLOR) {
             if (!f.linear && !cubemap) {
-                // The actual texture will be (at least) double the reported
-                // size and shifted by a 4 texel border but texture coordinates
-                // will still be relative to the reported size.
-                unsigned int reported_width =
-                    1 << GET_MASK(tex_fmt, NV_PGRAPH_TEXFMT0_BASE_SIZE_U);
-                unsigned int reported_height =
-                    1 << GET_MASK(tex_fmt, NV_PGRAPH_TEXFMT0_BASE_SIZE_V);
-                unsigned int reported_depth =
-                    1 << GET_MASK(tex_fmt, NV_PGRAPH_TEXFMT0_BASE_SIZE_P);
-
-                state->border_logical_size[i][0] = reported_width;
-                state->border_logical_size[i][1] = reported_height;
-                state->border_logical_size[i][2] = reported_depth;
-
-                if (reported_width < 8) {
-                    state->border_inv_real_size[i][0] = 0.0625f;
-                } else {
-                    state->border_inv_real_size[i][0] =
-                        1.0f / (reported_width * 2.0f);
-                }
-                if (reported_height < 8) {
-                    state->border_inv_real_size[i][1] = 0.0625f;
-                } else {
-                    state->border_inv_real_size[i][1] =
-                        1.0f / (reported_height * 2.0f);
-                }
-                if (reported_depth < 8) {
-                    state->border_inv_real_size[i][2] = 0.0625f;
-                } else {
-                    state->border_inv_real_size[i][2] =
-                        1.0f / (reported_depth * 2.0f);
-                }
+                state->border_adjust[i] = true;
             } else {
                 NV2A_UNIMPLEMENTED(
                     "Border source texture with linear %d cubemap %d", f.linear,
@@ -229,6 +319,25 @@ void pgraph_glsl_set_psh_state(PGRAPHState *pg, PshState *state)
                 pg->surface_shape.zeta_format);
         assert(false);
         break;
+    }
+
+    state->combiner_dynamic = false;
+    state->alpha_dynamic = false;
+    if (pgraph_gpu_boost_gl()) {
+        int i = psh_family_note(state);
+        /* The sibling is transient cover, not a destination: the raw state
+         * flows, and first meet serves the sibling only while the exact
+         * program builds off-thread. A sibling queued or already compiled
+         * needs nothing more here. */
+        if (i >= 0 && psh_seen[i].vary && !psh_seen[i].ready &&
+            !psh_seen[i].queued &&
+            psh_pending_w - psh_pending_r < ARRAY_SIZE(psh_pending)) {
+            PshState dyn = *state;
+            pgraph_glsl_psh_canonicalize_dynamic(&dyn);
+            psh_pending[psh_pending_w % ARRAY_SIZE(psh_pending)] = dyn;
+            psh_pending_w++;
+            psh_seen[i].queued = true;
+        }
     }
 }
 
@@ -769,13 +878,10 @@ static void psh_append_depth_range_test(const struct PixelShader *ps,
 
 // Adjust the s, t coordinates in the given VAR to account for the 4 texel
 // border supported by the hardware.
-/* UPSTREAM CANDIDATE: the reciprocals of the real texture sizes are printed
- * with nine significant digits: six decimals (%f) are half a texel off at
- * 1024. */
 static void apply_border_adjustment(const struct PixelShader *ps, MString *vars, int tex_index, const char *var_template)
 {
     int i = tex_index;
-    if (ps->state->border_logical_size[i][0] == 0.0f) {
+    if (!ps->state->border_adjust[i]) {
         return;
     }
 
@@ -784,10 +890,9 @@ static void apply_border_adjustment(const struct PixelShader *ps, MString *vars,
 
     mstring_append_fmt(
         vars,
-        "vec3 t%dLogicalSize = vec3(%f, %f, %f);\n"
-        "%s.xyz = (%s.xyz * t%dLogicalSize + vec3(4, 4, 4)) * vec3(%.9g, %.9g, %.9g);\n",
-        i, ps->state->border_logical_size[i][0], ps->state->border_logical_size[i][1], ps->state->border_logical_size[i][2],
-        var_name, var_name, i, ps->state->border_inv_real_size[i][0], ps->state->border_inv_real_size[i][1], ps->state->border_inv_real_size[i][2]);
+        "%s.xyz = (%s.xyz * borderLogicalSize[%d] + vec3(4, 4, 4)) *"
+        " borderInvRealSize[%d];\n",
+        var_name, var_name, i, i);
 }
 
 static void apply_convolution_filter(const struct PixelShader *ps, MString *vars, int tex)
@@ -820,10 +925,158 @@ static void define_colorkey_comparator(MString *preflight)
     // clang-format on
 }
 
+/* Register-driven combiner: the stage programs stay in PGRAPH register form
+ * (combCtl/combRgbIn/...) and one generated shader interprets them, exactly as
+ * the hardware does. Emitted only for states flagged combiner_dynamic. */
+static void emit_dynamic_combiner(struct PixelShader *ps, MString *preflight)
+{
+    mstring_append(preflight,
+        "vec4 cregs[16];\n"
+        "vec4 comb_fetch(uint reg, int stage) {\n"
+        "    if (reg == 1u) {\n"
+        "        return consts[((stage == 8 || (combCtl & 0x1000u) != 0u)"
+                             " ? stage : 0) * 2];\n"
+        "    }\n"
+        "    if (reg == 2u) {\n"
+        "        return consts[((stage == 8 || (combCtl & 0x10000u) != 0u)"
+                             " ? stage : 0) * 2 + 1];\n"
+        "    }\n"
+        "    return cregs[reg];\n"
+        "}\n"
+        /* Mapping switches compile poorly (select-chain blowup at link);
+         * scale/bias tables express the same eight functions. */
+        "const float cmap_s[8] = float[8](1.0, -1.0, 2.0, -2.0, 1.0, -1.0,"
+                                        " 1.0, -1.0);\n"
+        "const float cmap_b[8] = float[8](0.0, 1.0, -1.0, 1.0, -0.5, 0.5,"
+                                        " 0.0, 0.0);\n"
+        "const float omap_s[8] = float[8](1.0, 1.0, 2.0, 2.0, 4.0, 1.0,"
+                                        " 0.5, 1.0);\n"
+        "const float omap_b[8] = float[8](0.0, -0.5, 0.0, -0.5, 0.0, 0.0,"
+                                        " 0.0, 0.0);\n"
+        "vec3 comb_in_rgb(uint b, int stage) {\n"
+        "    vec4 v = comb_fetch(b & 0xFu, stage);\n"
+        "    vec3 x = ((b & 0x10u) != 0u) ? v.aaa : v.rgb;\n"
+        "    uint m = (b >> 5) & 7u;\n"
+        "    vec3 base = (m == 1u) ? clamp(x, 0.0, 1.0)"
+                     " : ((m >= 6u) ? x : max(x, 0.0));\n"
+        "    return base * cmap_s[m] + cmap_b[m];\n"
+        "}\n"
+        "float comb_in_a(uint b, int stage) {\n"
+        "    vec4 v = comb_fetch(b & 0xFu, stage);\n"
+        "    float x = ((b & 0x10u) != 0u) ? v.a : v.b;\n"
+        "    uint m = (b >> 5) & 7u;\n"
+        "    float base = (m == 1u) ? clamp(x, 0.0, 1.0)"
+                     " : ((m >= 6u) ? x : max(x, 0.0));\n"
+        "    return base * cmap_s[m] + cmap_b[m];\n"
+        "}\n"
+        "vec3 comb_map3(vec3 x, uint m) {\n"
+        "    return (x + omap_b[m]) * omap_s[m];\n"
+        "}\n"
+        "float comb_map1(float x, uint m) {\n"
+        "    return (x + omap_b[m]) * omap_s[m];\n"
+        "}\n"
+        "void comb_write3(uint reg, vec3 x) {\n"
+        "    if (reg != 0u) { cregs[reg].rgb = x; }\n"
+        "}\n"
+        "void comb_write1(uint reg, float x) {\n"
+        "    if (reg != 0u) { cregs[reg].a = x; }\n"
+        "}\n"
+        "void comb_stage(int s) {\n"
+        "    uint rin = combRgbIn[s];\n"
+        "    uint rout = combRgbOut[s];\n"
+        "    uint ain = combAlphaIn[s];\n"
+        "    uint aout = combAlphaOut[s];\n"
+        "    uint rf = rout >> 12;\n"
+        "    uint af = aout >> 12;\n"
+        "    vec3 ra = comb_in_rgb((rin >> 24) & 0xFFu, s);\n"
+        "    vec3 rb = comb_in_rgb((rin >> 16) & 0xFFu, s);\n"
+        "    vec3 rc = comb_in_rgb((rin >> 8) & 0xFFu, s);\n"
+        "    vec3 rd = comb_in_rgb(rin & 0xFFu, s);\n"
+        "    float a_a = comb_in_a((ain >> 24) & 0xFFu, s);\n"
+        "    float a_b = comb_in_a((ain >> 16) & 0xFFu, s);\n"
+        "    float a_c = comb_in_a((ain >> 8) & 0xFFu, s);\n"
+        "    float a_d = comb_in_a(ain & 0xFFu, s);\n"
+        "    vec3 rab = ((rf & 2u) != 0u) ? vec3(dot(ra, rb)) : (ra * rb);\n"
+        "    vec3 rcd = ((rf & 1u) != 0u) ? vec3(dot(rc, rd)) : (rc * rd);\n"
+        "    float aab = a_a * a_b;\n"
+        "    float acd = a_c * a_d;\n"
+        "    bool mux = ((combCtl & 0x100u) != 0u)"
+                     " ? (cregs[12].a >= 0.5)"
+                     " : ((uint(cregs[12].a * 255.0) & 1u) == 1u);\n"
+        "    vec3 rmux = ((rf & 4u) != 0u) ? (mux ? rcd : rab) : (rab + rcd);\n"
+        "    float amux = ((af & 4u) != 0u) ? (mux ? acd : aab) : (aab + acd);\n"
+        "    uint rmap = (rf >> 3) & 7u;\n"
+        "    uint amap = (af >> 3) & 7u;\n"
+        "    rab = clamp(comb_map3(rab, rmap), -1.0, 1.0);\n"
+        "    rcd = clamp(comb_map3(rcd, rmap), -1.0, 1.0);\n"
+        "    rmux = clamp(comb_map3(rmux, rmap), -1.0, 1.0);\n"
+        "    aab = clamp(comb_map1(aab, amap), -1.0, 1.0);\n"
+        "    acd = clamp(comb_map1(acd, amap), -1.0, 1.0);\n"
+        "    amux = clamp(comb_map1(amux, amap), -1.0, 1.0);\n"
+        "    comb_write3((rout >> 4) & 0xFu, rab);\n"
+        "    if ((rf & 0x80u) != 0u) { comb_write1((rout >> 4) & 0xFu, rab.b); }\n"
+        "    comb_write3(rout & 0xFu, rcd);\n"
+        "    if ((rf & 0x40u) != 0u) { comb_write1(rout & 0xFu, rcd.b); }\n"
+        "    comb_write3((rout >> 8) & 0xFu, rmux);\n"
+        "    comb_write1((aout >> 4) & 0xFu, aab);\n"
+        "    comb_write1(aout & 0xFu, acd);\n"
+        "    comb_write1((aout >> 8) & 0xFu, amux);\n"
+        "}\n"
+        "void comb_final() {\n"
+        "    if ((combFinal0 | combFinal1) == 0u) {\n"
+        /* All-zero registers output zero: fragColor is never left unset. */
+        "        fragColor = vec4(0.0);\n"
+        "        return;\n"
+        "    }\n"
+        "    uint flags = combFinal1 & 0xFFu;\n"
+        "    vec3 s1 = ((flags & 0x40u) != 0u) ? (1.0 - cregs[5]).rgb"
+                                              " : cregs[5].rgb;\n"
+        "    vec3 s2 = ((flags & 0x20u) != 0u) ? (1.0 - cregs[12]).rgb"
+                                              " : cregs[12].rgb;\n"
+        "    vec3 sum = s1 + s2;\n"
+        "    if ((flags & 0x80u) != 0u) { sum = clamp(sum, 0.0, 1.0); }\n"
+        "    cregs[14] = vec4(sum, 0.0);\n"
+        "    vec3 fe = comb_in_rgb((combFinal1 >> 24) & 0xFFu, 8);\n"
+        "    vec3 ff = comb_in_rgb((combFinal1 >> 16) & 0xFFu, 8);\n"
+        "    cregs[15] = vec4(fe * ff, 0.0);\n"
+        "    vec3 fa = comb_in_rgb((combFinal0 >> 24) & 0xFFu, 8);\n"
+        "    vec3 fb = comb_in_rgb((combFinal0 >> 16) & 0xFFu, 8);\n"
+        "    vec3 fc = comb_in_rgb((combFinal0 >> 8) & 0xFFu, 8);\n"
+        "    vec3 fd = comb_in_rgb(combFinal0 & 0xFFu, 8);\n"
+        "    fragColor.rgb = fd + mix(fc, fb, fa);\n"
+        "    fragColor.a = comb_in_a((combFinal1 >> 8) & 0xFFu, 8);\n"
+        "}\n");
+
+    mstring_append(ps->code, "// Dynamic combiner\n");
+    for (int i = 0; i < 16; i++) {
+        const char *init;
+        switch (i) {
+        case 3: init = "pFog"; break;
+        case 4: init = "v0"; break;
+        case 5: init = "v1"; break;
+        case 8: init = "t0"; break;
+        case 9: init = "t1"; break;
+        case 10: init = "t2"; break;
+        case 11: init = "t3"; break;
+        case 12: init = ps->tex_modes[0] != PS_TEXTUREMODES_NONE ?
+                        "vec4(0.0, 0.0, 0.0, t0.a)" : "vec4(0.0, 0.0, 0.0, 1.0)";
+            break;
+        default: init = "vec4(0.0)"; break;
+        }
+        mstring_append_fmt(ps->code, "cregs[%d] = %s;\n", i, init);
+    }
+    mstring_append(ps->code,
+        "for (int s = 0; s < int(combCtl & 0xFFu); s++) { comb_stage(s); }\n"
+        "comb_final();\n");
+}
+
 static MString* psh_convert(struct PixelShader *ps)
 {
     MString *preflight = mstring_new();
-    pgraph_glsl_get_vtx_header(preflight, ps->opts.vulkan,
+    /* Separable programs match stages by location: by name, an input the
+     * vertex stage never writes lets the driver pack the rest differently
+     * on each side (seen on AMD Windows GL). */
+    pgraph_glsl_get_vtx_header(preflight, ps->opts.vulkan || ps->opts.locations,
                              ps->state->smooth_shading, true, false, false);
 
     if (ps->opts.vulkan) {
@@ -1013,24 +1266,32 @@ static MString* psh_convert(struct PixelShader *ps)
                              "}\n");
     }
 
+    /* Barycentric depth: the perspective mode divides the weights by w
+     * (perspective-correct) and interpolates w instead of z. */
+    mstring_append(
+        clip,
+        "vec2 unscaled_xy = gl_FragCoord.xy / surfaceScale;\n"
+        "precise float bc0 = area(unscaled_xy, vtxPos1.xy, vtxPos2.xy);\n"
+        "precise float bc1 = area(unscaled_xy, vtxPos2.xy, vtxPos0.xy);\n"
+        "precise float bc2 = area(unscaled_xy, vtxPos0.xy, vtxPos1.xy);\n");
+    if (ps->state->z_perspective) {
+        mstring_append(clip, "bc0 /= vtxPos0.w;\n"
+                             "bc1 /= vtxPos1.w;\n"
+                             "bc2 /= vtxPos2.w;\n");
+    }
+    mstring_append(
+        clip,
+        "float inv_bcsum = 1.0 / (bc0 + bc1 + bc2);\n"
+        // Denominator can be zero in case the rasterized primitive is a
+        // point or a degenerate line or triangle.
+        "if (isinf(inv_bcsum)) {\n"
+        "  inv_bcsum = 0.0;\n"
+        "}\n"
+        "bc1 *= inv_bcsum;\n"
+        "bc2 *= inv_bcsum;\n");
     if (ps->state->z_perspective) {
         mstring_append(
             clip,
-            "vec2 unscaled_xy = gl_FragCoord.xy / surfaceScale;\n"
-            "precise float bc0 = area(unscaled_xy, vtxPos1.xy, vtxPos2.xy);\n"
-            "precise float bc1 = area(unscaled_xy, vtxPos2.xy, vtxPos0.xy);\n"
-            "precise float bc2 = area(unscaled_xy, vtxPos0.xy, vtxPos1.xy);\n"
-            "bc0 /= vtxPos0.w;\n"
-            "bc1 /= vtxPos1.w;\n"
-            "bc2 /= vtxPos2.w;\n"
-            "float inv_bcsum = 1.0 / (bc0 + bc1 + bc2);\n"
-            // Denominator can be zero in case the rasterized primitive is a
-            // point or a degenerate line or triangle.
-            "if (isinf(inv_bcsum)) {\n"
-            "  inv_bcsum = 0.0;\n"
-            "}\n"
-            "bc1 *= inv_bcsum;\n"
-            "bc2 *= inv_bcsum;\n"
             "precise float zvalue = vtxPos0.w + (bc1*(vtxPos1.w - vtxPos0.w) + bc2*(vtxPos2.w - vtxPos0.w));\n"
             // If GPU clipping is inaccurate, the point gl_FragCoord.xy might
             // be above the horizon of the plane of a rasterized triangle
@@ -1050,18 +1311,6 @@ static MString* psh_convert(struct PixelShader *ps)
     } else {
         mstring_append(
             clip,
-            "vec2 unscaled_xy = gl_FragCoord.xy / surfaceScale;\n"
-            "precise float bc0 = area(unscaled_xy, vtxPos1.xy, vtxPos2.xy);\n"
-            "precise float bc1 = area(unscaled_xy, vtxPos2.xy, vtxPos0.xy);\n"
-            "precise float bc2 = area(unscaled_xy, vtxPos0.xy, vtxPos1.xy);\n"
-            "float inv_bcsum = 1.0 / (bc0 + bc1 + bc2);\n"
-            // Denominator can be zero in case the rasterized primitive is a
-            // point or a degenerate line or triangle.
-            "if (isinf(inv_bcsum)) {\n"
-            "  inv_bcsum = 0.0;\n"
-            "}\n"
-            "bc1 *= inv_bcsum;\n"
-            "bc2 *= inv_bcsum;\n"
             "precise float zvalue = vtxPos0.z + (bc1*(vtxPos1.z - vtxPos0.z) + bc2*(vtxPos2.z - vtxPos0.z));\n"
             "zvalue += depthOffset;\n"
             "zvalue += depthFactor*triMZ;\n");
@@ -1193,7 +1442,7 @@ static MString* psh_convert(struct PixelShader *ps)
                 i, i, i, ps->state->tex_cubemap[i] ? "z" : "");
             break;
         case PS_TEXTUREMODES_PASSTHRU:
-            assert(ps->state->border_logical_size[i][0] == 0.0f && "Unexpected border texture on passthru");
+            assert(!ps->state->border_adjust[i] && "Unexpected border texture on passthru");
             mstring_append_fmt(vars, "vec4 t%d = pT%d;\n", i, i);
             break;
         case PS_TEXTUREMODES_CLIPPLANE: {
@@ -1409,7 +1658,11 @@ static MString* psh_convert(struct PixelShader *ps)
             mstring_append_fmt(preflight, "uniform %s texSamp%d;\n", sampler_type, i);
 
             /* As this means a texture fetch does happen, do alphakill */
-            if (ps->state->alphakill[i]) {
+            if (ps->state->alpha_dynamic) {
+                mstring_append_fmt(vars,
+                    "if ((alphaKillMask & %du) != 0u && t%d.a == 0.0)"
+                    " { discard; };\n", 1 << i, i);
+            } else if (ps->state->alphakill[i]) {
                 mstring_append_fmt(vars, "if (t%d.a == 0.0) { discard; };\n",
                                    i);
             }
@@ -1468,44 +1721,50 @@ static MString* psh_convert(struct PixelShader *ps)
         }
     }
 
-    for (int i = 0; i < ps->num_stages; i++) {
-        ps->cur_stage = i;
-        mstring_append_fmt(ps->code, "// Stage %d\n", i);
-        MString* color = add_stage_code(ps, ps->stage[i].rgb_input, ps->stage[i].rgb_output, "rgb", false);
-        MString* alpha = add_stage_code(ps, ps->stage[i].alpha_input, ps->stage[i].alpha_output, "a", true);
+    if (ps->state->combiner_dynamic) {
+        emit_dynamic_combiner(ps, preflight);
+    } else {
+        for (int i = 0; i < ps->num_stages; i++) {
+            ps->cur_stage = i;
+            mstring_append_fmt(ps->code, "// Stage %d\n", i);
+            MString* color = add_stage_code(ps, ps->stage[i].rgb_input, ps->stage[i].rgb_output, "rgb", false);
+            MString* alpha = add_stage_code(ps, ps->stage[i].alpha_input, ps->stage[i].alpha_output, "a", true);
 
-        mstring_append(ps->code, mstring_get_str(color));
-        mstring_append(ps->code, mstring_get_str(alpha));
-        mstring_unref(color);
-        mstring_unref(alpha);
+            mstring_append(ps->code, mstring_get_str(color));
+            mstring_append(ps->code, mstring_get_str(alpha));
+            mstring_unref(color);
+            mstring_unref(alpha);
+        }
+
+        if (ps->final_input.enabled) {
+            ps->cur_stage = 8;
+            mstring_append(ps->code, "// Final Combiner\n");
+            add_final_stage_code(ps, ps->final_input);
+        }
     }
 
-    if (ps->final_input.enabled) {
-        ps->cur_stage = 8;
-        mstring_append(ps->code, "// Final Combiner\n");
-        add_final_stage_code(ps, ps->final_input);
-    }
-
-    if (ps->state->alpha_test && ps->state->alpha_func != ALPHA_FUNC_ALWAYS) {
-        if (ps->state->alpha_func == ALPHA_FUNC_NEVER) {
-            mstring_append(ps->code, "discard;\n");
-        } else {
-            const char* alpha_op;
-            switch (ps->state->alpha_func) {
-            case ALPHA_FUNC_LESS: alpha_op = "<"; break;
-            case ALPHA_FUNC_EQUAL: alpha_op = "=="; break;
-            case ALPHA_FUNC_LEQUAL: alpha_op = "<="; break;
-            case ALPHA_FUNC_GREATER: alpha_op = ">"; break;
-            case ALPHA_FUNC_NOTEQUAL: alpha_op = "!="; break;
-            case ALPHA_FUNC_GEQUAL: alpha_op = ">="; break;
-            default:
-                assert(false);
-                break;
-            }
-            mstring_append_fmt(ps->code,
-                               "int fragAlpha = int(round(fragColor.a * 255.0));\n"
-                               "if (!(fragAlpha %s alphaRef)) discard;\n",
-                               alpha_op);
+    if (ps->state->alpha_dynamic || ps->state->alpha_test) {
+        /* The comparison function is a uniform: baking it in would compile
+         * one shader variant per function for identical code. */
+        if (ps->state->alpha_dynamic) {
+            mstring_append(ps->code, "if (alphaTestEnable != 0) {\n");
+        }
+        mstring_append(ps->code,
+            "int fragAlpha = int(round(fragColor.a * 255.0));\n"
+            "bool alphaPass;\n"
+            "switch (alphaFunc) {\n"
+            "case 0: alphaPass = false; break;\n"
+            "case 1: alphaPass = fragAlpha < alphaRef; break;\n"
+            "case 2: alphaPass = fragAlpha == alphaRef; break;\n"
+            "case 3: alphaPass = fragAlpha <= alphaRef; break;\n"
+            "case 4: alphaPass = fragAlpha > alphaRef; break;\n"
+            "case 5: alphaPass = fragAlpha != alphaRef; break;\n"
+            "case 6: alphaPass = fragAlpha >= alphaRef; break;\n"
+            "default: alphaPass = true; break;\n"
+            "}\n"
+            "if (!alphaPass) discard;\n");
+        if (ps->state->alpha_dynamic) {
+            mstring_append(ps->code, "}\n");
         }
     }
 
@@ -1550,7 +1809,8 @@ static MString* psh_convert(struct PixelShader *ps)
     }
 
     MString *final = mstring_new();
-    mstring_append_fmt(final, "#version %d\n\n", ps->opts.vulkan ? 450 : 400);
+    mstring_append_fmt(final, "#version %d\n\n",
+                       ps->opts.vulkan ? 450 : (ps->opts.locations ? 410 : 400));
     mstring_append(final, mstring_get_str(preflight));
     mstring_append(final, "void main() {\n");
     mstring_append(final, mstring_get_str(clip));
@@ -1679,6 +1939,42 @@ void pgraph_glsl_set_psh_uniform_values(PGRAPHState *pg,
             }
         }
     }
+    if (locs[PshUniform_combCtl] != -1) {
+        values->combCtl[0] = pgraph_reg_r(pg, NV_PGRAPH_COMBINECTL);
+        values->combFinal0[0] = pgraph_reg_r(pg, NV_PGRAPH_COMBINESPECFOG0);
+        values->combFinal1[0] = pgraph_reg_r(pg, NV_PGRAPH_COMBINESPECFOG1);
+        for (int i = 0; i < 8; i++) {
+            values->combRgbIn[i] =
+                pgraph_reg_r(pg, NV_PGRAPH_COMBINECOLORI0 + i * 4);
+            values->combRgbOut[i] =
+                pgraph_reg_r(pg, NV_PGRAPH_COMBINECOLORO0 + i * 4);
+            values->combAlphaIn[i] =
+                pgraph_reg_r(pg, NV_PGRAPH_COMBINEALPHAI0 + i * 4);
+            values->combAlphaOut[i] =
+                pgraph_reg_r(pg, NV_PGRAPH_COMBINEALPHAO0 + i * 4);
+        }
+    }
+    if (locs[PshUniform_alphaKillMask] != -1) {
+        uint32_t mask = 0;
+        for (int i = 0; i < 4; i++) {
+            uint32_t ctl_0 = pgraph_reg_r(pg, NV_PGRAPH_TEXCTL0_0 + i * 4);
+            if (pgraph_is_texture_stage_active(pg, i) &&
+                (ctl_0 & NV_PGRAPH_TEXCTL0_0_ENABLE) &&
+                (ctl_0 & NV_PGRAPH_TEXCTL0_0_ALPHAKILLEN)) {
+                mask |= 1u << i;
+            }
+        }
+        values->alphaKillMask[0] = mask;
+    }
+    if (locs[PshUniform_alphaTestEnable] != -1) {
+        values->alphaTestEnable[0] =
+            (pgraph_reg_r(pg, NV_PGRAPH_CONTROL_0) &
+             NV_PGRAPH_CONTROL_0_ALPHATESTENABLE) ? 1 : 0;
+    }
+    if (locs[PshUniform_alphaFunc] != -1) {
+        values->alphaFunc[0] = GET_MASK(pgraph_reg_r(pg, NV_PGRAPH_CONTROL_0),
+                                        NV_PGRAPH_CONTROL_0_ALPHAFUNC);
+    }
     if (locs[PshUniform_alphaRef] != -1) {
         int alpha_ref = GET_MASK(pgraph_reg_r(pg, NV_PGRAPH_CONTROL_0),
                                  NV_PGRAPH_CONTROL_0_ALPHAREF);
@@ -1694,6 +1990,23 @@ void pgraph_glsl_set_psh_uniform_values(PGRAPHState *pg,
        for (int i = 0; i < NV2A_MAX_TEXTURES; i++) {
             values->colorKeyMask[i] =
                 get_color_key_mask_for_texture(pg, i);
+        }
+    }
+    if (locs[PshUniform_borderLogicalSize] != -1) {
+        /* Texture coordinates stay relative to the reported size; the real
+         * texture is doubled and shifted by the 4 texel border. */
+        for (int i = 0; i < NV2A_MAX_TEXTURES; i++) {
+            uint32_t tex_fmt = pgraph_reg_r(pg, NV_PGRAPH_TEXFMT0 + i * 4);
+            unsigned int sz[3] = {
+                1u << GET_MASK(tex_fmt, NV_PGRAPH_TEXFMT0_BASE_SIZE_U),
+                1u << GET_MASK(tex_fmt, NV_PGRAPH_TEXFMT0_BASE_SIZE_V),
+                1u << GET_MASK(tex_fmt, NV_PGRAPH_TEXFMT0_BASE_SIZE_P),
+            };
+            for (int j = 0; j < 3; j++) {
+                values->borderLogicalSize[i][j] = sz[j];
+                values->borderInvRealSize[i][j] =
+                    sz[j] < 8 ? 0.0625f : 1.0f / (sz[j] * 2.0f);
+            }
         }
     }
 

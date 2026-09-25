@@ -4,6 +4,7 @@
  * Copyright (c) 2012 espes
  * Copyright (c) 2015 Jannik Vogel
  * Copyright (c) 2018-2024 Matt Borgerson
+ * Copyright (c) 2026 Réda Chérif-Touil
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -183,9 +184,13 @@ static void apply_texture_parameters(PGRAPHGLState *r,
         needs_border_color = needs_border_color || binding->addrp == NV_PGRAPH_TEXADDRESS0_ADDRU_BORDER;
     }
 
-    if (r->supported_extensions.texture_filter_anisotropic) {
+    /* Shadowed like the parameters above: a new binding is zeroed and a max
+     * anisotropy is never 0 (1 << clamp), so the first apply always sends. */
+    if (r->supported_extensions.texture_filter_anisotropic &&
+        max_anisotropy != binding->max_anisotropy) {
         glTexParameterf(binding->gl_target, GL_TEXTURE_MAX_ANISOTROPY_EXT,
                         max_anisotropy);
+        binding->max_anisotropy = max_anisotropy;
     }
 
     if (!is_bordered && needs_border_color) {
@@ -202,6 +207,28 @@ static void apply_texture_parameters(PGRAPHGLState *r,
     }
 }
 
+/* After a bind outside bind_textures: every bind reaches the driver until
+ * the flip resets the shadow. */
+void pgraph_gl_tex_shadow_invalidate(PGRAPHGLState *r)
+{
+    r->tex_shadow_valid = false;
+}
+
+void pgraph_gl_tex_shadow_reset(PGRAPHGLState *r)
+{
+    memset(r->tex_shadow_name, 0, sizeof(r->tex_shadow_name));
+    memset(r->tex_shadow_target, 0, sizeof(r->tex_shadow_target));
+    r->tex_shadow_valid = true;
+    /* Units are in an unknown state after an external bind: rebind all. */
+    for (int i = 0; i < NV2A_MAX_TEXTURES; i++) {
+        glActiveTexture(GL_TEXTURE0 + i);
+        glBindTexture(GL_TEXTURE_CUBE_MAP, 0);
+        glBindTexture(GL_TEXTURE_1D, 0);
+        glBindTexture(GL_TEXTURE_2D, 0);
+        glBindTexture(GL_TEXTURE_3D, 0);
+    }
+}
+
 void pgraph_gl_bind_textures(NV2AState *d)
 {
     int i;
@@ -214,14 +241,21 @@ void pgraph_gl_bind_textures(NV2AState *d)
         bool enabled = pgraph_is_texture_enabled(pg, i);
         /* FIXME: What happens if texture is disabled but stage is active? */
 
-        glActiveTexture(GL_TEXTURE0 + i);
         if (!enabled) {
+            if (r->tex_shadow_valid && r->tex_shadow_name[i] == 0 &&
+                r->tex_shadow_target[i] == 0) {
+                continue;
+            }
+            glActiveTexture(GL_TEXTURE0 + i);
             glBindTexture(GL_TEXTURE_CUBE_MAP, 0);
             glBindTexture(GL_TEXTURE_1D, 0);
             glBindTexture(GL_TEXTURE_2D, 0);
             glBindTexture(GL_TEXTURE_3D, 0);
+            r->tex_shadow_name[i] = 0;
+            r->tex_shadow_target[i] = 0;
             continue;
         }
+        glActiveTexture(GL_TEXTURE0 + i);
 
         uint32_t filter = pgraph_reg_r(pg, NV_PGRAPH_TEXFILTER0 + i*4);
         uint32_t address = pgraph_reg_r(pg, NV_PGRAPH_TEXADDRESS0 + i*4);
@@ -253,10 +287,39 @@ void pgraph_gl_bind_textures(NV2AState *d)
         bool possibly_dirty_checked = false;
 
         SurfaceBinding *surface = pgraph_gl_surface_get(d, texture_vram_offset);
+        /* A cubemap whose six faces are live colour surfaces is filled by
+         * GPU copies (render_cube_faces_to_texture). */
+        SurfaceBinding *cube_faces[6] = { 0 };
+        bool surf_to_tex_cube = false;
+        int cube_draw_time = 0;
+        if (surface && state.cubemap && state.levels == 1) {
+            size_t face_len = length / 6;
+            TextureShape flat = state;
+            flat.cubemap = false;
+            bool all = true;
+            for (int fc = 0; fc < 6; fc++) {
+                SurfaceBinding *fs = pgraph_gl_surface_get(
+                    d, texture_vram_offset + fc * face_len);
+                if (!fs || !fs->color || fs->width != state.width ||
+                    fs->height != state.height ||
+                    !pgraph_gl_check_surface_to_texture_compatibility(fs,
+                                                                     &flat)) {
+                    all = false;
+                    break;
+                }
+                cube_faces[fc] = fs;
+                if (fs->draw_time > cube_draw_time) {
+                    cube_draw_time = fs->draw_time;
+                }
+            }
+            surf_to_tex_cube = all;
+        }
         TextureBinding *tbind = r->texture_binding[i];
         if (!pg->texture_dirty[i] && tbind) {
             bool reusable = false;
-            if (surface && tbind->draw_time == surface->draw_time) {
+            if (surf_to_tex_cube) {
+                reusable = tbind->draw_time == cube_draw_time;
+            } else if (surface && tbind->draw_time == surface->draw_time) {
                 reusable = true;
             } else if (!surface) {
                 possibly_dirty = check_texture_possibly_dirty(
@@ -270,8 +333,14 @@ void pgraph_gl_bind_textures(NV2AState *d)
             }
 
             if (reusable) {
-                glBindTexture(r->texture_binding[i]->gl_target,
-                              r->texture_binding[i]->gl_texture);
+                TextureBinding *tb = r->texture_binding[i];
+                if (!(r->tex_shadow_valid &&
+                      r->tex_shadow_name[i] == tb->gl_texture &&
+                      r->tex_shadow_target[i] == tb->gl_target)) {
+                    glBindTexture(tb->gl_target, tb->gl_texture);
+                    r->tex_shadow_name[i] = tb->gl_texture;
+                    r->tex_shadow_target[i] = tb->gl_target;
+                }
                 apply_texture_parameters(r,
                                          r->texture_binding[i],
                                          &kelvin_color_format_info_map[state.color_format],
@@ -289,7 +358,13 @@ void pgraph_gl_bind_textures(NV2AState *d)
          * Check active surfaces to see if this texture was a render target
          */
         bool surf_to_tex = false;
-        if (surface != NULL) {
+        if (surf_to_tex_cube) {
+            for (int fc = 0; fc < 6; fc++) {
+                if (cube_faces[fc]->upload_pending) {
+                    pgraph_gl_upload_surface_data(d, cube_faces[fc], false);
+                }
+            }
+        } else if (surface != NULL) {
             surf_to_tex = pgraph_gl_check_surface_to_texture_compatibility(
                     surface, &state);
 
@@ -298,7 +373,7 @@ void pgraph_gl_bind_textures(NV2AState *d)
             }
         }
 
-        if (!surf_to_tex) {
+        if (!surf_to_tex && !surf_to_tex_cube) {
             // FIXME: Restructure to support rendering surfaces to cubemap faces
 
             // Writeback any surfaces which this texture may index
@@ -311,6 +386,9 @@ void pgraph_gl_bind_textures(NV2AState *d)
                     pgraph_gl_surface_download_if_dirty(d, surface);
                 }
             }
+            /* Parked surfaces owing this range write it back. */
+            pgraph_gl_parked_materialize_range(d, texture_vram_offset,
+                                               length);
         }
 
         TextureKey key;
@@ -330,7 +408,7 @@ void pgraph_gl_bind_textures(NV2AState *d)
         TextureLruNode *key_out = container_of(found, TextureLruNode, node);
         possibly_dirty |= (key_out->binding == NULL) || key_out->possibly_dirty;
 
-        if (!surf_to_tex && !possibly_dirty_checked) {
+        if (!surf_to_tex && !surf_to_tex_cube && !possibly_dirty_checked) {
             possibly_dirty |= check_texture_possibly_dirty(
                     d,
                     texture_vram_offset,
@@ -344,7 +422,7 @@ void pgraph_gl_bind_textures(NV2AState *d)
         void *palette_data = (char*)d->vram_ptr + palette_vram_offset;
 
         uint64_t tex_data_hash = 0;
-        if (!surf_to_tex && possibly_dirty) {
+        if (!surf_to_tex && !surf_to_tex_cube && possibly_dirty) {
             tex_data_hash = fast_hash(texture_data, length);
             if (is_indexed) {
                 tex_data_hash ^= fast_hash(palette_data, palette_length);
@@ -363,6 +441,10 @@ void pgraph_gl_bind_textures(NV2AState *d)
         if (key_out->binding == NULL) {
             // Must create the texture
             key_out->binding = generate_texture(state, texture_data, palette_data);
+            if (key_out->binding->gl_target == GL_TEXTURE_2D) {
+                r->fresh_tex[r->fresh_tex_w++ % ARRAY_SIZE(r->fresh_tex)] =
+                    key_out->binding->gl_texture;
+            }
             key_out->binding->data_hash = tex_data_hash;
             key_out->binding->scale = 1;
         } else {
@@ -370,18 +452,30 @@ void pgraph_gl_bind_textures(NV2AState *d)
             glBindTexture(key_out->binding->gl_target,
                           key_out->binding->gl_texture);
         }
+        r->tex_shadow_name[i] = key_out->binding->gl_texture;
+        r->tex_shadow_target[i] = key_out->binding->gl_target;
 
         key_out->possibly_dirty = false;
         TextureBinding *binding = key_out->binding;
         binding->refcnt++;
 
+        if (surf_to_tex_cube && binding->draw_time < cube_draw_time) {
+            pgraph_gl_render_cube_faces_to_texture(d, cube_faces, binding,
+                                                   &state, i);
+            binding->draw_time = cube_draw_time;
+            binding->scale = pg->surface_scale_factor;
+        }
         if (surf_to_tex && binding->draw_time < surface->draw_time) {
 
             trace_nv2a_pgraph_surface_render_to_texture(
                 surface->vram_addr, surface->width, surface->height);
-            pgraph_gl_render_surface_to_texture(d, surface, binding, &state, i);
+            pgraph_gl_render_surface_to_texture(d, surface, binding,
+                                                &state, i);
             binding->draw_time = surface->draw_time;
-            binding->scale = pg->surface_scale_factor;
+            /* Depth reads are downsampled to native 1x (GL_DEPTH_COMPONENT24
+             * marks that path); everything else stays at the scaled size. */
+            binding->scale = (binding->s2t_format == GL_DEPTH_COMPONENT24)
+                                 ? 1 : pg->surface_scale_factor;
         }
 
         apply_texture_parameters(r,
@@ -397,6 +491,8 @@ void pgraph_gl_bind_textures(NV2AState *d)
         if (r->texture_binding[i]) {
             if (r->texture_binding[i]->gl_target != binding->gl_target) {
                 glBindTexture(r->texture_binding[i]->gl_target, 0);
+                r->tex_shadow_name[i] = 0;
+                r->tex_shadow_target[i] = 0;
             }
             texture_binding_destroy(r->texture_binding[i]);
         }
@@ -740,7 +836,7 @@ static TextureBinding* generate_texture(const TextureShape s,
                          (const GLint *)f.gl_swizzle_mask);
     }
 
-    TextureBinding* ret = (TextureBinding *)g_malloc(sizeof(TextureBinding));
+    TextureBinding* ret = (TextureBinding *)g_malloc0(sizeof(TextureBinding));
     ret->gl_target = gl_target;
     ret->gl_texture = gl_texture;
     ret->refcnt = 1;

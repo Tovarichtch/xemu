@@ -8,6 +8,7 @@
  * Copyright (c) 2012 espes
  * Copyright (c) 2015 Jannik Vogel
  * Copyright (c) 2018-2024 Matt Borgerson
+ * Copyright (c) 2026 Réda Chérif-Touil
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -28,6 +29,7 @@
 #include "qemu/compiler.h"
 #include "ui/xemu-settings.h"
 #include "renderer.h"
+#include <math.h>
 
 const int num_invalid_surfaces_to_keep = 10;  // FIXME: Make automatic
 const int max_surface_frame_time_delta = 5;
@@ -130,6 +132,10 @@ static bool check_surface_overlaps_range(const SurfaceBinding *surface,
     return !(surface->vram_addr >= range_end || range_start >= surface_end);
 }
 
+static void parked_materialize_range(NV2AState *d, hwaddr start,
+                                     hwaddr size);
+static void parked_owed_settled(NV2AState *d, SurfaceBinding *s);
+
 void pgraph_vk_download_surfaces_in_range_if_dirty(PGRAPHState *pg,
                                                    hwaddr start, hwaddr size)
 {
@@ -142,6 +148,9 @@ void pgraph_vk_download_surfaces_in_range_if_dirty(PGRAPHState *pg,
                 container_of(pg, NV2AState, pgraph), surface);
         }
     }
+    /* A texture is built from this RAM: settle its owed lazy writebacks. */
+    parked_materialize_range(container_of(pg, NV2AState, pgraph), start,
+                             size);
 }
 
 static void download_surface_to_buffer(NV2AState *d, SurfaceBinding *surface,
@@ -169,11 +178,14 @@ static void download_surface_to_buffer(NV2AState *d, SurfaceBinding *surface,
     bool compute_needs_finish = (use_compute_to_convert_depth_stencil_format &&
                                  pgraph_vk_compute_needs_finish(r));
 
-    if (r->in_command_buffer &&
-        surface->draw_time >= r->command_buffer_start_time) {
-        pgraph_vk_finish(pg, VK_FINISH_REASON_SURFACE_DOWN);
-    } else if (compute_needs_finish) {
+    if (compute_needs_finish) {
+        /* Only a synchronous finish resets the compute descriptor sets: an
+         * asynchronous SURFACE_DOWN would leave them full. */
         pgraph_vk_finish(pg, VK_FINISH_REASON_NEED_BUFFER_SPACE);
+    } else if (r->in_command_buffer &&
+        (surface->draw_time >= r->command_buffer_start_time ||
+         pgraph_vk_surface_borrow_pending(r, surface))) {
+        pgraph_vk_finish(pg, VK_FINISH_REASON_SURFACE_DOWN);
     }
 
     bool downscale = (pg->surface_scale_factor != 1);
@@ -198,15 +210,28 @@ static void download_surface_to_buffer(NV2AState *d, SurfaceBinding *surface,
     unsigned int scaled_width = surface->width,
                  scaled_height = surface->height;
     pgraph_apply_scaling_factor(pg, &scaled_width, &scaled_height);
+    if (use_compute_to_convert_depth_stencil_format) {
+        /* Depth and stencil planes side by side, before the aux recording
+         * that reads them. */
+        pgraph_vk_buffer_ensure_capacity(pg, BUFFER_COMPUTE_DST,
+                                         (VkDeviceSize)scaled_width *
+                                             scaled_height * 8);
+    }
 
     VkCommandBuffer cmd = pgraph_vk_begin_single_time_commands(pg);
     pgraph_vk_begin_debug_marker(r, cmd, RGBA_RED, __func__);
 
+    /* In-place sampling: recorded draws may sample this surface in place;
+     * the copy only reads, so the image goes back to where it rests (a
+     * borrow transition still in the recording was drained above). */
+    bool sampled_in_place = surface->in_shader_read;
     pgraph_vk_transition_image_layout(
         pg, cmd, surface->image, surface->host_fmt.vk_format,
-        surface->color ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL :
-                         VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+        pgraph_vk_surface_base_layout(surface),
         VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    if (!sampled_in_place) {
+        pgraph_vk_surface_left_shader_read(&d->pgraph, surface);
+    }
 
     int num_copy_regions = 1;
     VkBufferImageCopy copy_regions[2];
@@ -314,8 +339,7 @@ static void download_surface_to_buffer(NV2AState *d, SurfaceBinding *surface,
     pgraph_vk_transition_image_layout(
         pg, cmd, surface->image, surface->host_fmt.vk_format,
         VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-        surface->color ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL :
-                         VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+        pgraph_vk_surface_base_layout(surface));
 
     // FIXME: Verify output of depth stencil conversion
     // FIXME: Track current layout and only transition when required
@@ -444,6 +468,7 @@ static void download_surface_to_buffer(NV2AState *d, SurfaceBinding *surface,
 
     nv2a_profile_inc_counter(NV2A_PROF_QUEUE_SUBMIT_1);
     pgraph_vk_end_debug_marker(r, cmd);
+
     pgraph_vk_end_single_time_commands(pg, cmd);
 
     void *mapped_memory_ptr = NULL;
@@ -488,6 +513,8 @@ static void download_surface(NV2AState *d, SurfaceBinding *surface, bool force)
     memory_region_set_client_dirty(d->vram, surface->vram_addr,
                                    surface->pitch * surface->height,
                                    DIRTY_MEMORY_NV2A_TEX);
+    pgraph_writeback_clear_discard(&d->pgraph, surface->vram_addr,
+                                   surface->pitch * surface->height);
 
     surface->download_pending = false;
     surface->draw_dirty = false;
@@ -516,6 +543,13 @@ void pgraph_vk_process_pending_downloads(NV2AState *d)
     QTAILQ_FOREACH(surface, &r->surfaces, entry) {
         download_surface(d, surface, false);
     }
+    /* Owed lazy writebacks the CPU access callback queued. */
+    QTAILQ_FOREACH(surface, &r->invalid_surfaces, entry) {
+        if (surface->writeback_owed && surface->download_pending) {
+            download_surface(d, surface, false);
+            parked_owed_settled(d, surface);
+        }
+    }
 
     qatomic_set(&r->downloads_pending, false);
     qemu_event_set(&r->downloads_complete);
@@ -528,6 +562,13 @@ void pgraph_vk_download_dirty_surfaces(NV2AState *d)
     SurfaceBinding *surface;
     QTAILQ_FOREACH(surface, &r->surfaces, entry) {
         pgraph_vk_surface_download_if_dirty(d, surface);
+    }
+    /* Settle every owed lazy writeback: a snapshot must find RAM exact. */
+    QTAILQ_FOREACH(surface, &r->invalid_surfaces, entry) {
+        if (surface->writeback_owed) {
+            pgraph_vk_surface_download_if_dirty(d, surface);
+            parked_owed_settled(d, surface);
+        }
     }
 
     qatomic_set(&r->download_dirty_surfaces_pending, false);
@@ -555,6 +596,7 @@ static void surface_access_callback(void *opaque, MemoryRegion *mr, hwaddr addr,
             trace_nv2a_pgraph_surface_cpu_write(surface->vram_addr, offset);
         } else {
             trace_nv2a_pgraph_surface_cpu_read(surface->vram_addr, offset);
+            surface->cpu_reads++;
         }
 
         if (surface->draw_dirty) {
@@ -564,6 +606,18 @@ static void surface_access_callback(void *opaque, MemoryRegion *mr, hwaddr addr,
 
         if (write) {
             surface->upload_pending = true;
+        }
+    }
+
+    /* RAM still owed a lazy writeback: queue it on the pfifo thread (no VK
+     * work here) and learn the range live, so its evictions stay eager. */
+    QTAILQ_FOREACH(surface, &r->invalid_surfaces, entry) {
+        if (surface->writeback_owed &&
+            check_surface_overlaps_range(surface, addr, len)) {
+            surface->download_pending = true;
+            wait_for_downloads = true;
+            pgraph_writeback_learn_live(&d->pgraph, surface->vram_addr,
+                                        surface->size);
         }
     }
 
@@ -603,11 +657,23 @@ static void register_cpu_access_callback(NV2AState *d, SurfaceBinding *surface)
 }
 
 static void unregister_cpu_access_callback(NV2AState *d,
-                                           SurfaceBinding const *surface)
+                                           SurfaceBinding *surface)
 {
-    if (tcg_enabled()) {
+    if (tcg_enabled() && surface->access_cb) {
         mem_access_callback_remove_by_ref(qemu_get_cpu(0), surface->access_cb);
+        surface->access_cb = NULL;
     }
+}
+
+/* An owed writeback keeps its parked binding's CPU access callback armed:
+ * the first guest access settles the debt before it lands, as on the
+ * hardware, and the callback goes with the debt. Otherwise a later
+ * materialisation would overwrite RAM the guest reused (Crazy Taxi puts
+ * its pushbuffer where SEGABOOT's framebuffers were). */
+static void parked_owed_settled(NV2AState *d, SurfaceBinding *s)
+{
+    s->writeback_owed = false;
+    unregister_cpu_access_callback(d, s);
 }
 
 static void bind_surface(PGRAPHVkState *r, SurfaceBinding *surface)
@@ -645,13 +711,8 @@ static void invalidate_surface(NV2AState *d, SurfaceBinding *surface)
 
     trace_nv2a_pgraph_surface_invalidated(surface->vram_addr);
 
-    // FIXME: We may be reading from the surface in the current command buffer!
-    // Add a detection to handle it. For now, finish to be safe.
-    pgraph_vk_finish(&d->pgraph, VK_FINISH_REASON_SURFACE_DOWN);
-
-    assert((!r->in_command_buffer ||
-            surface->draw_time < r->command_buffer_start_time) &&
-           "Surface evicted while in use!");
+    /* The trash keeps an image the open recording used alive, and a recycled
+     * image is drawn after those draws, on the same queue. */
 
     if (surface == r->color_binding) {
         assert(d->pgraph.surface_color.buffer_dirty);
@@ -662,10 +723,36 @@ static void invalidate_surface(NV2AState *d, SurfaceBinding *surface)
         unbind_surface(d, false);
     }
 
-    unregister_cpu_access_callback(d, surface);
+    /* In-place sampling: bindings aliasing this image lose it now (the
+     * image heads to the invalid pool and may change owner). */
+    pgraph_vk_texture_drop_borrowed(d, surface);
+
+    /* A parked binding that still owes its writeback keeps the callback
+     * (parked_owed_settled). */
+    if (!surface->writeback_owed) {
+        unregister_cpu_access_callback(d, surface);
+    }
+
+    pgraph_rt_memo_forget(&r->rt_memo, surface);
 
     QTAILQ_REMOVE(&r->surfaces, surface, entry);
     QTAILQ_INSERT_HEAD(&r->invalid_surfaces, surface, entry);
+}
+
+void pgraph_vk_surface_ensure_attachment_layout(PGRAPHState *pg,
+                                                SurfaceBinding *surface)
+{
+    if (!surface->in_shader_read) {
+        return;
+    }
+    VkCommandBuffer cmd = pgraph_vk_begin_nondraw_commands(pg);
+    pgraph_vk_transition_image_layout(
+        pg, cmd, surface->image, surface->host_fmt.vk_format,
+        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        surface->color ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL :
+                         VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+    pgraph_vk_end_nondraw_commands(pg, cmd);
+    pgraph_vk_surface_left_shader_read(pg, surface);
 }
 
 static bool check_surfaces_overlap(const SurfaceBinding *surface,
@@ -673,6 +760,87 @@ static bool check_surfaces_overlap(const SurfaceBinding *surface,
 {
     return check_surface_overlaps_range(surface, other_surface->vram_addr,
                                         other_surface->size);
+}
+
+/* Lazy writeback: a skipped eviction parks its image in invalid_surfaces
+ * with writeback_owed; the first reader of the RAM (texture, CPU access,
+ * create, snapshot) materialises it, and a newer dead eviction of the same
+ * range supersedes it. Materialising alone does not learn the range live,
+ * since pruning and recycling materialise too: only real readers do. */
+static void parked_materialize(NV2AState *d, SurfaceBinding *s)
+{
+    pgraph_vk_surface_download_if_dirty(d, s);
+    parked_owed_settled(d, s);
+}
+
+static void parked_materialize_range(NV2AState *d, hwaddr start,
+                                     hwaddr size)
+{
+    PGRAPHVkState *r = d->pgraph.vk_renderer_state;
+    SurfaceBinding *s, *next;
+    QTAILQ_FOREACH_SAFE(s, &r->invalid_surfaces, entry, next) {
+        if (s->writeback_owed && check_surface_overlaps_range(s, start, size)) {
+            parked_materialize(d, s);
+            /* a texture read this RAM: proven live, stay eager */
+            pgraph_writeback_learn_live(&d->pgraph, s->vram_addr, s->size);
+        }
+    }
+}
+
+static void parked_supersede_owed(PGRAPHVkState *r, hwaddr addr,
+                                  size_t size)
+{
+    SurfaceBinding *s;
+    QTAILQ_FOREACH(s, &r->invalid_surfaces, entry) {
+        if (s->writeback_owed && s->vram_addr == addr && s->size == size) {
+            parked_owed_settled(g_nv2a, s); /* superseded */
+        }
+    }
+}
+
+/* A create's upload reads the evicted range too, as on GL. Only the latest
+ * parked eviction can feed it (an older one was overwritten on the
+ * hardware), i.e. the first owed overlap in the head-inserted
+ * invalid_surfaces, and only with the same address, size, pitch and
+ * swizzle: the color and zeta views of one allocation (OutRun 2's drift
+ * smoke). Anything else stays dead. */
+static bool parked_settle_for_create(NV2AState *d, SurfaceBinding *neu)
+{
+    PGRAPHVkState *r = d->pgraph.vk_renderer_state;
+
+    SurfaceBinding *s, *latest = NULL;
+    QTAILQ_FOREACH(s, &r->invalid_surfaces, entry) {
+        if (s->writeback_owed &&
+            check_surface_overlaps_range(s, neu->vram_addr, neu->size)) {
+            latest = s;
+            break; /* head-insertion order: first hit = newest */
+        }
+    }
+    if (!latest || latest->vram_addr != neu->vram_addr ||
+        latest->size != neu->size || latest->pitch != neu->pitch ||
+        latest->swizzle != neu->swizzle) {
+        return false; /* no owed content, or layout-incompatible (dead) */
+    }
+    parked_materialize(d, latest);
+    pgraph_writeback_learn_live(&d->pgraph, latest->vram_addr, latest->size);
+    return true;
+}
+
+/* Evict a binding: its content is written back to RAM now, or, when that
+ * writeback looks dead, owed to the first reader of the RAM instead. */
+static void evict_surface(NV2AState *d, SurfaceBinding *s)
+{
+    PGRAPHVkState *r = d->pgraph.vk_renderer_state;
+
+    if (!pgraph_writeback_dead(d, s->vram_addr, s->size, s->cpu_reads)) {
+        pgraph_vk_surface_download_if_dirty(d, s);
+    } else {
+        pgraph_writeback_record_discard(&d->pgraph, s->vram_addr, s->size);
+        parked_supersede_owed(r, s->vram_addr, s->size);
+        /* Nothing is owed if RAM already holds the content. */
+        s->writeback_owed = s->draw_dirty;
+    }
+    invalidate_surface(d, s);
 }
 
 static void invalidate_overlapping_surfaces(NV2AState *d,
@@ -686,8 +854,7 @@ static void invalidate_overlapping_surfaces(NV2AState *d,
             trace_nv2a_pgraph_surface_evict_overlapping(
                 other_surface->vram_addr, other_surface->width,
                 other_surface->height, other_surface->pitch);
-            pgraph_vk_surface_download_if_dirty(d, other_surface);
-            invalidate_surface(d, other_surface);
+            evict_surface(d, other_surface);
         }
     }
 }
@@ -711,6 +878,12 @@ SurfaceBinding *pgraph_vk_surface_get(NV2AState *d, hwaddr addr)
     SurfaceBinding *surface;
     QTAILQ_FOREACH (surface, &r->surfaces, entry) {
         if (surface->vram_addr == addr) {
+            /* Move to front: a few addresses are looked up many times a
+             * frame. Callers do not iterate the list across this call. */
+            if (surface != QTAILQ_FIRST(&r->surfaces)) {
+                QTAILQ_REMOVE(&r->surfaces, surface, entry);
+                QTAILQ_INSERT_HEAD(&r->surfaces, surface, entry);
+            }
             return surface;
         }
     }
@@ -839,7 +1012,9 @@ static void create_surface_image(PGRAPHState *pg, SurfaceBinding *surface)
 
     nv2a_profile_inc_counter(NV2A_PROF_QUEUE_SUBMIT_3);
     pgraph_vk_end_debug_marker(r, cmd);
-    pgraph_vk_end_single_time_commands(pg, cmd);
+    /* No readback: queue order sequences this init before any later
+     * consumer; the next aux user waits the fence before reuse. */
+    pgraph_vk_end_single_time_commands_async(pg, cmd);
     nv2a_profile_inc_counter(NV2A_PROF_SURF_CREATE);
 }
 
@@ -862,17 +1037,26 @@ static void migrate_surface_image(SurfaceBinding *dst, SurfaceBinding *src)
 
 static void destroy_surface_image(PGRAPHVkState *r, SurfaceBinding *surface)
 {
-    vkDestroyImageView(r->device, surface->image_view, NULL);
-    surface->image_view = VK_NULL_HANDLE;
+    pgraph_vk_framebuffer_drop_view(r, surface->image_view);
 
-    vmaDestroyImage(r->allocator, surface->image, surface->allocation);
+    /* Submissions in flight and the open recording may still use this
+     * image (copies, framebuffers): the trash keeps it until all settle. */
+    struct XemuVkTrashEntry e = { .image_view = surface->image_view,
+                                  .image = surface->image,
+                                  .allocation = surface->allocation };
+    pgraph_vk_trash_push(r, &e);
+    surface->image_view = VK_NULL_HANDLE;
     surface->image = VK_NULL_HANDLE;
     surface->allocation = VK_NULL_HANDLE;
-
-    vmaDestroyImage(r->allocator, surface->image_scratch,
-                    surface->allocation_scratch);
-    surface->image_scratch = VK_NULL_HANDLE;
-    surface->allocation_scratch = VK_NULL_HANDLE;
+    if (surface->image_scratch) {
+        struct XemuVkTrashEntry e2 = {
+            .image = surface->image_scratch,
+            .allocation = surface->allocation_scratch,
+        };
+        pgraph_vk_trash_push(r, &e2);
+        surface->image_scratch = VK_NULL_HANDLE;
+        surface->allocation_scratch = VK_NULL_HANDLE;
+    }
 }
 
 static bool check_invalid_surface_is_compatibile(SurfaceBinding *surface,
@@ -890,6 +1074,20 @@ get_any_compatible_invalid_surface(PGRAPHVkState *r, SurfaceBinding *target)
     SurfaceBinding *surface, *next;
     QTAILQ_FOREACH_SAFE(surface, &r->invalid_surfaces, entry, next) {
         if (check_invalid_surface_is_compatibile(surface, target)) {
+            /* Recycling would destroy owed content: the same range's is
+             * superseded, another range's is materialised first. */
+            if (surface->writeback_owed) {
+                if (surface->vram_addr == target->vram_addr &&
+                    surface->size == target->size) {
+                    parked_owed_settled(g_nv2a, surface);
+                } else {
+                    parked_materialize(g_nv2a, surface);
+                }
+            }
+            /* In-place sampling: a recycled image must hand its new
+             * owner the attachment layout every consumer assumes. */
+            pgraph_vk_surface_ensure_attachment_layout(&g_nv2a->pgraph,
+                                                       surface);
             QTAILQ_REMOVE(&r->invalid_surfaces, surface, entry);
             return surface;
         }
@@ -906,6 +1104,10 @@ static void prune_invalid_surfaces(PGRAPHVkState *r, int keep)
     QTAILQ_FOREACH_SAFE(surface, &r->invalid_surfaces, entry, next) {
         num_surfaces += 1;
         if (num_surfaces > keep) {
+            /* Never destroy owed content silently. */
+            if (surface->writeback_owed) {
+                parked_materialize(g_nv2a, surface);
+            }
             QTAILQ_REMOVE(&r->invalid_surfaces, surface, entry);
             destroy_surface_image(r, surface);
             g_free(surface);
@@ -965,7 +1167,15 @@ void pgraph_vk_upload_surface_data(NV2AState *d, SurfaceBinding *surface,
 
     nv2a_profile_inc_counter(NV2A_PROF_SURF_UPLOAD);
 
-    pgraph_vk_finish(pg, VK_FINISH_REASON_SURFACE_CREATE); // FIXME: SURFACE_UP
+    /* An aux upload runs before the open recording: when draws recorded
+     * there wrote this surface or sample it in place,
+     * the recording is drained first, or they would see content newer than
+     * their record point. */
+    if (r->in_command_buffer &&
+        (surface->draw_time >= r->command_buffer_start_time ||
+         surface->in_shader_read)) {
+        pgraph_vk_finish(pg, VK_FINISH_REASON_SURFACE_UP);
+    }
 
     trace_nv2a_pgraph_surface_upload(
                  surface->color ? "COLOR" : "ZETA",
@@ -1009,6 +1219,27 @@ void pgraph_vk_upload_surface_data(NV2AState *d, SurfaceBinding *surface,
                                  surface->fmt.bytes_per_pixel;
     assert(uploaded_image_size <= copy_buffer->buffer_size);
 
+    if (surface->host_fmt.vk_format == VK_FORMAT_D24_UNORM_S8_UINT ||
+        surface->host_fmt.vk_format == VK_FORMAT_D32_SFLOAT_S8_UINT) {
+        /* The unpacked planes, before the aux recording that writes them. */
+        unsigned int cw = surface->width, ch = surface->height;
+        pgraph_apply_scaling_factor(pg, &cw, &ch);
+        pgraph_vk_buffer_ensure_capacity(pg, BUFFER_COMPUTE_DST,
+                                         (VkDeviceSize)cw * ch * 8);
+        /* The unpack takes a compute descriptor set: with none left, a
+         * synchronous finish frees them, as on the download path. */
+        if (pgraph_vk_compute_needs_finish(r)) {
+            pgraph_vk_finish(pg, VK_FINISH_REASON_NEED_BUFFER_SPACE);
+        }
+    }
+
+    /* Begin before touching the staging buffer: it waits out an earlier
+     * async aux submission still reading it. Recording ahead of the memcpy
+     * is fine: only the submission needs the data, ordered by the host
+     * barrier below. */
+    VkCommandBuffer cmd = pgraph_vk_begin_single_time_commands(pg);
+    pgraph_vk_begin_debug_marker(r, cmd, RGBA_RED, __func__);
+
     void *mapped_memory_ptr = NULL;
     VK_CHECK(vmaMapMemory(r->allocator, copy_buffer->allocation,
                           &mapped_memory_ptr));
@@ -1028,9 +1259,6 @@ void pgraph_vk_upload_surface_data(NV2AState *d, SurfaceBinding *surface,
 
     vmaFlushAllocation(r->allocator, copy_buffer->allocation, 0, VK_WHOLE_SIZE);
     vmaUnmapMemory(r->allocator, copy_buffer->allocation);
-
-    VkCommandBuffer cmd = pgraph_vk_begin_single_time_commands(pg);
-    pgraph_vk_begin_debug_marker(r, cmd, RGBA_RED, __func__);
 
     VkBufferMemoryBarrier host_barrier = {
         .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
@@ -1219,9 +1447,9 @@ void pgraph_vk_upload_surface_data(NV2AState *d, SurfaceBinding *surface,
 
     pgraph_vk_transition_image_layout(
         pg, cmd, surface->image, surface->host_fmt.vk_format,
-        surface->color ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL :
-                         VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+        pgraph_vk_surface_base_layout(surface),
         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    pgraph_vk_surface_left_shader_read(&d->pgraph, surface);
 
     bool upscale = pg->surface_scale_factor > 1 &&
                    !use_compute_to_convert_depth_stencil_format;
@@ -1277,7 +1505,9 @@ void pgraph_vk_upload_surface_data(NV2AState *d, SurfaceBinding *surface,
 
     nv2a_profile_inc_counter(NV2A_PROF_QUEUE_SUBMIT_2);
     pgraph_vk_end_debug_marker(r, cmd);
-    pgraph_vk_end_single_time_commands(pg, cmd);
+    /* Upload only, no readback: the aux wait at begin, which precedes the
+     * staging memcpy, protects the staging source. */
+    pgraph_vk_end_single_time_commands_async(pg, cmd);
 
     surface->initialized = true;
 }
@@ -1376,6 +1606,7 @@ static void populate_surface_binding_target_sized(NV2AState *d, bool color,
     target->frame_time = pg->frame_time;
     target->draw_time = pg->draw_time;
     target->cleared = false;
+    target->cpu_reads = 0;
 
     target->initialized = false;
 }
@@ -1407,10 +1638,85 @@ static void populate_surface_binding_target(NV2AState *d, bool color,
     populate_surface_binding_target_sized(d, color, width, height, target);
 }
 
+/* HEURISTIC: submit at render-target switches so the GPU starts while the
+ * frame is recorded, as the NV2A consumes its pushbuffer continuously.
+ * n submissions a frame cost n*c and leave a flip tail of about T/n, least
+ * at n = sqrt(T/c), with T (frame GPU time) and c (one submission) measured
+ * here. Switches count color and zeta parts apart. */
+static void eager_submit_at_switch(PGRAPHState *pg)
+{
+    PGRAPHVkState *r = pg->vk_renderer_state;
+
+    r->rt_switches++;
+    if (!r->in_command_buffer) {
+        return;
+    }
+    unsigned interval = r->eager_interval;
+    if (!interval) {
+        return;
+    }
+    if (++r->eager_count >= interval) {
+        r->eager_count = 0;
+        pgraph_vk_finish(pg, VK_FINISH_REASON_EAGER);
+    }
+}
+
+/* At the flip: choose next frame's eager interval from this frame's
+ * switch count and the measured costs. */
+void pgraph_vk_eager_frame_update(PGRAPHState *pg)
+{
+    PGRAPHVkState *r = pg->vk_renderer_state;
+
+    unsigned switches = r->rt_switches;
+    r->rt_switches = 0;
+    r->eager_count = 0;
+    r->eager_interval = 0;
+    /* One submission costs its issue, the next buffer's begin and the
+     * wait when its slot comes round again, two submissions later. */
+    double c = r->submit_us + r->cb_begin_us + r->reuse_wait_us;
+    double t = r->frame_gpu.busy_us;
+    if (switches && c > 0.0 && t > 0.0) {
+        double n = sqrt(t / c);
+        if (n >= 1.0) {
+            unsigned interval = (unsigned)(switches / n);
+            r->eager_interval = interval ? interval : 1;
+        }
+    }
+}
+
 static void update_surface_part(NV2AState *d, bool upload, bool color)
 {
     PGRAPHState *pg = &d->pgraph;
     PGRAPHVkState *r = pg->vk_renderer_state;
+
+    /* Render-target memo, as on GL: registers that resolved to a binding
+     * under the same shape generation swap it in without the full pass;
+     * a zeta binding must still match the color size. */
+    if (upload && tcg_enabled()) {
+        Surface *sf = color ? &pg->surface_color : &pg->surface_zeta;
+        if (sf->buffer_dirty) {
+            hwaddr dma = color ? pg->dma_color : pg->dma_zeta;
+            for (int i = 0; i < 2; i++) {
+                SurfaceBinding *m = pgraph_rt_memo_match(
+                    &r->rt_memo, color, i, dma, sf->offset, sf->pitch);
+                if (m && m != (color ? r->zeta_binding : r->color_binding) &&
+                    (color || !r->color_binding ||
+                     (m->width == r->color_binding->width &&
+                      m->height == r->color_binding->height))) {
+                    eager_submit_at_switch(pg);
+                    pgraph_vk_ensure_not_in_render_pass(pg);
+                    pgraph_set_surface_binding_dim(pg, m->width, m->height,
+                                                   &m->shape);
+                    if (color) {
+                        pg->surface_zeta.buffer_dirty = true;
+                    }
+                    bind_surface(r, m);
+                    sf->buffer_dirty = false;
+                    return;
+                }
+            }
+        }
+    }
 
     SurfaceBinding target;
     memset(&target, 0, sizeof(target));
@@ -1421,14 +1727,18 @@ static void update_surface_part(NV2AState *d, bool upload, bool color)
     bool mem_dirty = !tcg_enabled() && memory_region_test_and_clear_dirty(
                                            d->vram, target.vram_addr,
                                            target.size, DIRTY_MEMORY_NV2A);
+    if (mem_dirty) {
+        /* This consumed the range's NV2A dirty bit: the vertex mirror must
+         * still learn of the guest write. */
+        pgraph_vk_vertex_mark_stale(pg, target.vram_addr, target.size);
+    }
 
     SurfaceBinding *current_binding = color ? r->color_binding
                                             : r->zeta_binding;
 
     if (!current_binding ||
         (upload && (pg_surface->buffer_dirty || mem_dirty))) {
-        // FIXME: We don't need to be so aggressive flushing the command list
-        // pgraph_vk_finish(pg, VK_FINISH_REASON_SURFACE_CREATE);
+        eager_submit_at_switch(pg);
         pgraph_vk_ensure_not_in_render_pass(pg);
 
         unbind_surface(d, color);
@@ -1510,12 +1820,9 @@ static void update_surface_part(NV2AState *d, bool upload, bool color)
 
             if (is_compatible) {
                 // FIXME: Refactor
-                pg->surface_binding_dim.width = surface->width;
-                pg->surface_binding_dim.clip_x = surface->shape.clip_x;
-                pg->surface_binding_dim.clip_width = surface->shape.clip_width;
-                pg->surface_binding_dim.height = surface->height;
-                pg->surface_binding_dim.clip_y = surface->shape.clip_y;
-                pg->surface_binding_dim.clip_height = surface->shape.clip_height;
+                pgraph_set_surface_binding_dim(pg, surface->width,
+                                               surface->height,
+                                               &surface->shape);
                 surface->upload_pending |= mem_dirty;
                 pg->surface_zeta.buffer_dirty |= color;
                 should_create = false;
@@ -1523,12 +1830,36 @@ static void update_surface_part(NV2AState *d, bool upload, bool color)
                 trace_nv2a_pgraph_surface_evict_reason(
                     "incompatible", surface->vram_addr);
                 compare_surfaces(surface, &target);
-                pgraph_vk_surface_download_if_dirty(d, surface);
-                invalidate_surface(d, surface);
+                evict_surface(d, surface);
             }
         }
 
         if (should_create) {
+            /* Settle an owed writeback first: the create's upload must read
+             * the refreshed RAM, and a settle cancels the dead-upload skip. */
+            bool settled = parked_settle_for_create(d, &target);
+            if (settled) {
+                target.upload_pending = true;
+            }
+            if (!settled && target.upload_pending &&
+                pgraph_writeback_discarded(&d->pgraph, target.vram_addr,
+                                           target.size)) {
+                if (memory_region_test_and_clear_dirty(d->vram,
+                                                       target.vram_addr,
+                                                       target.size,
+                                                       DIRTY_MEMORY_NV2A)) {
+                    /* The guest wrote the range: it is uploaded, and the
+                     * vertex mirror learns of the dirty bit consumed here. */
+                    pgraph_vk_vertex_mark_stale(&d->pgraph, target.vram_addr,
+                                                target.size);
+                } else {
+                    /* Dead upload skipped: the image keeps whatever it
+                     * holds, as stale as the RAM. It counts as initialized
+                     * (draw.c) since the game clears or overdraws it first. */
+                    target.upload_pending = false;
+                    target.initialized = true;
+                }
+            }
             surface = get_any_compatible_invalid_surface(r, &target);
             if (surface) {
                 migrate_surface_image(&target, surface);
@@ -1542,12 +1873,8 @@ static void update_surface_part(NV2AState *d, bool upload, bool color)
             surface_put(d, surface);
 
             // FIXME: Refactor
-            pg->surface_binding_dim.width = target.width;
-            pg->surface_binding_dim.clip_x = target.shape.clip_x;
-            pg->surface_binding_dim.clip_width = target.shape.clip_width;
-            pg->surface_binding_dim.height = target.height;
-            pg->surface_binding_dim.clip_y = target.shape.clip_y;
-            pg->surface_binding_dim.clip_height = target.shape.clip_height;
+            pgraph_set_surface_binding_dim(pg, target.width, target.height,
+                                           &target.shape);
 
             if (color && r->zeta_binding &&
                 (r->zeta_binding->width != target.width ||
@@ -1570,6 +1897,10 @@ static void update_surface_part(NV2AState *d, bool upload, bool color)
                  surface->shape.clip_y, surface->shape.clip_height, surface->pitch);
 
         bind_surface(r, surface);
+
+        pgraph_rt_memo_store(&r->rt_memo, color,
+                             color ? pg->dma_color : pg->dma_zeta,
+                             pg_surface->offset, pg_surface->pitch, surface);
         pg_surface->buffer_dirty = false;
     }
 
@@ -1586,6 +1917,36 @@ static void update_surface_part(NV2AState *d, bool upload, bool color)
 }
 
 // FIXME: Move to common?
+static void touch_bound_surface(NV2AState *d, SurfaceBinding *s, bool upload,
+                                bool swizzle)
+{
+    s->frame_time = d->pgraph.frame_time;
+    if (upload) {
+        pgraph_vk_upload_surface_data(d, s, false);
+        s->draw_time = d->pgraph.draw_time;
+        s->swizzle = swizzle;
+    }
+}
+
+/* The bound surfaces serve this frame, and on upload this draw, with their
+ * RAM content brought in. */
+static void touch_bound_surfaces(NV2AState *d, bool upload)
+{
+    PGRAPHState *pg = &d->pgraph;
+    PGRAPHVkState *r = pg->vk_renderer_state;
+
+    if (upload) {
+        pg->draw_time++;
+    }
+    bool swizzle = (pg->surface_type == NV097_SET_SURFACE_FORMAT_TYPE_SWIZZLE);
+    if (r->color_binding) {
+        touch_bound_surface(d, r->color_binding, upload, swizzle);
+    }
+    if (r->zeta_binding) {
+        touch_bound_surface(d, r->zeta_binding, upload, swizzle);
+    }
+}
+
 void pgraph_vk_surface_update(NV2AState *d, bool upload, bool color_write,
                               bool zeta_write)
 {
@@ -1602,11 +1963,29 @@ void pgraph_vk_surface_update(NV2AState *d, bool upload, bool color_write,
 
     if (upload) {
         bool fb_dirty = framebuffer_dirty(pg);
+        /* Fast path, as on GL: registers, buffers, write masks, surface
+         * type and bindings unchanged, so the full pass would change
+         * nothing. TCG only: otherwise the dirty-memory test must run. */
+        if (tcg_enabled() && !fb_dirty &&
+            !pg->surface_color.buffer_dirty &&
+            !pg->surface_zeta.buffer_dirty &&
+            color_write == r->last_color_write &&
+            zeta_write == r->last_zeta_write &&
+            pg->surface_type == r->last_surface_type &&
+            (!color_write || r->color_binding) &&
+            (!zeta_write || r->zeta_binding)) {
+            touch_bound_surfaces(d, true);
+            return;
+        }
+        r->last_color_write = color_write;
+        r->last_zeta_write = zeta_write;
+        r->last_surface_type = pg->surface_type;
         if (fb_dirty) {
             memcpy(&pg->last_surface_shape, &pg->surface_shape,
                    sizeof(SurfaceShape));
             pg->surface_color.buffer_dirty = true;
             pg->surface_zeta.buffer_dirty = true;
+            r->rt_memo.shape_gen++;
         }
 
         if (pg->surface_color.buffer_dirty) {
@@ -1635,29 +2014,7 @@ void pgraph_vk_surface_update(NV2AState *d, bool upload, bool color_write,
         }
     }
 
-    if (upload) {
-        pg->draw_time++;
-    }
-
-    bool swizzle = (pg->surface_type == NV097_SET_SURFACE_FORMAT_TYPE_SWIZZLE);
-
-    if (r->color_binding) {
-        r->color_binding->frame_time = pg->frame_time;
-        if (upload) {
-            pgraph_vk_upload_surface_data(d, r->color_binding, false);
-            r->color_binding->draw_time = pg->draw_time;
-            r->color_binding->swizzle = swizzle;
-        }
-    }
-
-    if (r->zeta_binding) {
-        r->zeta_binding->frame_time = pg->frame_time;
-        if (upload) {
-            pgraph_vk_upload_surface_data(d, r->zeta_binding, false);
-            r->zeta_binding->draw_time = pg->draw_time;
-            r->zeta_binding->swizzle = swizzle;
-        }
-    }
+    touch_bound_surfaces(d, upload);
 
     // Sanity check color and zeta dimensions match
     if (r->color_binding && r->zeta_binding) {
@@ -1665,8 +2022,13 @@ void pgraph_vk_surface_update(NV2AState *d, bool upload, bool color_write,
         assert(r->color_binding->height == r->zeta_binding->height);
     }
 
-    expire_old_surfaces(d);
-    prune_invalid_surfaces(r, num_invalid_surfaces_to_keep);
+    /* Expiry counts in frames, so once per frame decides the same; the
+     * pruning rides along, letting the invalid list grow within a frame. */
+    if (r->expire_frame_time != pg->frame_time) {
+        r->expire_frame_time = pg->frame_time;
+        expire_old_surfaces(d);
+        prune_invalid_surfaces(r, num_invalid_surfaces_to_keep);
+    }
 }
 
 static bool check_format_and_usage_supported(PGRAPHVkState *r, VkFormat format,
@@ -1737,6 +2099,9 @@ void pgraph_vk_init_surfaces(PGRAPHState *pg)
     r->color_binding = NULL;
     r->zeta_binding = NULL;
     r->framebuffer_dirty = true;
+    memset(&r->rt_memo, 0, sizeof(r->rt_memo));
+    r->rt_switches = 0;
+    r->eager_interval = r->eager_count = 0;
 
     pgraph_vk_reload_surface_scale_factor(pg); // FIXME: Move internal
 }
@@ -1765,6 +2130,18 @@ void pgraph_vk_surface_flush(NV2AState *d)
         pgraph_vk_surface_download_if_dirty(d, s);
         invalidate_surface(d, s);
     }
+    /* After a snapshot load or a reset RAM is authoritative: an owed
+     * writeback goes without being written, and what was learnt of the old
+     * RAM is forgotten. A scale change has settled them all beforehand; at
+     * a renderer switch RAM is live, and the prune below writes them back. */
+    if (pg->renderer_switch_phase != PGRAPH_RENDERER_SWITCH_PHASE_CPU_WAITING) {
+        QTAILQ_FOREACH(s, &r->invalid_surfaces, entry) {
+            if (s->writeback_owed) {
+                parked_owed_settled(d, s);
+            }
+        }
+    }
+    pgraph_writeback_reset(pg);
     prune_invalid_surfaces(r, 0);
 
     pgraph_vk_reload_surface_scale_factor(pg);

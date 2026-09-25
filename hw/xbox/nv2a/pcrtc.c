@@ -79,6 +79,12 @@ void pcrtc_write(void *opaque, hwaddr addr, uint64_t val, unsigned int size)
         val &= 0x07FFFFFF;
         // assert(val < memory_region_size(d->vram));
         d->pcrtc.start = val;
+        /* The scanout moved: the render thread resolves the new front buffer
+         * (GL); kick it under the fifo lock, as the pgraph MMIO path does. */
+        qatomic_set(&d->pgraph.scanout_changed, true);
+        qemu_mutex_lock(&d->pfifo.lock);
+        pfifo_kick(d);
+        qemu_mutex_unlock(&d->pfifo.lock);
 
         NV2A_DPRINTF("PCRTC_START - %x %x %x %x\n",
                 d->vram_ptr[val+64], d->vram_ptr[val+64+1],

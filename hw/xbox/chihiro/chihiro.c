@@ -52,6 +52,7 @@
 #include "chihiro-driveboard-v257.h"
 #include "chihiro-netboard.h"
 #include "ui/xemu-notifications.h"
+#include "hw/xbox/nv2a/nv2a.h"
 
 /*
  * Chihiro Mediaboard LPC I/O
@@ -1421,6 +1422,7 @@ void chihiro_set_game_executable(const char *name)
     g_strlcpy(chihiro_game_filename, name, sizeof(chihiro_game_filename));
     chihiro_cabinet_forget();
     printf("Chihiro: game → '%s'\n", chihiro_game_filename);
+    nv2a_set_game_executable(chihiro_game_filename);
 }
 
 /* A game launched from a directory carries its boot.id as a file. */

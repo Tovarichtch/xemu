@@ -44,6 +44,11 @@ typedef struct PshState {
     uint32_t rgb_inputs[8], rgb_outputs[8];
     uint32_t alpha_inputs[8], alpha_outputs[8];
 
+    bool combiner_dynamic;
+    bool alpha_dynamic;
+    /* Never set; kept because the shader seeds store PshState as it is. */
+    bool universal;
+
     bool point_sprite;
     bool rect_tex[4];
     bool snorm_tex[4];
@@ -55,14 +60,12 @@ typedef struct PshState {
     int dim_tex[4];
     bool tex_cubemap[4];
 
-    float border_logical_size[4][3];
-    float border_inv_real_size[4][3];
+    bool border_adjust[4];
 
     bool shadow_map[4];
     enum PshShadowDepthFunc shadow_depth_func;
 
     bool alpha_test;
-    enum PshAlphaFunc alpha_func;
 
     bool window_clip_exclusive;
 
@@ -76,8 +79,17 @@ typedef struct PshState {
 
 void pgraph_glsl_set_psh_state(PGRAPHState *pg, PshState *state);
 
+bool pgraph_glsl_psh_dynamic_pending_take(PshState *out);
+void pgraph_glsl_psh_dynamic_ready(const PshState *state);
+bool pgraph_glsl_psh_canonicalize_dynamic(PshState *state);
+
 #define PSH_UNIFORM_DECL_X(S, DECL) \
     DECL(S, alphaRef, int, 1)       \
+    DECL(S, alphaFunc, int, 1)      \
+    DECL(S, alphaKillMask, uint, 1) \
+    DECL(S, alphaTestEnable, int, 1) \
+    DECL(S, borderLogicalSize, vec3, 4) \
+    DECL(S, borderInvRealSize, vec3, 4) \
     DECL(S, bumpMat, mat2, 4)       \
     DECL(S, bumpOffset, float, 4)   \
     DECL(S, bumpScale, float, 4)    \
@@ -85,6 +97,13 @@ void pgraph_glsl_set_psh_state(PGRAPHState *pg, PshState *state);
     DECL(S, clipRegion, ivec4, 8)   \
     DECL(S, colorKey, uint, 4)      \
     DECL(S, colorKeyMask, uint, 4)  \
+    DECL(S, combAlphaIn, uint, 8)   \
+    DECL(S, combAlphaOut, uint, 8)  \
+    DECL(S, combCtl, uint, 1)       \
+    DECL(S, combFinal0, uint, 1)    \
+    DECL(S, combFinal1, uint, 1)    \
+    DECL(S, combRgbIn, uint, 8)     \
+    DECL(S, combRgbOut, uint, 8)    \
     DECL(S, consts, vec4, 18)       \
     DECL(S, depthFactor, float, 1)  \
     DECL(S, depthOffset, float, 1)  \
@@ -97,6 +116,7 @@ DECL_UNIFORM_TYPES(PshUniform, PSH_UNIFORM_DECL_X)
 
 typedef struct GenPshGlslOptions {
     bool vulkan;
+    bool locations;
     int ubo_binding;
     int tex_binding;
 } GenPshGlslOptions;

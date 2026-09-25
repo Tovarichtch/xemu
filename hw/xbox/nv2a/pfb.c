@@ -21,6 +21,10 @@
 
 #include "nv2a_int.h"
 
+/* Set while a PFB compression region is valid: the zeta surface is compressed
+ * (Chihiro D3D programs region 1 as Z24S8_GRAD). Read by the cost model. */
+unsigned xemu_pfb_zcomp_on;
+
 uint64_t pfb_read(void *opaque, hwaddr addr, unsigned int size)
 {
     NV2AState *d = (NV2AState *)opaque;
@@ -52,5 +56,13 @@ void pfb_write(void *opaque, hwaddr addr, uint64_t val, unsigned int size)
     default:
         d->pfb.regs[addr] = val;
         break;
+    }
+
+    if (addr >= 0x300 && addr < 0x320) {
+        unsigned on = 0;
+        for (int i = 0; i < 8; i++) {
+            on |= (d->pfb.regs[0x300 + i * 4] >> 31) & 1;
+        }
+        xemu_pfb_zcomp_on = on;
     }
 }

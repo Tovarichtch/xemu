@@ -29,14 +29,15 @@
 #include "gloffscreen.h"
 
 #include <SDL3/SDL.h>
+#include <epoxy/gl.h>
 
 struct _GloContext {
     SDL_Window    *window;
     SDL_GLContext gl_context;
 };
 
-/* Create an OpenGL context */
-GloContext *glo_context_create(void)
+/* Create an OpenGL 4.<minor> context, 4.0 where the driver has no more. */
+static GloContext *context_create(int minor)
 {
     GloContext *context = (GloContext *)malloc(sizeof(GloContext));
     assert(context != NULL);
@@ -48,10 +49,13 @@ GloContext *glo_context_create(void)
     SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 24);
     SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 8);
 
+    SDL_Window *share_window = SDL_GL_GetCurrentWindow();
+    SDL_GLContext share_context = SDL_GL_GetCurrentContext();
+
     // Initialize rendering context
     SDL_GL_SetAttribute(SDL_GL_SHARE_WITH_CURRENT_CONTEXT, 1);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 4);
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, minor);
     SDL_GL_SetAttribute(
         SDL_GL_CONTEXT_PROFILE_MASK,
         SDL_GL_CONTEXT_PROFILE_CORE);
@@ -68,6 +72,18 @@ GloContext *glo_context_create(void)
     }
 
     context->gl_context = SDL_GL_CreateContext(context->window);
+    if (minor > 0 &&
+        (context->gl_context == NULL || epoxy_gl_version() < 40 + minor)) {
+        if (context->gl_context != NULL) {
+            SDL_GL_MakeCurrent(NULL, NULL);
+            SDL_GL_DestroyContext(context->gl_context);
+        }
+        /* The share source must be current again for the retry. */
+        SDL_GL_MakeCurrent(share_window, share_context);
+        SDL_GL_SetAttribute(SDL_GL_SHARE_WITH_CURRENT_CONTEXT, 1);
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
+        context->gl_context = SDL_GL_CreateContext(context->window);
+    }
     if (context->gl_context == NULL) {
         fprintf(stderr, "%s: Failed to create GL context\n", __func__);
         SDL_DestroyWindow(context->window);
@@ -78,6 +94,20 @@ GloContext *glo_context_create(void)
     glo_set_current(context);
 
     return context;
+}
+
+/* Create an OpenGL context */
+GloContext *glo_context_create(void)
+{
+    return context_create(0);
+}
+
+/* GPU boost asks for 4.1 like the window: a driver giving exactly the version
+ * asked (AMD) would make a 4.0 context, and separable stages need GLSL 4.10.
+ * On 4.0 the tuned shader path uses linked programs. */
+GloContext *glo_context_create_4_1(void)
+{
+    return context_create(1);
 }
 
 /* Set current context */

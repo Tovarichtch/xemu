@@ -6,6 +6,7 @@
  * Based on sdl2.c, sdl2-gl.c
  *
  * Copyright (c) 2003 Fabrice Bellard
+ * Copyright (c) 2026 Réda Chérif-Touil
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -816,6 +817,31 @@ static void report_stats(void)
 }
 #endif
 
+/* GPU boost: a GL error on the present path is logged once per site, not
+ * fatal. The stock GPU asserts, as the emulator does. */
+static void ui_gl_errcheck(const char *site)
+{
+    if (nv2a_stock_active()) {
+        assert(glGetError() == GL_NO_ERROR);
+        return;
+    }
+    GLenum e = glGetError();
+    if (e == GL_NO_ERROR) {
+        return;
+    }
+    static const char *seen[4];
+    static unsigned nseen;
+    for (unsigned i = 0; i < nseen; i++) {
+        if (seen[i] == site) {
+            return;
+        }
+    }
+    if (nseen < ARRAY_SIZE(seen)) {
+        seen[nseen++] = site;
+    }
+    fprintf(stderr, "xemu: GL error 0x%x at %s\n", e, site);
+}
+
 /**
  * Renders the main interface. Usually called from the main thread,
  * but may sometimes be called from another thread.
@@ -844,7 +870,7 @@ static void gl_render_frame(struct xemu_console *scon)
      */
     GLuint tex = nv2a_get_framebuffer_surface();
 
-    assert(glGetError() == GL_NO_ERROR);
+    ui_gl_errcheck("frame start");
 
     if (tex == 0) {
         xemu_main_loop_lock();
@@ -882,7 +908,7 @@ static void gl_render_frame(struct xemu_console *scon)
 
     nv2a_release_framebuffer_surface();
     SDL_GL_SwapWindow(scon->real_window);
-    assert(glGetError() == GL_NO_ERROR);
+    ui_gl_errcheck("swap");
     nv2a_profile_present();
 
     qatomic_set(&rendering, false);
@@ -1085,8 +1111,11 @@ static void display_very_early_init(DisplayOptions *o)
     SDL_GL_SetAttribute(SDL_GL_ALPHA_SIZE, 8);
     SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 24);
     SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 8);
+    /* GPU boost asks for 4.1 first (separable shaders); creation falls back
+     * to the stock 4.0 below if the driver refuses. */
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 4);
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION,
+                        nv2a_stock_active() ? 0 : 1);
     SDL_GL_SetAttribute(
         SDL_GL_CONTEXT_PROFILE_MASK,
         SDL_GL_CONTEXT_PROFILE_CORE);
@@ -1150,6 +1179,17 @@ static void display_very_early_init(DisplayOptions *o)
 
     m_context = SDL_GL_CreateContext(m_window);
 
+    if (!nv2a_stock_active() &&
+        (m_context == NULL || epoxy_gl_version() < 41)) {
+        /* No 4.1: fall back to the stock 4.0 context. */
+        if (m_context != NULL) {
+            SDL_GL_MakeCurrent(NULL, NULL);
+            SDL_GL_DestroyContext(m_context);
+        }
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
+        m_context = SDL_GL_CreateContext(m_window);
+    }
+
     if (m_context != NULL && epoxy_gl_version() < 40) {
         SDL_GL_MakeCurrent(NULL, NULL);
         SDL_GL_DestroyContext(m_context);
@@ -1187,6 +1227,22 @@ static void display_very_early_init(DisplayOptions *o)
     fprintf(stderr, "GL_RENDERER: %s\n", glGetString(GL_RENDERER));
     fprintf(stderr, "GL_VERSION: %s\n", glGetString(GL_VERSION));
     fprintf(stderr, "GL_SHADING_LANGUAGE_VERSION: %s\n", glGetString(GL_SHADING_LANGUAGE_VERSION));
+
+    if (!nv2a_stock_active()) {
+        /* The GL shader optimizations of GPU boost (pgraph_gpu_boost_gl)
+         * need GL 4.1 and a driver that passes the self-test
+         * (nv2a_gl_probe_optimizations); the rest of GPU boost runs anyway. */
+        char why[96] = "GL 4.1 unavailable";
+        xemu_gl_opt_capable = epoxy_gl_version() >= 41 &&
+                              nv2a_gl_probe_optimizations(why, sizeof(why));
+        if (!xemu_gl_opt_capable) {
+            fprintf(stderr, "nv2a: GL driver self-test failed (%s):"
+                            " the GL shader optimizations are off\n", why);
+            xemu_queue_notification("GPU boost: this graphics driver failed "
+                                    "the OpenGL self-test, its shader "
+                                    "optimizations are off");
+        }
+    }
 
     // Initialize offscreen rendering context now
     nv2a_context_init();
@@ -1516,9 +1572,25 @@ int main(int argc, char **argv)
     xemu_main_loop_unlock();
 
     struct xemu_console *scon = &scon_list[0];
+    /* Poll input at full rate, render at most every 4 ms: the render pass
+     * takes the main-loop lock and would starve the QEMU main loop. The pace
+     * ignores guest flips, so a guest frame shorter than 4 ms can go unseen. */
+    int64_t last_render_us = 0;
     while (!qatomic_read(&qemu_exiting)) {
         poll_events(scon);
-        gl_render_frame(scon);
+        if (nv2a_stock_active()) {
+            gl_render_frame(scon);
+            continue;
+        }
+        /* The real hardware speed flip deadline has no other wakeup. */
+        nv2a_fifo_kick_safety();
+        int64_t now_us = g_get_monotonic_time();
+        if (now_us - last_render_us >= 4000) {
+            gl_render_frame(scon);
+            last_render_us = now_us;
+        } else {
+            SDL_Delay(1);
+        }
     }
     qemu_sem_post(&display_shutdown_sem);
     qemu_thread_join(&thread);

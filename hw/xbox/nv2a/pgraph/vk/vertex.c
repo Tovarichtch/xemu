@@ -8,6 +8,7 @@
  * Copyright (c) 2012 espes
  * Copyright (c) 2015 Jannik Vogel
  * Copyright (c) 2018-2024 Matt Borgerson
+ * Copyright (c) 2026 Réda Chérif-Touil
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -53,20 +54,55 @@ void pgraph_vk_update_vertex_ram_buffer(PGRAPHState *pg, hwaddr offset,
     size_t end_bit = TARGET_PAGE_ALIGN(offset + size) / TARGET_PAGE_SIZE;
     size_t nbits = end_bit - start_bit;
 
-    if (find_next_bit(r->uploaded_bitmap, start_bit + nbits, start_bit) <
-        end_bit) {
-        // Vertex data changed while building the draw list. Finish drawing
-        // before updating RAM buffer.
+    /* The mirror is never overwritten under an unsettled reader: the draw
+     * path sends such ranges to the arena, other callers settle here. */
+    if (find_next_bit(r->vertex_consumed_bitmap, start_bit + nbits,
+                      start_bit) < end_bit) {
         pgraph_vk_finish(pg, VK_FINISH_REASON_VERTEX_BUFFER_DIRTY);
+        /* finish() is a no-op without an open recording (flush/loadvm
+         * path); pending fences must still settle before the overwrite. */
+        pgraph_vk_settle_all_slots(pg);
     }
 
     nv2a_profile_inc_counter(NV2A_PROF_GEOM_BUFFER_UPDATE_1);
     memcpy(r->storage_buffers[BUFFER_VERTEX_RAM].mapped + offset, data, size);
 
-    bitmap_set(r->uploaded_bitmap, start_bit, nbits);
+    bitmap_clear(r->vertex_stale_bitmap, start_bit, nbits);
+    /* Mirror is now newer than any cached snapshot of these bytes. */
+    pgraph_vk_vertex_cow_cache_invalidate(r, offset, size);
 }
 
-static void update_memory_buffer(NV2AState *d, hwaddr addr, hwaddr size)
+/* Drop cached COW snapshots overlapping [addr, addr+size): their content
+ * generation no longer matches guest RAM (or the mirror). */
+void pgraph_vk_vertex_cow_cache_invalidate(PGRAPHVkState *r, hwaddr addr,
+                                           VkDeviceSize size)
+{
+    for (int i = 0; i < ARRAY_SIZE(r->vertex_cow_cache); i++) {
+        VertexCowCacheEntry *e = &r->vertex_cow_cache[i];
+        if (e->valid && e->addr < addr + size && addr < e->addr + e->size) {
+            e->valid = false;
+        }
+    }
+}
+
+/* For a foreign consumer of the NV2A dirty bit on this range: declare the
+ * vertex mirror behind guest RAM, so the next draw refreshes it. */
+void pgraph_vk_vertex_mark_stale(PGRAPHState *pg, hwaddr addr,
+                                 VkDeviceSize size)
+{
+    PGRAPHVkState *r = pg->vk_renderer_state;
+
+    size_t start_bit = addr / TARGET_PAGE_SIZE;
+    size_t end_bit = TARGET_PAGE_ALIGN(addr + size) / TARGET_PAGE_SIZE;
+    end_bit = MIN(end_bit, r->bitmap_size);
+    if (start_bit < end_bit) {
+        bitmap_set(r->vertex_stale_bitmap, start_bit, end_bit - start_bit);
+    }
+    pgraph_vk_vertex_cow_cache_invalidate(r, addr, size);
+}
+
+static void update_memory_buffer(NV2AState *d, int attr_index, hwaddr addr,
+                                 hwaddr size)
 {
     PGRAPHState *pg = &d->pgraph;
     PGRAPHVkState *r = pg->vk_renderer_state;
@@ -74,6 +110,8 @@ static void update_memory_buffer(NV2AState *d, hwaddr addr, hwaddr size)
     assert(r->num_vertex_ram_buffer_syncs <
            ARRAY_SIZE(r->vertex_ram_buffer_syncs));
     r->vertex_ram_buffer_syncs[r->num_vertex_ram_buffer_syncs++] =
+        (MemorySyncRequirement){ .addr = addr, .size = size };
+    r->vertex_attr_span[attr_index] =
         (MemorySyncRequirement){ .addr = addr, .size = size };
 }
 
@@ -138,6 +176,8 @@ void pgraph_vk_bind_vertex_attributes(NV2AState *d, unsigned int min_element,
 
     r->num_active_vertex_attribute_descriptions = 0;
     r->num_active_vertex_binding_descriptions = 0;
+    memset(r->vertex_attr_cow, 0, sizeof(r->vertex_attr_cow));
+    memset(r->vertex_attr_span, 0, sizeof(r->vertex_attr_span));
 
     for (int i = 0; i < NV2A_VERTEXSHADER_ATTRIBUTES; i++) {
         VertexAttribute *attr = &pg->vertex_attributes[i];
@@ -209,7 +249,7 @@ void pgraph_vk_bind_vertex_attributes(NV2AState *d, unsigned int min_element,
             attrib_data_addr = attr_data + attr->offset - d->vram_ptr;
             stride = attr->stride;
             start = attrib_data_addr + min_element * stride;
-            update_memory_buffer(d, start, num_elements * stride);
+            update_memory_buffer(d, i, start, num_elements * stride);
         }
 
         uint32_t provoking_element_index = provoking_element - min_element;
@@ -284,6 +324,8 @@ void pgraph_vk_bind_vertex_attributes_inline(NV2AState *d)
 
     r->num_active_vertex_attribute_descriptions = 0;
     r->num_active_vertex_binding_descriptions = 0;
+    memset(r->vertex_attr_cow, 0, sizeof(r->vertex_attr_cow));
+    memset(r->vertex_attr_span, 0, sizeof(r->vertex_attr_span));
 
     for (int i = 0; i < NV2A_VERTEXSHADER_ATTRIBUTES; i++) {
         VertexAttribute *attr = &pg->vertex_attributes[i];

@@ -143,6 +143,7 @@ static void upload_pvideo_image(PGRAPHState *pg, PvideoState state)
     // Copy texture data to mapped device buffer
     uint8_t *mapped_memory_ptr;
 
+    pgraph_vk_wait_for_aux(pg);
     VK_CHECK(vmaMapMemory(r->allocator,
                           r->storage_buffers[BUFFER_STAGING_SRC].allocation,
                           (void *)&mapped_memory_ptr));
@@ -902,7 +903,8 @@ static void render_display(PGRAPHState *pg, SurfaceBinding *surface)
     PGRAPHVkDisplayState *disp = &r->display;
 
     if (r->in_command_buffer &&
-        surface->draw_time >= r->command_buffer_start_time) {
+        (surface->draw_time >= r->command_buffer_start_time ||
+         pgraph_vk_surface_borrow_pending(r, surface))) {
         pgraph_vk_finish(pg, VK_FINISH_REASON_PRESENTING);
     }
 
@@ -920,10 +922,15 @@ static void render_display(PGRAPHState *pg, SurfaceBinding *surface)
     pgraph_vk_begin_debug_marker(r, cmd, RGBA_YELLOW,
         "Display Surface %08"HWADDR_PRIx, surface->vram_addr);
 
-    pgraph_vk_transition_image_layout(pg, cmd, surface->image,
-                                      surface->host_fmt.vk_format,
-                                      VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                                      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    /* In-place sampling: a surface sampled in place is read and left in
+     * SHADER_READ, the layout its recorded draws expect. */
+    bool sampled_in_place = surface->in_shader_read;
+    if (!sampled_in_place) {
+        pgraph_vk_transition_image_layout(
+            pg, cmd, surface->image, surface->host_fmt.vk_format,
+            pgraph_vk_surface_base_layout(surface),
+            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    }
     pgraph_vk_transition_image_layout(
         pg, cmd, disp->image, VK_FORMAT_R8G8B8A8_UNORM,
         VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
@@ -984,10 +991,12 @@ static void render_display(PGRAPHState *pg, SurfaceBinding *surface)
                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
 #endif
 
-    pgraph_vk_transition_image_layout(pg, cmd, surface->image,
-                                      surface->host_fmt.vk_format,
-                                      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                                      VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    if (!sampled_in_place) {
+        pgraph_vk_transition_image_layout(
+            pg, cmd, surface->image, surface->host_fmt.vk_format,
+            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            pgraph_vk_surface_base_layout(surface));
+    }
 
     pgraph_vk_transition_image_layout(pg, cmd, disp->image,
                                       VK_FORMAT_R8G8B8_UNORM,

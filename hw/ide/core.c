@@ -45,6 +45,9 @@
 #include "trace.h"
 #include "hw/xbox/chihiro/chihiro.h"
 
+/* ATA commands issued; read by the NV2A cost model's bus-contention gate. */
+unsigned long xemu_ide_cmds;
+
 /* These values were based on a Seagate ST3500418AS but have been modified
    to make more sense in QEMU */
 static const int smart_attributes[][12] = {
@@ -2216,6 +2219,8 @@ void ide_bus_exec_cmd(IDEBus *bus, uint32_t val)
 
     s = ide_bus_active_if(bus);
     trace_ide_bus_exec_cmd(bus, s, val);
+
+    xemu_ide_cmds++;
 
     /* ignore commands to non existent slave */
     if (s != bus->ifs && !s->blk) {

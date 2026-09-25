@@ -4,6 +4,7 @@
  * Copyright (c) 2012 espes
  * Copyright (c) 2015 Jannik Vogel
  * Copyright (c) 2018-2024 Matt Borgerson
+ * Copyright (c) 2026 Réda Chérif-Touil
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -21,8 +22,77 @@
 
 #include "qemu/fast-hash.h"
 #include "hw/xbox/nv2a/nv2a_int.h"
+#include "hw/xbox/nv2a/pgraph/cost.h"
 #include "debug.h"
 #include "renderer.h"
+
+/* GL queries of the cost model (cost.c): fragment-shader invocations, a
+ * target the game's zpass query never uses, and SAMPLES_PASSED while the
+ * game's query is closed. */
+static GLuint gl_cost_segq[XEMU_COST_SEGS];
+static GLuint gl_cost_segq2[XEMU_COST_SEGS];
+static int xemu_cost_probe = -1;
+
+static bool gl_cost_seg_begin(NV2AState *d, int slot, bool want_samples)
+{
+    PGRAPHGLState *r = d->pgraph.gl_renderer_state;
+    if (!gl_cost_segq[slot]) {
+        glGenQueries(1, &gl_cost_segq[slot]);
+    }
+    glBeginQuery(GL_FRAGMENT_SHADER_INVOCATIONS_ARB, gl_cost_segq[slot]);
+    if (want_samples && !r->gl_zpass_query_open) {
+        if (!gl_cost_segq2[slot]) {
+            glGenQueries(1, &gl_cost_segq2[slot]);
+        }
+        glBeginQuery(GL_SAMPLES_PASSED, gl_cost_segq2[slot]);
+        return true;
+    }
+    return false;
+}
+
+static void gl_cost_seg_end(NV2AState *d)
+{
+    glEndQuery(GL_FRAGMENT_SHADER_INVOCATIONS_ARB);
+    if (xemu_cost_q2_open) {
+        glEndQuery(GL_SAMPLES_PASSED);
+    }
+}
+
+static void gl_cost_seg_read(NV2AState *d, int slot, uint64_t *invocations,
+                             uint64_t *samples)
+{
+    GLuint64 v = 0;
+    glGetQueryObjectui64v(gl_cost_segq[slot], GL_QUERY_RESULT, &v);
+    *invocations = v;
+    if (samples) {
+        GLuint64 s = 0;
+        glGetQueryObjectui64v(gl_cost_segq2[slot], GL_QUERY_RESULT, &s);
+        *samples = s;
+    }
+}
+
+const XemuCostQueryOps pgraph_gl_cost_ops = {
+    .seg_begin = gl_cost_seg_begin,
+    .seg_end = gl_cost_seg_end,
+    .seg_read = gl_cost_seg_read,
+};
+
+static inline bool cost_probe_active(void)
+{
+    if (!xemu_cost_model_active()) {
+        return false;
+    }
+    if (xemu_cost_probe < 0) {
+        xemu_cost_probe =
+            epoxy_has_gl_extension("GL_ARB_pipeline_statistics_query");
+        if (!xemu_cost_probe) {
+            fprintf(stderr, "xemu: real-hw-speed: "
+                    "GL_ARB_pipeline_statistics_query missing -- "
+                    "cost model running without fragments (degraded)\n");
+        }
+    }
+    return xemu_cost_probe;
+}
 
 /* The NV2A dithers to hide quantisation on 5/6-bit channel surfaces
  * (R5G6B5, X1R5G5B5); on 8888 targets host dithering only stipples
@@ -130,6 +200,9 @@ void pgraph_gl_clear_surface(NV2AState *d, uint32_t parameter)
     glClear(gl_mask);
 
     glDisable(GL_SCISSOR_TEST);
+    /* The masks, the scissor and the dither set here are not the cached
+     * draw state's: the next draw sets its own again. */
+    pgraph_gl_draw_state_invalidate(r);
 
     pgraph_gl_set_surface_dirty(pg, write_color, write_zeta);
 
@@ -143,12 +216,69 @@ void pgraph_gl_clear_surface(NV2AState *d, uint32_t parameter)
     pg->clearing = false;
 }
 
+/* Exactly the register fields the block reads, so a write outside them
+ * changes no GL call: keep them in step with the block. */
+#define GLST_CONTROL_0_FIELDS                                          \
+    (NV_PGRAPH_CONTROL_0_ZENABLE | NV_PGRAPH_CONTROL_0_ZFUNC |         \
+     NV_PGRAPH_CONTROL_0_DITHERENABLE |                                \
+     NV_PGRAPH_CONTROL_0_ZWRITEENABLE |                                \
+     NV_PGRAPH_CONTROL_0_ALPHA_WRITE_ENABLE |                          \
+     NV_PGRAPH_CONTROL_0_RED_WRITE_ENABLE |                            \
+     NV_PGRAPH_CONTROL_0_GREEN_WRITE_ENABLE |                          \
+     NV_PGRAPH_CONTROL_0_BLUE_WRITE_ENABLE)
+#define GLST_CONTROL_1_FIELDS                                             \
+    (NV_PGRAPH_CONTROL_1_STENCIL_TEST_ENABLE |                            \
+     NV_PGRAPH_CONTROL_1_STENCIL_FUNC | NV_PGRAPH_CONTROL_1_STENCIL_REF | \
+     NV_PGRAPH_CONTROL_1_STENCIL_MASK_READ |                              \
+     NV_PGRAPH_CONTROL_1_STENCIL_MASK_WRITE)
+#define GLST_CONTROL_2_FIELDS                                          \
+    (NV_PGRAPH_CONTROL_2_STENCIL_OP_FAIL |                             \
+     NV_PGRAPH_CONTROL_2_STENCIL_OP_ZFAIL |                            \
+     NV_PGRAPH_CONTROL_2_STENCIL_OP_ZPASS)
+#define GLST_BLEND_FIELDS                                              \
+    (NV_PGRAPH_BLEND_EQN | NV_PGRAPH_BLEND_EN |                        \
+     NV_PGRAPH_BLEND_SFACTOR | NV_PGRAPH_BLEND_DFACTOR)
+#define GLST_SETUPRASTER_FIELDS                                           \
+    (NV_PGRAPH_SETUPRASTER_CULLENABLE | NV_PGRAPH_SETUPRASTER_CULLCTRL |  \
+     NV_PGRAPH_SETUPRASTER_FRONTFACE |                                    \
+     NV_PGRAPH_SETUPRASTER_LINESMOOTHENABLE |                             \
+     NV_PGRAPH_SETUPRASTER_POLYSMOOTHENABLE)
+
+void pgraph_gl_draw_state_invalidate(PGRAPHGLState *r)
+{
+    r->draw_state_key.valid = false;
+}
+
+/* Keeps xemu's own surface conversion draws out of the game's zpass count
+ * and of the cost counts (why: xemu_cost_blit_suspend in cost.c). The
+ * game's query is closed; its next enabled draw opens a new one, and the
+ * report sums them. Returns whether a cost segment was suspended. */
+bool pgraph_gl_own_draw_suspend(NV2AState *d)
+{
+    PGRAPHGLState *r = d->pgraph.gl_renderer_state;
+
+    if (r->gl_zpass_query_open) {
+        glEndQuery(GL_SAMPLES_PASSED);
+        r->gl_zpass_query_open = false;
+    }
+    return xemu_cost_blit_suspend(d, &pgraph_gl_cost_ops);
+}
+
+void pgraph_gl_own_draw_resume(NV2AState *d)
+{
+    xemu_cost_blit_resume(d, &pgraph_gl_cost_ops);
+}
+
 void pgraph_gl_draw_begin(NV2AState *d)
 {
     PGRAPHState *pg = &d->pgraph;
     PGRAPHGLState *r = pg->gl_renderer_state;
 
     NV2A_GL_DGROUP_BEGIN("NV097_SET_BEGIN_END: 0x%x", pg->primitive_mode);
+
+    if (cost_probe_active()) {
+        xemu_cost_draw_begin(d, &pgraph_gl_cost_ops);
+    }
 
     uint32_t control_0 = pgraph_reg_r(pg, NV_PGRAPH_CONTROL_0);
     bool mask_alpha = control_0 & NV_PGRAPH_CONTROL_0_ALPHA_WRITE_ENABLE;
@@ -169,11 +299,10 @@ void pgraph_gl_draw_begin(NV2AState *d)
 
     assert(r->color_binding || r->zeta_binding);
 
-    pgraph_gl_bind_textures(d);
-    /* Lines wider than the host rasterizes go through the wide-line
-     * geometry shader: decided before the shader state is keyed, from the
-     * same width and range glLineWidth gets below. */
     {
+        /* Lines wider than the host rasterizes go through the wide-line
+         * geometry shader: decided here, before the shader state is keyed,
+         * from the same width and range the glLineWidth below uses. */
         bool line_prim = pg->primitive_mode == PRIM_TYPE_LINES ||
                          pg->primitive_mode == PRIM_TYPE_LINE_LOOP ||
                          pg->primitive_mode == PRIM_TYPE_LINE_STRIP;
@@ -185,9 +314,36 @@ void pgraph_gl_draw_begin(NV2AState *d)
         float host_max = smooth ? r->supported_smooth_line_width_range[1]
                                 : r->supported_aliased_line_width_range[1];
         r->wide_lines = line_prim && lw_px > host_max;
-    }
-    pgraph_gl_bind_shaders(pg);
 
+        pgraph_gl_bind_textures(d);
+        pgraph_gl_bind_shaders(pg);
+    }
+
+    {
+        uint32_t key[13] = {
+            pgraph_reg_r(pg, NV_PGRAPH_CONTROL_0) & GLST_CONTROL_0_FIELDS,
+            pgraph_reg_r(pg, NV_PGRAPH_CONTROL_1) & GLST_CONTROL_1_FIELDS,
+            pgraph_reg_r(pg, NV_PGRAPH_CONTROL_2) & GLST_CONTROL_2_FIELDS,
+            pgraph_reg_r(pg, NV_PGRAPH_BLEND) & GLST_BLEND_FIELDS,
+            pgraph_reg_r(pg, NV_PGRAPH_BLENDCOLOR),
+            pgraph_reg_r(pg, NV_PGRAPH_SETUPRASTER) & GLST_SETUPRASTER_FIELDS,
+            pgraph_reg_r(pg, NV_PGRAPH_ANTIALIASING),
+            pg->surface_binding_dim.width,
+            pg->surface_binding_dim.height,
+            pg->surface_shape.clip_x | (pg->surface_shape.clip_y << 16),
+            pg->surface_shape.clip_width |
+                (pg->surface_shape.clip_height << 16),
+            pg->surface_scale_factor,
+            /* Dithering follows the colour surface's channel depth. */
+            pg->surface_shape.color_format,
+        };
+        if (r->draw_state_key.valid &&
+            !memcmp(r->draw_state_key.k, key, sizeof(key))) {
+            goto gl_state_done;
+        }
+        memcpy(r->draw_state_key.k, key, sizeof(key));
+        r->draw_state_key.valid = true;
+    }
     glColorMask(mask_red, mask_green, mask_blue, mask_alpha);
     glDepthMask(!!(control_0 & NV_PGRAPH_CONTROL_0_ZWRITEENABLE));
     glStencilMask(GET_MASK(pgraph_reg_r(pg, NV_PGRAPH_CONTROL_1),
@@ -307,23 +463,14 @@ void pgraph_gl_draw_begin(NV2AState *d)
 
     bool anti_aliasing = GET_MASK(pgraph_reg_r(pg, NV_PGRAPH_ANTIALIASING), NV_PGRAPH_ANTIALIASING_ENABLE);
 
-    /* Edge Antialiasing */
-    /* NV097_SET_LINE_WIDTH is in 1/8 pixel: express it in pixels and scale
-     * to the internal resolution. The clamp is host plumbing (0 is a GL
-     * error, the top is driver dependent); past the top the geometry
-     * shader draws the segments as rectangles. */
-    GLfloat line_width = (pg->line_width / 8.0f) * pg->surface_scale_factor;
-    const GLfloat *lw_range = r->supported_aliased_line_width_range;
-    if (!anti_aliasing && pgraph_reg_r(pg, NV_PGRAPH_SETUPRASTER) &
-                              NV_PGRAPH_SETUPRASTER_LINESMOOTHENABLE) {
+    /* Edge Antialiasing; the line width is posed after gl_state_done. */
+    r->line_smooth_on = !anti_aliasing &&
+                        (pgraph_reg_r(pg, NV_PGRAPH_SETUPRASTER) &
+                         NV_PGRAPH_SETUPRASTER_LINESMOOTHENABLE);
+    if (r->line_smooth_on) {
         glEnable(GL_LINE_SMOOTH);
-        lw_range = r->supported_smooth_line_width_range;
     } else {
         glDisable(GL_LINE_SMOOTH);
-    }
-    glLineWidth(MAX(lw_range[0], MIN(lw_range[1], line_width)));
-    if (r->shader_binding->state.geom.wide_lines) {
-        pgraph_gl_wide_line_uniforms(pg);
     }
     if (!anti_aliasing && pgraph_reg_r(pg, NV_PGRAPH_SETUPRASTER) &
                               NV_PGRAPH_SETUPRASTER_POLYSMOOTHENABLE) {
@@ -353,18 +500,51 @@ void pgraph_gl_draw_begin(NV2AState *d)
     glEnable(GL_SCISSOR_TEST);
     glScissor(xmin, ymin, scissor_width, scissor_height);
 
-    /* Visibility testing */
-    if (pg->zpass_pixel_count_enable) {
-        r->gl_zpass_pixel_count_query_count++;
-        r->gl_zpass_pixel_count_queries = (GLuint*)g_realloc(
-            r->gl_zpass_pixel_count_queries,
-            sizeof(GLuint) * r->gl_zpass_pixel_count_query_count);
+gl_state_done:;
+    /* NV097_SET_LINE_WIDTH is in 1/8 pixel; posed every draw, as it changes
+     * too often for the cached block. The clamp is host plumbing (0 is a GL
+     * error, the top is driver dependent); wider lines go to the geometry
+     * shader. */
+    GLfloat line_width = (pg->line_width / 8.0f) * pg->surface_scale_factor;
+    const GLfloat *lw_range = r->line_smooth_on
+                                  ? r->supported_smooth_line_width_range
+                                  : r->supported_aliased_line_width_range;
+    glLineWidth(MAX(lw_range[0], MIN(lw_range[1], line_width)));
+    if (r->shader_binding && r->shader_binding->state.geom.wide_lines) {
+        pgraph_gl_wide_line_uniforms(pg);
+    }
 
-        GLuint gl_query;
-        glGenQueries(1, &gl_query);
-        r->gl_zpass_pixel_count_queries[
-            r->gl_zpass_pixel_count_query_count - 1] = gl_query;
-        glBeginQuery(GL_SAMPLES_PASSED, gl_query);
+    /* Visibility testing. The hardware zpass count is a running sum
+     * sampled by GET_REPORT, not a per-draw event (the XDK brackets each
+     * visibility test as CLEAR+ENABLE ... draws ... ENABLE(0)+REPORT):
+     * one query spanning the whole interval is the exact semantic, at a
+     * fraction of the driver cost of one query per draw. */
+    if (pg->zpass_pixel_count_enable) {
+        if (!r->gl_zpass_query_open) {
+            nv2a_profile_inc_counter(NV2A_PROF_QUERY);
+            r->gl_zpass_pixel_count_query_count++;
+            r->gl_zpass_pixel_count_queries = (GLuint*)g_realloc(
+                r->gl_zpass_pixel_count_queries,
+                sizeof(GLuint) * r->gl_zpass_pixel_count_query_count);
+
+            GLuint gl_query;
+            glGenQueries(1, &gl_query);
+            r->gl_zpass_pixel_count_queries[
+                r->gl_zpass_pixel_count_query_count - 1] = gl_query;
+            /* The game's query takes SAMPLES_PASSED: end the cost model's
+             * and mark its sample count partial. */
+            if (xemu_cost_q2_open) {
+                glEndQuery(GL_SAMPLES_PASSED);
+                xemu_cost_samples_interrupted();
+            }
+            glBeginQuery(GL_SAMPLES_PASSED, gl_query);
+            r->gl_zpass_query_open = true;
+        }
+    } else if (r->gl_zpass_query_open) {
+        /* The counter only accumulates enabled draws: close on the
+         * transition so disabled draws stay out of the sum. */
+        glEndQuery(GL_SAMPLES_PASSED);
+        r->gl_zpass_query_open = false;
     }
 }
 
@@ -384,6 +564,10 @@ void pgraph_gl_draw_end(NV2AState *d)
         pgraph_reg_r(pg, NV_PGRAPH_CONTROL_1) & NV_PGRAPH_CONTROL_1_STENCIL_TEST_ENABLE;
     bool is_nop_draw = !(color_write || depth_test || stencil_test);
 
+    if (cost_probe_active() && !is_nop_draw) {
+        xemu_cost_draw_end_tally(pg);
+    }
+
     if (is_nop_draw) {
         // FIXME: Check PGRAPH register 0x880.
         // HW uses bit 11 in 0x880 to enable or disable a color/zeta limit
@@ -397,12 +581,7 @@ void pgraph_gl_draw_end(NV2AState *d)
     }
 
     pgraph_gl_flush_draw(d);
-
-    /* End of visibility testing */
-    if (pg->zpass_pixel_count_enable) {
-        nv2a_profile_inc_counter(NV2A_PROF_QUERY);
-        glEndQuery(GL_SAMPLES_PASSED);
-    }
+    r->work_since_flush = true;
 
     pg->draw_time++;
     if (r->color_binding && pgraph_color_write_enabled(pg)) {
@@ -426,6 +605,13 @@ void pgraph_gl_flush_draw(NV2AState *d)
     }
     assert(r->shader_binding);
 
+    /* per-vertex cost of the current config (constant for the flush) */
+    unsigned long long vcost_milli = 0, vbytes_milli = 0;
+    if (cost_probe_active()) {
+        vcost_milli = xemu_cost_vert_cost_milli(pg);
+        vbytes_milli = xemu_cost_attr_bytes(pg) * 1000ull;
+    }
+
     if (pg->draw_arrays_length) {
         NV2A_GL_DPRINTF(false, "Draw Arrays");
         nv2a_profile_inc_counter(NV2A_PROF_DRAW_ARRAYS);
@@ -436,11 +622,17 @@ void pgraph_gl_flush_draw(NV2AState *d)
         pgraph_gl_bind_vertex_attributes(d, pg->draw_arrays_min_start,
                                       pg->draw_arrays_max_count - 1,
                                       false, 0,
-                                      pg->draw_arrays_max_count - 1);
+                                      pg->draw_arrays_max_count - 1, false);
         glMultiDrawArrays(r->shader_binding->gl_primitive_mode,
                           pg->draw_arrays_start,
                           pg->draw_arrays_count,
                           pg->draw_arrays_length);
+        if (cost_probe_active()) {
+            for (unsigned int i = 0; i < pg->draw_arrays_length; i++) {
+                xemu_cost_add_verts(pg->draw_arrays_count[i], vcost_milli,
+                                    vbytes_milli);
+            }
+        }
     } else if (pg->inline_elements_length) {
         NV2A_GL_DPRINTF(false, "Inline Elements");
         nv2a_profile_inc_counter(NV2A_PROF_INLINE_ELEMENTS);
@@ -456,7 +648,7 @@ void pgraph_gl_flush_draw(NV2AState *d)
 
         pgraph_gl_bind_vertex_attributes(
                 d, min_element, max_element, false, 0,
-                pg->inline_elements[pg->inline_elements_length - 1]);
+                pg->inline_elements[pg->inline_elements_length - 1], true);
 
         VertexKey k;
         memset(&k, 0, sizeof(VertexKey));
@@ -479,9 +671,14 @@ void pgraph_gl_flush_draw(NV2AState *d)
         } else {
             nv2a_profile_inc_counter(NV2A_PROF_GEOM_BUFFER_UPDATE_4_NOTDIRTY);
         }
-        glDrawElements(r->shader_binding->gl_primitive_mode,
-                       pg->inline_elements_length, GL_UNSIGNED_INT,
-                       (void *)0);
+        glDrawElementsBaseVertex(r->shader_binding->gl_primitive_mode,
+                                 pg->inline_elements_length,
+                                 GL_UNSIGNED_INT,
+                                 (void *)0, r->draw_basevertex);
+        if (cost_probe_active()) {
+            xemu_cost_add_verts(pg->inline_elements_length, vcost_milli,
+                                vbytes_milli);
+        }
     } else if (pg->inline_buffer_length) {
         NV2A_GL_DPRINTF(false, "Inline Buffer");
         nv2a_profile_inc_counter(NV2A_PROF_INLINE_BUFFERS);
@@ -500,20 +697,23 @@ void pgraph_gl_flush_draw(NV2AState *d)
                 glBufferData(GL_ARRAY_BUFFER,
                              pg->inline_buffer_length * sizeof(float) * 4,
                              attr->inline_buffer, GL_STREAM_DRAW);
-                glVertexAttribPointer(i, 4, GL_FLOAT, GL_FALSE, 0, 0);
-                glEnableVertexAttribArray(i);
+                pgraph_gl_attr_pointer(r, i, r->gl_inline_buffer[i], 4,
+                                       GL_FLOAT, GL_FALSE, 0, 0, false);
+                pgraph_gl_attr_enable(r, i, true);
                 attr->inline_buffer_populated = false;
                 memcpy(attr->inline_value,
                        attr->inline_buffer + (pg->inline_buffer_length - 1) * 4,
                        sizeof(attr->inline_value));
             } else {
-                glDisableVertexAttribArray(i);
-                glVertexAttrib4fv(i, attr->inline_value);
+                pgraph_gl_attr_enable(r, i, false);
+                pgraph_gl_attr_value(r, i, attr->inline_value);
             }
         }
 
         glDrawArrays(r->shader_binding->gl_primitive_mode,
                      0, pg->inline_buffer_length);
+        xemu_cost_add_verts(pg->inline_buffer_length, vcost_milli,
+                            vbytes_milli);
     } else if (pg->inline_array_length) {
         NV2A_GL_DPRINTF(false, "Inline Array");
         nv2a_profile_inc_counter(NV2A_PROF_INLINE_ARRAYS);
@@ -521,6 +721,7 @@ void pgraph_gl_flush_draw(NV2AState *d)
         unsigned int index_count = pgraph_gl_bind_inline_array(d);
         glDrawArrays(r->shader_binding->gl_primitive_mode,
                      0, index_count);
+        xemu_cost_add_verts(index_count, vcost_milli, vbytes_milli);
     } else {
         NV2A_GL_DPRINTF(true, "EMPTY NV097_SET_BEGIN_END");
         NV2A_UNCONFIRMED("EMPTY NV097_SET_BEGIN_END");

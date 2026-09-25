@@ -312,14 +312,25 @@ MString *pgraph_glsl_gen_geom(const GeomState *state, GenGeomGlslOptions opts)
         mstring_from_fmt("#version %d\n\n"
                          "%s"
                          "%s"
+                         "%s"
                          "\n"
                          "#define v_vtxPos v_vtxPos0\n"
                          "\n",
-                         opts.vulkan ? 450 : 400, layout_in, layout_out);
-    pgraph_glsl_get_vtx_header(output, opts.vulkan, state->smooth_shading, true,
-                               true, true);
-    pgraph_glsl_get_vtx_header(output, opts.vulkan, state->smooth_shading,
-                               false, false, false);
+                         opts.vulkan ? 450 : (opts.locations ? 410 : 400),
+                         opts.vulkan ? "" :
+                             "in gl_PerVertex {\n"
+                             "  vec4 gl_Position;\n"
+                             "  float gl_PointSize;\n"
+                             "} gl_in[];\n"
+                             "out gl_PerVertex {\n"
+                             "  vec4 gl_Position;\n"
+                             "  float gl_PointSize;\n"
+                             "};\n\n",
+                         layout_in, layout_out);
+    pgraph_glsl_get_vtx_header(output, opts.vulkan || opts.locations,
+                               state->smooth_shading, true, true, true);
+    pgraph_glsl_get_vtx_header(output, opts.vulkan || opts.locations,
+                               state->smooth_shading, false, false, false);
 
     char vertex_order_buf[80];
     const char *vertex_order_body = "";

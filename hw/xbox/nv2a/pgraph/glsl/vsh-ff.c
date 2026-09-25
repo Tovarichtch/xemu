@@ -65,6 +65,131 @@ static void append_skinning_code(MString *str, bool mix, unsigned int count,
     }
 }
 
+/* The eight 2-bit CSV0_D light modes read from a uniform, as the hardware
+ * does, not one program per combination; mirrors the unrolled code below. */
+static void gen_dynamic_lights(MString *body, const VshState *state)
+{
+    const char *eye =
+        state->fixed_function.csv0c_dynamic || state->fixed_function.local_eye ?
+            "VPeye" : "vec3(0.0, 0.0, 0.0)";
+    const char *half_infinite =
+        state->fixed_function.csv0c_dynamic ?
+            "(((csv0cCtl & 2u) != 0u) ? normalize(lightDirection + VPeye)"
+            " : lightInfiniteHalfVector[i])" :
+        state->fixed_function.local_eye ?
+            "normalize(lightDirection + VPeye)" :
+            "lightInfiniteHalfVector[i]";
+
+    mstring_append_fmt(
+        body,
+        "int lightCount = int((lightMode >> 16u) & 15u);\n"
+        "for (int i = 0; i < lightCount; i++) {\n"
+        "  uint lmode = (lightMode >> uint(i * 2)) & 3u;\n"
+        "  if (lmode == 0u) { continue; }\n"
+        "  float attenuation;\n"
+        "  float nDotVP;\n"
+        "  float nDotHV;\n"
+        "  float nDotVPraw;\n"
+        "  float nDotHVraw;\n"
+        "  if (lmode == 1u) {\n"
+        "    attenuation = 1.0;\n"
+        "    vec3 lightDirection = normalize(lightInfiniteDirection[i]);\n"
+        "    nDotVPraw = dot(tNormal, lightDirection);\n"
+        "    nDotHVraw = dot(tNormal, %s);\n"
+        "    nDotVP = max(0.0, nDotVPraw);\n"
+        "    nDotHV = max(0.0, nDotHVraw);\n"
+        "  } else {\n"
+        "    vec3 tPos = tPosition.xyz/tPosition.w;\n"
+        "    vec3 VP = lightLocalPosition[i] - tPos;\n"
+        "    float d = length(VP);\n"
+        /* The XDK stamps 1e30 into the range register for directional
+         * lights, pointless unless the silicon consumes the cutoff. */
+        "    if (d > lightLocalRange(i)) { continue; }\n"
+        "    VP = normalize(VP);\n"
+        "    attenuation = 1.0 / (lightLocalAttenuation[i].x\n"
+        "                           + lightLocalAttenuation[i].y * d\n"
+        "                           + lightLocalAttenuation[i].z * d * d);\n"
+        "    vec3 halfVector = normalize(VP + %s);\n"
+        "    nDotVPraw = dot(tNormal, VP);\n"
+        "    nDotHVraw = dot(tNormal, halfVector);\n"
+        "    nDotVP = max(0.0, nDotVPraw);\n"
+        "    nDotHV = max(0.0, nDotHVraw);\n",
+        half_infinite, eye);
+
+    /* Spot: the cooked vector, as in the unrolled LIGHT_SPOT case (cooking
+     * decompiled from D3DDevice_SetLight and the lighting flush of the HOTD3
+     * D3D8 runtime; real hardware renders its hard cones, so it does not
+     * renormalize). The Falloff curve (L0_K) is not modelled. */
+    mstring_append(
+        body,
+        "    if (lmode == 3u) {\n"
+        "      vec4 spotDir = lightSpotDirection(i);\n"
+        "      attenuation *=\n"
+        "          clamp(dot(spotDir.xyz, VP) + spotDir.w, 0.0, 1.0);\n"
+        "    }\n"
+        "  }\n");
+
+    mstring_append(
+        body,
+        "  float pf;\n"
+        "  if (nDotVP == 0.0 || nDotHV == 0.0) {\n"
+        "    pf = 0.0;\n"
+        "  } else {\n"
+        "    pf = pow(nDotHV, specularPower);\n"
+        "  }\n"
+        "  vec3 lightAmbient = lightAmbientColor(i) * attenuation;\n"
+        "  vec3 lightDiffuse = lightDiffuseColor(i) * attenuation * nDotVP;\n"
+        "  vec3 lightSpecular = lightSpecularColor(i) * attenuation * pf;\n"
+        "  oD0.xyz += lightAmbient;\n"
+        /* Two-sided lighting: the back face is lit with the negated
+         * normal and the back light registers. */
+        "  if ((csv0cCtl & 32768u) != 0u) {\n"
+        "    float bDotVP = max(0.0, -nDotVPraw);\n"
+        "    float bDotHV = max(0.0, -nDotHVraw);\n"
+        "    float bpf = (bDotVP == 0.0 || bDotHV == 0.0)"
+        " ? 0.0 : pow(bDotHV, specularPower);\n"
+        "    oB0.xyz += lightBackAmbientColor(i) * attenuation;\n"
+        "    oB0.xyz += lightBackDiffuseColor(i) * attenuation * bDotVP;\n"
+        "    oB1.xyz += lightBackSpecularColor(i) * attenuation * bpf;\n"
+        "  }\n");
+
+    if (state->fixed_function.csv0c_dynamic) {
+        mstring_append(body,
+            "  uint ldsrc = (csv0cCtl >> 8) & 3u;\n"
+            "  oD0.xyz += (ldsrc == 1u ? diffuse.xyz : ldsrc == 2u ?"
+            " specular.xyz : vec3(1.0)) * lightDiffuse;\n"
+            "  uint lssrc = (csv0cCtl >> 10) & 3u;\n"
+            "  oD1.xyz += (lssrc == 1u ? diffuse.xyz : lssrc == 2u ?"
+            " specular.xyz : vec3(1.0)) * lightSpecular;\n");
+    } else {
+    switch (state->fixed_function.diffuse_src) {
+    case MATERIAL_COLOR_SRC_MATERIAL:
+        mstring_append(body, "  oD0.xyz += lightDiffuse;\n");
+        break;
+    case MATERIAL_COLOR_SRC_DIFFUSE:
+        mstring_append(body, "  oD0.xyz += diffuse.xyz * lightDiffuse;\n");
+        break;
+    case MATERIAL_COLOR_SRC_SPECULAR:
+        mstring_append(body, "  oD0.xyz += specular.xyz * lightDiffuse;\n");
+        break;
+    }
+
+    switch (state->fixed_function.specular_src) {
+    case MATERIAL_COLOR_SRC_MATERIAL:
+        mstring_append(body, "  oD1.xyz += lightSpecular;\n");
+        break;
+    case MATERIAL_COLOR_SRC_DIFFUSE:
+        mstring_append(body, "  oD1.xyz += diffuse.xyz * lightSpecular;\n");
+        break;
+    case MATERIAL_COLOR_SRC_SPECULAR:
+        mstring_append(body, "  oD1.xyz += specular.xyz * lightSpecular;\n");
+        break;
+    }
+    }
+
+    mstring_append(body, "}\n");
+}
+
 void pgraph_glsl_gen_vsh_ff(const VshState *state, MString *header,
                             MString *body)
 {
@@ -184,10 +309,55 @@ GLSL_DEFINE(materialEmissionColor, GLSL_LTCTXA(NV_IGRAPH_XF_LTCTXA_CM_COL) ".xyz
                          "tNormal", "vec4(normal, 0.0)",
                          "invModelViewMat", "xyz");
 
-    if (state->fixed_function.normalization) {
+    if (state->fixed_function.csv0c_dynamic) {
+        mstring_append(body,
+            "if ((csv0cCtl & 4u) != 0u) { tNormal = normalize(tNormal); }\n");
+    } else if (state->fixed_function.normalization) {
         mstring_append(body, "tNormal = normalize(tNormal);\n");
     }
 
+    if (state->fixed_function.texgen_dynamic) {
+        /* The per-coordinate texgen mode (a CSV1_A/B field) is read from a
+         * uniform: every candidate source is computed and the mode selects. */
+        mstring_append(body,
+            "/* Dynamic texgen */\n"
+            "vec3 tgU = normalize(tPosition.xyz);\n"
+            "vec3 tgR = reflect(tgU, tNormal);\n"
+            "float tgInvM = 1.0 / (2.0 * length(tgR + vec3(0.0, 0.0, 1.0)));\n"
+            "vec3 tgSph = tgR * tgInvM + 0.5;\n");
+        for (i = 0; i < NV2A_MAX_TEXTURES; i++) {
+            for (j = 0; j < 4; j++) {
+                char c = "xyzw"[j];
+                char cSuffix = "STRQ"[j];
+                const char *sph = j < 2 ? (j == 0 ? "tgSph.x" : "tgSph.y")
+                                        : "0.0";
+                const char *nrm = j < 3 ? (j == 0 ? "tNormal.x" :
+                                           j == 1 ? "tNormal.y" : "tNormal.z")
+                                        : "0.0";
+                const char *rfl = j < 3 ? (j == 0 ? "tgR.x" :
+                                           j == 1 ? "tgR.y" : "tgR.z")
+                                        : "0.0";
+                mstring_append_fmt(body,
+                    "{ uint tgm = (texgenMode[%d] >> %du) & 7u;\n"
+                    "  oT%d.%c = tgm == 0u ? texture%d.%c\n"
+                    "          : tgm == 1u ? dot(texPlane%c%d, tPosition)\n"
+                    "          : tgm == 2u ? dot(texPlane%c%d, position)\n"
+                    "          : tgm == 3u ? %s\n"
+                    "          : tgm == 4u ? %s\n"
+                    "          : %s; }\n",
+                    i, j * 3,
+                    i, c, i, c,
+                    cSuffix, i,
+                    cSuffix, i,
+                    sph, nrm, rfl);
+            }
+        }
+        for (i = 0; i < NV2A_MAX_TEXTURES; i++) {
+            mstring_append_fmt(body,
+                "if ((texMatEnable & %du) != 0u) { oT%d = oT%d * texMat%d; }\n",
+                1 << i, i, i, i);
+        }
+    } else {
     for (i = 0; i < NV2A_MAX_TEXTURES; i++) {
         mstring_append_fmt(body, "/* Texgen for stage %d */\n",
                            i);
@@ -259,8 +429,45 @@ GLSL_DEFINE(materialEmissionColor, GLSL_LTCTXA(NV_IGRAPH_XF_LTCTXA_CM_COL) ".xyz
                                i, i, i);
         }
     }
+    }
 
-    if (!state->fixed_function.lighting) {
+    if (state->fixed_function.csv0c_dynamic) {
+        /* The whole CSV0_C block read at run time (master switch, colour
+         * sources, local eye), the lights through the dynamic loop. */
+        mstring_append(body,
+            "if ((csv0cCtl & 1u) == 0u) {\n"
+            "  oD0 = diffuse;\n"
+            "  oD1 = specular;\n"
+            "  oB0 = backDiffuse;\n"
+            "  oB1 = backSpecular;\n"
+            "} else {\n"
+            "  uint dsrc = (csv0cCtl >> 8) & 3u;\n"
+            "  float alphaSrc = dsrc == 0u ? material_alpha\n"
+            "                 : dsrc == 2u ? specular.a : diffuse.a;\n"
+            "  uint asrc = (csv0cCtl >> 6) & 3u;\n"
+            "  oD0 = vec4(asrc == 0u ? sceneAmbientColor\n"
+            "           : asrc == 2u ? specular.rgb : diffuse.rgb, alphaSrc);\n"
+            "  oD0.rgb *= materialEmissionColor.rgb;\n"
+            "  uint esrc = (csv0cCtl >> 4) & 3u;\n"
+            "  oD0.rgb += esrc == 0u ? sceneAmbientColor\n"
+            "           : esrc == 2u ? specular.rgb : diffuse.rgb;\n"
+            "  oD1 = vec4(0.0, 0.0, 0.0, specular.a);\n"
+            "  if ((csv0cCtl & 32768u) != 0u) {\n"
+            "    oB0 = vec4(sceneBackAmbientColor, oD0.a);\n"
+            "    oB1 = vec4(0.0, 0.0, 0.0, backSpecular.a);\n"
+            "  }\n"
+            "  vec3 VPeye = ((csv0cCtl & 2u) != 0u)\n"
+            "      ? normalize(eyePosition.xyz / eyePosition.w"
+                  " - tPosition.xyz / tPosition.w)\n"
+            "      : vec3(0.0);\n");
+        gen_dynamic_lights(body, state);
+        mstring_append(body,
+            "  if ((csv0cCtl & 32768u) == 0u) {\n"
+            "    oB0 = backDiffuse;\n"
+            "    oB1 = backSpecular;\n"
+            "  }\n"
+            "}\n");
+    } else if (!state->fixed_function.lighting) {
         mstring_append(body, "  oD0 = diffuse;\n");
         mstring_append(body, "  oD1 = specular;\n");
         mstring_append(body, "  oB0 = backDiffuse;\n");
@@ -307,7 +514,12 @@ GLSL_DEFINE(materialEmissionColor, GLSL_LTCTXA(NV_IGRAPH_XF_LTCTXA_CM_COL) ".xyz
             );
         }
 
-        for (i = 0; i < NV2A_MAX_LIGHTS; i++) {
+        if (state->fixed_function.light_dynamic) {
+            gen_dynamic_lights(body, state);
+        }
+
+        for (i = 0; i < NV2A_MAX_LIGHTS && !state->fixed_function.light_dynamic;
+             i++) {
             if (state->fixed_function.light[i] == LIGHT_OFF) {
                 continue;
             }
@@ -461,7 +673,26 @@ GLSL_DEFINE(materialEmissionColor, GLSL_LTCTXA(NV_IGRAPH_XF_LTCTXA_CM_COL) ".xyz
         }
     }
 
-    if (!state->specular_enable) {
+    if (state->fixed_function.csv0c_dynamic) {
+        mstring_append(body,
+            "  if ((csv0cCtl & 4096u) == 0u) {\n"
+            "    oD1 = vec4(0.0, 0.0, 0.0, 1.0);\n"
+            "    oB1 = vec4(0.0, 0.0, 0.0, 1.0);\n"
+            "  } else {\n"
+            "    if ((csv0cCtl & 8192u) == 0u) {\n"
+            "      if ((csv0cCtl & 1u) != 0u) {\n"
+            "        oD0.xyz += oD1.xyz;\n"
+            "        oB0.xyz += oB1.xyz;\n"
+            "      }\n"
+            "      oD1 = specular;\n"
+            "      oB1 = backSpecular;\n"
+            "    }\n"
+            "    if ((csv0cCtl & 16384u) != 0u) {\n"
+            "      oD1.a = 1.0;\n"
+            "      oB1.a = 1.0;\n"
+            "    }\n"
+            "  }\n");
+    } else if (!state->specular_enable) {
         mstring_append(body, "  oD1 = vec4(0.0, 0.0, 0.0, 1.0);\n");
         mstring_append(body, "  oB1 = vec4(0.0, 0.0, 0.0, 1.0);\n");
     } else {
@@ -485,7 +716,20 @@ GLSL_DEFINE(materialEmissionColor, GLSL_LTCTXA(NV_IGRAPH_XF_LTCTXA_CM_COL) ".xyz
         }
     }
 
-    if (state->fog_enable) {
+    if (state->fog_dynamic) {
+        mstring_append(body,
+            "  float fogDistance;\n"
+            "  {\n"
+            "  uint fgen = (fogCtl >> 4) & 7u;\n"
+            "  if (fgen == 0u) { fogDistance = clamp(specular.a, 0.0, 1.0); }\n"
+            "  else if (fgen == 1u) { fogDistance = length(tPosition.xyz); }\n"
+            "  else if (fgen == 4u) { fogDistance = fogCoord; }\n"
+            "  else {\n"
+            "    fogDistance = dot(fogPlane.xyz, tPosition.xyz) + fogPlane.w;\n"
+            "    if (fgen == 3u) { fogDistance = abs(fogDistance); }\n"
+            "  }\n"
+            "  }\n");
+    } else if (state->fog_enable) {
         /* From: https://www.opengl.org/registry/specs/NV/fog_distance.txt */
         switch(state->fixed_function.foggen) {
         case FOGGEN_SPEC_ALPHA:
@@ -536,12 +780,9 @@ GLSL_DEFINE(materialEmissionColor, GLSL_LTCTXA(NV_IGRAPH_XF_LTCTXA_CM_COL) ".xyz
             "  float ptMinSize = min(pointParams[7], 63.875);\n"
             "  float ptMaxSize = min(pointParams[3] + ptMinSize, 63.875);\n"
             "  oPts.x = 1/sqrt(pointParams[0] + pointParams[1] * d_e + pointParams[2] * d_e * d_e) + pointParams[6];\n");
-        mstring_append_fmt(body,
-                           "  oPts.x = clamp(oPts.x * pointParams[3] + pointParams[7], ptMinSize, ptMaxSize) * %d;\n",
-                           state->surface_scale_factor);
+        mstring_append(body,
+                       "  oPts.x = clamp(oPts.x * pointParams[3] + pointParams[7], ptMinSize, ptMaxSize) * pointScale;\n");
     } else {
-        mstring_append_fmt(body, "  oPts.x = %f * %d;\n",
-                           MAX(1.f, state->point_size),
-                           state->surface_scale_factor);
+        mstring_append(body, "  oPts.x = max(1.0, pointSizeReg) * pointScale;\n");
     }
 }

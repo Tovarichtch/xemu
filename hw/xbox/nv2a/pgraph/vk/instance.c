@@ -2,6 +2,7 @@
  * Geforce NV2A PGRAPH Vulkan Renderer
  *
  * Copyright (c) 2024-2025 Matt Borgerson
+ * Copyright (c) 2026 Réda Chérif-Touil
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -331,6 +332,26 @@ static void add_optional_device_extension_names(
     r->memory_budget_extension_enabled = add_extension_if_available(
         available_extensions, enabled_extension_names,
         VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+
+    r->eds_extension_enabled = add_extension_if_available(
+        available_extensions, enabled_extension_names,
+        VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME);
+
+    r->eds3_extension_enabled = add_extension_if_available(
+        available_extensions, enabled_extension_names,
+        VK_EXT_EXTENDED_DYNAMIC_STATE_3_EXTENSION_NAME);
+
+    r->vertex_input_dynamic_extension_enabled = add_extension_if_available(
+        available_extensions, enabled_extension_names,
+        VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_EXTENSION_NAME);
+
+    r->pipeline_library_extension_enabled =
+        add_extension_if_available(available_extensions,
+                                   enabled_extension_names,
+                                   VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME) &&
+        add_extension_if_available(
+            available_extensions, enabled_extension_names,
+            VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME);
 }
 
 static bool check_device_support_required_extensions(VkPhysicalDevice device)
@@ -491,6 +512,8 @@ static bool create_logical_device(PGRAPHState *pg, Error **errp)
         F(fillModeNonSolid, true),
         F(geometryShader, true),
         F(occlusionQueryPrecise, true),
+        /* Cost-model fragment counts, optional: without it none are billed. */
+        F(pipelineStatisticsQuery, false),
         F(samplerAnisotropy, false),
         F(shaderClipDistance, true),
         F(shaderTessellationAndGeometryPointSize, true),
@@ -518,26 +541,117 @@ static bool create_logical_device(PGRAPHState *pg, Error **errp)
 
     void *next_struct = NULL;
 
-    /* UPSTREAM CANDIDATE: in SPIR-V 1.6 glslang lowers discard to
-     * OpDemoteToHelperInvocation, which needs the Vulkan 1.3 feature
-     * shaderDemoteToHelperInvocation enabled
-     * (VUID-VkShaderModuleCreateInfo-pCode-08740). It is enabled where the
-     * device has it; elsewhere the shaders are built for SPIR-V 1.5, which a
-     * Vulkan 1.2 device accepts (a 1.1 device accepts neither). */
+    /* Query dynamic-state feature bits before enabling: extension presence
+     * alone does not guarantee the individual features. */
+    VkPhysicalDeviceExtendedDynamicStateFeaturesEXT eds_query = {
+        .sType =
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_FEATURES_EXT,
+    };
+    VkPhysicalDeviceExtendedDynamicState3FeaturesEXT eds3_query = {
+        .sType =
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT,
+        .pNext = &eds_query,
+    };
+    VkPhysicalDeviceVertexInputDynamicStateFeaturesEXT vids_query = {
+        .sType =
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_INPUT_DYNAMIC_STATE_FEATURES_EXT,
+        .pNext = &eds3_query,
+    };
+    VkPhysicalDeviceGraphicsPipelineLibraryFeaturesEXT gpl_query = {
+        .sType =
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_FEATURES_EXT,
+        .pNext = &vids_query,
+    };
+    VkPhysicalDeviceHostQueryResetFeatures hqr_query = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_QUERY_RESET_FEATURES,
+        .pNext = &gpl_query,
+    };
+    /* UPSTREAM CANDIDATE (the demote part). For SPIR-V 1.6, glslang lowers
+     * discard to OpDemoteToHelperInvocation:
+     * VUID-VkShaderModuleCreateInfo-pCode-08740 needs this 1.3 feature on.
+     * Chained on 1.3 devices only, older ones do not know the struct; without
+     * it the shaders are built for SPIR-V 1.5, which a Vulkan 1.2 device
+     * accepts (a 1.1 device accepts neither). */
     VkPhysicalDeviceVulkan13Features v13_query = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
+        .pNext = &hqr_query,
     };
-    if (r->vk_api_version >= VK_API_VERSION_1_3) {
-        VkPhysicalDeviceFeatures2 features2_query = {
-            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
-            .pNext = &v13_query,
+    bool query_v13 = r->vk_api_version >= VK_API_VERSION_1_3;
+    VkPhysicalDeviceFeatures2 features2_query = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+        .pNext = query_v13 ? (void *)&v13_query : (void *)&hqr_query,
+    };
+    vkGetPhysicalDeviceFeatures2(r->physical_device, &features2_query);
+    r->shader_demote = query_v13 && v13_query.shaderDemoteToHelperInvocation;
+    pgraph_vk_spirv_1_6 = r->shader_demote;
+    /* Host query reset (core 1.2): a reset recorded in a command buffer acts
+     * only when the GPU runs it; a read before then gets the old result. */
+    r->host_query_reset = r->vk_api_version >= VK_API_VERSION_1_2 &&
+                          hqr_query.hostQueryReset;
+
+    r->dyn_cull_front =
+        r->eds_extension_enabled && eds_query.extendedDynamicState;
+    r->dyn_blend = r->eds3_extension_enabled &&
+                   eds3_query.extendedDynamicState3ColorBlendEnable &&
+                   eds3_query.extendedDynamicState3ColorBlendEquation &&
+                   eds3_query.extendedDynamicState3ColorWriteMask;
+    r->dyn_vertex_input = r->vertex_input_dynamic_extension_enabled &&
+                          vids_query.vertexInputDynamicState;
+    r->pipeline_library = r->pipeline_library_extension_enabled &&
+                          gpl_query.graphicsPipelineLibrary;
+    fprintf(stderr,
+            "Dynamic state: cull/front %d, blend %d, vertex input %d"
+            " | pipeline library %d | host query reset %d"
+            " | shader demote %d\n",
+            r->dyn_cull_front, r->dyn_blend, r->dyn_vertex_input,
+            r->pipeline_library, r->host_query_reset, r->shader_demote);
+
+    VkPhysicalDeviceExtendedDynamicStateFeaturesEXT eds_features;
+    if (r->dyn_cull_front) {
+        eds_features = (VkPhysicalDeviceExtendedDynamicStateFeaturesEXT){
+            .sType =
+                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_FEATURES_EXT,
+            .extendedDynamicState = VK_TRUE,
+            .pNext = next_struct,
         };
-        vkGetPhysicalDeviceFeatures2(r->physical_device, &features2_query);
+        next_struct = &eds_features;
     }
-    pgraph_vk_spirv_1_6 = v13_query.shaderDemoteToHelperInvocation;
+    VkPhysicalDeviceExtendedDynamicState3FeaturesEXT eds3_features;
+    if (r->dyn_blend) {
+        eds3_features = (VkPhysicalDeviceExtendedDynamicState3FeaturesEXT){
+            .sType =
+                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT,
+            .extendedDynamicState3ColorBlendEnable = VK_TRUE,
+            .extendedDynamicState3ColorBlendEquation = VK_TRUE,
+            .extendedDynamicState3ColorWriteMask = VK_TRUE,
+            .pNext = next_struct,
+        };
+        next_struct = &eds3_features;
+    }
+    VkPhysicalDeviceGraphicsPipelineLibraryFeaturesEXT gpl_features;
+    if (r->pipeline_library) {
+        gpl_features = (VkPhysicalDeviceGraphicsPipelineLibraryFeaturesEXT){
+            .sType =
+                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_FEATURES_EXT,
+            .graphicsPipelineLibrary = VK_TRUE,
+            .pNext = next_struct,
+        };
+        next_struct = &gpl_features;
+    }
+
+    VkPhysicalDeviceVertexInputDynamicStateFeaturesEXT vids_features;
+    if (r->dyn_vertex_input) {
+        vids_features = (VkPhysicalDeviceVertexInputDynamicStateFeaturesEXT){
+            .sType =
+                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_INPUT_DYNAMIC_STATE_FEATURES_EXT,
+            .vertexInputDynamicState = VK_TRUE,
+            .pNext = next_struct,
+        };
+        next_struct = &vids_features;
+    }
 
     VkPhysicalDeviceVulkan13Features v13_features;
-    if (pgraph_vk_spirv_1_6) {
+    if (r->shader_demote) {
         v13_features = (VkPhysicalDeviceVulkan13Features){
             .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
             .shaderDemoteToHelperInvocation = VK_TRUE,
@@ -545,7 +659,16 @@ static bool create_logical_device(PGRAPHState *pg, Error **errp)
         };
         next_struct = &v13_features;
     }
-
+    VkPhysicalDeviceHostQueryResetFeatures hqr_features;
+    if (r->host_query_reset) {
+        hqr_features = (VkPhysicalDeviceHostQueryResetFeatures){
+            .sType =
+                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_QUERY_RESET_FEATURES,
+            .hostQueryReset = VK_TRUE,
+            .pNext = next_struct,
+        };
+        next_struct = &hqr_features;
+    }
     VkPhysicalDeviceCustomBorderColorFeaturesEXT custom_border_features;
     if (r->custom_border_color_extension_enabled) {
         custom_border_features = (VkPhysicalDeviceCustomBorderColorFeaturesEXT){

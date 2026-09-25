@@ -4,6 +4,7 @@
  * Copyright (c) 2015 espes
  * Copyright (c) 2015 Jannik Vogel
  * Copyright (c) 2020-2025 Matt Borgerson
+ * Copyright (c) 2026 Réda Chérif-Touil
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -20,12 +21,93 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/fast-hash.h"
 #include "hw/xbox/nv2a/pgraph/pgraph.h"
+#include "shaders.h"
 #include "vsh.h"
 #include "vsh-ff.h"
 #include "vsh-prog.h"
 
 DEF_UNIFORM_INFO_ARR(VshUniform, VSH_UNIFORM_DECL_X)
+
+/* Families awaiting their background-compiled all-dynamic lighting module
+ * (both prefix_outputs variants must be adopted before the switch).
+ * HEURISTIC: the session's first 256 families are tracked; a later one keeps
+ * specialising (performance only), as in the two tables below. */
+static struct {
+    uint64_t key;
+    uint8_t adopted;
+    bool queued;
+} vsh_seen[256];
+static unsigned vsh_seen_n;
+
+static VshState vsh_pending[8];
+static unsigned vsh_pending_r, vsh_pending_w;
+
+/* A family of fixed-function states (a state minus one group of fields)
+ * specialises on that group while it stays put; from its second distinct
+ * value on, it takes the dynamic variant for good. */
+typedef struct VaryTable {
+    struct {
+        uint64_t family, value;
+        bool vary;
+    } seen[256];
+    unsigned n;
+} VaryTable;
+
+static bool vary_note(VaryTable *t, uint64_t family, uint64_t value)
+{
+    for (unsigned i = 0; i < t->n; i++) {
+        if (t->seen[i].family != family) {
+            continue;
+        }
+        if (t->seen[i].value != value && !t->seen[i].vary) {
+            /* Bump on the transition only, as in psh_family_note. */
+            t->seen[i].vary = true;
+            pgraph_glsl_dynamic_gen++;
+        }
+        return t->seen[i].vary;
+    }
+
+    if (t->n < ARRAY_SIZE(t->seen)) {
+        t->seen[t->n].family = family;
+        t->seen[t->n].value = value;
+        t->n++;
+    }
+    return false;
+}
+
+/* The dynamic texgen variant compiles fast: switch at the second distinct
+ * config (the combiner interpreter waits for a third). */
+static bool ff_texgen_vary(const FixedFunctionVshState *state)
+{
+    static VaryTable table;
+    FixedFunctionVshState family = *state;
+    memset(family.texgen, 0, sizeof(family.texgen));
+    memset(family.texture_matrix_enable, 0,
+           sizeof(family.texture_matrix_enable));
+
+    uint64_t fh = fast_hash((const uint8_t *)&family, sizeof(family));
+    uint64_t th = fast_hash((const uint8_t *)state->texgen,
+                            sizeof(state->texgen)) ^
+                  fast_hash((const uint8_t *)state->texture_matrix_enable,
+                            sizeof(state->texture_matrix_enable));
+    return vary_note(&table, fh, th);
+}
+
+/* Specialising on the light modes pays only while they stay put: a family
+ * seen with a second configuration switches to the dynamic loop for good. */
+static bool ff_lights_vary(const FixedFunctionVshState *state)
+{
+    static VaryTable table;
+    FixedFunctionVshState family = *state;
+    memset(family.light, 0, sizeof(family.light));
+
+    uint64_t fh = fast_hash((const uint8_t *)&family, sizeof(family));
+    uint64_t lh = fast_hash((const uint8_t *)state->light,
+                            sizeof(state->light));
+    return vary_note(&table, fh, lh);
+}
 
 static void set_fixed_function_vsh_state(PGRAPHState *pg,
                                          FixedFunctionVshState *state)
@@ -51,28 +133,33 @@ static void set_fixed_function_vsh_state(PGRAPHState *pg,
     }
 
     for (int i = 0; i < 4; i++) {
-        unsigned int reg = (i < 2) ? NV_PGRAPH_CSV1_A : NV_PGRAPH_CSV1_B;
         for (int j = 0; j < 4; j++) {
-            unsigned int masks[] = {
-                (i % 2) ? NV_PGRAPH_CSV1_A_T1_S : NV_PGRAPH_CSV1_A_T0_S,
-                (i % 2) ? NV_PGRAPH_CSV1_A_T1_T : NV_PGRAPH_CSV1_A_T0_T,
-                (i % 2) ? NV_PGRAPH_CSV1_A_T1_R : NV_PGRAPH_CSV1_A_T0_R,
-                (i % 2) ? NV_PGRAPH_CSV1_A_T1_Q : NV_PGRAPH_CSV1_A_T0_Q
-            };
-            state->texgen[i][j] =
-                (enum VshTexgen)GET_MASK(pgraph_reg_r(pg, reg), masks[j]);
+            state->texgen[i][j] = (enum VshTexgen)pgraph_texgen_mode(pg, i, j);
         }
     }
 
     state->lighting =
         GET_MASK(pgraph_reg_r(pg, NV_PGRAPH_CSV0_C), NV_PGRAPH_CSV0_C_LIGHTING);
     if (state->lighting) {
+        uint32_t modes = GET_MASK(pgraph_reg_r(pg, NV_PGRAPH_CSV0_D),
+                                  NV_PGRAPH_CSV0_D_LIGHTS);
         for (int i = 0; i < NV2A_MAX_LIGHTS; i++) {
-            state->light[i] =
-                (enum VshLight)GET_MASK(pgraph_reg_r(pg, NV_PGRAPH_CSV0_D),
-                                        NV_PGRAPH_CSV0_D_LIGHT0 << (i * 2));
+            state->light[i] = (enum VshLight)((modes >> (i * 2)) & 3);
+        }
+
+        if (pgraph_gpu_boost_gl() && ff_lights_vary(state)) {
+            state->light_dynamic = true;
+            memset(state->light, 0, sizeof(state->light));
         }
         state->two_sided = pg->two_side_light_en;
+    }
+
+    state->texgen_dynamic = false;
+    if (pgraph_gpu_boost_gl() && ff_texgen_vary(state)) {
+        state->texgen_dynamic = true;
+        memset(state->texgen, 0, sizeof(state->texgen));
+        memset(state->texture_matrix_enable, 0,
+               sizeof(state->texture_matrix_enable));
     }
 
     if (pgraph_reg_r(pg, NV_PGRAPH_CONTROL_3) & NV_PGRAPH_CONTROL_3_FOGENABLE) {
@@ -110,9 +197,8 @@ void pgraph_glsl_set_vsh_state(PGRAPHState *pg, VshState *vsh)
 
     assert(vertex_program || fixed_function);
 
-    vsh->surface_scale_factor = pg->surface_scale_factor; // FIXME
-
     vsh->compressed_attrs = pg->compressed_attrs;
+    vsh->const_attrs_dynamic = false;
     vsh->uniform_attrs = pg->uniform_attrs;
     vsh->swizzle_attrs = pg->swizzle_attrs;
 
@@ -123,20 +209,12 @@ void pgraph_glsl_set_vsh_state(PGRAPHState *pg, VshState *vsh)
     vsh->ignore_specular_alpha =
         !GET_MASK(pgraph_reg_r(pg, NV_PGRAPH_CSV0_C),
                   NV_PGRAPH_CSV0_C_ALPHA_FROM_MATERIAL_SPECULAR);
-    vsh->specular_power = pg->specular_power;
-    vsh->specular_power_back = pg->specular_power_back;
 
     vsh->z_perspective = pgraph_reg_r(pg, NV_PGRAPH_CONTROL_0) &
                          NV_PGRAPH_CONTROL_0_Z_PERSPECTIVE_ENABLE;
 
     vsh->point_params_enable = GET_MASK(pgraph_reg_r(pg, NV_PGRAPH_CSV0_D),
                                         NV_PGRAPH_CSV0_D_POINTPARAMSENABLE);
-    vsh->point_size = pgraph_reg_r(pg, NV_PGRAPH_POINTSIZE) / 8.0f;
-    if (vsh->point_params_enable) {
-        for (int i = 0; i < 8; i++) {
-            vsh->point_params[i] = pg->point_params[i];
-        }
-    }
 
     vsh->smooth_shading = GET_MASK(pgraph_reg_r(pg, NV_PGRAPH_CONTROL_3),
                                    NV_PGRAPH_CONTROL_3_SHADEMODE) ==
@@ -156,6 +234,85 @@ void pgraph_glsl_set_vsh_state(PGRAPHState *pg, VshState *vsh)
         set_fixed_function_vsh_state(pg, &vsh->fixed_function);
     } else {
         set_programmable_vsh_state(pg, &vsh->programmable);
+    }
+
+    vsh->fog_dynamic = false;
+    if (pgraph_gpu_boost_gl()) {
+        vsh->fog_dynamic = true;
+        vsh->fog_enable = false;
+        vsh->fog_mode = 0;
+        vsh->fixed_function.foggen = 0;
+    }
+
+    if (fixed_function && pgraph_gpu_boost_gl()) {
+        /* The all-dynamic lighting module compiles in the background; the
+         * family keeps specialising until it is ready, then switches. */
+        VshState dyn = *vsh;
+        FixedFunctionVshState *f = &dyn.fixed_function;
+        f->csv0c_dynamic = true;
+        f->lighting = false;
+        f->local_eye = false;
+        f->normalization = false;
+        f->emission_src = 0;
+        f->ambient_src = 0;
+        f->diffuse_src = 0;
+        f->specular_src = 0;
+        memset(f->light, 0, sizeof(f->light));
+        f->light_dynamic = false;
+        f->two_sided = false;
+        dyn.specular_enable = false;
+        dyn.separate_specular = false;
+        dyn.ignore_specular_alpha = false;
+
+        uint64_t h = fast_hash((const uint8_t *)&dyn, sizeof(dyn));
+        int idx = -1;
+        for (unsigned i = 0; i < vsh_seen_n; i++) {
+            if (vsh_seen[i].key == h) {
+                idx = i;
+                break;
+            }
+        }
+        if (idx < 0 && vsh_seen_n < ARRAY_SIZE(vsh_seen)) {
+            idx = vsh_seen_n++;
+            vsh_seen[idx].key = h;
+            vsh_seen[idx].adopted = 0;
+            vsh_seen[idx].queued = false;
+        }
+        if (idx >= 0) {
+            if (vsh_seen[idx].adopted >= 2) {
+                *vsh = dyn;
+            } else if (!vsh_seen[idx].queued &&
+                       vsh_pending_w - vsh_pending_r <
+                           ARRAY_SIZE(vsh_pending)) {
+                vsh_pending[vsh_pending_w % ARRAY_SIZE(vsh_pending)] = dyn;
+                vsh_pending_w++;
+                vsh_seen[idx].queued = true;
+            }
+        }
+    }
+}
+
+bool pgraph_glsl_vsh_dynamic_pending_take(VshState *out)
+{
+    if (vsh_pending_r == vsh_pending_w) {
+        return false;
+    }
+    *out = vsh_pending[vsh_pending_r % ARRAY_SIZE(vsh_pending)];
+    vsh_pending_r++;
+    return true;
+}
+
+/* Called once per adopted module; the family needs both prefix_outputs
+ * variants before it may switch. */
+void pgraph_glsl_vsh_dynamic_ready(const VshState *state)
+{
+    pgraph_glsl_dynamic_gen++;
+    uint64_t h = fast_hash((const uint8_t *)state, sizeof(*state));
+    for (unsigned i = 0; i < vsh_seen_n; i++) {
+        if (vsh_seen[i].key == h) {
+            vsh_seen[i].adopted++;
+            return;
+        }
     }
 }
 
@@ -233,8 +390,9 @@ MString *pgraph_glsl_gen_vsh(const VshState *state, GenVshGlslOptions opts)
         "  return trunc(pos * 16.0f) / 16.0f;\n"
         "}\n");
 
-    pgraph_glsl_get_vtx_header(header, opts.vulkan, state->smooth_shading,
-                               false, opts.prefix_outputs, false);
+    pgraph_glsl_get_vtx_header(header, opts.vulkan || opts.locations,
+                               state->smooth_shading, false,
+                               opts.prefix_outputs, false);
 
     if (opts.prefix_outputs) {
         mstring_append(header,
@@ -306,14 +464,42 @@ MString *pgraph_glsl_gen_vsh(const VshState *state, GenVshGlslOptions opts)
             VSH_VERSION_XVS, (uint32_t *)state->programmable.program_data,
             state->programmable.program_length, header, body);
         if (!state->point_params_enable) {
-            mstring_append_fmt(body, "  oPts.x = %f * %d;\n",
-                               state->point_size <= 0.f ? 1.f :
-                                                          state->point_size,
-                               state->surface_scale_factor);
+            mstring_append(
+                body,
+                "  oPts.x = (pointSizeReg <= 0.0 ? 1.0 : pointSizeReg) * pointScale;\n");
         }
     }
 
-    if (!state->fog_enable) {
+    if (state->fog_dynamic) {
+        if (!state->is_fixed_function) {
+            mstring_append(body, "  float fogDistance = oFog.x;\n");
+        }
+        mstring_append(body,
+            "  {\n"
+            "  uint fmode = (fogCtl >> 1) & 7u;\n"
+            "  float fogFactor;\n"
+            "  if ((fmode & 3u) == 0u) {\n"
+            "    fogFactor = fogParam.x + fogDistance * fogParam.y - 1.0;\n"
+            "  } else if ((fmode & 3u) == 1u) {\n"
+            "    fogFactor = fogParam.x + exp2(fogDistance * fogParam.y * 16.0)"
+                " - 1.5;\n"
+            "  } else {\n"
+            "    fogFactor = fogParam.x + exp2(-fogDistance * fogDistance *"
+                " fogParam.y * fogParam.y * 32.0) - 1.5;\n"
+            "  }\n"
+            "  if (fmode >= 4u) { fogFactor = abs(fogFactor); }\n"
+            "  const float fogSpec[8] ="
+                " float[8](1.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0);\n"
+            "  if ((fogCtl & 1u) == 0u) {\n"
+            "    oFog = vec4(1.0);\n"
+            "  } else if (isinf(fogDistance)) {\n"
+            "    oFog = vec4(fogSpec[fmode]);\n"
+            "  } else {\n"
+            "    oFog = clamp(NaNToValue(vec4(fogFactor), fogSpec[fmode]),"
+                " -FLOAT_MAX, FLOAT_MAX);\n"
+            "  }\n"
+            "  }\n");
+    } else if (!state->fog_enable) {
         /* FIXME: Is the fog still calculated / passed somehow?! */
         mstring_append(body, "  oFog = vec4(1.0);\n");
     } else {
@@ -413,7 +599,20 @@ MString *pgraph_glsl_gen_vsh(const VshState *state, GenVshGlslOptions opts)
                    "  gl_PointSize = oPts.x;\n"
     );
 
-    if (state->specular_enable) {
+    if (state->is_fixed_function && state->fixed_function.csv0c_dynamic) {
+        mstring_append(body,
+            "  if ((csv0cCtl & 4096u) != 0u) {\n"
+            "    vtxD1 = clamp(NaNToOne(oD1), 0.0, 1.0);\n"
+            "    vtxB1 = clamp(NaNToOne(oB1), 0.0, 1.0);\n"
+            "    if ((csv0cCtl & 16384u) != 0u) {\n"
+            "      vtxD1.w = 1.0;\n"
+            "      vtxB1.w = 1.0;\n"
+            "    }\n"
+            "  } else {\n"
+            "    vtxD1 = vec4(0.0, 0.0, 0.0, 1.0);\n"
+            "    vtxB1 = vec4(0.0, 0.0, 0.0, 1.0);\n"
+            "  }\n");
+    } else if (state->specular_enable) {
         mstring_append(body,
                        "  vtxD1 = clamp(NaNToOne(oD1), 0.0, 1.0);\n"
                        "  vtxB1 = clamp(NaNToOne(oB1), 0.0, 1.0);\n"
@@ -446,7 +645,13 @@ MString *pgraph_glsl_gen_vsh(const VshState *state, GenVshGlslOptions opts)
 
     /* Return combined header + source */
     MString *output =
-        mstring_from_fmt("#version %d\n\n", opts.vulkan ? 450 : 400);
+        mstring_from_fmt("#version %d\n\n%s",
+                         opts.vulkan ? 450 : (opts.locations ? 410 : 400),
+                         opts.vulkan ? "" :
+                             "out gl_PerVertex {\n"
+                             "  vec4 gl_Position;\n"
+                             "  float gl_PointSize;\n"
+                             "};\n\n");
 
     if (opts.vulkan) {
         // FIXME: Optimize uniforms
@@ -506,10 +711,88 @@ void pgraph_glsl_set_vsh_uniform_values(PGRAPHState *pg, const VshState *state,
         memcpy(values->pointParams, pg->point_params, sizeof(pg->point_params));
     }
 
+    if (locs[VshUniform_pointScale] != -1) {
+        values->pointScale[0] = (float)pg->surface_scale_factor;
+    }
+
+    if (locs[VshUniform_pointSizeReg] != -1) {
+        values->pointSizeReg[0] =
+            pgraph_reg_r(pg, NV_PGRAPH_POINTSIZE) / 8.0f;
+    }
+
     if (locs[VshUniform_material_alpha] != -1) {
         values->material_alpha[0] = pg->material_alpha;
     }
 
+    if (locs[VshUniform_lightMode] != -1) {
+        /* CSV0_D holds all eight 2-bit light modes in one field; hand it to
+         * the shader as-is, then say how far it needs to walk. */
+        uint32_t modes = GET_MASK(pgraph_reg_r(pg, NV_PGRAPH_CSV0_D),
+                                  NV_PGRAPH_CSV0_D_LIGHTS);
+        uint32_t count = 0;
+        for (int i = 0; i < NV2A_MAX_LIGHTS; i++) {
+            if (((modes >> (i * 2)) & 3) != LIGHT_OFF) {
+                count = i + 1;
+            }
+        }
+        values->lightMode[0] = modes | (count << 16);
+    }
+    if (locs[VshUniform_csv0cCtl] != -1) {
+        uint32_t c = pgraph_reg_r(pg, NV_PGRAPH_CSV0_C);
+        uint32_t ctl = 0;
+        if (GET_MASK(c, NV_PGRAPH_CSV0_C_LIGHTING)) {
+            ctl |= 1u;
+        }
+        if (GET_MASK(c, NV_PGRAPH_CSV0_C_LOCALEYE)) {
+            ctl |= 2u;
+        }
+        if (c & NV_PGRAPH_CSV0_C_NORMALIZATION_ENABLE) {
+            ctl |= 4u;
+        }
+        ctl |= GET_MASK(c, NV_PGRAPH_CSV0_C_EMISSION) << 4;
+        ctl |= GET_MASK(c, NV_PGRAPH_CSV0_C_AMBIENT) << 6;
+        ctl |= GET_MASK(c, NV_PGRAPH_CSV0_C_DIFFUSE) << 8;
+        ctl |= GET_MASK(c, NV_PGRAPH_CSV0_C_SPECULAR) << 10;
+        if (GET_MASK(c, NV_PGRAPH_CSV0_C_SPECULAR_ENABLE)) {
+            ctl |= 1u << 12;
+        }
+        if (GET_MASK(c, NV_PGRAPH_CSV0_C_SEPARATE_SPECULAR)) {
+            ctl |= 1u << 13;
+        }
+        if (!GET_MASK(c, NV_PGRAPH_CSV0_C_ALPHA_FROM_MATERIAL_SPECULAR)) {
+            ctl |= 1u << 14;
+        }
+        if (pg->two_side_light_en) {
+            ctl |= 1u << 15;
+        }
+        values->csv0cCtl[0] = ctl;
+    }
+    if (locs[VshUniform_fogCtl] != -1) {
+        uint32_t c3 = pgraph_reg_r(pg, NV_PGRAPH_CONTROL_3);
+        uint32_t ctl = (c3 & NV_PGRAPH_CONTROL_3_FOGENABLE) ? 1u : 0;
+        ctl |= GET_MASK(c3, NV_PGRAPH_CONTROL_3_FOG_MODE) << 1;
+        ctl |= GET_MASK(pgraph_reg_r(pg, NV_PGRAPH_CSV0_D),
+                        NV_PGRAPH_CSV0_D_FOGGENMODE) << 4;
+        values->fogCtl[0] = ctl;
+    }
+    if (locs[VshUniform_texgenMode] != -1) {
+        for (int i = 0; i < 4; i++) {
+            uint32_t packed = 0;
+            for (int j = 0; j < 4; j++) {
+                packed |= pgraph_texgen_mode(pg, i, j) << (j * 3);
+            }
+            values->texgenMode[i] = packed;
+        }
+    }
+    if (locs[VshUniform_texMatEnable] != -1) {
+        uint32_t m = 0;
+        for (int i = 0; i < 4; i++) {
+            if (pg->texture_matrix_enable[i]) {
+                m |= 1u << i;
+            }
+        }
+        values->texMatEnable[0] = m;
+    }
     if (locs[VshUniform_inlineValue] != -1) {
         pgraph_get_inline_values(pg, state->uniform_attrs, values->inlineValue,
                                  NULL);

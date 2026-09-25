@@ -2,6 +2,7 @@
  * Geforce NV2A PGRAPH Vulkan Renderer
  *
  * Copyright (c) 2024-2025 Matt Borgerson
+ * Copyright (c) 2026 Réda Chérif-Touil
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -18,10 +19,12 @@
  */
 
 #include "ui/xemu-settings.h"
+#include "qemu/fast-hash.h"
 #include "renderer.h"
 
 #include <assert.h>
 #include <glslang/Include/glslang_c_interface.h>
+#include <inttypes.h>
 #include <stdio.h>
 
 static const glslang_resource_t
@@ -140,12 +143,48 @@ void pgraph_vk_finalize_glsl_compiler(void)
     glslang_finalize_process();
 }
 
+/* Compiling GLSL to SPIR-V hitches the frame that first uses a shader, so
+ * the module is kept on disk and only the very first visit ever pays it. */
+static char *spv_cache_path(glslang_stage_t stage, const char *glsl_source)
+{
+    uint64_t h = fast_hash((const uint8_t *)glsl_source, strlen(glsl_source));
+    /* The module also depends on the SPIR-V target and the debug info: a
+     * cache carried to another GPU or driver must not hand over the other. */
+    return g_strdup_printf("%s/vk_shader_cache/%02d_%s%s_%016" PRIx64 ".spv",
+                           xemu_settings_get_base_path(), (int)stage,
+                           pgraph_vk_spirv_1_6 ? "v16" : "v15",
+                           g_config.display.vulkan.debug_shaders ? "d" : "",
+                           h);
+}
+
 /* Chosen at device creation (instance.c); SPIR-V 1.5 until then. */
 bool pgraph_vk_spirv_1_6;
 
 GByteArray *pgraph_vk_compile_glsl_to_spv(glslang_stage_t stage,
                                           const char *glsl_source)
 {
+    char *cache_path = spv_cache_path(stage, glsl_source);
+    gchar *blob = NULL;
+    gsize blob_len = 0;
+    if (g_file_get_contents(cache_path, &blob, &blob_len, NULL)) {
+        if (blob_len > 20 && ((const uint32_t *)blob)[0] == 0x07230203) {
+            g_free(cache_path);
+            return g_byte_array_new_take((guint8 *)blob, blob_len);
+        }
+        g_free(blob);
+    }
+    /* glslang is called from the render thread and from the first-meet
+     * shader worker; its C interface shares process-global state, so the
+     * actual compilation is serialised (disk-cache hits above stay
+     * lock-free). The lock lives as long as the process, as the worker
+     * does, and is made once whichever thread comes first. */
+    static QemuMutex glslang_lock;
+    static gsize glslang_lock_ready;
+    if (g_once_init_enter(&glslang_lock_ready)) {
+        qemu_mutex_init(&glslang_lock);
+        g_once_init_leave(&glslang_lock_ready, 1);
+    }
+    qemu_mutex_lock(&glslang_lock);
     const glslang_input_t input = {
         .language = GLSLANG_SOURCE_GLSL,
         .stage = stage,
@@ -153,6 +192,8 @@ GByteArray *pgraph_vk_compile_glsl_to_spv(glslang_stage_t stage,
         .client_version = pgraph_vk_spirv_1_6 ? GLSLANG_TARGET_VULKAN_1_3
                                               : GLSLANG_TARGET_VULKAN_1_2,
         .target_language = GLSLANG_TARGET_SPV,
+        /* SPIR-V 1.6 lowers discard to demote, which needs the 1.3 feature
+         * enabled at device creation; without it stay on 1.5 (OpKill). */
         .target_language_version = pgraph_vk_spirv_1_6 ? GLSLANG_TARGET_SPV_1_6
                                                        : GLSLANG_TARGET_SPV_1_5,
         .code = glsl_source,
@@ -176,6 +217,7 @@ GByteArray *pgraph_vk_compile_glsl_to_spv(glslang_stage_t stage,
                 glslang_shader_get_info_debug_log(shader), input.code);
         assert(!"glslang preprocess failed");
         glslang_shader_delete(shader);
+        qemu_mutex_unlock(&glslang_lock);
         return NULL;
     }
 
@@ -190,6 +232,7 @@ GByteArray *pgraph_vk_compile_glsl_to_spv(glslang_stage_t stage,
                 glslang_shader_get_preprocessed_code(shader));
         assert(!"glslang parse failed");
         glslang_shader_delete(shader);
+        qemu_mutex_unlock(&glslang_lock);
         return NULL;
     }
 
@@ -207,6 +250,7 @@ GByteArray *pgraph_vk_compile_glsl_to_spv(glslang_stage_t stage,
         assert(!"glslang link failed");
         glslang_program_delete(program);
         glslang_shader_delete(shader);
+        qemu_mutex_unlock(&glslang_lock);
         return NULL;
     }
 
@@ -243,6 +287,14 @@ GByteArray *pgraph_vk_compile_glsl_to_spv(glslang_stage_t stage,
 
     glslang_program_delete(program);
     glslang_shader_delete(shader);
+    qemu_mutex_unlock(&glslang_lock);
+
+    char *cache_dir = g_path_get_dirname(cache_path);
+    g_mkdir_with_parents(cache_dir, 0755);
+    g_file_set_contents(cache_path, (const char *)data, num_program_bytes,
+                        NULL);
+    g_free(cache_dir);
+    g_free(cache_path);
 
     return g_byte_array_new_take(data, num_program_bytes);
 }

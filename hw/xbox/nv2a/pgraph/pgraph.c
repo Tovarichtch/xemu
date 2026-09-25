@@ -22,10 +22,12 @@
 
 #include <math.h>
 
+#include "qemu/fast-hash.h"
 #include "hw/xbox/nv2a/nv2a_int.h"
 #include "ui/xemu-notifications.h"
 #include "ui/xemu-settings.h"
 #include "util.h"
+#include "cost.h"
 #include "swizzle.h"
 #include "nv2a_vsh_emulator.h"
 
@@ -164,6 +166,9 @@ void pgraph_write(void *opaque, hwaddr addr, uint64_t val, unsigned int size)
     }
     default:
         pgraph_reg_w(pg, addr, val);
+        /* The driver restores a channel's context through these writes:
+         * the switch registers are loaded again at the next method. */
+        pg->ctx_switch_subchannel = -1;
         break;
     }
 
@@ -214,6 +219,7 @@ void pgraph_context_switch(NV2AState *d, unsigned int channel_id)
 
         pg->waiting_for_context_switch = true;
         pg->pending_interrupts |= NV_PGRAPH_INTR_CONTEXT_SWITCH;
+        pg->ctx_switch_subchannel = -1;
         pgraph_schedule_irq_update(d);
     }
 }
@@ -226,6 +232,40 @@ void pgraph_renderer_register(const PGRAPHRenderer *renderer)
     renderers[renderer->type] = renderer;
 }
 
+static char pgraph_game_tag[64];
+static unsigned long long xemu_flip_inc_count; /* guest flips */
+
+/* "OllieKing.xbe" -> "ollieking", "ctx_ac[r].xbe" -> "ctx_ac_r_": the
+ * spelling of the seed files and the dictionary. */
+void nv2a_set_game_executable(const char *name)
+{
+    size_t n = 0;
+    for (const char *p = name; *p && n < sizeof(pgraph_game_tag) - 1; p++) {
+        if (*p == '.' && strcasecmp(p, ".xbe") == 0) {
+            break;
+        }
+        char c = g_ascii_tolower(*p);
+        bool keep = g_ascii_isalnum(c) || c == '-' || c == '_';
+        pgraph_game_tag[n++] = keep ? c : '_';
+    }
+    pgraph_game_tag[n] = '\0';
+}
+
+const char *pgraph_seed_game_tag(void)
+{
+    if (!pgraph_game_tag[0]) {
+        /* A boot that never names the game keys the seeds on the disc
+         * image name after 900 flips (15 s), so they still load and learn. */
+        const char *dvd = g_config.sys.files.dvd_path;
+        if (xemu_flip_inc_count > 900 && dvd && dvd[0]) {
+            char *base = g_path_get_basename(dvd);
+            nv2a_set_game_executable(base);
+            g_free(base);
+        }
+    }
+    return pgraph_game_tag[0] ? pgraph_game_tag : NULL;
+}
+
 bool pgraph_gpu_boost(void)
 {
     static int on = -1;
@@ -233,6 +273,43 @@ bool pgraph_gpu_boost(void)
         on = g_config.perf.optimizations;
     }
     return on;
+}
+
+bool pgraph_gpu_boost_gl(void)
+{
+    return pgraph_gpu_boost() && xemu_gl_opt_capable;
+}
+
+/* Whether the NV09F blit may run as a GPU copy between surfaces of these
+ * sizes and pitches: a SRCCOPY within both, at the pitches the surfaces were
+ * made with, no alpha forced by an X8 format (the RAM path's patch_alpha),
+ * and not cut by a GPU tile limit (the RAM path clips it there). The
+ * renderer checks the rest: two distinct plain colour surfaces of one
+ * format and of the blit's pixel size. */
+bool pgraph_blit_gpu_fits(NV2AState *d, hwaddr dest_addr,
+                          unsigned int bytes_per_pixel,
+                          unsigned int src_width, unsigned int src_height,
+                          unsigned int src_pitch, unsigned int dst_width,
+                          unsigned int dst_height, unsigned int dst_pitch)
+{
+    ContextSurfaces2DState *cs = &d->pgraph.context_surfaces_2d;
+    ImageBlitState *ib = &d->pgraph.image_blit;
+
+    if (ib->operation != NV09F_SET_OPERATION_SRCCOPY ||
+        cs->color_format == NV062_SET_COLOR_FORMAT_LE_X8R8G8B8 ||
+        cs->color_format == NV062_SET_COLOR_FORMAT_LE_X8R8G8B8_Z8R8G8B8 ||
+        ib->width == 0 || ib->height == 0 || cs->source_pitch != src_pitch ||
+        cs->dest_pitch != dst_pitch ||
+        ib->in_x + ib->width > src_width ||
+        ib->in_y + ib->height > src_height ||
+        ib->out_x + ib->width > dst_width ||
+        ib->out_y + ib->height > dst_height) {
+        return false;
+    }
+    hwaddr off = ib->out_y * cs->dest_pitch + ib->out_x * bytes_per_pixel;
+    hwaddr size = (ib->height - 1) * cs->dest_pitch +
+                  ib->width * bytes_per_pixel;
+    return nv_clip_gpu_tile_blit(d, dest_addr + off, size) == size;
 }
 
 void pgraph_init(NV2AState *d)
@@ -264,12 +341,15 @@ void pgraph_init(NV2AState *d)
         attribute->inline_buffer_populated = false;
     }
 
+    pg->ctx_switch_subchannel = -1;
+
     pgraph_clear_dirty_reg_map(pg);
 }
 
 void pgraph_clear_dirty_reg_map(PGRAPHState *pg)
 {
     memset(pg->regs_dirty, 0, sizeof(pg->regs_dirty));
+    pgraph_glsl_snapshot_shader_regs(pg);
 }
 
 static CONFIG_DISPLAY_RENDERER get_default_renderer(void)
@@ -377,6 +457,23 @@ void pgraph_destroy(PGRAPHState *pg)
     }
 
     qemu_mutex_destroy(&pg->lock);
+}
+
+/* Called at every turn of the UI loop, up to a thousand times a second. It
+ * is what re-checks the flip deadline of the real hardware speed model
+ * (is_flip_stall_complete): nothing signals that deadline passing, so a flip
+ * the model holds would otherwise wait for the guest's next GPU register
+ * write, at worst the next vblank's. With the model off every wakeup is
+ * signalled and the kick finds nothing to do. If the fifo lock is held the
+ * thread is already working and needs no kick; if it is free, kick under the
+ * lock so the wakeup cannot be lost. */
+void nv2a_fifo_kick_safety(void)
+{
+    NV2AState *d = g_nv2a;
+    if (d && qemu_mutex_trylock(&d->pfifo.lock) == 0) {
+        pfifo_kick(d);
+        qemu_mutex_unlock(&d->pfifo.lock);
+    }
 }
 
 int nv2a_get_framebuffer_surface(void)
@@ -561,6 +658,10 @@ static void pgraph_method_log(unsigned int subchannel,
     static unsigned int last = 0;
     static unsigned int count = 0;
 
+    if (!trace_event_get_state_backends(TRACE_NV2A_PGRAPH_METHOD)) {
+        return;
+    }
+
     if (last == NV097_ARRAY_ELEMENT16 && method != last) {
         method_name = "NV097_ARRAY_ELEMENT16";
         trace_nv2a_pgraph_method_abbrev(subchannel, graphics_class, last,
@@ -694,16 +795,22 @@ int pgraph_method(NV2AState *d, unsigned int subchannel,
     }
 
     // is this right?
-    pgraph_reg_w(pg, NV_PGRAPH_CTX_SWITCH1,
-                 pgraph_reg_r(pg, NV_PGRAPH_CTX_CACHE1 + subchannel * 4));
-    pgraph_reg_w(pg, NV_PGRAPH_CTX_SWITCH2,
-                 pgraph_reg_r(pg, NV_PGRAPH_CTX_CACHE2 + subchannel * 4));
-    pgraph_reg_w(pg, NV_PGRAPH_CTX_SWITCH3,
-                 pgraph_reg_r(pg, NV_PGRAPH_CTX_CACHE3 + subchannel * 4));
-    pgraph_reg_w(pg, NV_PGRAPH_CTX_SWITCH4,
-                 pgraph_reg_r(pg, NV_PGRAPH_CTX_CACHE4 + subchannel * 4));
-    pgraph_reg_w(pg, NV_PGRAPH_CTX_SWITCH5,
-                 pgraph_reg_r(pg, NV_PGRAPH_CTX_CACHE5 + subchannel * 4));
+    /* Refresh the switch registers only for a new subchannel or object (or
+     * after a reset to -1): this runs for every method word. */
+    if (pg->ctx_switch_subchannel != (int)subchannel ||
+        method == NV_SET_OBJECT) {
+        pgraph_reg_w(pg, NV_PGRAPH_CTX_SWITCH1,
+                     pgraph_reg_r(pg, NV_PGRAPH_CTX_CACHE1 + subchannel * 4));
+        pgraph_reg_w(pg, NV_PGRAPH_CTX_SWITCH2,
+                     pgraph_reg_r(pg, NV_PGRAPH_CTX_CACHE2 + subchannel * 4));
+        pgraph_reg_w(pg, NV_PGRAPH_CTX_SWITCH3,
+                     pgraph_reg_r(pg, NV_PGRAPH_CTX_CACHE3 + subchannel * 4));
+        pgraph_reg_w(pg, NV_PGRAPH_CTX_SWITCH4,
+                     pgraph_reg_r(pg, NV_PGRAPH_CTX_CACHE4 + subchannel * 4));
+        pgraph_reg_w(pg, NV_PGRAPH_CTX_SWITCH5,
+                     pgraph_reg_r(pg, NV_PGRAPH_CTX_CACHE5 + subchannel * 4));
+        pg->ctx_switch_subchannel = subchannel;
+    }
 
     uint32_t graphics_class = PG_GET_MASK(NV_PGRAPH_CTX_SWITCH1,
                                        NV_PGRAPH_CTX_SWITCH1_GRCLASS);
@@ -893,7 +1000,8 @@ DEF_METHOD(NV097, NO_OPERATION)
 
 DEF_METHOD(NV097, WAIT_FOR_IDLE)
 {
-    d->pgraph.renderer->ops.surface_update(d, false, true, true);
+    /* Perf shortcut: no eager surface download (a full GPU drain); CPU
+     * visibility rests on the memory access callbacks alone. */
 }
 
 DEF_METHOD(NV097, SET_FLIP_READ)
@@ -921,6 +1029,7 @@ DEF_METHOD(NV097, FLIP_INCREMENT_WRITE)
         fprintf(stderr, "PGRAPH: FLIP_INCREMENT_WRITE triggered\n");
         flip_inc_logged = 1;
     }
+    xemu_flip_inc_count++;
     uint32_t old =
         PG_GET_MASK(NV_PGRAPH_SURFACE, NV_PGRAPH_SURFACE_WRITE_3D);
 
@@ -948,9 +1057,15 @@ DEF_METHOD(NV097, FLIP_STALL)
     trace_nv2a_pgraph_flip_stall();
     d->pgraph.renderer->ops.surface_update(d, false, true, true);
     d->pgraph.renderer->ops.flip_stall(d);
+
+    xemu_cost_flip_deadline(d);
+
     nv2a_profile_flip_stall();
     pg->waiting_for_flip = true;
 }
+
+int64_t xemu_flip_ready_ns;
+int64_t xemu_flip_completed_ns;
 
 // TODO: these should be loading the dma objects from ramin here?
 
@@ -1100,7 +1215,12 @@ DEF_METHOD(NV097, SET_COMBINER_SPECULAR_FOG_CW1)
 DEF_METHOD(NV097, SET_TEXTURE_ADDRESS)
 {
     int slot = (method - NV097_SET_TEXTURE_ADDRESS) / 64;
-    pgraph_reg_w(pg, NV_PGRAPH_TEXADDRESS0 + slot * 4, parameter);
+    /* Mark the slot dirty on a real wrap-mode change, as SET_TEXTURE_FILTER
+     * does: the VK renderer rebinds only the slots something flagged. */
+    if (pgraph_reg_r(pg, NV_PGRAPH_TEXADDRESS0 + slot * 4) != parameter) {
+        pgraph_reg_w(pg, NV_PGRAPH_TEXADDRESS0 + slot * 4, parameter);
+        pg->texture_dirty[slot] = true;
+    }
 }
 
 DEF_METHOD(NV097, SET_CONTROL0)
@@ -1689,8 +1809,10 @@ DEF_METHOD_INC(NV097, SET_MATERIAL_EMISSION)
 {
     int slot = (method - NV097_SET_MATERIAL_EMISSION) / 4;
     // FIXME: Verify NV_IGRAPH_XF_LTCTXA_CM_COL is correct
-    pg->ltctxa[NV_IGRAPH_XF_LTCTXA_CM_COL][slot] = parameter;
-    pg->ltctxa_dirty[NV_IGRAPH_XF_LTCTXA_CM_COL] = true;
+    if (pg->ltctxa[NV_IGRAPH_XF_LTCTXA_CM_COL][slot] != parameter) {
+        pg->ltctxa[NV_IGRAPH_XF_LTCTXA_CM_COL][slot] = parameter;
+        pg->ltctxa_dirty[NV_IGRAPH_XF_LTCTXA_CM_COL] = true;
+    }
 }
 
 DEF_METHOD(NV097, SET_MATERIAL_ALPHA)
@@ -1842,6 +1964,7 @@ DEF_METHOD_INC(NV097, SET_FOG_PARAMS)
     int slot = (method - NV097_SET_FOG_PARAMS) / 4;
     if (slot < 2) {
         pgraph_reg_w(pg, NV_PGRAPH_FOGPARAM0 + slot*4, parameter);
+        pg->fog_params_dirty = true;
     } else {
         /* FIXME: No idea where slot = 2 is */
     }
@@ -2006,8 +2129,10 @@ DEF_METHOD(NV097, SET_BACK_MATERIAL_ALPHA)
 DEF_METHOD_INC(NV097, SET_BACK_MATERIAL_EMISSION)
 {
     int slot = (method - NV097_SET_BACK_MATERIAL_EMISSION) / 4;
-    pg->ltctxa[NV_IGRAPH_XF_LTCTXA_BCM_COL][slot] = parameter;
-    pg->ltctxa_dirty[NV_IGRAPH_XF_LTCTXA_BCM_COL] = true;
+    if (pg->ltctxa[NV_IGRAPH_XF_LTCTXA_BCM_COL][slot] != parameter) {
+        pg->ltctxa[NV_IGRAPH_XF_LTCTXA_BCM_COL][slot] = parameter;
+        pg->ltctxa_dirty[NV_IGRAPH_XF_LTCTXA_BCM_COL] = true;
+    }
 }
 
 DEF_METHOD_INC(NV097, SET_VIEWPORT_OFFSET)
@@ -2021,6 +2146,7 @@ DEF_METHOD_INC(NV097, SET_POINT_PARAMS)
 {
     int slot = (method - NV097_SET_POINT_PARAMS) / 4;
     pg->point_params[slot] = *(float *)&parameter; /* FIXME: Where? */
+    pg->point_params_dirty = true;
 }
 
 DEF_METHOD_INC(NV097, SET_EYE_POSITION)
@@ -2181,11 +2307,13 @@ DEF_METHOD_INC(NV097, SET_LIGHT_AMBIENT_COLOR)
             NV097_SET_LIGHT_INFINITE_HALF_VECTOR + 8:
         part -= NV097_SET_LIGHT_INFINITE_HALF_VECTOR / 4;
         pg->light_infinite_half_vector[slot][part] = *(float*)&parameter;
+        pg->light_dirty = true;
         break;
     case NV097_SET_LIGHT_INFINITE_DIRECTION ...
             NV097_SET_LIGHT_INFINITE_DIRECTION + 8:
         part -= NV097_SET_LIGHT_INFINITE_DIRECTION / 4;
         pg->light_infinite_direction[slot][part] = *(float*)&parameter;
+        pg->light_dirty = true;
         break;
     case NV097_SET_LIGHT_SPOT_FALLOFF ...
             NV097_SET_LIGHT_SPOT_FALLOFF + 8:
@@ -2203,11 +2331,13 @@ DEF_METHOD_INC(NV097, SET_LIGHT_AMBIENT_COLOR)
             NV097_SET_LIGHT_LOCAL_POSITION + 8:
         part -= NV097_SET_LIGHT_LOCAL_POSITION / 4;
         pg->light_local_position[slot][part] = *(float*)&parameter;
+        pg->light_dirty = true;
         break;
     case NV097_SET_LIGHT_LOCAL_ATTENUATION ...
             NV097_SET_LIGHT_LOCAL_ATTENUATION + 8:
         part -= NV097_SET_LIGHT_LOCAL_ATTENUATION / 4;
         pg->light_local_attenuation[slot][part] = *(float*)&parameter;
+        pg->light_dirty = true;
         break;
     default:
         assert(false);
@@ -2566,6 +2696,13 @@ DEF_METHOD(NV097, GET_REPORT)
     uint8_t type = GET_MASK(parameter, NV097_GET_REPORT_TYPE);
     assert(type == NV097_GET_REPORT_TYPE_ZPASS_PIXEL_CNT);
 
+    /* A report drains the NV2A pipeline: billed by the cost model, and
+     * counted only while it runs, like its other tallies (the first frame
+     * after it is switched on must not bill the reports made while off). */
+    if (xemu_cost_model_active()) {
+        xemu_cost_reports++;
+    }
+
     d->pgraph.renderer->ops.get_report(d, parameter);
 }
 
@@ -2600,11 +2737,16 @@ DEF_METHOD(NV097, SET_BEGIN_END)
     }
 }
 
+/* Games re-send identical texture state before every draw: mark the slot
+ * dirty only on a real register change. Content changes come from the
+ * memory access callbacks. */
 DEF_METHOD(NV097, SET_TEXTURE_OFFSET)
 {
     int slot = (method - NV097_SET_TEXTURE_OFFSET) / 64;
-    pgraph_reg_w(pg, NV_PGRAPH_TEXOFFSET0 + slot * 4, parameter);
-    pg->texture_dirty[slot] = true;
+    if (pgraph_reg_r(pg, NV_PGRAPH_TEXOFFSET0 + slot * 4) != parameter) {
+        pgraph_reg_w(pg, NV_PGRAPH_TEXOFFSET0 + slot * 4, parameter);
+        pg->texture_dirty[slot] = true;
+    }
 }
 
 DEF_METHOD(NV097, SET_TEXTURE_FORMAT)
@@ -2631,6 +2773,7 @@ DEF_METHOD(NV097, SET_TEXTURE_FORMAT)
         GET_MASK(parameter, NV097_SET_TEXTURE_FORMAT_BASE_SIZE_P);
 
     unsigned int reg = NV_PGRAPH_TEXFMT0 + slot * 4;
+    uint32_t prev = pgraph_reg_r(pg, reg);
     PG_SET_MASK(reg, NV_PGRAPH_TEXFMT0_CONTEXT_DMA, dma_select);
     PG_SET_MASK(reg, NV_PGRAPH_TEXFMT0_CUBEMAPENABLE, cubemap);
     PG_SET_MASK(reg, NV_PGRAPH_TEXFMT0_BORDER_SOURCE, border_source);
@@ -2641,35 +2784,45 @@ DEF_METHOD(NV097, SET_TEXTURE_FORMAT)
     PG_SET_MASK(reg, NV_PGRAPH_TEXFMT0_BASE_SIZE_V, log_height);
     PG_SET_MASK(reg, NV_PGRAPH_TEXFMT0_BASE_SIZE_P, log_depth);
 
-    pg->texture_dirty[slot] = true;
+    if (pgraph_reg_r(pg, reg) != prev) {
+        pg->texture_dirty[slot] = true;
+    }
 }
 
 DEF_METHOD(NV097, SET_TEXTURE_CONTROL0)
 {
     int slot = (method - NV097_SET_TEXTURE_CONTROL0) / 64;
-    pgraph_reg_w(pg, NV_PGRAPH_TEXCTL0_0 + slot*4, parameter);
-    pg->texture_dirty[slot] = true;
+    if (pgraph_reg_r(pg, NV_PGRAPH_TEXCTL0_0 + slot*4) != parameter) {
+        pgraph_reg_w(pg, NV_PGRAPH_TEXCTL0_0 + slot*4, parameter);
+        pg->texture_dirty[slot] = true;
+    }
 }
 
 DEF_METHOD(NV097, SET_TEXTURE_CONTROL1)
 {
     int slot = (method - NV097_SET_TEXTURE_CONTROL1) / 64;
-    pgraph_reg_w(pg, NV_PGRAPH_TEXCTL1_0 + slot*4, parameter);
-    pg->texture_dirty[slot] = true;
+    if (pgraph_reg_r(pg, NV_PGRAPH_TEXCTL1_0 + slot*4) != parameter) {
+        pgraph_reg_w(pg, NV_PGRAPH_TEXCTL1_0 + slot*4, parameter);
+        pg->texture_dirty[slot] = true;
+    }
 }
 
 DEF_METHOD(NV097, SET_TEXTURE_FILTER)
 {
     int slot = (method - NV097_SET_TEXTURE_FILTER) / 64;
-    pgraph_reg_w(pg, NV_PGRAPH_TEXFILTER0 + slot * 4, parameter);
-    pg->texture_dirty[slot] = true;
+    if (pgraph_reg_r(pg, NV_PGRAPH_TEXFILTER0 + slot * 4) != parameter) {
+        pgraph_reg_w(pg, NV_PGRAPH_TEXFILTER0 + slot * 4, parameter);
+        pg->texture_dirty[slot] = true;
+    }
 }
 
 DEF_METHOD(NV097, SET_TEXTURE_IMAGE_RECT)
 {
     int slot = (method - NV097_SET_TEXTURE_IMAGE_RECT) / 64;
-    pgraph_reg_w(pg, NV_PGRAPH_TEXIMAGERECT0 + slot * 4, parameter);
-    pg->texture_dirty[slot] = true;
+    if (pgraph_reg_r(pg, NV_PGRAPH_TEXIMAGERECT0 + slot * 4) != parameter) {
+        pgraph_reg_w(pg, NV_PGRAPH_TEXIMAGERECT0 + slot * 4, parameter);
+        pg->texture_dirty[slot] = true;
+    }
 }
 
 DEF_METHOD(NV097, SET_TEXTURE_PALETTE)
@@ -2684,17 +2837,25 @@ DEF_METHOD(NV097, SET_TEXTURE_PALETTE)
         GET_MASK(parameter, NV097_SET_TEXTURE_PALETTE_OFFSET);
 
     unsigned int reg = NV_PGRAPH_TEXPALETTE0 + slot * 4;
+    uint32_t prev = pgraph_reg_r(pg, reg);
     PG_SET_MASK(reg, NV_PGRAPH_TEXPALETTE0_CONTEXT_DMA, dma_select);
     PG_SET_MASK(reg, NV_PGRAPH_TEXPALETTE0_LENGTH, length);
     PG_SET_MASK(reg, NV_PGRAPH_TEXPALETTE0_OFFSET, offset);
 
-    pg->texture_dirty[slot] = true;
+    if (pgraph_reg_r(pg, reg) != prev) {
+        pg->texture_dirty[slot] = true;
+    }
 }
 
 DEF_METHOD(NV097, SET_TEXTURE_BORDER_COLOR)
 {
     int slot = (method - NV097_SET_TEXTURE_BORDER_COLOR) / 64;
-    pgraph_reg_w(pg, NV_PGRAPH_BORDERCOLOR0 + slot * 4, parameter);
+    /* As SET_TEXTURE_ADDRESS: a real change marks the slot dirty, or the VK
+     * renderer keeps the unit's sampler of the old border colour. */
+    if (pgraph_reg_r(pg, NV_PGRAPH_BORDERCOLOR0 + slot * 4) != parameter) {
+        pgraph_reg_w(pg, NV_PGRAPH_BORDERCOLOR0 + slot * 4, parameter);
+        pg->texture_dirty[slot] = true;
+    }
 }
 
 DEF_METHOD(NV097, SET_TEXTURE_SET_BUMP_ENV_MAT)
@@ -2833,11 +2994,25 @@ DEF_METHOD(NV097, DRAW_ARRAYS)
     pg->draw_arrays_prevent_connect = false;
 }
 
-DEF_METHOD_NON_INC(NV097, INLINE_ARRAY)
+/* No NON_INC wrapper on purpose: the whole run of vertex data is consumed at
+ * once, not one dispatch-loop turn a word (little-endian host assumed). */
+DEF_METHOD(NV097, INLINE_ARRAY)
 {
     pgraph_check_within_begin_end_block(pg);
     assert(pg->inline_array_length < NV2A_MAX_BATCH_LENGTH);
-    pg->inline_array[pg->inline_array_length++] = parameter;
+
+    if (inc) {
+        pg->inline_array[pg->inline_array_length++] = parameter;
+        return;
+    }
+
+    size_t count = MIN(num_words_available,
+                       (size_t)NV2A_MAX_BATCH_LENGTH -
+                           (size_t)pg->inline_array_length);
+    memcpy(&pg->inline_array[pg->inline_array_length], parameters,
+           count * sizeof(uint32_t));
+    pg->inline_array_length += count;
+    *num_words_consumed = count;
 }
 
 DEF_METHOD_INC(NV097, SET_EYE_VECTOR)
@@ -2925,11 +3100,7 @@ DEF_METHOD(NV097, SET_SEMAPHORE_OFFSET)
 
 DEF_METHOD(NV097, BACK_END_WRITE_SEMAPHORE_RELEASE)
 {
-    d->pgraph.renderer->ops.surface_update(d, false, true, true);
-
-    //qemu_mutex_unlock(&d->pgraph.lock);
-    //bql_lock();
-
+    /* Perf shortcut, as in WAIT_FOR_IDLE: no eager surface download. */
     uint32_t semaphore_offset = pgraph_reg_r(pg, NV_PGRAPH_SEMAPHOREOFFSET);
 
     hwaddr semaphore_dma_len;
@@ -2939,9 +3110,6 @@ DEF_METHOD(NV097, BACK_END_WRITE_SEMAPHORE_RELEASE)
     semaphore_data += semaphore_offset;
 
     stl_le_p((uint32_t*)semaphore_data, parameter);
-
-    //qemu_mutex_lock(&d->pgraph.lock);
-    //bql_unlock();
 }
 
 DEF_METHOD(NV097, SET_ZMIN_MAX_CONTROL)
@@ -3102,8 +3270,51 @@ DEF_METHOD(NV097, SET_TRANSFORM_PROGRAM_CXT_WRITE_EN)
     pg->enable_vertex_program_write = parameter;
 }
 
+/* Vertex program contents already prewarmed: building a program's shaders
+ * at upload hides the compile from its first draw. The session's first 4096
+ * programs are prewarmed; a later one compiles at its first draw. */
+static uint64_t vp_prewarmed[4096];
+static unsigned vp_prewarmed_n;
+
+static bool vp_prewarmed_contains(uint64_t h)
+{
+    for (unsigned i = 0; i < vp_prewarmed_n; i++) {
+        if (vp_prewarmed[i] == h) {
+            return true;
+        }
+    }
+    return false;
+}
+
 DEF_METHOD(NV097, SET_TRANSFORM_PROGRAM_LOAD)
 {
+    {
+        /* Build a changed program's shaders while the game is still
+         * uploading, not when a draw needs them (a renderer option). */
+        if (!pg->program_data_dirty || !pg->renderer ||
+            !pg->renderer->ops.prewarm_vertex_program) {
+            goto prewarm_done;
+        }
+        /* Only a complete program: its words arrive after this method. */
+        bool complete = false;
+        int start = GET_MASK(pgraph_reg_r(pg, NV_PGRAPH_CSV0_C),
+                             NV_PGRAPH_CSV0_C_CHEOPS_PROGRAM_START);
+        for (int i = start; i < NV2A_MAX_TRANSFORM_PROGRAM_LENGTH; i++) {
+            if (vsh_get_field((uint32_t *)&pg->program_data[i], FLD_FINAL)) {
+                complete = true;
+                break;
+            }
+        }
+        if (complete && vp_prewarmed_n < ARRAY_SIZE(vp_prewarmed)) {
+            uint64_t h = fast_hash((const uint8_t *)pg->program_data,
+                                   sizeof(pg->program_data));
+            if (!vp_prewarmed_contains(h)) {
+                vp_prewarmed[vp_prewarmed_n++] = h;
+                pg->renderer->ops.prewarm_vertex_program(d);
+            }
+        }
+    prewarm_done:;
+    }
     assert(parameter < NV2A_MAX_TRANSFORM_PROGRAM_LENGTH);
     PG_SET_MASK(NV_PGRAPH_CHEOPS_OFFSET,
              NV_PGRAPH_CHEOPS_OFFSET_PROG_LD_PTR, parameter);

@@ -1,11 +1,14 @@
 specific_ss.add(files(
+	'cost.c',
 	'pgraph.c',
 	'profile.c',
 	'rdi.c',
+	'seed.c',
 	's3tc.c',
 	'swizzle.c',
 	'texture.c',
 	'vertex.c',
+	'writeback.c',
 	))
 if have_renderdoc
 	specific_ss.add(files('debug_renderdoc.c'))

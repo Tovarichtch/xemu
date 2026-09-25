@@ -8,6 +8,7 @@
  * Copyright (c) 2012 espes
  * Copyright (c) 2015 Jannik Vogel
  * Copyright (c) 2018-2024 Matt Borgerson
+ * Copyright (c) 2026 Réda Chérif-Touil
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -25,6 +26,7 @@
 
 #include "hw/xbox/nv2a/nv2a_int.h"
 #include "renderer.h"
+#include "ui/xemu-settings.h"
 
 static void perform_blit(int operation, uint8_t *source, uint8_t *dest,
                          size_t width, size_t height, size_t width_bytes,
@@ -120,6 +122,97 @@ void pgraph_vk_image_blit(NV2AState *d)
     hwaddr dest_addr = dest - d->vram_ptr;
 
     SurfaceBinding *surf_src = pgraph_vk_surface_get(d, source_addr);
+
+    /* An NV09F SRCCOPY between two cached surfaces is a GPU image copy,
+     * VRAM to VRAM as on the hardware, not a download, memmove and upload;
+     * whatever the guards reject takes the CPU path below. */
+    {
+        SurfaceBinding *gdst;
+        if (image_blit->operation == NV09F_SET_OPERATION_SRCCOPY &&
+            surf_src != NULL &&
+            (gdst = pgraph_vk_surface_get(d, dest_addr)) != NULL &&
+            gdst != surf_src && surf_src->color && gdst->color &&
+            !surf_src->swizzle && !gdst->swizzle &&
+            surf_src->host_fmt.vk_format == gdst->host_fmt.vk_format &&
+            bytes_per_pixel == surf_src->fmt.bytes_per_pixel &&
+            bytes_per_pixel == gdst->fmt.bytes_per_pixel &&
+            pgraph_blit_gpu_fits(d, dest_addr, bytes_per_pixel,
+                                 surf_src->width, surf_src->height,
+                                 surf_src->pitch, gdst->width, gdst->height,
+                                 gdst->pitch)) {
+
+            bool full_replace = image_blit->out_x == 0 &&
+                                image_blit->out_y == 0 &&
+                                image_blit->width == gdst->width &&
+                                image_blit->height == gdst->height;
+            if (surf_src->upload_pending) {
+                pgraph_vk_upload_surface_data(d, surf_src, false);
+            }
+            if (gdst->upload_pending) {
+                if (full_replace) {
+                    gdst->upload_pending = false;
+                } else {
+                    pgraph_vk_upload_surface_data(d, gdst, false);
+                }
+            }
+
+            unsigned int scale = pg->surface_scale_factor;
+            VkCommandBuffer cmd = pgraph_vk_begin_nondraw_commands(pg);
+
+            pgraph_vk_transition_image_layout(
+                pg, cmd, surf_src->image, surf_src->host_fmt.vk_format,
+                pgraph_vk_surface_base_layout(surf_src),
+                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+            pgraph_vk_surface_left_shader_read(&d->pgraph, surf_src);
+            pgraph_vk_transition_image_layout(
+                pg, cmd, gdst->image, gdst->host_fmt.vk_format,
+                pgraph_vk_surface_base_layout(gdst),
+                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+            pgraph_vk_surface_left_shader_read(&d->pgraph, gdst);
+
+            VkImageCopy region = {
+                .srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                .srcSubresource.layerCount = 1,
+                .srcOffset = { (int32_t)(image_blit->in_x * scale),
+                               (int32_t)(image_blit->in_y * scale), 0 },
+                .dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                .dstSubresource.layerCount = 1,
+                .dstOffset = { (int32_t)(image_blit->out_x * scale),
+                               (int32_t)(image_blit->out_y * scale), 0 },
+                .extent = { image_blit->width * scale,
+                            image_blit->height * scale, 1 },
+            };
+            vkCmdCopyImage(cmd, surf_src->image,
+                           VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, gdst->image,
+                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+
+            pgraph_vk_transition_image_layout(
+                pg, cmd, surf_src->image, surf_src->host_fmt.vk_format,
+                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+            pgraph_vk_transition_image_layout(
+                pg, cmd, gdst->image, gdst->host_fmt.vk_format,
+                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+
+            pgraph_vk_end_nondraw_commands(pg, cmd);
+
+            /* As after a draw, RAM is behind (draw_dirty). download_pending
+             * stays as it is: clearing it would lose a pending read-back
+             * (the CPU path clears it only as its memmove refreshes RAM),
+             * and setting it would read back every blit destination. */
+            gdst->initialized = true;
+            pg->draw_time++;
+            gdst->draw_time = pg->draw_time;
+            /* Only a target bind refreshes frame_time: a surface fed only
+             * by blits would otherwise expire every few frames. */
+            gdst->frame_time = pg->frame_time;
+            gdst->draw_dirty = true;
+            gdst->upload_pending = false;
+            return;
+        }
+    }
+
     if (surf_src) {
         pgraph_vk_surface_download_if_dirty(d, surf_src);
     }

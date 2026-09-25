@@ -2,6 +2,7 @@
  * Geforce NV2A PGRAPH Vulkan Renderer
  *
  * Copyright (c) 2024 Matt Borgerson
+ * Copyright (c) 2026 Réda Chérif-Touil
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -18,6 +19,12 @@
  */
 
 #include "renderer.h"
+
+const StagedBuffer pgraph_vk_staged_buffers[3] = {
+    { BUFFER_INDEX_STAGING, BUFFER_INDEX },
+    { BUFFER_VERTEX_INLINE_STAGING, BUFFER_VERTEX_INLINE },
+    { BUFFER_UNIFORM_STAGING, BUFFER_UNIFORM },
+};
 
 static void create_buffer(PGRAPHState *pg, StorageBuffer *buffer)
 {
@@ -72,11 +79,14 @@ void pgraph_vk_init_buffers(NV2AState *d)
         .buffer_size = r->storage_buffers[BUFFER_STAGING_DST].buffer_size,
     };
 
+    /* Sized to the need MEASURED in six games at 3x, and grown on demand
+     * (pgraph_vk_buffer_ensure_capacity), where the fixed upstream sizes do
+     * not fit an integrated GPU at 4x. */
     r->storage_buffers[BUFFER_COMPUTE_DST] = (StorageBuffer){
         .alloc_info = device_alloc_create_info,
         .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT |
                  VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-        .buffer_size = (1024 * 10) * (1024 * 10) * 8,
+        .buffer_size = 16 * 1024 * 1024,
     };
 
     r->storage_buffers[BUFFER_COMPUTE_SRC] = (StorageBuffer){
@@ -90,7 +100,8 @@ void pgraph_vk_init_buffers(NV2AState *d)
         .alloc_info = device_alloc_create_info,
         .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT |
                  VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
-        .buffer_size = sizeof(pg->inline_elements) * 100,
+        /* At least one full inline element batch. */
+        .buffer_size = MAX(sizeof(pg->inline_elements), 8 * 1024 * 1024),
     };
 
     r->storage_buffers[BUFFER_INDEX_STAGING] = (StorageBuffer){
@@ -106,16 +117,25 @@ void pgraph_vk_init_buffers(NV2AState *d)
         .buffer_size = memory_region_size(d->vram),
     };
 
-    r->bitmap_size = memory_region_size(d->vram) / 4096;
-    r->uploaded_bitmap = bitmap_new(r->bitmap_size);
-    bitmap_clear(r->uploaded_bitmap, 0, r->bitmap_size);
+    r->bitmap_size = memory_region_size(d->vram) / TARGET_PAGE_SIZE;
+    r->vertex_consumed_bitmap = bitmap_new(r->bitmap_size);
+    r->vertex_stale_bitmap = bitmap_new(r->bitmap_size);
+
+    /* Two arenas for copy-on-write snapshots of vertex ranges whose mirror
+     * pages unsettled work still reads (draw.c sync_vertex_ram_buffer). */
+    for (int i = 0; i < 2; i++) {
+        r->vertex_arena[i] = (StorageBuffer){
+            .alloc_info = host_alloc_create_info,
+            .usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+            .buffer_size = 32 * 1024 * 1024,
+        };
+    }
 
     r->storage_buffers[BUFFER_VERTEX_INLINE] = (StorageBuffer){
         .alloc_info = device_alloc_create_info,
         .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT |
                  VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
-        .buffer_size = NV2A_VERTEXSHADER_ATTRIBUTES * NV2A_MAX_BATCH_LENGTH *
-                       4 * sizeof(float) * 10,
+        .buffer_size = 16 * 1024 * 1024,
     };
 
     r->storage_buffers[BUFFER_VERTEX_INLINE_STAGING] = (StorageBuffer){
@@ -128,7 +148,7 @@ void pgraph_vk_init_buffers(NV2AState *d)
         .alloc_info = device_alloc_create_info,
         .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT |
                  VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
-        .buffer_size = 8 * 1024 * 1024,
+        .buffer_size = 16 * 1024 * 1024,
     };
 
     r->storage_buffers[BUFFER_UNIFORM_STAGING] = (StorageBuffer){
@@ -139,6 +159,35 @@ void pgraph_vk_init_buffers(NV2AState *d)
 
     for (int i = 0; i < BUFFER_COUNT; i++) {
         create_buffer(pg, &r->storage_buffers[i]);
+    }
+
+    /* Second staging set for the ring rotation, and its device
+     * destinations: the next recording writes the other set. */
+    for (int i = 0; i < ARRAY_SIZE(pgraph_vk_staged_buffers); i++) {
+        const StorageBuffer *staging =
+            &r->storage_buffers[pgraph_vk_staged_buffers[i].staging];
+        const StorageBuffer *device =
+            &r->storage_buffers[pgraph_vk_staged_buffers[i].device];
+        r->alt_staging[i] = (StorageBuffer){
+            .alloc_info = host_alloc_create_info,
+            .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+            .buffer_size = staging->buffer_size,
+        };
+        create_buffer(pg, &r->alt_staging[i]);
+        VK_CHECK(vmaMapMemory(r->allocator, r->alt_staging[i].allocation,
+                              (void **)&r->alt_staging[i].mapped));
+        r->alt_device[i] = (StorageBuffer){
+            .alloc_info = device->alloc_info,
+            .usage = device->usage,
+            .buffer_size = device->buffer_size,
+        };
+        create_buffer(pg, &r->alt_device[i]);
+    }
+
+    for (int i = 0; i < 2; i++) {
+        create_buffer(pg, &r->vertex_arena[i]);
+        VK_CHECK(vmaMapMemory(r->allocator, r->vertex_arena[i].allocation,
+                              (void **)&r->vertex_arena[i].mapped));
     }
 
     // FIXME: Add fallback path for device using host mapped memory
@@ -167,8 +216,25 @@ void pgraph_vk_finalize_buffers(NV2AState *d)
         destroy_buffer(pg, &r->storage_buffers[i]);
     }
 
-    g_free(r->uploaded_bitmap);
-    r->uploaded_bitmap = NULL;
+    for (int i = 0; i < ARRAY_SIZE(pgraph_vk_staged_buffers); i++) {
+        if (r->alt_staging[i].mapped) {
+            vmaUnmapMemory(r->allocator, r->alt_staging[i].allocation);
+        }
+        destroy_buffer(pg, &r->alt_staging[i]);
+        destroy_buffer(pg, &r->alt_device[i]);
+    }
+
+    for (int i = 0; i < 2; i++) {
+        if (r->vertex_arena[i].mapped) {
+            vmaUnmapMemory(r->allocator, r->vertex_arena[i].allocation);
+        }
+        destroy_buffer(pg, &r->vertex_arena[i]);
+    }
+
+    g_free(r->vertex_consumed_bitmap);
+    r->vertex_consumed_bitmap = NULL;
+    g_free(r->vertex_stale_bitmap);
+    r->vertex_stale_bitmap = NULL;
 }
 
 bool pgraph_vk_buffer_has_space_for(PGRAPHState *pg, int index,
@@ -178,6 +244,70 @@ bool pgraph_vk_buffer_has_space_for(PGRAPHState *pg, int index,
     PGRAPHVkState *r = pg->vk_renderer_state;
     StorageBuffer *b = &r->storage_buffers[index];
     return (ROUND_UP(b->buffer_offset, alignment) + size) <= b->buffer_size;
+}
+
+static void recreate_buffer(PGRAPHState *pg, StorageBuffer *b,
+                            VkDeviceSize size)
+{
+    PGRAPHVkState *r = pg->vk_renderer_state;
+    bool mapped = b->mapped != NULL;
+
+    if (mapped) {
+        vmaUnmapMemory(r->allocator, b->allocation);
+        b->mapped = NULL;
+    }
+    destroy_buffer(pg, b);
+    b->buffer_size = size;
+    b->buffer_offset = 0;
+    create_buffer(pg, b);
+    if (mapped) {
+        VK_CHECK(vmaMapMemory(r->allocator, b->allocation,
+                              (void **)&b->mapped));
+    }
+}
+
+/* Grow a buffer to hold `needed` bytes, once everything in flight has
+ * settled, with its family: a ring, its staging half and both rotation
+ * sets, or the two conversion buffers, or the two staging buffers. */
+void pgraph_vk_buffer_ensure_capacity(PGRAPHState *pg, int index,
+                                      VkDeviceSize needed)
+{
+    PGRAPHVkState *r = pg->vk_renderer_state;
+
+    if (needed <= r->storage_buffers[index].buffer_size) {
+        return;
+    }
+
+    if (r->in_command_buffer) {
+        pgraph_vk_finish(pg, VK_FINISH_REASON_NEED_BUFFER_SPACE);
+    }
+    pgraph_vk_wait_for_aux(pg);
+    pgraph_vk_settle_all_slots(pg);
+
+    VkDeviceSize size = MAX(needed, 2 * r->storage_buffers[index].buffer_size);
+    size = ROUND_UP(size, 1024 * 1024);
+
+    for (int i = 0; i < ARRAY_SIZE(pgraph_vk_staged_buffers); i++) {
+        const StagedBuffer *f = &pgraph_vk_staged_buffers[i];
+        if (index == f->staging || index == f->device) {
+            recreate_buffer(pg, &r->storage_buffers[f->staging], size);
+            recreate_buffer(pg, &r->storage_buffers[f->device], size);
+            recreate_buffer(pg, &r->alt_staging[i], size);
+            recreate_buffer(pg, &r->alt_device[i], size);
+            return;
+        }
+    }
+    if (index == BUFFER_COMPUTE_DST || index == BUFFER_COMPUTE_SRC) {
+        recreate_buffer(pg, &r->storage_buffers[BUFFER_COMPUTE_DST], size);
+        recreate_buffer(pg, &r->storage_buffers[BUFFER_COMPUTE_SRC], size);
+        return;
+    }
+    if (index == BUFFER_STAGING_DST || index == BUFFER_STAGING_SRC) {
+        recreate_buffer(pg, &r->storage_buffers[BUFFER_STAGING_DST], size);
+        recreate_buffer(pg, &r->storage_buffers[BUFFER_STAGING_SRC], size);
+        return;
+    }
+    recreate_buffer(pg, &r->storage_buffers[index], size);
 }
 
 VkDeviceSize pgraph_vk_append_to_buffer(PGRAPHState *pg, int index, void **data,
