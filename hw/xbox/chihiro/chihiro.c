@@ -731,6 +731,26 @@ static void chihiro_segaboot_poll(void)
     }
 }
 
+/* The name ends up in file paths (saves/<name>.sav): a ".." component or a
+ * drive colon, which no game uses, would lead them out of the data folder. */
+static bool chihiro_executable_name_safe(const char *name)
+{
+    if (strchr(name, ':')) {
+        return false;
+    }
+    for (const char *p = name; *p;) {
+        size_t n = strcspn(p, "\\/");
+        if (n == 2 && p[0] == '.' && p[1] == '.') {
+            return false;
+        }
+        p += n;
+        if (*p) {
+            p++;
+        }
+    }
+    return true;
+}
+
 /*
  * SEGABOOT reached boot=3 (checks complete). Recover the game executable
  * name so the save file can be resolved: boot.id is loaded at PA 0x4F000
@@ -749,7 +769,7 @@ bool chihiro_bootid_executable(const uint8_t *bid, char *out, size_t out_len)
     exec[31] = 0;
     const char *name = exec;
     while (*name == '\\' || *name == '/') name++;
-    if (!*name) {
+    if (!*name || !chihiro_executable_name_safe(name)) {
         return false;
     }
     g_strlcpy(out, name, out_len);
@@ -760,7 +780,8 @@ bool chihiro_bootid_executable(const uint8_t *bid, char *out, size_t out_len)
  * file, JVS profile, drive board) reads chihiro_game_filename. */
 void chihiro_set_game_executable(const char *name)
 {
-    if (strcmp(chihiro_game_filename, name) == 0) {
+    if (!chihiro_executable_name_safe(name) ||
+        strcmp(chihiro_game_filename, name) == 0) {
         return;
     }
     g_strlcpy(chihiro_game_filename, name, sizeof(chihiro_game_filename));
