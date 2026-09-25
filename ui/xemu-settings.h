@@ -65,6 +65,11 @@ const char *xemu_chihiro_image(void);
 /* DOGE (not upstream) easter egg: [doge] doge_mode = 'wow', read once. */
 bool xemu_doge_mode(void);
 
+/* Debug mode (perf.debug_mode; XEMU_DEBUG_MODE=1 or 0 decides for one
+ * session): the session log gets the Chihiro log categories and the
+ * XEMU_TBRATE report. Read once, after the settings are loaded. */
+bool xemu_debug_mode(void);
+
 // Get path of the config file on disk
 const char *xemu_settings_get_path(void);
 

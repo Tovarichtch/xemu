@@ -46,6 +46,7 @@
 #include "system/system.h"
 #include "xui/xemu-hud.h"
 #include "xemu-input.h"
+#include "xemu-log.h"
 #include "xemu-settings.h"
 #include "xemu-snapshots.h"
 #include "xemu-version.h"
@@ -1498,16 +1499,9 @@ int main(int argc, char **argv)
         if (_fileno(stderr) == -2) {
             freopen("CONOUT$", "w+", stderr);
         }
-    } else {
-        // Launched without a console. Redirect stdout and stderr to a log file.
-        HANDLE logfile = CreateFileA("xemu.log",
-            GENERIC_WRITE, FILE_SHARE_WRITE|FILE_SHARE_READ,
-            NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-        if (logfile != INVALID_HANDLE_VALUE) {
-            freopen("xemu.log", "a", stdout);
-            freopen("xemu.log", "a", stderr);
-        }
     }
+    /* With a console or without, stdout and stderr go to the session log
+     * (xemu-log.c) once the settings are loaded. */
 
     _set_error_mode(_OUT_TO_STDERR);
 #endif
@@ -1542,6 +1536,7 @@ int main(int argc, char **argv)
         exit(1);
     }
     atexit(xemu_settings_save);
+    xemu_log_start(argc, argv);
 
 #ifdef _WIN32
     if (g_config.display.setup_nvidia_profile) {
@@ -1617,6 +1612,7 @@ int main(int argc, char **argv)
     }
     xemu_settings_save();
     fflush(NULL);
+    xemu_log_flush();
     _exit(exit_status);
 }
 

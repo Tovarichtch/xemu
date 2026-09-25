@@ -452,3 +452,13 @@ bool xemu_doge_mode(void)
     }
     return mode;
 }
+
+bool xemu_debug_mode(void)
+{
+    static int mode = -1;
+    if (mode < 0) {
+        const char *e = getenv("XEMU_DEBUG_MODE");
+        mode = e && e[0] ? e[0] != '0' : g_config.perf.debug_mode;
+    }
+    return mode;
+}

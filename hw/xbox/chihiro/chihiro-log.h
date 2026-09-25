@@ -26,6 +26,8 @@
 #ifndef HW_XBOX_CHIHIRO_LOG_H
 #define HW_XBOX_CHIHIRO_LOG_H
 
+#include "ui/xemu-settings.h"
+
 enum {
     CHIHIRO_LOG_BOOT    = 1 << 0,  /* SEGABOOT state machine, boot handoff */
     CHIHIRO_LOG_JVS     = 1 << 1,  /* JVS frames and I/O board */
@@ -86,6 +88,13 @@ static inline void chihiro_log_init(void)
 {
     const char *spec = getenv("XEMU_CHIHIRO_LOG");
     if (!spec || !*spec) {
+        /* Debug mode (Experimental Settings): every category but the two
+         * firehoses, LPC traffic and the drive board's UART bytes. */
+        if (xemu_debug_mode()) {
+            chihiro_log_mask = ~0u & ~(CHIHIRO_LOG_VERBOSE | CHIHIRO_LOG_FFB);
+            fprintf(stderr, "Chihiro: logging enabled (Debug mode: boot jvs "
+                    "card mbcom usb net)\n");
+        }
         return;
     }
 

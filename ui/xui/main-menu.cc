@@ -33,6 +33,7 @@
 #include "actions.hh"
 
 #include "../xemu-input.h"
+#include "../xemu-log.h"
 #include "../xemu-pointer.h"
 #include "../xemu-notifications.h"
 #include "../xemu-settings.h"
@@ -1736,8 +1737,23 @@ void MainMenuChihiroView::Draw()
         perf_changed |= Toggle("CPU boost", &g_config.perf.native_sse,
                                "Games run faster. Turn off only if a game "
                                "misbehaves (restart needed)");
+        perf_changed |= Toggle("Debug mode", &g_config.perf.debug_mode,
+                               "Detailed log for bug reports, slightly "
+                               "slower (restart needed)");
         if (perf_changed) {
             xemu_settings_save();
+        }
+        /* Every session writes a log (xemu-log.c), the file a player
+         * attaches to a bug report. */
+        if (xemu_log_dir_link()) {
+            if (xemu_debug_mode() != g_config.perf.debug_mode) {
+                ImGui::TextDisabled(xemu_debug_mode() ?
+                                    "Debug mode is on for this session" :
+                                    "Debug mode is off for this session");
+            }
+            ImGui::TextDisabled("This session's log: %s",
+                                xemu_log_file_name());
+            Hyperlink("Open the logs folder", xemu_log_dir_link());
         }
     }
 }

@@ -48,6 +48,7 @@
 #include "system/whpx.h"
 #include "hw/boards.h"
 #include "hw/hw.h"
+#include "ui/xemu-settings.h"
 #include "trace.h"
 
 #ifdef CONFIG_LINUX
@@ -548,7 +549,7 @@ bool xemu_tbrate_init(void)
 {
     const char *e = getenv("XEMU_TBRATE");
 
-    xemu_tbrate_state = e && e[0] && e[0] != '0';
+    xemu_tbrate_state = e && e[0] ? e[0] != '0' : xemu_debug_mode();
     return xemu_tbrate_state;
 }
 

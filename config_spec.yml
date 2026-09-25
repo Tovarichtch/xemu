@@ -462,6 +462,9 @@ perf:
   shader_seeding:
     type: bool
     default: true
+  debug_mode:
+    type: bool
+    default: false
 
 chihiro:
   jvs:
