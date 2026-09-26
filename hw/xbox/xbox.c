@@ -377,7 +377,8 @@ void xbox_init_common(MachineState *machine,
         }
 
         isa_create_simple(isa_bus, "chihiro-lpc");
-        isa_create_simple(isa_bus, "lpc47m157");
+        /* The Super I/O is not added here: -device lpc47m157 plugs one in,
+         * and -serial then gets what SEGABOOT and the games print. */
 
         /* Chihiro southbridge has revision >= 0xB4. This clears bit 0 of
          * XboxHardwareInfo in the kernel, selecting PATH_B for USB topology
