@@ -234,6 +234,8 @@ static bool chihiro_resolve_save_path(void);
 static void chihiro_dimm_sys_load(void);
 static bool chihiro_dimm_sys_flush(void);
 static bool chihiro_dimm_sys_dirty;
+static bool chihiro_read_image_bootid(uint8_t *bid);
+static bool chihiro_game_name(char *out, size_t out_len);
 static void chihiro_resolve_card_path(int player, char *out, size_t out_len);
 static const CardStock *chihiro_cabinet_card_stock(void);
 static bool chihiro_cabinet_is(const char *xbe);
@@ -1081,7 +1083,7 @@ typedef struct {
     bool                  type1;    /* shipped on a Type-1 media board */
     ChihiroMonitorKind    monitor;  /* the scan frequency it is wired for */
     const CardStock      *stock;    /* what a fresh card from its stock carries */
-    const char           *cards;    /* what the cards it issues are named */
+    const char           *cards;    /* its cards' name, the game's MAME name */
     uint8_t               locks[2]; /* card lock outputs, JVS GPO bank 0 */
 } ChihiroCabinet;
 
@@ -1118,17 +1120,17 @@ static const ChihiroCabinet chihiro_cabinets[] = {
     { "hod3xb",    CONFIG_CHIHIRO_JVS_PROFILE_HOTD3, CHIHIRO_CARD_NONE,    CHIHIRO_DRIVE_NONE,    true,  CHIHIRO_MONITOR_15KHZ, NULL, NULL, { 0, 0 } },
     { "ctx_ac",    CONFIG_CHIHIRO_JVS_PROFILE_CTX,   CHIHIRO_CARD_NONE,    CHIHIRO_DRIVE_NONE,    true,  CHIHIRO_MONITOR_15KHZ, NULL, NULL, { 0, 0 } },
     { "vc3",       CONFIG_CHIHIRO_JVS_PROFILE_VC3,   CHIHIRO_CARD_NONE,    CHIHIRO_DRIVE_NONE,    false, CHIHIRO_MONITOR_15KHZ, NULL, NULL, { 0, 0 } },
-    { "vsg",       CONFIG_CHIHIRO_JVS_PROFILE_GS,    CHIHIRO_CARD_HW210,   CHIHIRO_DRIVE_NONE,    false, CHIHIRO_MONITOR_15KHZ, &chihiro_card_stock_vsg, "ghostsquad", { 0x20, 0x01 } },
+    { "vsg",       CONFIG_CHIHIRO_JVS_PROFILE_GS,    CHIHIRO_CARD_HW210,   CHIHIRO_DRIVE_NONE,    false, CHIHIRO_MONITOR_15KHZ, &chihiro_card_stock_vsg, "ghostsqu", { 0x20, 0x01 } },
     { "outrun2",   CONFIG_CHIHIRO_JVS_PROFILE_OR2,   CHIHIRO_CARD_NONE,    CHIHIRO_DRIVE_SEGA838, false, CHIHIRO_MONITOR_15KHZ, NULL, NULL, { 0, 0 } },
     { "OllieKing", CONFIG_CHIHIRO_JVS_PROFILE_OK,    CHIHIRO_CARD_NONE,    CHIHIRO_DRIVE_NONE,    false, CHIHIRO_MONITOR_15KHZ, NULL, NULL, { 0, 0 } },
     /* Maximum Tune 1 and 2. Namco numbered these discs V3xx; the test-mode
      * image V322TEST.xbe is the same cabinet. */
-    { "V307",      CONFIG_CHIHIRO_JVS_PROFILE_WMMT2, CHIHIRO_CARD_CRP1231, CHIHIRO_DRIVE_V257,    false, CHIHIRO_MONITOR_15KHZ, NULL, "wmmt1", { 0, 0 } },
-    { "V322",      CONFIG_CHIHIRO_JVS_PROFILE_WMMT2, CHIHIRO_CARD_CRP1231, CHIHIRO_DRIVE_V257,    false, CHIHIRO_MONITOR_15KHZ, NULL, "wmmt2", { 0, 0 } },
+    { "V307",      CONFIG_CHIHIRO_JVS_PROFILE_WMMT2, CHIHIRO_CARD_CRP1231, CHIHIRO_DRIVE_V257,    false, CHIHIRO_MONITOR_15KHZ, NULL, "wangmid", { 0, 0 } },
+    { "V322",      CONFIG_CHIHIRO_JVS_PROFILE_WMMT2, CHIHIRO_CARD_CRP1231, CHIHIRO_DRIVE_V257,    false, CHIHIRO_MONITOR_15KHZ, NULL, "wangmid2", { 0, 0 } },
     /* Gundam B.O.S. (gs.xbe, test gs_gtest.xbe): one HW210-family reader on
      * SC UART1, Ghost Squad's player 1 wire, same frames and blocks (gs.xbe
      * FUN_00079a90, FUN_0007ae00); UART0 is never opened. */
-    { "gs",        CONFIG_CHIHIRO_JVS_PROFILE_GUNDAM, CHIHIRO_CARD_HW210,  CHIHIRO_DRIVE_NONE,    false, CHIHIRO_MONITOR_15KHZ, &chihiro_card_stock_gs, "gundam", { 0x40, 0x00 } },
+    { "gs",        CONFIG_CHIHIRO_JVS_PROFILE_GUNDAM, CHIHIRO_CARD_HW210,  CHIHIRO_DRIVE_NONE,    false, CHIHIRO_MONITOR_15KHZ, &chihiro_card_stock_gs, "gundamos", { 0x40, 0x00 } },
     /* 31 kHz sit-down cabinets: only the monitor is stated (MJ3 Evolution
      * stops on Caution 51 at 15 kHz). */
     { "mj3",       -1,                               CHIHIRO_CARD_NONE,    CHIHIRO_DRIVE_NONE,    false, CHIHIRO_MONITOR_31KHZ, NULL, NULL, { 0, 0 } },
@@ -3111,7 +3113,7 @@ type_init(chihiro_register_types)
  *
  * Persists QC ic11 (512 B) and the baseboard SRAM's backup half (the two
  * windows the game's backup occupies, 55 KB) per game.
- * File: saves/<game>.sav in xemu's data folder
+ * File: saves/<MAME name>.sav in xemu's data folder
  * ═══════════════════════════════════════════════════════════════════════ */
 
 bool chihiro_file_replace(const char *path, const ChihiroFilePart *parts,
@@ -3152,7 +3154,7 @@ static bool chihiro_data_dir(const char *name, char *out, size_t out_len)
 
 /* A card issued to a player with none: a new empty file (a blank) in
  * <data>/cards/, named after the game, the player and the day
- * ("wmmt2_<year>-<month>-<day>.bin", then "_2", "_3"), created exclusively. The slot
+ * ("wangmid2_<year>-<month>-<day>.bin", then "_2", "_3"), created exclusively. The slot
  * is assigned at the UI's next frame. */
 static struct {
     bool        due;
@@ -3243,8 +3245,7 @@ void chihiro_card_ui_sync(void)
     }
 }
 
-/* Game name without its .xbe extension, e.g. "vsg" — the stem shared by the
- * save file and the memory cards. */
+/* Game name without its .xbe extension, e.g. "vsg". */
 static bool chihiro_game_base_name(char *base, size_t base_len)
 {
     if (!chihiro_game_dir[0]) return false;
@@ -3258,14 +3259,107 @@ static bool chihiro_game_base_name(char *base, size_t base_len)
     return base[0] != 0;
 }
 
+/* A game's files take its MAME name, the parent set's (revisions and regions
+ * share it), found by the identifier at boot.id 0x30. A game MAME does not
+ * have takes that identifier in lower case (the OutRun 2 prototype: gbz). */
+static const struct {
+    char id[5];
+    const char *name;
+} chihiro_game_names[] = {
+    { "SBFN", "hotd3" },    /* The House of the Dead III */
+    { "SBFY", "crtaxihr" }, /* Crazy Taxi High Roller */
+    { "SBFZ", "vcop3" },    /* Virtua Cop 3 */
+    { "SGBZ", "outr2" },    /* OutRun 2 */
+    { "SBHC", "mj2" },      /* Sega Network Taisen Mahjong MJ 2 */
+    { "SBHF", "ollie" },    /* Ollie King */
+    { "SBHQ", "wangmid" },  /* Wangan Midnight Maximum Tune */
+    { "SBHU", "ghostsqu" }, /* Ghost Squad */
+    { "SBJK", "gundamos" }, /* Gundam Battle Operating Simulator */
+    { "SBJE", "outr2st" },  /* OutRun 2 Special Tours */
+    { "SBKD", "wangmid2" }, /* Wangan Midnight Maximum Tune 2 */
+    { "SBKK", "mj3" },      /* Sega Network Taisen Mahjong MJ 3 */
+    { "SBLF", "scg06nt" },  /* Sega Club Golf 2006 Next Tours */
+    { "SBME", "mj3evo" },   /* Sega Network Taisen Mahjong MJ 3 Evolution */
+};
+
+static void chihiro_game_name_of(const uint8_t *id, char *out, size_t out_len)
+{
+    size_t n = 0;
+
+    for (size_t i = 0; i < ARRAY_SIZE(chihiro_game_names); i++) {
+        if (memcmp(chihiro_game_names[i].id, id, 4) == 0) {
+            g_strlcpy(out, chihiro_game_names[i].name, out_len);
+            return;
+        }
+    }
+    while (n < 4 && n + 1 < out_len && g_ascii_isalnum(id[n])) {
+        out[n] = g_ascii_tolower(id[n]);
+        n++;
+    }
+    out[n] = 0;
+}
+
+/* The name of the game on the disc; false when its boot.id has none. */
+static bool chihiro_game_name(char *out, size_t out_len)
+{
+    uint8_t bid[CHIHIRO_BOOTID_LEN];
+
+    out[0] = 0;
+    if (chihiro_read_image_bootid(bid)) {
+        chihiro_game_name_of(bid + 0x30, out, out_len);
+    }
+    return out[0] != 0;
+}
+
+/* A save named after the executable, from before, moves to the name of the
+ * game that wrote it, the one its backup header names, with its DIMM system
+ * area: two games that shared the file (OutRun 2 and OutRun 2 SP) each find
+ * their own, whichever runs first. */
+static void chihiro_save_move_old(const char *saves_dir, const char *base)
+{
+    char old_path[1200], new_path[1200], old_dimm[1200], new_dimm[1200];
+    char name[16];
+    uint8_t owner[4];
+
+    snprintf(old_path, sizeof(old_path), "%s/%s.sav", saves_dir, base);
+    if (!chihiro_usb_save_owner(old_path, owner)) {
+        return;
+    }
+    chihiro_game_name_of(owner, name, sizeof(name));
+    snprintf(new_path, sizeof(new_path), "%s/%s.sav", saves_dir, name);
+    if (!name[0] || strcmp(new_path, old_path) == 0 ||
+        g_file_test(new_path, G_FILE_TEST_EXISTS) ||
+        g_rename(old_path, new_path) != 0) {
+        return;
+    }
+    fprintf(stderr, "Chihiro: save %s renamed %s\n", old_path, new_path);
+    snprintf(old_dimm, sizeof(old_dimm), "%s/%s.dimm", saves_dir, base);
+    snprintf(new_dimm, sizeof(new_dimm), "%s/%s.dimm", saves_dir, name);
+    if (g_file_test(old_dimm, G_FILE_TEST_EXISTS)) {
+        g_rename(old_dimm, new_dimm);
+    }
+}
+
+/* saves/<name>.sav, the game's name above. The executable's will not do:
+ * games share it (OUTRUN2.XBE is OutRun 2 and OutRun 2 SP, mj3.xbe MJ3 and
+ * MJ3 Evolution), and a backup another game wrote does not load: OutRun 2 SP
+ * then resets its bookkeeping, settings and ranking (acBackupLoadUserData
+ * answers 1). A disc without an identifier keeps saves/<executable>.sav. */
 static bool chihiro_resolve_save_path(void)
 {
-    char base[64];
+    char base[64], name[16];
     char saves_dir[1024];
+
     if (!chihiro_game_base_name(base, sizeof(base)) ||
         !chihiro_data_dir("saves", saves_dir, sizeof(saves_dir)))
         return false;
 
+    if (chihiro_game_name(name, sizeof(name))) {
+        chihiro_save_move_old(saves_dir, base);
+        snprintf(chihiro_save_path, sizeof(chihiro_save_path), "%s/%s.sav",
+                 saves_dir, name);
+        return true;
+    }
     snprintf(chihiro_save_path, sizeof(chihiro_save_path),
              "%s/%s.sav", saves_dir, base);
     /* "A\V322.xbe" keeps its backslash: one file on Linux, a folder "A" that
@@ -3395,7 +3489,11 @@ bool chihiro_gundam_card_repair(const char *card_path, char *why, size_t why_len
             snprintf(why, why_len, "No saves folder.");
             return false;
         }
-        snprintf(path, sizeof(path), "%s/gs.sav", saves_dir);
+        /* gundamos.sav, or gs.sav from before saves took the MAME name */
+        snprintf(path, sizeof(path), "%s/gundamos.sav", saves_dir);
+        if (!g_file_test(path, G_FILE_TEST_EXISTS)) {
+            snprintf(path, sizeof(path), "%s/gs.sav", saves_dir);
+        }
         if (!g_file_test(path, G_FILE_TEST_EXISTS)) {
             snprintf(why, why_len, "No save yet, the cabinet never read this card.");
             return false;

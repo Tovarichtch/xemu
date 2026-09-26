@@ -1376,6 +1376,23 @@ bool chihiro_usb_save_read_backup(const char *path, uint8_t *backup)
     return chihiro_usb_save_read(path, ic11, backup, &version);
 }
 
+/* The game that wrote a save: the identifier after "ACBU0001" in its ic11
+ * (0x14, the four characters at boot.id 0x30). */
+bool chihiro_usb_save_owner(const char *path, uint8_t *owner)
+{
+    uint8_t ic11[CHIHIRO_SAVE_IC11_SIZE];
+    uint8_t *backup = g_malloc(0x10000);
+    uint32_t version;
+    bool ok = chihiro_usb_save_read(path, ic11, backup, &version) &&
+              memcmp(ic11, "ACBU0001", 8) == 0;
+
+    g_free(backup);
+    if (ok) {
+        memcpy(owner, ic11 + 0x14, 4);
+    }
+    return ok;
+}
+
 bool chihiro_usb_save_load(const char *path)
 {
     ChihiroUSBState *s = chihiro_qc_instance;

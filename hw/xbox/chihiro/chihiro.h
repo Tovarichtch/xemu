@@ -133,6 +133,8 @@ bool chihiro_usb_save_dirty(void);
 const uint8_t *chihiro_usb_backup_live(void);
 /* The 64 KB backup half a save file holds; false when it is not one. */
 bool chihiro_usb_save_read_backup(const char *path, uint8_t *backup);
+/* The four-character identifier of the game that wrote a save file. */
+bool chihiro_usb_save_owner(const char *path, uint8_t *owner);
 /* The Gundam test menu's CARD REPAIR, done to the named card file; `why`
  * gets a sentence either way. */
 bool chihiro_gundam_card_repair(const char *card_path, char *why, size_t why_len);
