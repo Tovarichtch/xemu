@@ -353,6 +353,15 @@ typedef struct PGRAPHGLState {
     GLuint dl_zshrink_fbo, dl_zshrink_tex;
     unsigned dl_zshrink_w, dl_zshrink_h;
     GLint dl_zshrink_fmt;
+    /* A colour surface's guest pixels are written here at native size,
+     * then grown on the GPU into the scaled surface (surface upload). */
+    GLuint ul_grow_fbo, ul_grow_tex;
+    unsigned ul_grow_w, ul_grow_h;
+    GLint ul_grow_fmt;
+    /* The same for a depth surface. */
+    GLuint ul_zgrow_fbo, ul_zgrow_tex;
+    unsigned ul_zgrow_w, ul_zgrow_h;
+    GLint ul_zgrow_fmt;
     /* FBO bound on the render context: a same-name glBindFramebuffer still
      * costs a driver revalidation. */
     GLuint fb_bound;

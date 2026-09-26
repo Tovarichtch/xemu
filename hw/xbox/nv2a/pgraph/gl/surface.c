@@ -2058,6 +2058,102 @@ static void surface_copy_expand(uint8_t *out, uint8_t *in, unsigned int width,
     }
 }
 
+/* Grow a native-size image into a scaled surface on the GPU: only the
+ * guest's pixel count crosses the bus, not scale^2 times it, and the CPU no
+ * longer writes the scaled copy (at 10x a 640x480 frame, 123 MB for each
+ * upload). Point sampled, so each guest pixel fills its scale x scale block
+ * as the CPU expand did, and a nearest depth-stencil blit copies both as
+ * stored. The surface keeps the scaled storage it was created with;
+ * anything else stays on the CPU path. gl_fb_util is bound on entry. */
+static bool surface_grow_on_gpu(PGRAPHState *pg, SurfaceBinding *surface,
+                                const uint8_t *pixels)
+{
+    PGRAPHGLState *r = pg->gl_renderer_state;
+    bool zeta = !surface->color;
+    GLuint *fbo = zeta ? &r->ul_zgrow_fbo : &r->ul_grow_fbo;
+    GLuint *tex = zeta ? &r->ul_zgrow_tex : &r->ul_grow_tex;
+    unsigned *tw = zeta ? &r->ul_zgrow_w : &r->ul_grow_w;
+    unsigned *th = zeta ? &r->ul_zgrow_h : &r->ul_grow_h;
+    GLint *tf = zeta ? &r->ul_zgrow_fmt : &r->ul_grow_fmt;
+    unsigned w = surface->width, h = surface->height, sw = w, sh = h;
+    GLbitfield mask;
+
+    pgraph_apply_scaling_factor(pg, &sw, &sh);
+    if (pg->surface_scale_factor == 1 || surface->tex_w != sw ||
+        surface->tex_h != sh ||
+        surface->tex_fmt != (GLint)surface->fmt.gl_internal_format) {
+        return false;
+    }
+    if (zeta) {
+        mask = GL_DEPTH_BUFFER_BIT;
+        if (surface->fmt.gl_attachment == GL_DEPTH_STENCIL_ATTACHMENT) {
+            mask |= GL_STENCIL_BUFFER_BIT;
+        }
+    } else if (surface->fmt.gl_attachment == GL_COLOR_ATTACHMENT0) {
+        mask = GL_COLOR_BUFFER_BIT;
+    } else {
+        return false;
+    }
+
+    if (!*fbo) {
+        glGenFramebuffers(1, fbo);
+        glGenTextures(1, tex);
+    }
+    GLint prev_tex, prev_alignment;
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &prev_tex);
+    glGetIntegerv(GL_UNPACK_ALIGNMENT, &prev_alignment);
+    glPixelStorei(GL_UNPACK_ALIGNMENT,
+                  (w * surface->fmt.bytes_per_pixel) % 4 ? 1 : 4);
+    glBindTexture(GL_TEXTURE_2D, *tex);
+    bool fresh = *tw != w || *th != h ||
+                 *tf != (GLint)surface->fmt.gl_internal_format;
+    if (fresh) {
+        glTexImage2D(GL_TEXTURE_2D, 0, surface->fmt.gl_internal_format, w, h,
+                     0, surface->fmt.gl_format, surface->fmt.gl_type, pixels);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
+    } else {
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h, surface->fmt.gl_format,
+                        surface->fmt.gl_type, pixels);
+    }
+    glPixelStorei(GL_UNPACK_ALIGNMENT, prev_alignment);
+    glBindTexture(GL_TEXTURE_2D, prev_tex);
+
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, *fbo);
+    if (fresh) {
+        if (zeta) {
+            /* A depth-only format after a depth-stencil one, or back:
+             * no stale half of the other attachment may stay behind. */
+            glFramebufferTexture2D(GL_READ_FRAMEBUFFER,
+                                   GL_DEPTH_STENCIL_ATTACHMENT, GL_TEXTURE_2D,
+                                   0, 0);
+        }
+        glFramebufferTexture2D(GL_READ_FRAMEBUFFER, surface->fmt.gl_attachment,
+                               GL_TEXTURE_2D, *tex, 0);
+        *tw = w;
+        *th = h;
+        *tf = surface->fmt.gl_internal_format;
+    }
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, r->gl_fb_util);
+    glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, surface->fmt.gl_attachment,
+                           GL_TEXTURE_2D, surface->gl_buffer, 0);
+    /* xemu's own copy: the scissor a draw left enabled would clip it, and
+     * none of the game's write masks apply (the draw state cache is told
+     * it changed). */
+    pgraph_gl_draw_state_invalidate(r);
+    glDisable(GL_SCISSOR_TEST);
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glDepthMask(GL_TRUE);
+    glStencilMask(0xFF);
+    glBlitFramebuffer(0, 0, w, h, 0, 0, sw, sh, mask, GL_NEAREST);
+    glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, surface->fmt.gl_attachment,
+                           GL_TEXTURE_2D, 0, 0);
+    glBindFramebuffer(GL_FRAMEBUFFER, r->gl_fb_util);
+    r->fb_bound = r->gl_fb_util;
+    return true;
+}
+
 static void upload_surface_data_impl(NV2AState *d, SurfaceBinding *surface,
                                 bool force)
 {
@@ -2129,6 +2225,18 @@ static void upload_surface_data_impl(NV2AState *d, SurfaceBinding *surface,
 
     uint8_t *gl_read_buf = optimal_buf;
     unsigned int width = surface->width, height = surface->height;
+
+    if (surface_grow_on_gpu(pg, surface, optimal_buf)) {
+        if (optimal_buf != buf) {
+            g_free(optimal_buf);
+        }
+        if (surface->swizzle) {
+            g_free(buf);
+        }
+        glBindTexture(GL_TEXTURE_2D, last_texture_binding);
+        bind_current_surface(d);
+        return;
+    }
 
     if (pg->surface_scale_factor > 1) {
         pgraph_apply_scaling_factor(pg, &width, &height);
@@ -2757,6 +2865,12 @@ void pgraph_gl_finalize_surfaces(PGRAPHState *pg)
     glDeleteTextures(1, &r->dl_zshrink_tex);
     r->dl_shrink_fbo = r->dl_shrink_tex = 0;
     r->dl_zshrink_fbo = r->dl_zshrink_tex = 0;
+    glDeleteFramebuffers(1, &r->ul_grow_fbo);
+    glDeleteTextures(1, &r->ul_grow_tex);
+    glDeleteFramebuffers(1, &r->ul_zgrow_fbo);
+    glDeleteTextures(1, &r->ul_zgrow_tex);
+    r->ul_grow_fbo = r->ul_grow_tex = 0;
+    r->ul_zgrow_fbo = r->ul_zgrow_tex = 0;
 
     finalize_render_to_texture(pg);
 }
