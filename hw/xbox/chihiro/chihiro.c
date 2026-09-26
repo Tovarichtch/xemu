@@ -20,6 +20,7 @@
  */
 
 #include "qemu/osdep.h"
+#include <glib/gstdio.h>
 #include "hw/hw.h"
 #include "hw/irq.h"
 #include "hw/isa/isa.h"
