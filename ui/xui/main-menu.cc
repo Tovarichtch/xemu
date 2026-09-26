@@ -1438,11 +1438,28 @@ void MainMenuChihiroView::Draw()
         Toggle("Freeplay", &g_config.chihiro.settings.freeplay,
                "Disable coin requirement (applies on reset)");
         chihiro_freeplay_setting = g_config.chihiro.settings.freeplay;
-        ChevronCombo("Region", &g_config.chihiro.settings.region,
-                     "Auto\0Japan\0USA\0Export\0",
-                     "Cabinet region (applies on reset). Auto follows the "
-                     "game's own list of regions: Export where the game "
-                     "accepts it, Japan for the Japan-only titles");
+        /* Export, Japan, USA; the setting's older 'auto' is Export. */
+        static const int region_values[] = {
+            CONFIG_CHIHIRO_SETTINGS_REGION_EX,
+            CONFIG_CHIHIRO_SETTINGS_REGION_JP,
+            CONFIG_CHIHIRO_SETTINGS_REGION_US,
+        };
+        const int n_regions =
+            (int)(sizeof(region_values) / sizeof(region_values[0]));
+        int region_item = 0;
+        for (int i = 0; i < n_regions; i++) {
+            if (g_config.chihiro.settings.region == region_values[i]) {
+                region_item = i;
+            }
+        }
+        if (ChevronCombo("Preferred Region", &region_item,
+                         "Export\0Japan\0USA\0",
+                         "Cabinet region (applies on reset). A game that "
+                         "does not accept it runs in the first of Export, "
+                         "USA and Japan it does, and a notification says "
+                         "so")) {
+            g_config.chihiro.settings.region = region_values[region_item];
+        }
         ChevronCombo("Board Type", &g_config.chihiro.settings.board_type,
                      "Auto\0Type-1 (FPGA)\0Type-3 (ASIC)\0",
                      "Media board (needs a restart). Auto follows the game: "

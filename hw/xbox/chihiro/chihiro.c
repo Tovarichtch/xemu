@@ -3796,45 +3796,52 @@ out:
 
 /* The cabinet's region, the byte at EEPROM 0x1F00: 1 Japan, 2 USA, 3 Export.
  * SEGABOOT tests bit (1 << byte) of the mask at boot.id + 0x38 and stops on
- * Error 05 when it is clear (fpr21042, verifier at 0x0002EAE0). Auto takes
- * Export, then USA, then Japan, as the mask allows; a region set by hand
- * stays. */
+ * Error 05 when it is clear (fpr21042, verifier at 0x0002EAE0). The setting
+ * is the preferred region, Export unless changed ('auto' is Export's older
+ * name): a game whose mask lacks it gets the first of Export, USA and Japan
+ * the mask has, and a notification says so. */
 uint8_t chihiro_region_byte(void)
 {
     static const char *const names[] = { "", "Japan", "USA", "Export" };
     static uint8_t region;
+    static int for_set = -1;
     static char *for_path;
     int set = g_config.chihiro.settings.region;
     const char *path = g_config.sys.files.dvd_path;
 
-    if (set != CONFIG_CHIHIRO_SETTINGS_REGION_AUTO) {
-        return (uint8_t)set;    /* the enum index is the byte */
+    if (set == CONFIG_CHIHIRO_SETTINGS_REGION_AUTO) {
+        set = CONFIG_CHIHIRO_SETTINGS_REGION_EX;
     }
-    if (for_path && g_strcmp0(for_path, path) == 0) {
+    if (set == for_set && for_path && g_strcmp0(for_path, path) == 0) {
         return region;
     }
+    for_set = set;
     g_free(for_path);
     for_path = g_strdup(path ? path : "");
 
     uint8_t bid[CHIHIRO_BOOTID_LEN];
     uint8_t mask = chihiro_read_image_bootid(bid) ? bid[0x38] : 0;
-    region = CONFIG_CHIHIRO_SETTINGS_REGION_JP;
-    for (uint8_t r = CONFIG_CHIHIRO_SETTINGS_REGION_EX;
-         r >= CONFIG_CHIHIRO_SETTINGS_REGION_JP; r--) {
-        if (mask & (1u << r)) {
-            region = r;
-            break;
+    region = set;           /* the enum index is the byte */
+    if (mask & (1u << set)) {
+        fprintf(stderr, "Chihiro: region %s, the preferred one, %.4s "
+                "accepts it\n", names[region], (const char *)bid + 0x30);
+    } else if (mask & 0x0E) {
+        for (int r = CONFIG_CHIHIRO_SETTINGS_REGION_EX;
+             r >= CONFIG_CHIHIRO_SETTINGS_REGION_JP; r--) {
+            if (mask & (1u << r)) {
+                region = r;
+                break;
+            }
         }
-    }
-    if (mask == 0) {
-        fprintf(stderr, "Chihiro: region %s, no boot.id to read the game's "
-                "list from\n", names[region]);
-    } else if ((mask & 0x0E) == (1u << region)) {
-        fprintf(stderr, "Chihiro: region %s, the only one %.4s accepts\n",
-                names[region], (const char *)bid + 0x30);
+        fprintf(stderr, "Chihiro: region %s, %.4s does not accept %s\n",
+                names[region], (const char *)bid + 0x30, names[set]);
+        char msg[96];
+        snprintf(msg, sizeof(msg), "This game has no %s region: %s used",
+                 names[set], names[region]);
+        xemu_queue_notification(msg);
     } else {
-        fprintf(stderr, "Chihiro: region %s, from the list %.4s accepts\n",
-                names[region], (const char *)bid + 0x30);
+        fprintf(stderr, "Chihiro: region %s, the preferred one, no boot.id "
+                "list to check it against\n", names[region]);
     }
     return region;
 }

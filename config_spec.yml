@@ -640,14 +640,14 @@ chihiro:
     freeplay:
       type: bool
       default: false
-    # The cabinet's region, the byte SEGABOOT reads at EEPROM 0x1F00 (the enum
+    # The preferred region, the byte SEGABOOT reads at EEPROM 0x1F00 (the enum
     # index: 1 Japan, 2 USA, 3 Export); a game outside its boot.id mask (0x38)
-    # stops on Error 05. Auto takes Export, then USA, then Japan, as the game
-    # allows.
+    # would stop on Error 05, so it gets the first of Export, USA and Japan it
+    # accepts. 'auto' is Export's older name.
     region:
       type: enum
       values: [auto, jp, us, ex]
-      default: auto
+      default: ex
     # The media board's DIMM: the JP1/JP2 jumper value (the enum index), for
     # the host side and the board's own SPD alike (a mismatch is SEGABOOT's
     # Caution 53). Gundam's 603 MB image needs 1024 MB.
