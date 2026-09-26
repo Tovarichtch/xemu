@@ -984,7 +984,7 @@ void pgraph_vk_init_shaders(PGRAPHState *pg)
 }
 
 /* Per flip until the boot has named the game (the seeds are keyed by
- * the game executable, captured a few seconds into SEGABOOT). */
+ * the game's name, known at the latest a few seconds into SEGABOOT). */
 void pgraph_vk_seed_service(void)
 {
     static bool done;

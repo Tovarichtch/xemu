@@ -30,6 +30,7 @@
 #include "cost.h"
 #include "swizzle.h"
 #include "nv2a_vsh_emulator.h"
+#include "seed.h"
 
 #define PG_GET_MASK(reg, mask) GET_MASK(pgraph_reg_r(pg, reg), mask)
 #define PG_SET_MASK(reg, mask, value)        \
@@ -237,18 +238,32 @@ static unsigned long long xemu_flip_inc_count; /* guest flips */
 
 /* "OllieKing.xbe" -> "ollieking", "ctx_ac[r].xbe" -> "ctx_ac_r_": the
  * spelling of the seed files and the dictionary. */
-void nv2a_set_game_executable(const char *name)
+static void pgraph_game_tag_of(const char *name, char *tag, size_t len)
 {
     size_t n = 0;
-    for (const char *p = name; *p && n < sizeof(pgraph_game_tag) - 1; p++) {
+    for (const char *p = name; *p && n < len - 1; p++) {
         if (*p == '.' && strcasecmp(p, ".xbe") == 0) {
             break;
         }
         char c = g_ascii_tolower(*p);
         bool keep = g_ascii_isalnum(c) || c == '-' || c == '_';
-        pgraph_game_tag[n++] = keep ? c : '_';
+        tag[n++] = keep ? c : '_';
     }
-    pgraph_game_tag[n] = '\0';
+    tag[n] = '\0';
+}
+
+/* A Chihiro game's seeds take its MAME name ("outr2st"). The seed file it
+ * had under `before`, its executable's name ("OUTRUN2.XBE" -> "outrun2"),
+ * takes the new one: a file two games shared goes to the first that runs,
+ * and the dictionary holds both. */
+void nv2a_set_game_name(const char *name, const char *before)
+{
+    pgraph_game_tag_of(name, pgraph_game_tag, sizeof(pgraph_game_tag));
+    if (before) {
+        char old[sizeof(pgraph_game_tag)];
+        pgraph_game_tag_of(before, old, sizeof(old));
+        pgraph_seed_rename(old, pgraph_game_tag);
+    }
 }
 
 const char *pgraph_seed_game_tag(void)
@@ -259,7 +274,7 @@ const char *pgraph_seed_game_tag(void)
         const char *dvd = g_config.sys.files.dvd_path;
         if (xemu_flip_inc_count > 900 && dvd && dvd[0]) {
             char *base = g_path_get_basename(dvd);
-            nv2a_set_game_executable(base);
+            nv2a_set_game_name(base, NULL);
             g_free(base);
         }
     }

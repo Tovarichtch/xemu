@@ -62,9 +62,10 @@ typedef struct VertexAttribute {
     bool inline_buffer_populated;
 } VertexAttribute;
 
-/* The game's executable name, captured by the Chihiro boot, which keys the
- * shader seeds and the dictionary; the disc image's name when a boot has
- * not named it after 900 flips; NULL until then. */
+/* The game's name, found by the Chihiro boot (its MAME name, else its
+ * executable's), which keys the shader seeds and the dictionary; the disc
+ * image's name when a boot has not named it after 900 flips; NULL until
+ * then. */
 const char *pgraph_seed_game_tag(void);
 
 /* Real hardware speed model, QEMU_CLOCK_REALTIME ns: the deadline before

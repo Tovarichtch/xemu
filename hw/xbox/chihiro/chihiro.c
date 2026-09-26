@@ -1422,7 +1422,12 @@ void chihiro_set_game_executable(const char *name)
     g_strlcpy(chihiro_game_filename, name, sizeof(chihiro_game_filename));
     chihiro_cabinet_forget();
     printf("Chihiro: game → '%s'\n", chihiro_game_filename);
-    nv2a_set_game_executable(chihiro_game_filename);
+    /* The shader seeds take the game's name, as its saves do. */
+    char game[64];
+    if (!chihiro_game_name(game, sizeof(game))) {
+        g_strlcpy(game, chihiro_game_filename, sizeof(game));
+    }
+    nv2a_set_game_name(game, chihiro_game_filename);
 }
 
 /* A game launched from a directory carries its boot.id as a file. */

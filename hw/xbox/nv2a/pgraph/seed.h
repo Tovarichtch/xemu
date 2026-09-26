@@ -28,10 +28,10 @@
  *      files recorded while playing each game, so it holds their shader
  *      states, vertex programs included): what a fresh install gets on its
  *      first play;
- *   2. the local file shader_seeds/<executable>.seed, keyed by the name the
- *      Chihiro boot reveals (never the disc image name): the union of what
- *      was on disk and what each session drew, rewritten at shutdown by the
- *      backend that ran (GL sections 1-2, Vulkan section 3).
+ *   2. the local file shader_seeds/<game>.seed, keyed by the game's name (a
+ *      Chihiro game's MAME name, found by its disc's identifier): the union
+ *      of what was on disk and what each session drew, rewritten at shutdown
+ *      by the backend that ran (GL sections 1-2, Vulkan section 3).
  * During SEGABOOT a seeded state gets its modules, its dynamic-sibling cover
  * and (Vulkan) its pipeline libraries built. An unseeded state of a known
  * family is drawn at once with its dynamic sibling while a worker compiles
@@ -48,6 +48,10 @@ enum {
     PGRAPH_SEED_GL_STATES = 2,  /* ShaderState as the OpenGL backend keys it */
     PGRAPH_SEED_VK_STATES = 3,  /* ShaderState as the Vulkan backend keys it */
 };
+
+/* Renames the seed file `from`, a name the game's seeds had before, to `to`,
+ * unless `to` exists. */
+void pgraph_seed_rename(const char *from, const char *to);
 
 /* Items of one section of the current game's local seed (NULL when the
  * game is not named yet, the file is absent or the section is stale).

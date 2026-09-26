@@ -18,6 +18,7 @@
  */
 
 #include "qemu/osdep.h"
+#include <glib/gstdio.h>
 #include "qemu/fast-hash.h"
 #include "ui/xemu-settings.h"
 #include "hw/xbox/nv2a/pgraph/pgraph.h"
@@ -55,6 +56,26 @@ static char *seed_path(void)
     char *path = g_strdup_printf("%s/%s.seed", dir, tag);
     g_free(dir);
     return path;
+}
+
+void pgraph_seed_rename(const char *from, const char *to)
+{
+    if (strcmp(from, to) == 0) {
+        return;
+    }
+    char *dir = g_strdup_printf("%sshader_seeds",
+                                xemu_settings_get_base_path());
+    char *old_path = g_strdup_printf("%s/%s.seed", dir, from);
+    char *new_path = g_strdup_printf("%s/%s.seed", dir, to);
+    if (g_file_test(old_path, G_FILE_TEST_EXISTS) &&
+        !g_file_test(new_path, G_FILE_TEST_EXISTS) &&
+        g_rename(old_path, new_path) == 0) {
+        fprintf(stderr, "nv2a: shader seed %s renamed %s\n", old_path,
+                new_path);
+    }
+    g_free(new_path);
+    g_free(old_path);
+    g_free(dir);
 }
 
 /* Walk the sections of a seed image; `visit` returns false to stop.
