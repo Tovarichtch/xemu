@@ -416,7 +416,7 @@ chihiro:
     test:
       type: integer
       default: 39
-    # Driving keys, shared by Crazy Taxi and OutRun 2 (a wheel or a pad)
+    # Driving keys, shared by the driving games (a wheel or a pad)
     steer_left:
       type: integer
       default: 80
@@ -429,6 +429,14 @@ chihiro:
     brake:
       type: integer
       default: 81
+    # Gear paddles: OutRun 2's sequential shifter, and Maximum Tune's lever
+    # moved one gear at a time
+    gear_up:
+      type: integer
+      default: 29
+    gear_down:
+      type: integer
+      default: 27
     hotd3:
       trigger:
         type: integer
@@ -478,6 +486,7 @@ chihiro:
         type: integer
         default: 44
     or2:
+      # Deprecated: read once into jvs.gear_up and jvs.gear_down
       gear_up:
         type: integer
         default: 29
@@ -490,19 +499,26 @@ chihiro:
     # Maximum Tune reads its H shifter and its two wheel buttons from the
     # SECOND switch byte of player 1 (V322.xbe 0x00055AA0): bits 7/6 are the
     # lever's up/down, bits 5/4 its left/right, and bits 1/0 the two buttons.
+    # gear1..gear6: a real shifter's positions, none set by default.
     wmmt2:
-      shift_up:
+      gear1:
         type: integer
-        default: 26
-      shift_down:
+        default: 0
+      gear2:
         type: integer
-        default: 22
-      shift_left:
+        default: 0
+      gear3:
         type: integer
-        default: 4
-      shift_right:
+        default: 0
+      gear4:
         type: integer
-        default: 7
+        default: 0
+      gear5:
+        type: integer
+        default: 0
+      gear6:
+        type: integer
+        default: 0
       view_change:
         type: integer
         default: 224

@@ -201,6 +201,17 @@ bool xemu_settings_load(void)
         }
     }
 
+    /* CHIHIRO (not upstream): OutRun 2's own gear keys are now the gear
+     * paddles every driving game shares; keys set there move over once. */
+    CNode *jvs = config_tree.child("chihiro")->child("jvs");
+    for (const char *key : { "gear_up", "gear_down" }) {
+        CNode *old = jvs->child("or2")->child(key);
+        if (old->differs_from_default()) {
+            jvs->child(key)->data.integer.val = old->data.integer.val;
+            old->reset_to_defaults();
+        }
+    }
+
     config_tree.store_to_struct(&g_config);
 
     return success;

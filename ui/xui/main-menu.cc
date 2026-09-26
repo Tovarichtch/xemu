@@ -1147,8 +1147,10 @@ static void ChihiroDevicesTab(std::unique_ptr<ChihiroRebindingMap> &rebinding)
         ChihiroPointerCell(1);
 
         /* Row ids 200+ keep clear of the other tables. */
-        static const char *labels[] = { "Steer Left", "Steer Right", "Gas", "Brake" };
-        for (int i = 0; i < 4; i++) {
+        static const char *labels[] = {
+            "Steer Left", "Steer Right", "Gas", "Brake", "Gear Up", "Gear Down"
+        };
+        for (int i = 0; i < 6; i++) {
             ImGui::TableNextRow();
             ImGui::TableSetColumnIndex(0);
             ImGui::Text("%s", labels[i]);
@@ -1166,6 +1168,8 @@ static void ChihiroDevicesTab(std::unique_ptr<ChihiroRebindingMap> &rebinding)
         g_config.chihiro.jvs.steer_right = 79;
         g_config.chihiro.jvs.gas = 82;
         g_config.chihiro.jvs.brake = 81;
+        g_config.chihiro.jvs.gear_up = 29;
+        g_config.chihiro.jvs.gear_down = 27;
         xemu_settings_save();
     }
 }
@@ -1293,20 +1297,17 @@ void MainMenuChihiroView::DrawGameTab()
             break;
         }
         case CONFIG_CHIHIRO_JVS_PROFILE_OR2: {
-            static const char *labels[] = {
-                "Gear Up", "Gear Down", "View Change"
-            };
-            for (int i = 0; i < 3; i++)
-                ChihiroRebindRow(labels[i], g_chihiro_or2_map[i],
-                                 row++, m_rebinding, 0);
+            /* The shifter is the gear paddles, in Devices. */
+            ChihiroRebindRow("View Change", g_chihiro_or2_map[0],
+                             row++, m_rebinding, 0);
             break;
         }
         case CONFIG_CHIHIRO_JVS_PROFILE_WMMT2: {
             static const char *labels[] = {
-                "Shift Up", "Shift Down", "Shift Left", "Shift Right",
+                "Gear 1", "Gear 2", "Gear 3", "Gear 4", "Gear 5", "Gear 6",
                 "View Change", "Intrude Change", "Card In"
             };
-            for (int i = 0; i < 7; i++)
+            for (int i = 0; i < 9; i++)
                 ChihiroRebindRow(labels[i], g_chihiro_wmmt2_map[i],
                                  row++, m_rebinding, 0);
             break;
@@ -1365,12 +1366,16 @@ void MainMenuChihiroView::DrawGameTab()
             g_config.chihiro.jvs.gs.body_button = 1003;
             g_config.chihiro.jvs.gs.change = 44;
             g_config.chihiro.jvs.gs.card = 6;
+            g_config.chihiro.jvs.wmmt2.gear1 = 0;
+            g_config.chihiro.jvs.wmmt2.gear2 = 0;
+            g_config.chihiro.jvs.wmmt2.gear3 = 0;
+            g_config.chihiro.jvs.wmmt2.gear4 = 0;
+            g_config.chihiro.jvs.wmmt2.gear5 = 0;
+            g_config.chihiro.jvs.wmmt2.gear6 = 0;
             g_config.chihiro.jvs.wmmt2.card = 6;
             g_config.chihiro.jvs.ctx.drive_gear = 225;
             g_config.chihiro.jvs.ctx.reverse = 224;
             g_config.chihiro.jvs.ctx.jump = 44;
-            g_config.chihiro.jvs.or2.gear_up = 29;
-            g_config.chihiro.jvs.or2.gear_down = 27;
             g_config.chihiro.jvs.or2.view_change = 224;
             g_config.chihiro.jvs.ok.swing_left = 80;
             g_config.chihiro.jvs.ok.swing_right = 79;

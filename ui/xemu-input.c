@@ -201,12 +201,14 @@ int *g_chihiro_gs_map[5] = {
     &g_config.chihiro.jvs.gs.card,
 };
 
-/* Steering and pedals are shared by the driving games (g_chihiro_drive_map). */
-int *g_chihiro_drive_map[4] = {
+/* Steering, pedals and gear paddles are shared by the driving games. */
+int *g_chihiro_drive_map[6] = {
     &g_config.chihiro.jvs.steer_left,
     &g_config.chihiro.jvs.steer_right,
     &g_config.chihiro.jvs.gas,
     &g_config.chihiro.jvs.brake,
+    &g_config.chihiro.jvs.gear_up,
+    &g_config.chihiro.jvs.gear_down,
 };
 
 int *g_chihiro_ctx_map[3] = {
@@ -215,17 +217,17 @@ int *g_chihiro_ctx_map[3] = {
     &g_config.chihiro.jvs.ctx.jump,
 };
 
-int *g_chihiro_or2_map[3] = {
-    &g_config.chihiro.jvs.or2.gear_up,
-    &g_config.chihiro.jvs.or2.gear_down,
+int *g_chihiro_or2_map[1] = {
     &g_config.chihiro.jvs.or2.view_change,
 };
 
-int *g_chihiro_wmmt2_map[7] = {
-    &g_config.chihiro.jvs.wmmt2.shift_up,
-    &g_config.chihiro.jvs.wmmt2.shift_down,
-    &g_config.chihiro.jvs.wmmt2.shift_left,
-    &g_config.chihiro.jvs.wmmt2.shift_right,
+int *g_chihiro_wmmt2_map[9] = {
+    &g_config.chihiro.jvs.wmmt2.gear1,
+    &g_config.chihiro.jvs.wmmt2.gear2,
+    &g_config.chihiro.jvs.wmmt2.gear3,
+    &g_config.chihiro.jvs.wmmt2.gear4,
+    &g_config.chihiro.jvs.wmmt2.gear5,
+    &g_config.chihiro.jvs.wmmt2.gear6,
     &g_config.chihiro.jvs.wmmt2.view_change,
     &g_config.chihiro.jvs.wmmt2.intrude_change,
     &g_config.chihiro.jvs.wmmt2.card,
@@ -910,47 +912,34 @@ static uint8_t gundam_stick(int *const *controls, const bool *kbd,
 }
 
 /* Maximum Tune's H shifter (V322.xbe 0x00055AA0, V307.xbe 0x0006F150):
- * switches up 0x80, down 0x40, left 0x20, right 0x10; 1st gear is left + up,
- * 6th right + down, and neutral sits in the centre. The real lever stays in
- * its gate, and the race drops to neutral after 30 frames without a gear
- * (V322.xbe 0x000B6420): the lever takes the keys held when one goes down
- * and stays there when they come up; left or right alone puts it back in
- * neutral. Keys pressed within the settle time make one move, so that a gear
- * on a diagonal is not reached through another (changes in quick succession
- * also drop the car to neutral). */
-#define WMMT_LEVER_SETTLE_MS 50
+ * switches up 0x80, down 0x40, left 0x20, right 0x10, and each gear is where
+ * the game reads it, neutral none. A real shifter's gear, held, puts the
+ * lever there, and letting it go puts it back in neutral. The paddles move
+ * it one gear at a time and leave it there, as a hand would: the race drops
+ * to neutral after 30 frames without a gear (V322.xbe 0x000B6420). */
+static const uint8_t wmmt_gate[7] = { 0x00, 0xA0, 0x60, 0x80, 0x40, 0x90, 0x50 };
 
 static uint8_t wmmt_lever(const bool *kbd, uint32_t mouseBtn)
 {
-    static const uint8_t bits[4] = { 0x80, 0x40, 0x20, 0x10 };
-    static uint8_t lever, held_before, move;
-    static int64_t move_ends;
-    int64_t now = g_get_monotonic_time() / 1000;
-    uint8_t held = 0;
+    static int gear, held_before;
+    static bool up_before, down_before;
+    int held = 0;
 
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < 6 && !held; i++) {
         if (chihiro_check_input(*g_chihiro_wmmt2_map[i], kbd, mouseBtn))
-            held |= bits[i];
+            held = i + 1;
     }
-    if (held & ~held_before) {
-        if (!move)
-            move_ends = now + WMMT_LEVER_SETTLE_MS;
-        move |= held;
+    if (held != held_before) {
+        gear = held;
+        held_before = held;
     }
-    held_before = held;
-    if (move && now >= move_ends) {
-        /* Both ends of an axis: the lever stays in its middle. */
-        if ((move & 0xC0) == 0xC0)
-            move &= ~0xC0;
-        if ((move & 0x30) == 0x30)
-            move &= ~0x30;
-        /* Neither up nor down: neutral, at the centre. */
-        if (!(move & 0xC0))
-            move = 0;
-        lever = move;
-        move = 0;
-    }
-    return lever;
+    if (key_pressed(chihiro_check_input(g_config.chihiro.jvs.gear_up, kbd,
+                                        mouseBtn), &up_before) && gear < 6)
+        gear++;
+    if (key_pressed(chihiro_check_input(g_config.chihiro.jvs.gear_down, kbd,
+                                        mouseBtn), &down_before) && gear > 0)
+        gear--;
+    return wmmt_gate[gear];
 }
 
 /* How far an input is pressed, 0..1. */
@@ -1438,9 +1427,9 @@ static void xemu_input_update_jvs(void)
     // from that player-2 word, not from player 1 -- verified by decompiling the
     // input-test display. Applied after the P2 update so it is not cleared.
     if (profile == CONFIG_CHIHIRO_JVS_PROFILE_OR2) {
-        if (chihiro_check_input(g_config.chihiro.jvs.or2.gear_up, kbd, mouseBtn))
+        if (chihiro_check_input(g_config.chihiro.jvs.gear_up, kbd, mouseBtn))
             jvs->player_switches[1][0] |= 0x20;
-        if (chihiro_check_input(g_config.chihiro.jvs.or2.gear_down, kbd, mouseBtn))
+        if (chihiro_check_input(g_config.chihiro.jvs.gear_down, kbd, mouseBtn))
             jvs->player_switches[1][0] |= 0x10;
     }
 
