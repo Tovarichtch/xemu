@@ -905,9 +905,9 @@ static bool event_watch_callback(void *userdata, SDL_Event *event)
 
 /* CHIHIRO (not upstream): the window title names the fork, the upstream
  * release it builds on, the playtest, and the game once it is known:
- * "xemu Chihiro 0.8.134 | Playtest #1 | Virtua Cop 3". */
+ * "xemu Chihiro 0.8.134 | Playtest #2 | Virtua Cop 3". */
 #define XEMU_BUILD_TITLE "xemu Chihiro"
-#define XEMU_BUILD_LABEL "Playtest #1"
+#define XEMU_BUILD_LABEL "Playtest #2"
 
 static const char *const chihiro_game_titles[] = {
     [CONFIG_CHIHIRO_JVS_PROFILE_HOTD3] = "The House of the Dead III",
