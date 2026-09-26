@@ -1402,14 +1402,15 @@ static void take_image_and_machine(int argc, char **argv)
             g_auto(GStrv) items = g_strsplit(argv[i + 1], ",", -1);
             for (int k = 0; items[k]; k++) {
                 char *value = strchr(items[k], '=');
-                bool on = true;
-                if (value) {
-                    *value++ = '\0';
-                } else if (k == 0) {
-                    continue; /* the machine type */
+                bool on;
+                /* key=value; only the machine type may go without (QEMU
+                 * refuses any other key without a value). */
+                if (!value) {
+                    continue;
                 }
+                *value++ = '\0';
                 if (!strcmp(items[k], "chihiro") &&
-                    (!value || qapi_bool_parse("chihiro", value, &on, NULL))) {
+                    qapi_bool_parse("chihiro", value, &on, NULL)) {
                     xemu_chihiro_mode_ask(on);
                 }
             }
