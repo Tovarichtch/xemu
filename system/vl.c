@@ -3156,16 +3156,22 @@ void qemu_init(int argc, char **argv)
     }
 
     const char *flashrom_path = g_config.sys.files.flashrom_path;
-    /* A Chihiro boots the BIOS from Settings > Chihiro > Files when one is
-     * set, else the Xbox flash; an Xbox boots the Xbox flash. */
-    if (chihiro_machine && g_config.chihiro.roms.bios_path &&
-        g_config.chihiro.roms.bios_path[0]) {
-        flashrom_path = g_config.chihiro.roms.bios_path;
+    bool chihiro_bios_ok = false;
+    /* A Chihiro only boots its own BIOS (Settings > Chihiro > Files), never
+     * an Xbox one. Its other files, if not set, are taken from the BIOS
+     * folder. */
+    if (chihiro_machine) {
+        flashrom_path = g_config.chihiro.roms.bios_path ?: "";
+        chihiro_bios_ok = flashrom_path[0] &&
+                          !xemu_check_file(flashrom_path) &&
+                          chihiro_bios_known(flashrom_path);
     }
     if (g_config.general.show_welcome) {
         // Don't display an error if this is the first boot. Give user a chance
         // to configure the path.
         autostart = 0;
+    } else if (chihiro_machine && !chihiro_bios_ok) {
+        autostart = 0; /* reported below with the other Chihiro files */
     } else if (xemu_check_file(flashrom_path)) {
         char *msg = g_strdup_printf("Failed to open flash file '%s'. Please check machine settings.", flashrom_path);
         xemu_queue_error_message(msg);
@@ -3189,6 +3195,9 @@ void qemu_init(int argc, char **argv)
         chihiro_load_flash_rom(flashrom_path);
         chihiro_load_eeproms(flashrom_path);
         GString *missing = g_string_new(NULL);
+        if (!flashrom_path[0] || xemu_check_file(flashrom_path)) {
+            g_string_append(missing, "\n- BIOS (chihiro_xbox_bios.bin)");
+        }
         if (!chihiro_flash_rom_loaded()) {
             g_string_append(missing, "\n- media board flash (fpr21042_m29w160et.bin)");
         }
@@ -3209,6 +3218,14 @@ void qemu_init(int argc, char **argv)
             xemu_queue_error_message(msg);
             g_free(msg);
             autostart = 0;
+        } else if (!chihiro_bios_ok) {
+            char *msg = g_strdup_printf(
+                "'%s' is not a Chihiro BIOS.\n\nSelect chihiro_xbox_bios.bin "
+                "(from MAME's chihiro set) in Settings > Chihiro > Files, "
+                "then restart.",
+                flashrom_path);
+            xemu_queue_error_message(msg);
+            g_free(msg);
         }
         g_string_free(missing, TRUE);
     }

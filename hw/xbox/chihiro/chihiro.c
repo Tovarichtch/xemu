@@ -2528,6 +2528,20 @@ static bool chihiro_read_flash_rom(const char *path)
 
 /* Explicit path from Settings > Chihiro > Files wins; otherwise look for the
  * known file names next to the Xbox BIOS. */
+/* The Chihiro BIOS listed by MAME (chihiro_xbox_bios.bin). */
+bool chihiro_bios_known(const char *path)
+{
+    g_autofree gchar *data = NULL;
+    gsize len = 0;
+
+    if (!g_file_get_contents(path, &data, &len, NULL) || len != 0x80000) {
+        return false;
+    }
+    g_autofree gchar *sha1 = g_compute_checksum_for_data(
+        G_CHECKSUM_SHA1, (const guchar *)data, len);
+    return !strcmp(sha1, "b700b0041af8f84835e45d1d1250247bf7077188");
+}
+
 void chihiro_load_flash_rom(const char *bios_path)
 {
     if (chihiro_flash_rom) return; /* already loaded */
@@ -2537,6 +2551,9 @@ void chihiro_load_flash_rom(const char *bios_path)
         if (chihiro_read_flash_rom(configured)) return;
         fprintf(stderr, "Chihiro: cannot read media board flash '%s'\n",
                 configured);
+    }
+    if (!bios_path[0]) {
+        return;
     }
 
     char dir[1024] = {0};
@@ -2602,7 +2619,7 @@ static uint8_t *load_eeprom_configured(const char *configured, const char *dir,
         fprintf(stderr, "Chihiro: cannot read EEPROM '%s' (expected %u bytes)\n",
                 configured, expected_size);
     }
-    return load_eeprom_file(dir, name, expected_size, out_size);
+    return dir ? load_eeprom_file(dir, name, expected_size, out_size) : NULL;
 }
 
 void chihiro_load_eeproms(const char *bios_path)
@@ -2620,14 +2637,16 @@ void chihiro_load_eeproms(const char *bios_path)
             memcpy(dir, bios_path, dir_len);
     }
 
+    /* Without a BIOS, only the files set in the settings are used. */
+    const char *next_to = bios_path[0] ? dir : NULL;
     chihiro_ic10_data = load_eeprom_configured(g_config.chihiro.roms.ic10_path,
-                                               dir, "ic10_g24lc64.bin",
+                                               next_to, "ic10_g24lc64.bin",
                                                8192, &chihiro_ic10_size);
     chihiro_ic11_data = load_eeprom_configured(g_config.chihiro.roms.ic11_path,
-                                               dir, "ic11_24lc024.bin",
+                                               next_to, "ic11_24lc024.bin",
                                                128, &chihiro_ic11_size);
     chihiro_pc20_data = load_eeprom_configured(g_config.chihiro.roms.pc20_path,
-                                               dir, "pc20_g24lc64.bin",
+                                               next_to, "pc20_g24lc64.bin",
                                                8192, &chihiro_pc20_size);
 
     printf("Chihiro: EEPROMs from disk: ic10=%s (%uB), ic11=%s (%uB), pc20=%s (%uB)\n",

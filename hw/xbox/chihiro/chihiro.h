@@ -38,6 +38,9 @@ void chihiro_mbcom_init(void);
 /* USB delayed hotplug (AN2131 firmware boot simulation) */
 void chihiro_usb_set_devices(USBDevice *qc, USBDevice *sc);
 
+/* True if the file is the Chihiro BIOS listed by MAME. */
+bool chihiro_bios_known(const char *path);
+
 /* Load baseboard flash ROM (SEGABOOT) from file */
 void chihiro_load_flash_rom(const char *bios_path);
 bool chihiro_flash_rom_loaded(void);

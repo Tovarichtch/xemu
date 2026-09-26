@@ -1675,8 +1675,8 @@ void MainMenuChihiroView::Draw()
     }
 
     if (ImGui::CollapsingHeader("Files")) {
-        ImGui::TextDisabled("Leave empty to look next to the Xbox BIOS "
-                            "(applies on reset)");
+        ImGui::TextDisabled("The BIOS is required. Files left empty are "
+                            "taken from the BIOS folder (applies on reset)");
         static const SDL_DialogFileFilter rom_filters[] = {
             { "ROM Files", "bin;rom;ic2" },
             { "All Files", "*" }
