@@ -48,12 +48,15 @@ void xemu_settings_set_path(const char *path);
 // Get the path of the base settings dir
 const char *xemu_settings_get_base_path(void);
 
-/* CHIHIRO (not upstream): the machine is the loaded image's. An Xbox disc
- * (XISO) boots an Xbox, any other image boots a Chihiro; with no image the
- * sys.default_machine setting decides, "auto" being the machine last
- * booted (sys.last_machine). Decided once, when the machine is built. */
+/* CHIHIRO (not upstream): the machine asked for on the command line
+ * (-machine ...,chihiro=on|off, see xemu_chihiro_mode_ask), else the loaded
+ * image's. An Xbox disc (XISO) boots an Xbox, any other image boots a
+ * Chihiro; with no image the sys.default_machine setting decides, "auto"
+ * being the machine last booted (sys.last_machine). Decided once, at the
+ * first call. */
 bool xemu_media_is_xbox_disc(const char *path);
 bool xemu_chihiro_mode(void);
+void xemu_chihiro_mode_ask(bool chihiro);
 
 // Get path of the config file on disk
 const char *xemu_settings_get_path(void);

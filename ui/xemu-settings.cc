@@ -381,12 +381,22 @@ bool xemu_media_is_xbox_disc(const char *path)
     return disc;
 }
 
+/* CHIHIRO (not upstream): -1 when the command line does not ask. */
+static int chihiro_mode_asked = -1;
+
+void xemu_chihiro_mode_ask(bool chihiro)
+{
+    chihiro_mode_asked = chihiro;
+}
+
 bool xemu_chihiro_mode(void)
 {
     static int mode = -1;
     if (mode < 0) {
         const char *image = g_config.sys.files.dvd_path;
-        if (image && image[0]) {
+        if (chihiro_mode_asked >= 0) {
+            mode = chihiro_mode_asked;
+        } else if (image && image[0]) {
             mode = !xemu_media_is_xbox_disc(image);
         } else {
             switch (g_config.sys.default_machine) {

@@ -3087,22 +3087,8 @@ void qemu_init(int argc, char **argv)
     fake_argv[fake_argc++] = argv[0];
     fake_argv[fake_argc++] = strdup("-machine");
 
-    /* An image given on the command line is the loaded image: it decides
-     * the machine and is remembered as the last game. */
-    for (int i = 1; i < argc; i++) {
-        if (argv[i] && strcmp(argv[i], "-dvd_path") == 0) {
-            argv[i] = NULL;
-            if (i < argc - 1 && argv[i + 1]) {
-                xemu_settings_set_string(&g_config.sys.files.dvd_path,
-                                         argv[i + 1]);
-                argv[i + 1] = NULL;
-            }
-            break;
-        }
-    }
-
-    /* The machine follows the loaded image (see xemu_chihiro_mode); it is
-     * remembered for a launch with no image. */
+    /* The machine asked for on the command line, else the loaded image's
+     * (xemu_chihiro_mode), remembered for a launch with no image. */
     bool chihiro_machine = xemu_chihiro_mode();
     g_config.sys.last_machine = chihiro_machine ? CONFIG_SYS_LAST_MACHINE_CHIHIRO
                                                 : CONFIG_SYS_LAST_MACHINE_XBOX;
@@ -3249,54 +3235,15 @@ void qemu_init(int argc, char **argv)
 
     const char *dvd_path = g_config.sys.files.dvd_path;
 
-    // On a Chihiro, auto-detect media type:
-    // - .iso files = DVD/CD-ROM (game disc images)
-    // - other files = IDE disk (baseboard image)
-    // On an Xbox, always mount as CD-ROM.
-    char *escaped_dvd_path = strdup_double_commas(dvd_path);
-    const char *dvd_media = "cdrom";
-    const char *format_suffix = "";
-    if (chihiro_machine && dvd_path[0] == '\0') {
-        /* Chihiro without an image: the IDE slave is already registered by
-         * chihiro_ide_interface_init(); a second -drive at index=1 collides. */
-        free(escaped_dvd_path);
-        escaped_dvd_path = NULL;
-    } else if (chihiro_machine && strlen(dvd_path) > 4) {
-        const char *ext = dvd_path + strlen(dvd_path) - 4;
-        if (g_ascii_strcasecmp(ext, ".iso") != 0) {
-            dvd_media = "disk";
-            format_suffix = ",format=raw";
-        }
-
-        /* Chihiro: if dvd_path is a directory, XBE, or FATX image, skip the
-         * -drive for index=1. The IDE slave is registered programmatically
-         * by chihiro_ide_interface_init() with a MemoryRegion-backed device.
-         * Sniff the FATX magic instead of trusting the extension: a renamed
-         * image (.bin_dec etc.) would fall through here and add a second
-         * drive on index=1, which collides with the registered IDE slave and
-         * crashes at startup. Content decides, not the name. */
-        bool dvd_is_fatx = false;
-        FILE *df = qemu_fopen(dvd_path, "rb");
-        if (df) {
-            uint8_t dm[4];
-            dvd_is_fatx = fread(dm, 1, 4, df) == 4 &&
-                          memcmp(dm, "FATX", 4) == 0;
-            fclose(df);
-        }
-        struct stat dvd_st;
-        if (stat(dvd_path, &dvd_st) == 0 &&
-            (S_ISDIR(dvd_st.st_mode) ||
-             g_ascii_strcasecmp(ext, ".xbe") == 0 ||
-             g_ascii_strcasecmp(ext, ".bin") == 0 ||
-             dvd_is_fatx)) {
-            free(escaped_dvd_path);
-            escaped_dvd_path = NULL;
-        }
-    }
-    if (escaped_dvd_path) {
+    /* An Xbox mounts the image in its DVD drive. A Chihiro has none: its IDE
+     * slave is the media board's interface (chihiro_ide_interface_init),
+     * which serves a FATX image from the DIMM; another -drive at index 1
+     * crashes QEMU's check of orphaned drives. */
+    if (!chihiro_machine) {
+        char *escaped_dvd_path = strdup_double_commas(dvd_path);
         fake_argv[fake_argc++] = strdup("-drive");
-        fake_argv[fake_argc++] = g_strdup_printf("index=1,media=%s,file=%s%s",
-            dvd_media, escaped_dvd_path, format_suffix);
+        fake_argv[fake_argc++] = g_strdup_printf("index=1,media=cdrom,file=%s",
+                                                 escaped_dvd_path);
         free(escaped_dvd_path);
     }
 

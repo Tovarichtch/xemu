@@ -34,6 +34,7 @@
 #include "qemu/rcu.h"
 #include "qemu-version.h"
 #include "qapi/error.h"
+#include "qapi/util.h"
 #include "qapi/qapi-commands-block.h"
 #include "qobject/qdict.h"
 #include "ui/console.h"
@@ -1373,6 +1374,49 @@ static void init_sdl_app_metadata(void)
                                "https://xemu.app");
 }
 
+/* CHIHIRO (not upstream): the image and the machine the command line gives,
+ * taken before anything asks which machine this is (the window's title does,
+ * before QEMU starts). The first -dvd_path is the loaded image, remembered as
+ * the last game; the last -machine that sets chihiro decides the machine,
+ * whatever the image. */
+static void take_image_and_machine(int argc, char **argv)
+{
+    bool image_taken = false;
+
+    for (int i = 1; i < argc; i++) {
+        if (!argv[i]) {
+            continue;
+        }
+        /* QEMU takes its options with one dash or two. */
+        const char *opt = strncmp(argv[i], "--", 2) ? argv[i] : argv[i] + 1;
+        if (!image_taken && !strcmp(argv[i], "-dvd_path")) {
+            argv[i] = NULL;
+            if (i + 1 < argc && argv[i + 1]) {
+                xemu_settings_set_string(&g_config.sys.files.dvd_path,
+                                         argv[i + 1]);
+                argv[i + 1] = NULL;
+            }
+            image_taken = true;
+        } else if ((!strcmp(opt, "-machine") || !strcmp(opt, "-M")) &&
+                   i + 1 < argc && argv[i + 1]) {
+            g_auto(GStrv) items = g_strsplit(argv[i + 1], ",", -1);
+            for (int k = 0; items[k]; k++) {
+                char *value = strchr(items[k], '=');
+                bool on = true;
+                if (value) {
+                    *value++ = '\0';
+                } else if (k == 0) {
+                    continue; /* the machine type */
+                }
+                if (!strcmp(items[k], "chihiro") &&
+                    (!value || qapi_bool_parse("chihiro", value, &on, NULL))) {
+                    xemu_chihiro_mode_ask(on);
+                }
+            }
+        }
+    }
+}
+
 int main(int argc, char **argv)
 {
     QemuThread thread;
@@ -1440,6 +1484,7 @@ int main(int argc, char **argv)
     }
 #endif
 
+    take_image_and_machine(argc, argv);
     display_very_early_init(NULL);
 
     qemu_sem_init(&display_init_sem, 0);
