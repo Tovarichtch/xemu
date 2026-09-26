@@ -37,7 +37,9 @@ extern "C" {
  * is opened.
  */
 
-#define XEMU_POINTER_MAX 8
+/* Room for a cabinet: a gun often shows as several pointers, and an
+ * unplugged device keeps its entry. */
+#define XEMU_POINTER_MAX 32
 
 typedef struct XemuPointer {
     char identity[64];
