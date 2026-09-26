@@ -487,10 +487,9 @@ chihiro:
       view_change:
         type: integer
         default: 224
-    # Maximum Tune reads its shifter and its two wheel buttons from the
-    # SECOND switch byte of player 1 (V322.xbe 0x00055950 and 0x000559B0):
-    # bits 4/5 are the shifter's up/down gate, bits 7/6 its left/right one,
-    # and bits 1/0 the two buttons.
+    # Maximum Tune reads its H shifter and its two wheel buttons from the
+    # SECOND switch byte of player 1 (V322.xbe 0x00055AA0): bits 7/6 are the
+    # lever's up/down, bits 5/4 its left/right, and bits 1/0 the two buttons.
     wmmt2:
       shift_up:
         type: integer

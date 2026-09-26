@@ -909,6 +909,50 @@ static uint8_t gundam_stick(int *const *controls, const bool *kbd,
     return sw;
 }
 
+/* Maximum Tune's H shifter (V322.xbe 0x00055AA0, V307.xbe 0x0006F150):
+ * switches up 0x80, down 0x40, left 0x20, right 0x10; 1st gear is left + up,
+ * 6th right + down, and neutral sits in the centre. The real lever stays in
+ * its gate, and the race drops to neutral after 30 frames without a gear
+ * (V322.xbe 0x000B6420): the lever takes the keys held when one goes down
+ * and stays there when they come up; left or right alone puts it back in
+ * neutral. Keys pressed within the settle time make one move, so that a gear
+ * on a diagonal is not reached through another (changes in quick succession
+ * also drop the car to neutral). */
+#define WMMT_LEVER_SETTLE_MS 50
+
+static uint8_t wmmt_lever(const bool *kbd, uint32_t mouseBtn)
+{
+    static const uint8_t bits[4] = { 0x80, 0x40, 0x20, 0x10 };
+    static uint8_t lever, held_before, move;
+    static int64_t move_ends;
+    int64_t now = g_get_monotonic_time() / 1000;
+    uint8_t held = 0;
+
+    for (int i = 0; i < 4; i++) {
+        if (chihiro_check_input(*g_chihiro_wmmt2_map[i], kbd, mouseBtn))
+            held |= bits[i];
+    }
+    if (held & ~held_before) {
+        if (!move)
+            move_ends = now + WMMT_LEVER_SETTLE_MS;
+        move |= held;
+    }
+    held_before = held;
+    if (move && now >= move_ends) {
+        /* Both ends of an axis: the lever stays in its middle. */
+        if ((move & 0xC0) == 0xC0)
+            move &= ~0xC0;
+        if ((move & 0x30) == 0x30)
+            move &= ~0x30;
+        /* Neither up nor down: neutral, at the centre. */
+        if (!(move & 0xC0))
+            move = 0;
+        lever = move;
+        move = 0;
+    }
+    return lever;
+}
+
 /* How far an input is pressed, 0..1. */
 static float chihiro_input_travel(int binding, const bool *kbd,
                                   uint32_t mouseBtn)
@@ -1293,17 +1337,9 @@ static void xemu_input_update_jvs(void)
             if (chihiro_check_input(g_config.chihiro.jvs.ctx.jump, kbd, mouseBtn))
                 sw0 |= 0x02;
         } else if (profile == CONFIG_CHIHIRO_JVS_PROFILE_WMMT2) {
-            /* Player 1's second switch byte: gears 1/2/3/4 on bits 7/6/4/5,
-             * an H shifter (V322.xbe 0x00055950, 0x000559B0), the two wheel
-             * buttons on bits 1 and 0 (0x00055850, 0x00055880). */
-            if (chihiro_check_input(g_config.chihiro.jvs.wmmt2.shift_up, kbd, mouseBtn))
-                sw1 |= 0x10;
-            if (chihiro_check_input(g_config.chihiro.jvs.wmmt2.shift_down, kbd, mouseBtn))
-                sw1 |= 0x20;
-            if (chihiro_check_input(g_config.chihiro.jvs.wmmt2.shift_left, kbd, mouseBtn))
-                sw1 |= 0x80;
-            if (chihiro_check_input(g_config.chihiro.jvs.wmmt2.shift_right, kbd, mouseBtn))
-                sw1 |= 0x40;
+            /* Player 1's second switch byte: the shifter (wmmt_lever), the
+             * two wheel buttons on bits 1 and 0 (0x00055850, 0x00055880). */
+            sw1 |= wmmt_lever(kbd, mouseBtn);
             if (chihiro_check_input(g_config.chihiro.jvs.wmmt2.view_change, kbd, mouseBtn))
                 sw1 |= 0x02;
             if (chihiro_check_input(g_config.chihiro.jvs.wmmt2.intrude_change, kbd, mouseBtn))
