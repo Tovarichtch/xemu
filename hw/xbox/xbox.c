@@ -369,14 +369,6 @@ void xbox_init_common(MachineState *machine,
                     "(fpr21042_m29w160et.bin). Set path in Settings > System > "
                     "Chihiro Files.\n");
         }
-        if (!chihiro_ic10_data) {
-            fprintf(stderr, "Chihiro: WARNING — EEPROM QC not found "
-                    "(ic10_g24lc64.bin). GAME TEST settings will not persist.\n");
-        }
-        if (!chihiro_ic11_data) {
-            fprintf(stderr, "Chihiro: WARNING — EEPROM Baseboard not found "
-                    "(ic11_24lc024.bin). JVS settings will not persist.\n");
-        }
 
         isa_create_simple(isa_bus, "chihiro-lpc");
         /* The Super I/O is not added here: -device lpc47m157 plugs one in,
@@ -478,11 +470,12 @@ void xbox_init_common(MachineState *machine,
             if (bs) usb0_bus = USB_BUS(bs);
         }
 
-        if (usb0_bus && (!chihiro_ic10_data || !chihiro_pc20_data)) {
+        if (usb0_bus &&
+            (!chihiro_ic10_data || !chihiro_pc20_data || !chihiro_ic11_data)) {
             /* Their realize needs the dumps and usb_create_simple aborts on
              * failure; the startup check has already told the user. */
             fprintf(stderr, "Chihiro: QC/SC USB devices not created "
-                    "(ic10/pc20 EEPROM dump missing)\n");
+                    "(ic10, pc20 or ic11 EEPROM dump missing)\n");
         } else if (usb0_bus) {
             /* Create but don't attach (auto_attach=0 in realize) */
             USBDevice *qc = usb_create_simple(usb0_bus, "chihiro-an2131qc");
