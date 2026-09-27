@@ -2302,6 +2302,11 @@ bool xemu_input_bind_xmu(int player_index, int expansion_slot_index,
     assert(player_index >= 0 && player_index < 4);
     assert(expansion_slot_index >= 0 && expansion_slot_index < 2);
 
+    /* A Chihiro's pads have no hub to plug a memory unit into. */
+    if (xemu_chihiro_mode()) {
+        return false;
+    }
+
     ControllerState *player = bound_controllers[player_index];
     enum peripheral_type peripheral_type =
         player->peripheral_types[expansion_slot_index];
@@ -2424,6 +2429,12 @@ void xemu_input_unbind_xmu(int player_index, int expansion_slot_index)
 
 void xemu_input_rebind_xmu(int port)
 {
+    /* A Chihiro's pads have no hub (xemu_input_bind): the saved memory
+     * units wait for the Xbox. */
+    if (xemu_chihiro_mode()) {
+        return;
+    }
+
     // Try to bind peripherals back to controller
     for (int i = 0; i < 2; i++) {
         enum peripheral_type peripheral_type =
