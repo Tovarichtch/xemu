@@ -415,7 +415,7 @@ void xemu_snapshots_save_extra_data(QEMUFile *f)
     /* Chihiro: the game is the netboot image, not a DVD, and the title is
      * the executable SEGABOOT launched. */
     char *path = xemu_chihiro_mode() ?
-                     g_strdup(g_config.sys.files.dvd_path) :
+                     g_strdup(xemu_chihiro_image()) :
                      xemu_get_currently_loaded_disc_path();
     size_t path_size = path ? strlen(path) : 0;
 

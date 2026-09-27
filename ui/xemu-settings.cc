@@ -406,11 +406,21 @@ void xemu_chihiro_mode_ask(bool chihiro)
     chihiro_mode_asked = chihiro;
 }
 
+const char *xemu_chihiro_image(void)
+{
+    static char *image;
+    if (!image) {
+        const char *path = g_config.sys.files.dvd_path;
+        image = g_strdup(path ? path : "");
+    }
+    return image;
+}
+
 bool xemu_chihiro_mode(void)
 {
     static int mode = -1;
     if (mode < 0) {
-        const char *image = g_config.sys.files.dvd_path;
+        const char *image = xemu_chihiro_image();
         if (chihiro_mode_asked >= 0) {
             mode = chihiro_mode_asked;
         } else if (image && image[0]) {

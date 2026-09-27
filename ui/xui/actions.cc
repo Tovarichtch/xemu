@@ -118,7 +118,7 @@ void ActionScreenshot(void)
  * Chihiro, the disc on an Xbox. Its quick slots are named after it. */
 static std::string QuickSlotGame(void)
 {
-    char *path = xemu_chihiro_mode() ? g_strdup(g_config.sys.files.dvd_path)
+    char *path = xemu_chihiro_mode() ? g_strdup(xemu_chihiro_image())
                                      : xemu_get_currently_loaded_disc_path();
     std::string game = "Xbox";
     if (path && path[0]) {

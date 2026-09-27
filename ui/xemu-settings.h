@@ -57,6 +57,10 @@ const char *xemu_settings_get_base_path(void);
 bool xemu_media_is_xbox_disc(const char *path);
 bool xemu_chihiro_mode(void);
 void xemu_chihiro_mode_ask(bool chihiro);
+/* CHIHIRO (not upstream): the image the machine booted, kept at the first
+ * xemu_chihiro_mode() call. Load Disc on a Chihiro only sets dvd_path for
+ * the next launch. */
+const char *xemu_chihiro_image(void);
 
 // Get path of the config file on disk
 const char *xemu_settings_get_path(void);

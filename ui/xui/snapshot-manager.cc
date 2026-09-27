@@ -91,7 +91,7 @@ void SnapshotManager::LoadSnapshotChecked(const char *name)
      * cannot be swapped in, so refuse before the machine is touched. */
     bool chihiro = xemu_chihiro_mode();
     if (chihiro) {
-        const char *have = path_basename_ptr(g_config.sys.files.dvd_path);
+        const char *have = path_basename_ptr(xemu_chihiro_image());
         char *msg = NULL;
         if (data->disc_path && data->disc_path[0]) {
             const char *want = path_basename_ptr(data->disc_path);

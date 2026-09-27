@@ -443,7 +443,7 @@ unsigned chihiro_dimm_factor(void)
     }
 
     factor = SEGA_DIMM_SIZE_512M;
-    const char *path = g_config.sys.files.dvd_path;
+    const char *path = xemu_chihiro_image();
     int64_t size = -1;
     if (path && path[0]) {
         FILE *f = qemu_fopen(path, "rb");
@@ -3753,7 +3753,7 @@ static uint64_t chihiro_fs_size(void)
  * launched from a directory carries it as a file. */
 static bool chihiro_read_image_bootid(uint8_t *bid)
 {
-    const char *path = g_config.sys.files.dvd_path;
+    const char *path = xemu_chihiro_image();
     if (!path || !path[0]) {
         return false;
     }
@@ -3826,7 +3826,7 @@ uint8_t chihiro_region_byte(void)
     static int for_set = -1;
     static char *for_path;
     int set = g_config.chihiro.settings.region;
-    const char *path = g_config.sys.files.dvd_path;
+    const char *path = xemu_chihiro_image();
 
     if (set == CONFIG_CHIHIRO_SETTINGS_REGION_AUTO) {
         set = CONFIG_CHIHIRO_SETTINGS_REGION_EX;
@@ -3894,7 +3894,7 @@ const char *chihiro_dimm_last_error(void)
 
 static const char *chihiro_image_basename(void)
 {
-    const char *path = g_config.sys.files.dvd_path;
+    const char *path = xemu_chihiro_image();
     const char *sep = path ? strrchr(path, '/') : NULL;
     const char *bsep = path ? strrchr(path, '\\') : NULL;
     if (bsep > sep) sep = bsep;
@@ -3904,7 +3904,7 @@ static const char *chihiro_image_basename(void)
 static uint8_t *chihiro_dimm_read_image(uint64_t buf_size,
                                         uint64_t *file_size, uint32_t *crc)
 {
-    const char *path = g_config.sys.files.dvd_path;
+    const char *path = xemu_chihiro_image();
     FILE *f = (path && path[0]) ? qemu_fopen(path, "rb") : NULL;
     if (!f) {
         return NULL;

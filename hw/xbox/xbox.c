@@ -405,7 +405,7 @@ void xbox_init_common(MachineState *machine,
 
         /* Load pre-built FATX netboot image into DIMM buffer */
         {
-            const char *dvd = g_config.sys.files.dvd_path;
+            const char *dvd = xemu_chihiro_image();
             if (dvd && strlen(dvd) > 0) {
                 uint32_t fs_size = 0;
                 uint8_t *fs_buf = chihiro_fatx_get_buffer(&fs_size);
