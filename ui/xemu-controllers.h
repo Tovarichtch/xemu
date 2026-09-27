@@ -120,6 +120,10 @@ struct ChihiroRebindingMap : public virtual RebindingMap {
     int      m_player;
     uint32_t m_pointer_seen;
 
+    /* The key or button pressed while the row waits; it binds on its
+     * release. 0: none yet. */
+    int m_pressed;
+
     ChihiroRebindingMap(int table_row, int *scancode, int player);
     RebindEventResult ConsumeRebindEvent(SDL_Event *event) override;
     bool PollPointer();

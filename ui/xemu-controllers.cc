@@ -147,7 +147,8 @@ ControllerGamepadRebindingMap::HandleAxisEvent(SDL_GamepadAxisEvent *event)
 ChihiroRebindingMap::ChihiroRebindingMap(int table_row, int *scancode,
                                          int player)
     : RebindingMap(table_row), m_scancode(scancode), m_joy_id{ 0, 0, 0, 0 },
-      m_joy_num_axes{ 0, 0, 0, 0 }, m_player(player), m_pointer_seen(0)
+      m_joy_num_axes{ 0, 0, 0, 0 }, m_player(player), m_pointer_seen(0),
+      m_pressed(0)
 {
     // Snapshot every bound raw joystick's axes at rest, so a pedal that
     // idles at an extreme can still be captured by movement (header note).
@@ -176,16 +177,58 @@ static int joy_event_port(const SDL_JoystickID *ids, SDL_JoystickID which)
 RebindEventResult
 ChihiroRebindingMap::ConsumeRebindEvent(SDL_Event *event)
 {
-    if (event->type == SDL_EVENT_KEY_UP) {
-        *m_scancode = event->key.scancode;
-        return RebindEventResult::Complete;
+    /* A key or button binds on its release, once its press was seen here:
+     * keyboard and pad navigation open the row on the press of Enter, Space
+     * or A, and that release must not bind itself. */
+    int pressed = 0, released = 0;
+    switch (event->type) {
+    case SDL_EVENT_KEY_DOWN:
+        if (!event->key.repeat) {
+            pressed = event->key.scancode;
+        }
+        break;
+    case SDL_EVENT_KEY_UP:
+        released = event->key.scancode;
+        break;
+    case SDL_EVENT_MOUSE_BUTTON_DOWN:
+        pressed = CHIHIRO_MOUSE_BUTTON_BASE - 1 + event->button.button;
+        break;
+    case SDL_EVENT_MOUSE_BUTTON_UP:
+        released = CHIHIRO_MOUSE_BUTTON_BASE - 1 + event->button.button;
+        break;
+    case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
+        pressed = CHIHIRO_GAMEPAD_BUTTON_BASE + event->gbutton.button;
+        break;
+    case SDL_EVENT_GAMEPAD_BUTTON_UP:
+        released = CHIHIRO_GAMEPAD_BUTTON_BASE + event->gbutton.button;
+        break;
+    case SDL_EVENT_JOYSTICK_BUTTON_DOWN:
+    case SDL_EVENT_JOYSTICK_BUTTON_UP: {
+        /* Raw joystick button, on whichever port the device sits. */
+        int port = joy_event_port(m_joy_id, event->jbutton.which);
+        if (port >= 0) {
+            int b = CHIHIRO_JOY_PORTED(
+                CHIHIRO_JOY_BUTTON_BINDING(event->jbutton.button), port);
+            if (event->type == SDL_EVENT_JOYSTICK_BUTTON_DOWN) {
+                pressed = b;
+            } else {
+                released = b;
+            }
+        }
+        break;
     }
-    if (event->type == SDL_EVENT_MOUSE_BUTTON_UP) {
-        *m_scancode = CHIHIRO_MOUSE_BUTTON_BASE - 1 + event->button.button;
-        return RebindEventResult::Complete;
+    default:
+        break;
     }
-    if (event->type == SDL_EVENT_GAMEPAD_BUTTON_UP) {
-        *m_scancode = CHIHIRO_GAMEPAD_BUTTON_BASE + event->gbutton.button;
+    if (pressed) {
+        m_pressed = pressed;
+        return RebindEventResult::Ignore;
+    }
+    if (released) {
+        if (released != m_pressed) {
+            return RebindEventResult::Ignore;
+        }
+        *m_scancode = released;
         return RebindEventResult::Complete;
     }
     /* Well past rest, so a resting stick cannot bind itself. */
@@ -194,15 +237,6 @@ ChihiroRebindingMap::ConsumeRebindEvent(SDL_Event *event)
         *m_scancode = CHIHIRO_AXIS_BINDING(event->gaxis.axis,
                                            event->gaxis.value > 0);
         return RebindEventResult::Complete;
-    }
-    /* Raw joystick button, on whichever port the device sits. */
-    if (event->type == SDL_EVENT_JOYSTICK_BUTTON_UP) {
-        int port = joy_event_port(m_joy_id, event->jbutton.which);
-        if (port >= 0) {
-            *m_scancode = CHIHIRO_JOY_PORTED(
-                CHIHIRO_JOY_BUTTON_BINDING(event->jbutton.button), port);
-            return RebindEventResult::Complete;
-        }
     }
     /* Raw joystick axis: capture by movement from the rest snapshot, then
      * classify centre-rest (steering half-axis) vs extreme-rest (pedal,
