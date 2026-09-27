@@ -225,6 +225,9 @@ bool xemu_settings_load(void)
         jvs_p2->child("card_in")->data.integer.val = old_p2->data.integer.val;
         old_p2->reset_to_defaults();
     }
+    /* Snapshots are no longer bound to F5-F8: quick saves are per game. */
+    config_tree.child("general")->child("snapshots")->child("shortcuts")
+        ->reset_to_defaults();
 
     config_tree.store_to_struct(&g_config);
 

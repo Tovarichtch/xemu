@@ -50,16 +50,14 @@ std::string string_format( const std::string& format, Args ... args )
     return std::string( buf.get(), buf.get() + size - 1 ); // We don't want the '\0' inside
 }
 
-static inline bool IsShortcutKeyPressed(ImGuiKey key)
-{
-    ImGuiIO& io = ImGui::GetIO();
-
-    if (io.KeyAlt || io.KeyShift) {
-        return false;
-    }
-
-    return io.KeyCtrl && ImGui::IsKeyPressed(key);
-}
+/* An emulator shortcut (Settings > Hotkeys) pressed this frame; while_typing
+ * also takes it from a text field in use. */
+bool HotkeyPressed(int hotkey, bool while_typing = false);
+/* A shortcut as text ("Shift+T"), empty when it has none. */
+std::string HotkeyName(int hotkey);
+/* The keys of quick save and quick load 0 to 3. */
+int QuickSaveHotkey(int slot);
+int QuickLoadHotkey(int slot);
 
 static inline float mix(float a, float b, float t)
 {

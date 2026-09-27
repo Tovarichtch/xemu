@@ -136,6 +136,75 @@ static void RenderSindenBorder(float vx, float vy, float vw, float vh,
     dl->AddRectFilled(ImVec2(bx + bw - t, by + t), ImVec2(bx + bw, by + bh - t), white);
 }
 
+/* Keys pressed since the last frame (key down, not a repeat), by scancode:
+ * the emulator's shortcuts are read from it. */
+static bool hotkeys_down[SDL_SCANCODE_COUNT];
+static int hotkeys_mods[SDL_SCANCODE_COUNT];
+
+bool HotkeyPressed(int hotkey, bool while_typing)
+{
+    int sc = HOTKEY_SCANCODE(hotkey);
+    if (sc <= 0 || sc >= SDL_SCANCODE_COUNT || !hotkeys_down[sc] ||
+        hotkeys_mods[sc] != (hotkey & ~0xFFFF)) {
+        return false;
+    }
+    /* A text field in use keeps the keys that type: only F-keys and Ctrl or
+     * Alt combos are shortcuts there. */
+    bool fkey = (sc >= SDL_SCANCODE_F1 && sc <= SDL_SCANCODE_F12) ||
+                (sc >= SDL_SCANCODE_F13 && sc <= SDL_SCANCODE_F24);
+    if (!while_typing && ImGui::GetIO().WantTextInput && !fkey &&
+        !(hotkey & (HOTKEY_CTRL | HOTKEY_ALT))) {
+        return false;
+    }
+    /* A single key bound to a cabinet input is the game's while a Chihiro
+     * runs; a combo is the user's choice. */
+    return hotkey != sc ||
+           !(xemu_chihiro_mode() && xemu_input_chihiro_key_bound(sc));
+}
+
+std::string HotkeyName(int hotkey)
+{
+    int sc = HOTKEY_SCANCODE(hotkey);
+    const char *key = sc > 0 && sc < SDL_SCANCODE_COUNT ?
+        SDL_GetScancodeName((SDL_Scancode)sc) : NULL;
+    if (!key || !key[0]) {
+        return "";
+    }
+    std::string name;
+    if (hotkey & HOTKEY_CTRL) {
+#ifdef __APPLE__
+        name += "Cmd+";
+#else
+        name += "Ctrl+";
+#endif
+    }
+    if (hotkey & HOTKEY_ALT) {
+        name += "Alt+";
+    }
+    if (hotkey & HOTKEY_SHIFT) {
+        name += "Shift+";
+    }
+    return name + key;
+}
+
+int QuickSaveHotkey(int slot)
+{
+    const int keys[4] = {
+        g_config.input.hotkeys.quick_save1, g_config.input.hotkeys.quick_save2,
+        g_config.input.hotkeys.quick_save3, g_config.input.hotkeys.quick_save4,
+    };
+    return keys[slot];
+}
+
+int QuickLoadHotkey(int slot)
+{
+    const int keys[4] = {
+        g_config.input.hotkeys.quick_load1, g_config.input.hotkeys.quick_load2,
+        g_config.input.hotkeys.quick_load3, g_config.input.hotkeys.quick_load4,
+    };
+    return keys[slot];
+}
+
 /* No crosshair, border or hidden pointer outside a Chihiro gun game. */
 static bool ChihiroGunGame(void)
 {
@@ -155,7 +224,9 @@ static void RenderLightGunOverlays(void)
 {
     bool gun_game = ChihiroGunGame();
 
-    if (gun_game && g_config.chihiro.settings.lightgun_mode)
+    /* The cursor stays visible in the menus, gun mode or not. */
+    if (gun_game && g_config.chihiro.settings.lightgun_mode &&
+        !g_scene_mgr.IsDisplayingScene())
         SDL_HideCursor();
     else
         SDL_ShowCursor();
@@ -313,6 +384,12 @@ void xemu_hud_process_sdl_events(SDL_Event *event)
         return;
     }
 
+    if (event->type == SDL_EVENT_KEY_DOWN && !event->key.repeat &&
+        event->key.scancode < SDL_SCANCODE_COUNT) {
+        hotkeys_down[event->key.scancode] = true;
+        hotkeys_mods[event->key.scancode] = hotkey_mods(event->key.mod);
+    }
+
     ImGui_ImplSDL3_ProcessEvent(event);
 }
 
@@ -439,14 +516,14 @@ void xemu_hud_update(void)
             menu_button = true;
         }
 
-        if (ImGui::IsKeyPressed(ImGuiKey_F3)) {
+        if (HotkeyPressed(g_config.input.hotkeys.lightgun_mode)) {
             g_config.chihiro.settings.lightgun_mode =
                 !g_config.chihiro.settings.lightgun_mode;
         }
 
-        if (ImGui::IsKeyPressed(ImGuiKey_F1)) {
+        if (HotkeyPressed(g_config.input.hotkeys.settings)) {
             g_scene_mgr.PushScene(g_main_menu);
-        } else if (ImGui::IsKeyPressed(ImGuiKey_F2)) {
+        } else if (HotkeyPressed(g_config.input.hotkeys.quick_menu)) {
             g_scene_mgr.PushScene(g_popup_menu);
         } else if (menu_button ||
                    (!xemu_input_lightgun_active() &&
@@ -460,10 +537,13 @@ void xemu_hud_update(void)
             xemu_toggle_fullscreen();
         }
 
-        bool mod_key_down = ImGui::IsKeyDown(ImGuiKey_ModShift);
-        for (int f_key = 0; f_key < 4; ++f_key) {
-            if (ImGui::IsKeyPressed((enum ImGuiKey)(ImGuiKey_F5 + f_key))) {
-                ActionActivateBoundSnapshot(f_key, mod_key_down);
+        for (int i = 0; i < 4; ++i) {
+            if (HotkeyPressed(QuickSaveHotkey(i))) {
+                ActionQuickSave(i);
+                break;
+            }
+            if (HotkeyPressed(QuickLoadHotkey(i))) {
+                ActionQuickLoad(i);
                 break;
             }
         }
@@ -480,6 +560,8 @@ void xemu_hud_update(void)
     g_scene_mgr.Draw();
     if (!first_boot_window.is_open) notification_manager.Draw();
     g_snapshot_mgr.Draw();
+
+    memset(hotkeys_down, 0, sizeof(hotkeys_down));
 
     // static bool show_demo = true;
     // if (show_demo) ImGui::ShowDemoWindow(&show_demo);

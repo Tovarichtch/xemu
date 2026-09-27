@@ -114,28 +114,83 @@ void ActionScreenshot(void)
 	g_screenshot_pending = true;
 }
 
-void ActionActivateBoundSnapshot(int slot, bool save)
+/* The game running as the snapshots record it: the netboot image on a
+ * Chihiro, the disc on an Xbox. Its quick slots are named after it. */
+static std::string QuickSlotGame(void)
+{
+    char *path = xemu_chihiro_mode() ? g_strdup(g_config.sys.files.dvd_path)
+                                     : xemu_get_currently_loaded_disc_path();
+    std::string game = "Xbox";
+    if (path && path[0]) {
+        char *base = g_path_get_basename(path);
+        char *dot = strrchr(base, '.');
+        if (dot && dot != base) {
+            *dot = '\0';
+        }
+        game = base;
+        g_free(base);
+    }
+    g_free(path);
+    return game;
+}
+
+/* Quick slot 0 to 3 of a game: one snapshot per game and slot, "vcop3 slot
+ * 1". */
+static std::string QuickSlotName(const std::string &game, int slot)
 {
     assert(slot < 4 && slot >= 0);
-    const char *snapshot_name = *(g_snapshot_shortcut_index_key_map[slot]);
-    if (!snapshot_name || !(snapshot_name[0])) {
-        char *msg = g_strdup_printf("F%d is not bound to a snapshot", slot + 5);
-        xemu_queue_notification(msg);
-        g_free(msg);
-        return;
-    }
+    return game + " slot " + std::to_string(slot + 1);
+}
 
+/* When the snapshot was taken, or 0 if there is none by that name. */
+static int64_t SnapshotDate(const std::string &name)
+{
+    g_snapshot_mgr.Refresh();
+    for (int i = 0; i < g_snapshot_mgr.m_snapshots_len; i++) {
+        if (name == g_snapshot_mgr.m_snapshots[i].name) {
+            return g_snapshot_mgr.m_snapshots[i].date_sec;
+        }
+    }
+    return 0;
+}
+
+void QuickSlotDates(int64_t dates[4])
+{
+    std::string game = QuickSlotGame();
+    for (int slot = 0; slot < 4; slot++) {
+        dates[slot] = SnapshotDate(QuickSlotName(game, slot));
+    }
+}
+
+void ActionQuickSave(int slot)
+{
+    std::string name = QuickSlotName(QuickSlotGame(), slot);
     Error *err = NULL;
-    if (save) {
-        xemu_snapshots_save(snapshot_name, &err);
-    } else {
-        ActionLoadSnapshotChecked(snapshot_name);
-    }
-
+    xemu_snapshots_save(name.c_str(), &err);
     if (err) {
         xemu_queue_error_message(error_get_pretty(err));
         error_free(err);
+        return;
     }
+    char *msg = g_strdup_printf("Saved to slot %d", slot + 1);
+    xemu_queue_notification(msg);
+    g_free(msg);
+}
+
+void ActionQuickLoad(int slot)
+{
+    std::string name = QuickSlotName(QuickSlotGame(), slot);
+    if (SnapshotDate(name)) {
+        ActionLoadSnapshotChecked(name.c_str());
+        return;
+    }
+    std::string save_key = HotkeyName(QuickSaveHotkey(slot));
+    char *msg = save_key.empty() ?
+        g_strdup_printf("Slot %d is empty", slot + 1) :
+        g_strdup_printf("Slot %d is empty (%s saves)", slot + 1,
+                        save_key.c_str());
+    xemu_queue_notification(msg);
+    g_free(msg);
 }
 
 void ActionLoadSnapshotChecked(const char *name)

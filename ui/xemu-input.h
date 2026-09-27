@@ -256,6 +256,8 @@ extern int *g_chihiro_p2_hotd3_map[2];
 extern int *g_chihiro_p2_vc3_map[4];
 extern int *g_chihiro_p2_gs_map[4];
 
+bool xemu_input_chihiro_key_bound(int scancode);
+
 void xemu_input_init(void);
 void xemu_input_process_sdl_events(const SDL_Event *event); // SDL_EVENT_GAMEPAD_ADDED, SDL_EVENT_GAMEPAD_REMOVED
 void xemu_input_update_controllers(void);

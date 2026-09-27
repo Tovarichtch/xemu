@@ -40,6 +40,28 @@ ControllerKeyboardRebindingMap::ConsumeRebindEvent(SDL_Event *event)
     return RebindEventResult::Ignore;
 }
 
+/* Read on key down, with the modifiers held then, and set when that key is
+ * released: the release of Enter or Space that opened the rebinding is not a
+ * key press. */
+RebindEventResult HotkeyRebindingMap::ConsumeRebindEvent(SDL_Event *event)
+{
+    if (event->type == SDL_EVENT_KEY_DOWN && !event->key.repeat) {
+        SDL_Scancode sc = event->key.scancode;
+        /* A modifier alone waits for the key it goes with. */
+        if (sc != SDL_SCANCODE_UNKNOWN &&
+            (sc < SDL_SCANCODE_LCTRL || sc > SDL_SCANCODE_RGUI)) {
+            m_pressed = sc | hotkey_mods(event->key.mod);
+        }
+    } else if (event->type == SDL_EVENT_KEY_UP && m_pressed &&
+               event->key.scancode == HOTKEY_SCANCODE(m_pressed)) {
+        *m_scancode =
+            event->key.scancode == SDL_SCANCODE_ESCAPE ? 0 : m_pressed;
+        return RebindEventResult::Complete;
+    }
+
+    return RebindEventResult::Ignore;
+}
+
 RebindEventResult ControllerGamepadRebindingMap::HandleButtonEvent(
     SDL_GamepadButtonEvent *event)
 {

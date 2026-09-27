@@ -140,8 +140,8 @@ protected:
     std::string m_search_buf;
 
     void ClearSearch();
-    void DrawSnapshotContextMenu(QEMUSnapshotInfo *snapshot, XemuSnapshotData *data, int current_snapshot_binding);
-    bool BigSnapshotButton(QEMUSnapshotInfo *snapshot, XemuSnapshotData *data, int current_snapshot_binding);
+    void DrawSnapshotContextMenu(QEMUSnapshotInfo *snapshot, XemuSnapshotData *data);
+    bool BigSnapshotButton(QEMUSnapshotInfo *snapshot, XemuSnapshotData *data);
     static int OnSearchTextUpdate(ImGuiInputTextCallbackData *data);
 
 public:
@@ -158,6 +158,21 @@ protected:
 
 public:
     MainMenuSystemView();
+    void Draw() override;
+};
+
+class MainMenuHotkeysView : public virtual MainMenuTabView
+{
+protected:
+    std::unique_ptr<HotkeyRebindingMap> m_rebinding;
+
+public:
+    MainMenuHotkeysView() : m_rebinding{ nullptr }
+    {
+    }
+    bool ConsumeRebindEvent(SDL_Event *event);
+    bool IsInputRebinding();
+    void Hide() override;
     void Draw() override;
 };
 
@@ -199,6 +214,7 @@ protected:
                                     m_snapshots_button,
                                     m_system_button,
                                     m_chihiro_button,
+                                    m_hotkeys_button,
                                     m_about_button;
     std::vector<MainMenuTabView*>   m_views;
     MainMenuGeneralView             m_general_view;
@@ -209,6 +225,7 @@ protected:
     MainMenuSnapshotsView           m_snapshots_view;
     MainMenuSystemView              m_system_view;
     MainMenuChihiroView             m_chihiro_view;
+    MainMenuHotkeysView             m_hotkeys_view;
     MainMenuAboutView               m_about_view;
 
 

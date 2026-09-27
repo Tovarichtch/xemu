@@ -46,13 +46,6 @@ static XemuSnapshotData *xemu_snapshots_extra_data = NULL;
 static int xemu_snapshots_len = 0;
 static bool xemu_snapshots_dirty = true;
 
-const char **g_snapshot_shortcut_index_key_map[] = {
-    &g_config.general.snapshots.shortcuts.f5,
-    &g_config.general.snapshots.shortcuts.f6,
-    &g_config.general.snapshots.shortcuts.f7,
-    &g_config.general.snapshots.shortcuts.f8,
-};
-
 /* The image the snapshots live in: the Chihiro store, else the Xbox disk. */
 static const char *xemu_snapshots_image_path(void)
 {

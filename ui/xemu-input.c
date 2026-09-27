@@ -282,6 +282,47 @@ int *g_chihiro_p2_gs_map[4] = {
     &g_config.chihiro.jvs_p2.gs_reload,
 };
 
+/* A key bound to one of the Chihiro's inputs: the emulator's shortcuts leave
+ * it to the game (a cabinet's TEST button is often F2, as in MAME). */
+bool xemu_input_chihiro_key_bound(int scancode)
+{
+    static const struct {
+        int **map;
+        int n;
+    } maps[] = {
+        { g_chihiro_universal_map, ARRAY_SIZE(g_chihiro_universal_map) },
+        { g_chihiro_hotd3_map, ARRAY_SIZE(g_chihiro_hotd3_map) },
+        { g_chihiro_vc3_map, ARRAY_SIZE(g_chihiro_vc3_map) },
+        { g_chihiro_gs_map, ARRAY_SIZE(g_chihiro_gs_map) },
+        { g_chihiro_drive_map, ARRAY_SIZE(g_chihiro_drive_map) },
+        { g_chihiro_ctx_map, ARRAY_SIZE(g_chihiro_ctx_map) },
+        { g_chihiro_or2_map, ARRAY_SIZE(g_chihiro_or2_map) },
+        { g_chihiro_wmmt2_map, ARRAY_SIZE(g_chihiro_wmmt2_map) },
+        { g_chihiro_ok_map, ARRAY_SIZE(g_chihiro_ok_map) },
+        { g_chihiro_gundam_map, ARRAY_SIZE(g_chihiro_gundam_map) },
+        { g_chihiro_p2_universal_map, ARRAY_SIZE(g_chihiro_p2_universal_map) },
+        { g_chihiro_p2_hotd3_map, ARRAY_SIZE(g_chihiro_p2_hotd3_map) },
+        { g_chihiro_p2_vc3_map, ARRAY_SIZE(g_chihiro_p2_vc3_map) },
+        { g_chihiro_p2_gs_map, ARRAY_SIZE(g_chihiro_p2_gs_map) },
+    };
+
+    if (scancode <= 0) {
+        return false;
+    }
+    if (g_config.chihiro.jvs.card_in == scancode ||
+        g_config.chihiro.jvs_p2.card_in == scancode) {
+        return true;
+    }
+    for (int i = 0; i < ARRAY_SIZE(maps); i++) {
+        for (int j = 0; j < maps[i].n; j++) {
+            if (*maps[i].map[j] == scancode) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 static void check_and_reset_in_range(int *btn, int min, int max,
                                      const char *message)
 {

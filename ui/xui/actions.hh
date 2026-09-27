@@ -18,6 +18,8 @@
 //
 #pragma once
 
+#include <stdint.h>
+
 void ActionEjectDisc();
 void ActionLoadDisc();
 void ActionLoadDiscFile(const char *file_path);
@@ -25,5 +27,9 @@ void ActionTogglePause();
 void ActionReset();
 void ActionShutdown();
 void ActionScreenshot();
-void ActionActivateBoundSnapshot(int slot, bool save);
+void ActionQuickSave(int slot);
+void ActionQuickLoad(int slot);
+/* When quick slots 0 to 3 of the game running were saved, in seconds since
+ * 1970; 0 when empty. */
+void QuickSlotDates(int64_t dates[4]);
 void ActionLoadSnapshotChecked(const char *name);

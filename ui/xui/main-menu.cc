@@ -1555,8 +1555,14 @@ void MainMenuChihiroView::Draw()
     }
 
     if (ImGui::CollapsingHeader("Light Gun")) {
+        std::string gun_desc = "Hides system cursor and prevents mouse from "
+                               "triggering menus.";
+        std::string gun_key = HotkeyName(g_config.input.hotkeys.lightgun_mode);
+        if (!gun_key.empty()) {
+            gun_desc += " Toggle with " + gun_key + ".";
+        }
         Toggle("Light Gun Mode", &g_config.chihiro.settings.lightgun_mode,
-               "Hides system cursor and prevents mouse from triggering menus. Toggle with F3.");
+               gun_desc.c_str());
 
         const char *backend = xemu_pointer_backend();
         if (backend) {
@@ -2152,8 +2158,7 @@ MainMenuSnapshotsView::~MainMenuSnapshotsView()
 }
 
 bool MainMenuSnapshotsView::BigSnapshotButton(QEMUSnapshotInfo *snapshot,
-                                              XemuSnapshotData *data,
-                                              int current_snapshot_binding)
+                                              XemuSnapshotData *data)
 {
     ImGuiStyle &style = ImGui::GetStyle();
     ImDrawList *draw_list = ImGui::GetWindowDrawList();
@@ -2179,8 +2184,6 @@ bool MainMenuSnapshotsView::BigSnapshotButton(QEMUSnapshotInfo *snapshot,
                      name_pos.y + ts_title.y + style.FramePadding.x);
     ImVec2 date_pos(name_pos.x,
                     title_pos.y + ts_title.y + style.FramePadding.x);
-    ImVec2 binding_pos(name_pos.x,
-                       date_pos.y + ts_title.y + style.FramePadding.x);
     ImVec2 button_size(-FLT_MIN,
                        fmax(thumbnail_size.y + style.FramePadding.y * 2,
                             ts_title.y + ts_sub.y + style.FramePadding.y * 3));
@@ -2240,15 +2243,6 @@ bool MainMenuSnapshotsView::BigSnapshotButton(QEMUSnapshotInfo *snapshot,
     draw_list->AddText(ImVec2(p0.x + date_pos.x, p0.y + date_pos.y),
                        IM_COL32(255, 255, 255, 200), date_buf);
     g_free(date_buf);
-
-    // Snapshot keyboard binding
-    if (current_snapshot_binding != -1) {
-        char *binding_text =
-            g_strdup_printf("Bound to F%d", current_snapshot_binding + 5);
-        draw_list->AddText(ImVec2(p0.x + binding_pos.x, p0.y + binding_pos.y),
-                           IM_COL32(255, 255, 255, 200), binding_text);
-        g_free(binding_text);
-    }
 
     ImGui::PopFont();
     draw_list->PopClipRect();
@@ -2414,19 +2408,10 @@ void MainMenuSnapshotsView::Draw()
         QEMUSnapshotInfo *snapshot = &g_snapshot_mgr.m_snapshots[i];
         XemuSnapshotData *data = &g_snapshot_mgr.m_extra_data[i];
 
-        int current_snapshot_binding = -1;
-        for (int j = 0; j < 4; ++j) {
-            if (g_strcmp0(*(g_snapshot_shortcut_index_key_map[j]),
-                          snapshot->name) == 0) {
-                assert(current_snapshot_binding == -1);
-                current_snapshot_binding = j;
-            }
-        }
-
         ImGui::PushID(i);
 
         ImVec2 pos = ImGui::GetCursorScreenPos();
-        bool load = BigSnapshotButton(snapshot, data, current_snapshot_binding);
+        bool load = BigSnapshotButton(snapshot, data);
 
         // FIXME: Provide context menu control annotation
         if (ImGui::IsItemHovered() &&
@@ -2435,7 +2420,7 @@ void MainMenuSnapshotsView::Draw()
             ImGui::OpenPopup("Snapshot Options");
         }
 
-        DrawSnapshotContextMenu(snapshot, data, current_snapshot_binding);
+        DrawSnapshotContextMenu(snapshot, data);
 
         ImGui::PopID();
 
@@ -2466,8 +2451,7 @@ void MainMenuSnapshotsView::Draw()
 }
 
 void MainMenuSnapshotsView::DrawSnapshotContextMenu(
-    QEMUSnapshotInfo *snapshot, XemuSnapshotData *data,
-    int current_snapshot_binding)
+    QEMUSnapshotInfo *snapshot, XemuSnapshotData *data)
 {
     if (!ImGui::BeginPopupContextItem("Snapshot Options")) {
         return;
@@ -2475,37 +2459,6 @@ void MainMenuSnapshotsView::DrawSnapshotContextMenu(
 
     if (ImGui::MenuItem("Load")) {
         ActionLoadSnapshotChecked(snapshot->name);
-    }
-
-    if (ImGui::BeginMenu("Keybinding")) {
-        for (int i = 0; i < 4; ++i) {
-            char *item_name = g_strdup_printf("Bind to F%d", i + 5);
-
-            if (ImGui::MenuItem(item_name)) {
-                if (current_snapshot_binding >= 0) {
-                    xemu_settings_set_string(g_snapshot_shortcut_index_key_map
-                                                 [current_snapshot_binding],
-                                             "");
-                }
-                xemu_settings_set_string(g_snapshot_shortcut_index_key_map[i],
-                                         snapshot->name);
-                current_snapshot_binding = i;
-
-                ImGui::CloseCurrentPopup();
-            }
-
-            g_free(item_name);
-        }
-
-        if (current_snapshot_binding >= 0) {
-            if (ImGui::MenuItem("Unbind")) {
-                xemu_settings_set_string(
-                    g_snapshot_shortcut_index_key_map[current_snapshot_binding],
-                    "");
-                current_snapshot_binding = -1;
-            }
-        }
-        ImGui::EndMenu();
     }
 
     ImGui::Separator();
@@ -2567,7 +2520,7 @@ void MainMenuSystemView::Draw()
             "System Memory", &g_config.sys.mem_limit,
             "64 MiB (Default)\0"
             "128 MiB\0",
-            "Increase to 128 MiB for debug or homebrew applications")) {
+            "Xbox only; 128 MiB for debug or homebrew applications")) {
         m_dirty = true;
     }
 
@@ -2660,6 +2613,118 @@ void MainMenuSystemView::Draw()
     ImGui::TextDisabled("Required for OutRun 2 SP, Gundam and linked "
                         "cabinets.");
     ImGui::PopTextWrapPos();
+}
+
+/* The emulator's own shortcuts: a key, or a key with Shift, Ctrl or Alt. */
+bool MainMenuHotkeysView::ConsumeRebindEvent(SDL_Event *event)
+{
+    if (!m_rebinding) {
+        return false;
+    }
+
+    RebindEventResult result = m_rebinding->ConsumeRebindEvent(event);
+    if (result == RebindEventResult::Complete) {
+        m_rebinding = nullptr;
+        xemu_settings_save();
+    }
+
+    /* Releases go on to the UI, which saw Enter or Space go down. */
+    return result == RebindEventResult::Ignore &&
+           event->type != SDL_EVENT_KEY_UP;
+}
+
+bool MainMenuHotkeysView::IsInputRebinding()
+{
+    return m_rebinding != nullptr;
+}
+
+void MainMenuHotkeysView::Hide()
+{
+    m_rebinding = nullptr;
+}
+
+void MainMenuHotkeysView::Draw()
+{
+    SectionTitle("Hotkeys");
+    static const struct {
+        const char *label;
+        int *key;
+        int initial;
+    } hotkeys[] = {
+        { "Settings", &g_config.input.hotkeys.settings, SDL_SCANCODE_F1 },
+        { "Quick menu", &g_config.input.hotkeys.quick_menu, SDL_SCANCODE_F2 },
+        { "Pause", &g_config.input.hotkeys.pause,
+          SDL_SCANCODE_P | HOTKEY_CTRL },
+        { "Reset", &g_config.input.hotkeys.reset,
+          SDL_SCANCODE_R | HOTKEY_CTRL },
+        { "Exit", &g_config.input.hotkeys.quit, SDL_SCANCODE_Q | HOTKEY_CTRL },
+        { "Quick save 1", &g_config.input.hotkeys.quick_save1,
+          SDL_SCANCODE_F5 | HOTKEY_SHIFT },
+        { "Quick save 2", &g_config.input.hotkeys.quick_save2,
+          SDL_SCANCODE_F6 | HOTKEY_SHIFT },
+        { "Quick save 3", &g_config.input.hotkeys.quick_save3,
+          SDL_SCANCODE_F7 | HOTKEY_SHIFT },
+        { "Quick save 4", &g_config.input.hotkeys.quick_save4,
+          SDL_SCANCODE_F8 | HOTKEY_SHIFT },
+        { "Quick load 1", &g_config.input.hotkeys.quick_load1,
+          SDL_SCANCODE_F5 },
+        { "Quick load 2", &g_config.input.hotkeys.quick_load2,
+          SDL_SCANCODE_F6 },
+        { "Quick load 3", &g_config.input.hotkeys.quick_load3,
+          SDL_SCANCODE_F7 },
+        { "Quick load 4", &g_config.input.hotkeys.quick_load4,
+          SDL_SCANCODE_F8 },
+        { "Fullscreen", &g_config.input.hotkeys.fullscreen,
+          SDL_SCANCODE_F11 },
+        { "Screenshot", &g_config.input.hotkeys.screenshot,
+          SDL_SCANCODE_F12 },
+        { "Light gun mode", &g_config.input.hotkeys.lightgun_mode,
+          SDL_SCANCODE_F3 },
+        { "Eject disc", &g_config.input.hotkeys.eject_disc,
+          SDL_SCANCODE_E | HOTKEY_CTRL },
+        { "Load disc", &g_config.input.hotkeys.load_disc,
+          SDL_SCANCODE_O | HOTKEY_CTRL },
+        { "Monitor", &g_config.input.hotkeys.monitor, SDL_SCANCODE_GRAVE },
+    };
+    float pad = ImGui::GetFrameHeight() * 0.3;
+    ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, ImVec2(pad, pad));
+    if (ImGui::BeginTable("hotkeys_tbl", 2,
+                          ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders)) {
+        ImGui::TableSetupColumn("Action");
+        ImGui::TableSetupColumn("Key");
+        ImGui::TableHeadersRow();
+        for (int i = 0; i < (int)std::size(hotkeys); i++) {
+            int row = i;
+            ImGui::TableNextRow();
+            ImGui::TableSetColumnIndex(0);
+            ImGui::Text("%s", hotkeys[i].label);
+            ImGui::TableSetColumnIndex(1);
+            if (m_rebinding && m_rebinding->GetTableRow() == row) {
+                ImGui::Text("Press a key or a combo (Esc: none)");
+                continue;
+            }
+            std::string key_name = HotkeyName(*hotkeys[i].key);
+            ImGui::PushID(row);
+            if (ImGui::Button(key_name.empty() ? "None" : key_name.c_str(),
+                              ImVec2(-FLT_MIN, 0))) {
+                m_rebinding =
+                    std::make_unique<HotkeyRebindingMap>(row, hotkeys[i].key);
+            }
+            ImGui::PopID();
+        }
+        ImGui::EndTable();
+    }
+    ImGui::PopStyleVar();
+    if (ImGui::Button("Reset to Default")) {
+        for (int i = 0; i < (int)std::size(hotkeys); i++) {
+            *hotkeys[i].key = hotkeys[i].initial;
+        }
+        xemu_settings_save();
+    }
+    ImGui::TextDisabled("Each game has its own quick save slots (see "
+                        "Snapshots).");
+    ImGui::TextDisabled("A single key used by a Chihiro input is left to the "
+                        "game.");
 }
 
 MainMenuAboutView::MainMenuAboutView() : m_config_info_text{ NULL }
@@ -2812,6 +2877,7 @@ MainMenuScene::MainMenuScene()
       m_snapshots_button("Snapshots", ICON_FA_CLOCK_ROTATE_LEFT),
       m_system_button("System", ICON_FA_MICROCHIP),
       m_chihiro_button("Chihiro", ICON_FA_SERVER),
+      m_hotkeys_button("Hotkeys", ICON_FA_SLIDERS),
       m_about_button("About", ICON_FA_CIRCLE_INFO)
 {
     m_had_focus_last_frame = false;
@@ -2824,6 +2890,7 @@ MainMenuScene::MainMenuScene()
     m_tabs.push_back(&m_snapshots_button);
     m_tabs.push_back(&m_system_button);
     m_tabs.push_back(&m_chihiro_button);
+    m_tabs.push_back(&m_hotkeys_button);
     m_tabs.push_back(&m_about_button);
 
     m_views.push_back(&m_general_view);
@@ -2834,6 +2901,7 @@ MainMenuScene::MainMenuScene()
     m_views.push_back(&m_snapshots_view);
     m_views.push_back(&m_system_view);
     m_views.push_back(&m_chihiro_view);
+    m_views.push_back(&m_hotkeys_view);
     m_views.push_back(&m_about_view);
 
     m_current_view_index = 0;
@@ -2857,7 +2925,7 @@ void MainMenuScene::ShowSystem()
 
 void MainMenuScene::ShowAbout()
 {
-    SetNextViewIndexWithFocus(8);
+    SetNextViewIndexWithFocus(9);
 }
 
 void MainMenuScene::SetNextViewIndexWithFocus(int i)
@@ -2935,12 +3003,15 @@ void MainMenuScene::UpdateAboutViewConfigInfo()
 bool MainMenuScene::ConsumeRebindEvent(SDL_Event *event)
 {
     if (m_input_view.ConsumeRebindEvent(event)) return true;
+    if (m_hotkeys_view.ConsumeRebindEvent(event)) return true;
     return m_chihiro_view.ConsumeRebindEvent(event);
 }
 
 bool MainMenuScene::IsInputRebinding()
 {
-    return m_input_view.IsInputRebinding() || m_chihiro_view.IsInputRebinding();
+    return m_input_view.IsInputRebinding() ||
+           m_hotkeys_view.IsInputRebinding() ||
+           m_chihiro_view.IsInputRebinding();
 }
 
 bool MainMenuScene::Draw()

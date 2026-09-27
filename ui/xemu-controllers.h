@@ -69,6 +69,39 @@ public:
     }
 };
 
+/* An emulator shortcut: an SDL scancode, with in bits 16-18 the modifiers
+ * held with it. */
+#define HOTKEY_SHIFT (1 << 16)
+#define HOTKEY_CTRL (1 << 17)
+#define HOTKEY_ALT (1 << 18)
+#define HOTKEY_SCANCODE(h) ((h) & 0xFFFF)
+
+static inline int hotkey_mods(SDL_Keymod mod)
+{
+#ifdef __APPLE__
+    /* Cmd plays Ctrl's part on a Mac, as in the rest of the UI. */
+    SDL_Keymod ctrl = SDL_KMOD_GUI;
+#else
+    SDL_Keymod ctrl = SDL_KMOD_CTRL;
+#endif
+    return (mod & SDL_KMOD_SHIFT ? HOTKEY_SHIFT : 0) |
+           (mod & ctrl ? HOTKEY_CTRL : 0) |
+           (mod & SDL_KMOD_ALT ? HOTKEY_ALT : 0);
+}
+
+/* The next key pressed, with the modifiers held; Escape for none. */
+struct HotkeyRebindingMap : public virtual RebindingMap {
+    int *m_scancode;
+    int m_pressed;
+
+    RebindEventResult ConsumeRebindEvent(SDL_Event *event) override;
+
+    HotkeyRebindingMap(int table_row, int *scancode)
+        : RebindingMap(table_row), m_scancode{ scancode }, m_pressed{ 0 }
+    {
+    }
+};
+
 struct ChihiroRebindingMap : public virtual RebindingMap {
     /* The binding itself: the row number is not its index in its group. */
     int *m_scancode;

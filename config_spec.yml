@@ -13,6 +13,8 @@ general:
   last_viewed_menu_index: integer
   user_token: string
   snapshots:
+    # Deprecated: quick saves are per game now (Settings > Hotkeys); cleared
+    # at load.
     shortcuts:
       f5: string
       f6: string
@@ -60,6 +62,67 @@ input:
     type: bool
     default: true
   background_input_capture: bool
+  # Emulator shortcuts (Settings > Hotkeys): an SDL scancode, with Shift,
+  # Ctrl (Cmd on a Mac) and Alt in bits 16-18; 0 = none. While a Chihiro runs,
+  # a single key also bound to one of its inputs is left to the game.
+  hotkeys:
+    settings:
+      type: integer
+      default: 58 # F1
+    quick_menu:
+      type: integer
+      default: 59 # F2
+    pause:
+      type: integer
+      default: 131091 # Ctrl+P
+    reset:
+      type: integer
+      default: 131093 # Ctrl+R
+    quit:
+      type: integer
+      default: 131092 # Ctrl+Q
+    quick_save1:
+      type: integer
+      default: 65598 # Shift+F5
+    quick_save2:
+      type: integer
+      default: 65599 # Shift+F6
+    quick_save3:
+      type: integer
+      default: 65600 # Shift+F7
+    quick_save4:
+      type: integer
+      default: 65601 # Shift+F8
+    quick_load1:
+      type: integer
+      default: 62 # F5
+    quick_load2:
+      type: integer
+      default: 63 # F6
+    quick_load3:
+      type: integer
+      default: 64 # F7
+    quick_load4:
+      type: integer
+      default: 65 # F8
+    fullscreen:
+      type: integer
+      default: 68 # F11
+    screenshot:
+      type: integer
+      default: 69 # F12
+    lightgun_mode:
+      type: integer
+      default: 60 # F3
+    eject_disc:
+      type: integer
+      default: 131080 # Ctrl+E
+    load_disc:
+      type: integer
+      default: 131090 # Ctrl+O
+    monitor:
+      type: integer
+      default: 53 # `
   keyboard_controller_scancode_map:
     # Scancode reference : https://github.com/libsdl-org/SDL/blob/main/include/SDL_scancode.h
     a:

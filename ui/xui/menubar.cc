@@ -35,43 +35,38 @@ extern float g_main_menu_height; // FIXME
 bool g_capture_renderdoc_frame = false;
 #endif
 
-#if defined(__APPLE__)
-#define SHORTCUT_MENU_TEXT(c) "Cmd+" #c
-#else
-#define SHORTCUT_MENU_TEXT(c) "Ctrl+" #c
-#endif
-
 void ProcessKeyboardShortcuts(void)
 {
-    if (IsShortcutKeyPressed(ImGuiKey_E)) {
+    if (HotkeyPressed(g_config.input.hotkeys.eject_disc)) {
         ActionEjectDisc();
     }
 
-    if (IsShortcutKeyPressed(ImGuiKey_O)) {
+    if (HotkeyPressed(g_config.input.hotkeys.load_disc)) {
         ActionLoadDisc();
     }
 
-    if (IsShortcutKeyPressed(ImGuiKey_P)) {
+    if (HotkeyPressed(g_config.input.hotkeys.pause)) {
         ActionTogglePause();
     }
 
-    if (IsShortcutKeyPressed(ImGuiKey_R)) {
+    if (HotkeyPressed(g_config.input.hotkeys.reset)) {
         ActionReset();
     }
 
-    if (IsShortcutKeyPressed(ImGuiKey_Q)) {
+    if (HotkeyPressed(g_config.input.hotkeys.quit)) {
         ActionShutdown();
     }
 
-    if (ImGui::IsKeyPressed(ImGuiKey_GraveAccent)) {
+    /* Its own key also closes the monitor from its command line. */
+    if (HotkeyPressed(g_config.input.hotkeys.monitor, true)) {
         monitor_window.ToggleOpen();
     }
 
-    if (ImGui::IsKeyPressed(ImGuiKey_F12)) {
+    if (HotkeyPressed(g_config.input.hotkeys.screenshot)) {
         ActionScreenshot();
     }
 
-    if (ImGui::IsKeyPressed(ImGuiKey_F11)) {
+    if (HotkeyPressed(g_config.input.hotkeys.fullscreen)) {
         xemu_toggle_fullscreen();
     }
 
@@ -92,8 +87,16 @@ void ShowMainMenu()
     {
         if (ImGui::BeginMenu("Machine"))
         {
-            if (ImGui::MenuItem(running ? "Pause" : "Resume", SHORTCUT_MENU_TEXT(P))) ActionTogglePause();
-            if (ImGui::MenuItem("Screenshot", "F12")) ActionScreenshot();
+            std::string pause_key = HotkeyName(g_config.input.hotkeys.pause);
+            if (ImGui::MenuItem(running ? "Pause" : "Resume",
+                                pause_key.c_str())) {
+                ActionTogglePause();
+            }
+            std::string screenshot_key =
+                HotkeyName(g_config.input.hotkeys.screenshot);
+            if (ImGui::MenuItem("Screenshot", screenshot_key.c_str())) {
+                ActionScreenshot();
+            }
 
             if (ImGui::BeginMenu("Snapshot")) {
                 if (ImGui::MenuItem("Create Snapshot")) {
@@ -101,37 +104,36 @@ void ShowMainMenu()
                     xemu_queue_notification("Created new snapshot");
                 }
 
+                int64_t dates[4];
+                QuickSlotDates(dates);
                 for (int i = 0; i < 4; ++i) {
-                    char *hotkey = g_strdup_printf("Shift+F%d", i + 5);
+                    std::string slot = std::to_string(i + 1);
+                    std::string save_key = HotkeyName(QuickSaveHotkey(i));
+                    std::string load_key = HotkeyName(QuickLoadHotkey(i));
 
-                    char *load_name;
-                    char *save_name;
-
-                    assert(g_snapshot_shortcut_index_key_map[i]);
-                    bool bound = *(g_snapshot_shortcut_index_key_map[i]) &&
-                            (**(g_snapshot_shortcut_index_key_map[i]) != 0);
-
-                    if (bound) {
-                        load_name = g_strdup_printf("Load '%s'", *(g_snapshot_shortcut_index_key_map[i]));
-                        save_name = g_strdup_printf("Save '%s'", *(g_snapshot_shortcut_index_key_map[i]));
-                    } else {
-                        load_name = g_strdup_printf("Load F%d (Unbound)", i + 5);
-                        save_name = g_strdup_printf("Save F%d (Unbound)", i + 5);
+                    /* When the slot was saved, or that it is empty. */
+                    std::string load_name = "Quick Load " + slot + " (empty)";
+                    if (dates[i]) {
+                        g_autoptr(GDateTime) date =
+                            g_date_time_new_from_unix_local(dates[i]);
+                        g_autofree char *when =
+                            date ? g_date_time_format(date, "%Y-%m-%d %H:%M")
+                                 : NULL;
+                        load_name = "Quick Load " + slot + " (" +
+                                    (when ? when : "saved") + ")";
                     }
 
                     ImGui::Separator();
 
-                    if (ImGui::MenuItem(load_name, hotkey + sizeof("Shift+") - 1, false, bound)) {
-                        ActionActivateBoundSnapshot(i, false);
+                    if (ImGui::MenuItem(("Quick Save " + slot).c_str(),
+                                        save_key.c_str())) {
+                        ActionQuickSave(i);
                     }
 
-                    if (ImGui::MenuItem(save_name, hotkey, false, bound)) {
-                        ActionActivateBoundSnapshot(i, true);
+                    if (ImGui::MenuItem(load_name.c_str(), load_key.c_str(),
+                                        false, dates[i] != 0)) {
+                        ActionQuickLoad(i);
                     }
-
-                    g_free(hotkey);
-                    g_free(load_name);
-                    g_free(save_name);
                 }
 
                 ImGui::EndMenu();
@@ -139,8 +141,16 @@ void ShowMainMenu()
 
             ImGui::Separator();
 
-            if (ImGui::MenuItem("Eject Disc", SHORTCUT_MENU_TEXT(E))) ActionEjectDisc();
-            if (ImGui::MenuItem("Load Disc...", SHORTCUT_MENU_TEXT(O))) ActionLoadDisc();
+            std::string eject_key =
+                HotkeyName(g_config.input.hotkeys.eject_disc);
+            std::string load_disc_key =
+                HotkeyName(g_config.input.hotkeys.load_disc);
+            if (ImGui::MenuItem("Eject Disc", eject_key.c_str())) {
+                ActionEjectDisc();
+            }
+            if (ImGui::MenuItem("Load Disc...", load_disc_key.c_str())) {
+                ActionLoadDisc();
+            }
 
             ImGui::Separator();
 
@@ -148,8 +158,14 @@ void ShowMainMenu()
 
             ImGui::Separator();
 
-            if (ImGui::MenuItem("Reset", SHORTCUT_MENU_TEXT(R))) ActionReset();
-            if (ImGui::MenuItem("Exit", SHORTCUT_MENU_TEXT(Q))) ActionShutdown();
+            std::string reset_key = HotkeyName(g_config.input.hotkeys.reset);
+            std::string quit_key = HotkeyName(g_config.input.hotkeys.quit);
+            if (ImGui::MenuItem("Reset", reset_key.c_str())) {
+                ActionReset();
+            }
+            if (ImGui::MenuItem("Exit", quit_key.c_str())) {
+                ActionShutdown();
+            }
             ImGui::EndMenu();
         }
 
@@ -207,7 +223,9 @@ void ShowMainMenu()
                          "Linear\0Nearest\0");
             ImGui::Combo("Aspect Ratio", &g_config.display.ui.aspect_ratio,
                          "Native\0Auto\0""4:3\0""16:9\0");
-            if (ImGui::MenuItem("Fullscreen", "F11",
+            std::string fullscreen_key =
+                HotkeyName(g_config.input.hotkeys.fullscreen);
+            if (ImGui::MenuItem("Fullscreen", fullscreen_key.c_str(),
                                 xemu_is_fullscreen(), true)) {
                 xemu_toggle_fullscreen();
             }
