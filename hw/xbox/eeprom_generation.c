@@ -119,10 +119,10 @@ bool xbox_eeprom_generate(const char *file, XboxEEPROMVersion ver) {
 
     // set default North American and NTSC-M region settings
     e.region = cpu_to_le32(1);
-    e.video_standard = cpu_to_le32(0x00480100); /* NTSC-M + 60Hz + 480p
-                                                  * Chihiro uses VGA (31kHz progressive).
-                                                  * 480p flag → kernel configures NV2A
-                                                  * for progressive scan. */
+    /* NTSC-M. The Chihiro's (debug) EEPROM also sets 480p: its kernel then
+     * drives the NV2A in progressive scan, as its VGA output needs. */
+    e.video_standard = cpu_to_le32(ver == XBOX_EEPROM_VERSION_D ? 0x00480100
+                                                              : 0x00400100);
 
     // randomize hardware information
     qcrypto_random_bytes(e.confounder, sizeof(e.confounder), &error_fatal);
