@@ -260,8 +260,12 @@ void ShowMainMenu()
             ImGui::MenuItem("Report Compatibility...", NULL,
                             &compatibility_reporter_window.is_open);
              */
-            /* No "Check for Updates...": xemu's updater would install
-             * upstream xemu over this build. */
+            /* Commented out: xemu's updater would install upstream xemu
+             * over this build.
+#if defined(_WIN32)
+            ImGui::MenuItem("Check for Updates...", NULL, &update_window.is_open);
+#endif
+             */
 
             ImGui::Separator();
             if (ImGui::MenuItem("About")) g_main_menu.ShowAbout();

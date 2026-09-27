@@ -63,7 +63,14 @@ void MainMenuTabView::Draw()
 
 void MainMenuGeneralView::Draw()
 {
-    /* No update check: xemu's updater would install upstream xemu. */
+    /* Commented out: xemu's updater would install upstream xemu over this
+     * build.
+#if defined(_WIN32)
+    SectionTitle("Updates");
+    Toggle("Check for updates", &g_config.general.updates.check,
+           "Check for updates whenever xemu is opened");
+#endif
+     */
 
 #if defined(__x86_64__)
     SectionTitle("Performance");
