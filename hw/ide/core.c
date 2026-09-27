@@ -35,14 +35,12 @@
 #include "system/system.h"
 #include "system/blockdev.h"
 #include "system/dma.h"
-#include "system/address-spaces.h"
 #include "hw/block/block.h"
 #include "system/block-backend.h"
 #include "qapi/error.h"
 #include "qemu/cutils.h"
 #include "system/replay.h"
 #include "system/runstate.h"
-#include "exec/watchpoint.h"
 #include "ide-internal.h"
 #include "trace.h"
 #include "hw/xbox/chihiro/chihiro.h"
@@ -896,8 +894,6 @@ static void ide_dma_cb(void *opaque, int ret)
     bool stay_active = false;
     int32_t prep_size = 0;
 
-
-
     if (ret == -EINVAL) {
         ide_dma_error(s);
         return;
@@ -935,7 +931,6 @@ static void ide_dma_cb(void *opaque, int ret)
     if (s->nsector == 0) {
         s->status = READY_STAT | SEEK_STAT;
         ide_bus_set_irq(s->bus);
-
         goto eot;
     }
 
@@ -947,7 +942,16 @@ static void ide_dma_cb(void *opaque, int ret)
     /* prepare_buf() must succeed and respect the limit */
     assert(prep_size >= 0 && prep_size <= n * 512);
 
+    /*
+     * Now prep_size stores the number of bytes in the sglist, and
+     * s->io_buffer_size stores the number of bytes described by the PRDs.
+     */
+
     if (prep_size < n * 512) {
+        /*
+         * The PRDs are too short for this request. Error condition!
+         * Reset the Active bit and don't raise the interrupt.
+         */
         s->status = READY_STAT | SEEK_STAT;
         ide_dma_buf_commit(s, 0);
         goto eot;

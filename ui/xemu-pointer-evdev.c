@@ -154,8 +154,7 @@ static void open_node(const char *node)
 
     bool has_left = test_bit(key, BTN_LEFT);
     bool pointer = has_left || test_bit(key, BTN_TOUCH);
-    bool pad = test_bit(key, BTN_SOUTH) || test_bit(key, BTN_JOYSTICK) ||
-               test_bit(key, BTN_TRIGGER);
+    bool pad = test_bit(key, BTN_SOUTH) || test_bit(key, BTN_JOYSTICK);
     bool absolute = test_bit(ev, EV_ABS) && test_bit(abs, ABS_X) &&
                     test_bit(abs, ABS_Y);
     bool relative = test_bit(ev, EV_REL) && test_bit(rel, REL_X) &&

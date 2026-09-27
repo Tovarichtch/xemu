@@ -2,6 +2,7 @@
  * xemu Settings Management
  *
  * Copyright (C) 2025 Matt Borgerson
+ * Copyright (c) 2026 Réda Chérif-Touil
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by

@@ -108,8 +108,8 @@ void usb_xid_handle_reset(USBDevice *dev)
     DPRINTF("xid reset\n");
 }
 
-void usb_xid_handle_control(USBDevice *dev, USBPacket *p, int request, 
-                            int value, int index, int length, uint8_t *data)
+void usb_xid_handle_control(USBDevice *dev, USBPacket *p,
+               int request, int value, int index, int length, uint8_t *data)
 {
     USBXIDGamepadState *s = (USBXIDGamepadState *)dev;
 
@@ -216,7 +216,7 @@ void usb_xid_handle_control(USBDevice *dev, USBPacket *p, int request,
 }
 
 #if 0
-void usb_xid_handle_destroy(USBDevice *dev)
+static void usb_xid_handle_destroy(USBDevice *dev)
 {
     USBXIDState *s = DO_UPCAST(USBXIDState, dev, dev);
     DPRINTF("xid handle_destroy\n");

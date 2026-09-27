@@ -7,6 +7,7 @@
  * runtime.
  *
  * Copyright (C) 2020-2021 Matt Borgerson
+ * Copyright (c) 2026 Réda Chérif-Touil
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -101,12 +102,6 @@ typedef struct LightGunState {
     uint16_t buttons;
     uint8_t status;
     int16_t axis[2];
-
-    // Calibration
-    int16_t offsetX;
-    int16_t offsetY;
-    float scaleX;
-    float scaleY;
 } LightGunState;
 
 typedef struct ControllerState {
@@ -125,7 +120,8 @@ typedef struct ControllerState {
     SDL_JoystickID      sdl_joystick_id;
     SDL_GUID            sdl_joystick_guid;
 
-    // Chihiro drive-board force feedback on an FFB steering wheel (OutRun 2).
+    // Chihiro drive-board force feedback on an FFB steering wheel (OutRun 2,
+    // Maximum Tune).
     // haptic is NULL for pads with only rumble motors.
     SDL_Haptic         *haptic;
     uint32_t            haptic_features;
@@ -241,7 +237,6 @@ extern "C" {
      CHIHIRO_BINDING_IS_JOY_PEDAL(b))
 
 extern int *g_keyboard_scancode_map[25];
-extern int *g_chihiro_universal_map[4];
 extern int *g_chihiro_hotd3_map[2];
 extern int *g_chihiro_vc3_map[4];
 extern int *g_chihiro_gs_map[4];
@@ -251,7 +246,6 @@ extern int *g_chihiro_or2_map[1];
 extern int *g_chihiro_wmmt2_map[8];
 extern int *g_chihiro_ok_map[6];
 extern int *g_chihiro_gundam_map[13];
-extern int *g_chihiro_p2_universal_map[2];
 extern int *g_chihiro_p2_hotd3_map[2];
 extern int *g_chihiro_p2_vc3_map[4];
 extern int *g_chihiro_p2_gs_map[4];
@@ -264,7 +258,6 @@ void xemu_input_update_controllers(void);
 void xemu_input_update_controller(ControllerState *state);
 void xemu_input_update_sdl_kbd_controller_state(ControllerState *state);
 void xemu_input_update_light_gun(ControllerState *state); /* LIGHTGUN (not upstream) */
-void xemu_input_update_sdl_mouse_controller_state(ControllerState *state);
 void xemu_input_update_sdl_controller_state(ControllerState *state);
 void xemu_input_update_rumble(ControllerState *state);
 ControllerState *xemu_input_get_bound(int index);

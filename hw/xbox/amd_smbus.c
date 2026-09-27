@@ -88,8 +88,7 @@ static void amd756_smb_transaction(AMD756SMBus *s)
     I2CBus *bus  = s->smbus;
     int ret;
 
-    if(0) printf("SMBus transaction: addr=0x%02X prot=%d read=%d cmd=0x%02X data=0x%02X\n",
-           addr, prot, read, cmd, s->smb_data0);
+    SMBUS_DPRINTF("SMBus trans addr=0x%02x prot=0x%02x\n", addr, prot);
 
     switch (prot) {
     case AMD756_QUICK:
@@ -154,14 +153,12 @@ done:
         goto error;
     }
     s->smb_stat |= GS_HCYC_STS;
-    if(0) printf("SMBus transaction: SUCCESS (stat=0x%02X)\n", s->smb_stat);
     goto out;
 out:
     return;
 
 error:
     s->smb_stat |= GS_PRERR_STS;
-    printf("SMBus transaction: ERROR ret=%d (stat=0x%02X)\n", ret, s->smb_stat);
     return;
 }
 

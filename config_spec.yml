@@ -304,6 +304,8 @@ display:
     type: enum
     values: [linear, nearest]
     default: linear
+  # A gamma exponent on the final image, after the DAC palette: 1.0 = off.
+  # The Display page keeps it between 1.0 and 1.5.
   crt_gamma:
     type: number
     default: 1.0
@@ -414,8 +416,8 @@ net:
           default: tcp
 
 sys:
-  # The machine that boots when no image is loaded: the last game's, the
-  # Xbox dashboard, or SEGABOOT waiting for a game. With an image loaded,
+  # The machine that boots when no image is loaded: the machine last booted,
+  # the Xbox dashboard, or SEGABOOT waiting for a game. With an image loaded,
   # the image decides (Xbox disc = Xbox, anything else = Chihiro).
   default_machine:
     type: enum
@@ -451,6 +453,8 @@ perf:
 
 chihiro:
   jvs:
+    # The game whose keys the Game tab edits; also the keys used for a game
+    # the cabinet table does not know.
     profile:
       type: enum
       values: [hotd3, vc3, gs, ctx, or2, ok, wmmt2, gundam]
@@ -733,8 +737,8 @@ chihiro:
       values: [auto, jp, us, ex]
       default: ex
     # The media board's DIMM: the JP1/JP2 jumper value (the enum index), for
-    # the host side and the board's own SPD alike (a mismatch is SEGABOOT's
-    # Caution 53). Gundam's 603 MB image needs 1024 MB.
+    # the host side and the Type-3 board's block table alike (a mismatch is
+    # SEGABOOT's Caution 53). Gundam's 603 MB image needs 1024 MB.
     dimm_size:
       type: enum
       values: ['128', '256', '512', '1024', 'auto']
@@ -747,8 +751,9 @@ chihiro:
     force_feedback:
       type: bool
       default: false
-    # Drive-board force-feedback strength, percent. Scales both gamepad rumble
-    # and steering-wheel haptic effects (OutRun 2). 0 = off.
+    # Drive-board force-feedback strength, percent: 0-200, 100 = what the game
+    # asks for, 0 = off. Scales gamepad rumble and steering-wheel haptic
+    # effects (OutRun 2, Maximum Tune).
     ffb_strength:
       type: integer
       default: 100
@@ -814,6 +819,8 @@ chihiro:
     cabinet:
       type: integer
       default: 1
+    # Empty: this cabinet is the host (cabinet 1); the others give its
+    # address.
     host:
       type: string
       default: ""
@@ -847,8 +854,8 @@ chihiro:
       mt2:
         type: string
         default: ""
-    # The names the HW210 slots had before the readers were told apart. Moved
-    # into hw210 above on the first run and left empty.
+    # Deprecated: the names the HW210 slots had before the readers were told
+    # apart; read into hw210 above at a Chihiro boot, when that slot is empty.
     card1_path:
       type: string
       default: ""
@@ -880,7 +887,8 @@ chihiro:
       type: string
       default: ""
     # The qcow2 that holds the Chihiro VM snapshots. Empty: chihiro_snapshots.qcow2
-    # in the data directory, created when missing.
+    # in the data directory, created when missing; that path is then saved
+    # here.
     snapshot_store_path:
       type: string
       default: ""

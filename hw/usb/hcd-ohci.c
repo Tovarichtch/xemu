@@ -30,7 +30,6 @@
 #include "qapi/error.h"
 #include "qemu/module.h"
 #include "qemu/timer.h"
-#define TS_MS ((long long)(qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL)))
 #include "hw/usb.h"
 #include "migration/vmstate.h"
 #include "hw/sysbus.h"
@@ -248,15 +247,11 @@ static const char *ohci_reg_names[] = {
 
 static const char *ohci_reg_name(hwaddr addr)
 {
-    if (addr >= 0x54) {
-        static char buf[32];
-        snprintf(buf, sizeof(buf), "HcRhPort%d", (int)((addr - 0x54) >> 2));
-        return buf;
-    }
     if (addr >> 2 < ARRAY_SIZE(ohci_reg_names)) {
         return ohci_reg_names[addr >> 2];
+    } else {
+        return "<unknown>";
     }
-    return "<unknown>";
 }
 
 static void ohci_die(OHCIState *ohci)
@@ -842,7 +837,6 @@ static int ohci_service_iso_td(OHCIState *ohci, struct ohci_ed *ed)
 
 static void ohci_td_pkt(const char *msg, const uint8_t *buf, size_t len)
 {
-    return;
     bool print16;
     bool printall;
     int i;
@@ -910,7 +904,6 @@ static int ohci_service_td(OHCIState *ohci, struct ohci_ed *ed)
         ohci_die(ohci);
         return 1;
     }
-
 
     dir = OHCI_BM(ed->flags, ED_D);
     switch (dir) {
@@ -1276,7 +1269,6 @@ static void ohci_frame_boundary(void *opaque)
     if (ohci->done_count != 7 && ohci->done_count != 0) {
         ohci->done_count--;
     }
-
     /* Do SOF stuff here */
     ohci_sof(ohci);
 
@@ -1292,7 +1284,6 @@ static void ohci_frame_boundary(void *opaque)
  */
 static int ohci_bus_start(OHCIState *ohci)
 {
-    printf("[%07lld] OHCI BUS START (HCFS -> OPERATIONAL)\n", TS_MS);
     trace_usb_ohci_start(ohci->name);
 
     /* Chihiro: the USB devices attach after the kernel enables RHSC, so
@@ -1312,7 +1303,6 @@ static int ohci_bus_start(OHCIState *ohci)
 /* Stop sending SOF tokens on the bus */
 void ohci_bus_stop(OHCIState *ohci)
 {
-    printf("[%07lld] OHCI BUS STOP\n", TS_MS);
     trace_usb_ohci_stop(ohci->name);
 
     chihiro_on_ohci_bus_stop();
@@ -1494,7 +1484,6 @@ static void ohci_port_set_status(OHCIState *ohci, int portnum, uint32_t val)
 
     port = &ohci->rhport[portnum];
     old_state = port->ctrl;
-
 
     /* Write to clear CSC, PESC, PSSC, OCIC, PRSC */
     if (val & OHCI_PORT_WTC) {
@@ -1725,10 +1714,7 @@ static void ohci_mem_write(void *opaque,
         break;
 
     case 8: /* HcControlHeadED */
-        {
-            uint32_t new_head = val & OHCI_EDPTR_MASK;
-            ohci->ctrl_head = new_head;
-        }
+        ohci->ctrl_head = val & OHCI_EDPTR_MASK;
         break;
 
     case 9: /* HcControlCurrentED */
@@ -1736,10 +1722,7 @@ static void ohci_mem_write(void *opaque,
         break;
 
     case 10: /* HcBulkHeadED */
-        {
-            uint32_t new_bhead = val & OHCI_EDPTR_MASK;
-            ohci->bulk_head = new_bhead;
-        }
+        ohci->bulk_head = val & OHCI_EDPTR_MASK;
         break;
 
     case 11: /* HcBulkCurrentED */
@@ -1814,10 +1797,6 @@ static void ohci_attach(USBPort *port1)
     OHCIPort *port = &s->rhport[port1->index];
     uint32_t old_state = port->ctrl;
 
-    printf("[%07lld] OHCI ATTACH: port%d device=%s\n", TS_MS,
-           port1->index,
-           port1->dev ? port1->dev->product_desc : "NULL");
-
     /* set connect status */
     port->ctrl |= OHCI_PORT_CCS | OHCI_PORT_CSC;
 
@@ -1857,8 +1836,6 @@ static void ohci_detach(USBPort *port1)
     OHCIState *s = port1->opaque;
     OHCIPort *port = &s->rhport[port1->index];
     uint32_t old_state = port->ctrl;
-
-    printf("[%07lld] OHCI DETACH: port%d\n", TS_MS, port1->index);
 
     ohci_child_detach(port1, port1->dev);
 

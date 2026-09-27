@@ -921,8 +921,11 @@ static const char *const chihiro_game_titles[] = {
     [CONFIG_CHIHIRO_JVS_PROFILE_GUNDAM] = "Gundam Battle Operating Simulator",
 };
 
-/* The settings picker builds its list from this table, so a profile added to
- * the enum can never be missing from the menu. */
+/* The settings picker builds its list from this table, so every profile of
+ * the enum needs its title here. */
+QEMU_BUILD_BUG_ON(ARRAY_SIZE(chihiro_game_titles) !=
+                  CONFIG_CHIHIRO_JVS_PROFILE__COUNT);
+
 int xemu_chihiro_profile_count(void)
 {
     return (int)ARRAY_SIZE(chihiro_game_titles);

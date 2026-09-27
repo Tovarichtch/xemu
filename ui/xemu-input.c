@@ -174,7 +174,7 @@ int *g_keyboard_scancode_map[25] = {
     &g_config.input.keyboard_controller_scancode_map.rtrigger,
 };
 
-int *g_chihiro_universal_map[4] = {
+static int *g_chihiro_universal_map[4] = {
     &g_config.chihiro.jvs.start,
     &g_config.chihiro.jvs.service,
     &g_config.chihiro.jvs.coin,
@@ -258,7 +258,7 @@ int *g_chihiro_gundam_map[13] = {
 };
 
 /* Player 2: start and coin only. */
-int *g_chihiro_p2_universal_map[2] = {
+static int *g_chihiro_p2_universal_map[2] = {
     &g_config.chihiro.jvs_p2.start,
     &g_config.chihiro.jvs_p2.coin,
 };
@@ -457,8 +457,6 @@ void xemu_input_init(void)
     new_con->peripheral_types[1] = PERIPHERAL_NONE;
     new_con->peripherals[0] = NULL;
     new_con->peripherals[1] = NULL;
-    new_con->lg.scaleX = 1.0f;
-    new_con->lg.scaleY = 1.0f;
 
     for (int i = 0; i < 25; i++) {
         static const char *format_str =
@@ -599,14 +597,17 @@ static void xemu_input_register_controller(ControllerState *new_con)
 
     QTAILQ_INSERT_TAIL(&available_controllers, new_con, entry);
     // The gamepad remap (controller_map) is a gamepad-only concept; a raw
-    // joystick has none (it is mapped per game in the Chihiro tab).
+    // joystick has none (it is mapped in the Chihiro tab: Input > Devices,
+    // and the Game tab).
     if (new_con->type == INPUT_DEVICE_SDL_GAMEPAD) {
         xemu_input_bindings_reload_map(new_con);
     }
 
-    // Do not replace binding for a currently bound device. If the same GUID is
-    // specified on multiple ports, allow any available port to be bound (e.g.
-    // an X360 wireless receiver hands every pad the same GUID).
+    // Do not replace binding for a currently bound device. A saved identity
+    // with a serial or a device path matches that unit only; a bare GUID
+    // matches any unit of the model unless a twin is connected (two pads of
+    // one model, such as an X360 wireless receiver's), and twins bind through
+    // auto_bind below.
 
     // Attempt to re-bind to a port previously bound to this GUID
     int port = 0;
@@ -688,8 +689,6 @@ void xemu_input_process_sdl_events(const SDL_Event *event)
         new_con->peripheral_types[1] = PERIPHERAL_NONE;
         new_con->peripherals[0] = NULL;
         new_con->peripherals[1] = NULL;
-        new_con->lg.scaleX = 1.0f;
-        new_con->lg.scaleY = 1.0f;
 
         xemu_input_register_controller(new_con);
     } else if (event->type == SDL_EVENT_JOYSTICK_ADDED) {
@@ -719,8 +718,6 @@ void xemu_input_process_sdl_events(const SDL_Event *event)
         new_con->peripheral_types[1] = PERIPHERAL_NONE;
         new_con->peripherals[0] = NULL;
         new_con->peripherals[1] = NULL;
-        new_con->lg.scaleX = 1.0f;
-        new_con->lg.scaleY = 1.0f;
 
         xemu_input_register_controller(new_con);
     } else if (event->type == SDL_EVENT_GAMEPAD_REMOVED ||
@@ -1516,13 +1513,14 @@ static void xemu_input_grab_pointers(void)
 }
 
 // ---------------------------------------------------------------------------
-// Chihiro drive-board force feedback -> host haptics (OutRun 2)
+// Chihiro drive-board force feedback -> host haptics (OutRun 2's Sega 838,
+// Maximum Tune's V257)
 //
 // OutRun 2 drives the 838-13683 drive board with SPRING / TORQUE / DAMPER /
-// VIBRATION commands (decoded in chihiro-driveboard.c). We translate the live
-// effect state onto the bound player-1 device: a real force-feedback wheel gets
-// proportional SDL_Haptic condition/constant/periodic effects; a plain gamepad
-// gets rumble from the vibration channel.
+// VIBRATION commands (decoded in chihiro-driveboard-sega838.c). We translate
+// the live effect state onto the device that steers (steer_left's binding): a
+// real force-feedback wheel gets proportional SDL_Haptic condition and constant
+// effects; a plain gamepad gets rumble from the package pulse and 0x85.
 //
 // The arcade board itself runs a fixed-PWM binary motor; these proportional
 // mappings realise the game's *computed* FFB intent on modern hardware. The
@@ -1534,14 +1532,8 @@ static void xemu_input_grab_pointers(void)
                                       // (Logitech condition springs barely register); the drive
                                       // board's spring is rendered with the wheel's own autocentre
                                       // (see chihiro_ffb_update), this covers drivers without one.
-#define CHIHIRO_FFB_TORQUE_LEVEL 240  // per torque force unit
+#define CHIHIRO_FFB_TORQUE_LEVEL 240  // per movement (0x84) power unit
 #define CHIHIRO_FFB_DAMPER_COEFF 18   // per damper unit (mild; too high fights the spring & slows the return)
-// Idle wheel liveliness: every Chihiro wheel cab centres MECHANICALLY (spring --
-// Crazy Taxi HR has no drive board at all, and OutRun 2's servo only acts once
-// the game engages). A modern FFB wheel has no spring, so while no drive-board
-// effect is running we arm the wheel's BUILT-IN autocentre (firmware spring;
-// smooth on Logitech, no host update loop, no hunting) at the user's
-// strength (chihiro.settings.wheel_autocenter_strength, 0-100).
 
 static int16_t chihiro_ffb_clamp(int v)
 {
@@ -1793,8 +1785,9 @@ static void chihiro_ffb_update(ControllerState *c)
 
     // Wheel auto-centre while no drive-board effect is running: the cab's
     // mechanical spring, there even on cabs with no FFB hardware (Crazy Taxi
-    // HR), so independent of the FFB master switch. In service the game's
-    // own spring takes over below.
+    // HR), so independent of the FFB master switch. The wheel's built-in
+    // autocentre renders it (a firmware spring: no host loop). In service the
+    // game's own spring takes over below.
     if (c->haptic && c->sdl_joystick && !c->haptic_running) {
         int want = g_config.chihiro.settings.wheel_autocenter ?
                        g_config.chihiro.settings.wheel_autocenter_strength : 0;
@@ -1833,7 +1826,7 @@ static void chihiro_ffb_update(ControllerState *c)
         }
 
         // Combined power scaling: user slider (percent) x the game's in-game
-        // FFB power (0x83; 0x60 = 100%, 0 = unset -> full).
+        // FFB power (0x83; 0x60 = 100%; unset: see below).
         int str = g_config.chihiro.settings.ffb_strength;
         if (str < 0) str = 0;
         // Global power (0x83). Per the OR2 manual, MOTOR POWER is 60/80/90/100%
@@ -1909,7 +1902,7 @@ static void chihiro_ffb_update(ControllerState *c)
             // SDL STEERING_AXIS convention; Windows (DirectInput) and macOS (IOKit) can
             // invert a wheel's physical direction. This user toggle flips the whole
             // directional (constant) force -- default off = correct on Linux and the
-            // standard case. Sine (buzz) and damper are direction-agnostic, so unaffected.
+            // standard case. The spring and damper are direction-agnostic, so unaffected.
             if (g_config.chihiro.settings.ffb_invert) lvl = -lvl;
             lvl = chihiro_ffb_clamp(lvl);
             if (lvl != c->haptic_constant_lv) {

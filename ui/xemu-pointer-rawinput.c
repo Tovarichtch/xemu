@@ -345,9 +345,11 @@ static void handle_mouse(Pointer *p, const RAWMOUSE *m)
 }
 
 /* Runs inside SDL_PollEvent on the UI thread, outside the main-loop lock.
- * Every reader of the table runs on that same thread (the input update
- * of the main loop), so no lock is needed. The hook only writes into a
- * device's entry; arrivals and removals wait for xemu_pointer_poll. */
+ * The Chihiro readers run on that same thread (the input update of the main
+ * loop). An Xbox light gun also reads the table from the USB poll on the
+ * QEMU thread, with no lock: a reading can then mix two packets (harmless).
+ * The hook only writes into a device's entry; arrivals and removals wait for
+ * xemu_pointer_poll. */
 static bool SDLCALL message_hook(void *userdata, MSG *msg)
 {
     if (msg->message == WM_INPUT_DEVICE_CHANGE) {

@@ -118,7 +118,8 @@ static int coroutine_fn memory_co_pwritev(BlockDriverState *bs, int64_t offset,
 static BlockDriver bdrv_memory = {
     .format_name        = "memory",
     .instance_size      = sizeof(BDRVMemoryState),
-    /* The backing MemoryRegion is part of migrated guest RAM. */
+    /* Its content is saved by the chihiro-dimm vmstate, not by block
+     * snapshots. */
     .snapshots_covered_by_vmstate = true,
     .bdrv_open          = memory_open,
     .bdrv_close         = memory_close,

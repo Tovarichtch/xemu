@@ -3243,9 +3243,9 @@ void qemu_init(int argc, char **argv)
 
     const char *hdd_path = g_config.sys.files.hdd_path;
     if (chihiro_machine) {
-        /* Chihiro has no IDE hard disk; the image is only the VM snapshot
-         * store, attached once the block layer is up (see
-         * chihiro_snapshot_store_setup), created there when absent. */
+        /* Chihiro has no IDE hard disk; hdd_path is the Xbox's. Snapshots go
+         * to chihiro.roms.snapshot_store_path, attached once the block layer
+         * is up (chihiro_snapshot_store_setup), created there when absent. */
     } else if (strlen(hdd_path) > 0) {
         if (xemu_check_file(hdd_path)) {
             char *msg = g_strdup_printf("Failed to open hard disk image file '%s'. Please check machine settings.", hdd_path);

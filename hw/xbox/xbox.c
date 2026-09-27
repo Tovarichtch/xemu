@@ -299,10 +299,10 @@ void xbox_init_common(MachineState *machine,
 
     PCIDevice *dev = pci_create_simple(pci_bus, PCI_DEVFN(9, 0), "piix3-ide");
     pci_ide_create_devs(dev);
+    // idebus[0] = qdev_get_child_bus(&dev->qdev, "ide.0");
+    // idebus[1] = qdev_get_child_bus(&dev->qdev, "ide.1");
 
     /* smbus devices */
-    /* Chihiro: SMC default 0x00 maps to VGA in arcade kernel.
-     * No avpack override needed — the kernel handles the mapping. */
     smbus_xbox_smc_init(smbus, 0x10);
 
     const char *video_encoder =
@@ -442,7 +442,8 @@ void xbox_init_common(MachineState *machine,
                         fclose(f);
                     }
                 }
-                /* Store parent dir for QuickReboot fallback */
+                /* The image's folder, where a boot.id file may sit
+                 * (chihiro_capture_game_filename_from_dir) */
                 snprintf(chihiro_game_dir, sizeof(chihiro_game_dir),
                          "%s", dvd);
                 char *slash = strrchr(chihiro_game_dir, '/');
@@ -460,12 +461,10 @@ void xbox_init_common(MachineState *machine,
          *
          * On real hardware, the AN2131 chips load firmware from their
          * I2C EEPROMs (ic10/pc20) at power-up (~200-500ms).
-         * The kernel boots and does its initial USB scan before the
-         * AN2131 chips are ready. They appear as hot-plug devices
-         * AFTER the kernel has started.
          *
-         * We create the devices with auto_attach=0 (set in realize),
-         * then attach them via a timer 1.5s after boot. */
+         * We create the devices with auto_attach=0 (set in realize), then
+         * attach them 50 ms (QC) and 100 ms (SC) after each OHCI bus start
+         * (chihiro_on_ohci_bus_start). */
         USBBus *usb0_bus = NULL;
         for (int i = 0; i < 4 && !usb0_bus; i++) {
             char bn[32]; snprintf(bn, sizeof(bn), "usb-bus.%d", i);

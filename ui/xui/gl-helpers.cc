@@ -949,8 +949,8 @@ void ScaleDimensions(int src_width, int src_height, int max_width, int max_heigh
 }
 
 /* What the framebuffer shows, taken from the machine under the main-loop
- * lock (LayoutFramebuffer, RenderFramebufferToPng), so that drawing it needs
- * no lock. */
+ * lock by LayoutFramebuffer and the snapshot thumbnail, so that drawing it
+ * needs no lock. A screenshot takes it again after the unlock. */
 static uint8_t fb_palette[256 * 3];
 static bool fb_screen_off;
 

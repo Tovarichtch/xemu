@@ -1,6 +1,8 @@
 specific_ss.add(files(
 	'acpi_xbox.c',
 	'amd_smbus.c',
+	# 'chihiro-usb.c',
+	# 'chihiro.c',
 	'eeprom_generation.c',
 	'lpc47m157.c',
 	'smbus_adm1032.c',
@@ -12,7 +14,6 @@ specific_ss.add(files(
 	'xbox.c',
 	'xbox_pci.c',
 	'xid.c',
-	'xid-gamepad.c',
 	'xid-light-gun.c',
 	'xblc.c',
 	'xid-gamepad.c',

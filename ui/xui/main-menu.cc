@@ -566,15 +566,14 @@ void MainMenuInputView::Draw()
         ImGui::PushStyleColor(ImGuiCol_Header, tc);
 
         if (bound_state->type == INPUT_DEVICE_SDL_JOYSTICK) {
-            // A raw wheel/joystick has no Xbox-gamepad remap; it is mapped per
-            // game in the Chihiro tab, and its range/pedals calibrate in the
-            // game's TEST MENU.
+            // A raw wheel/joystick has no Xbox-gamepad remap; it is mapped in
+            // the Chihiro tab (Input: Devices and Game).
             ImGui::TextWrapped(
                 "Steering wheel / raw joystick. Bind its axes and buttons in "
-                "the Chihiro tab (Arcade Settings); a separate pedal set or "
-                "shifter goes on another port and is bound the same way. "
-                "Wheel rotation range and pedals are calibrated in each "
-                "game's TEST MENU.");
+                "the Chihiro tab (Input: Devices and Game); a separate pedal "
+                "set or shifter goes on another port and is bound the same "
+                "way. Its rotation is set in Chihiro > Steering Wheel; each "
+                "game's TEST MENU calibrates the steering and pedals.");
         } else if (ImGui::CollapsingHeader("Input Mapping")) {
             float p = ImGui::GetFrameHeight() * 0.3;
             ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, ImVec2(p, p));
@@ -1227,7 +1226,8 @@ void MainMenuChihiroView::DrawGameTab()
         if (profile_order[i] == g_config.chihiro.jvs.profile)
             shown = (int)i;
     if (ChevronCombo("###ChihiroProfile", &shown, profile_items.c_str(),
-                     "Select JVS input profile for the current game")) {
+                     "Which game's keys to show and edit (also used for an "
+                     "unrecognised game)")) {
         g_config.chihiro.jvs.profile = profile_order[shown];
         m_rebinding = nullptr;
     }
@@ -1655,8 +1655,8 @@ void MainMenuChihiroView::Draw()
         if (g_config.chihiro.settings.sinden_border) {
             ChevronCombo("Border Style",
                          &g_config.chihiro.settings.sinden_border_style,
-                         "Game (4:3)\0Fullscreen (16:9)\0",
-                         "Game = around viewport, Fullscreen = around window");
+                         "Around the game\0Around the window\0",
+                         "Around the game picture, or around the whole window");
             ImGui::SliderInt("Border Size",
                              &g_config.chihiro.settings.sinden_border_size,
                              2, 30, "%d px");
@@ -1697,7 +1697,7 @@ void MainMenuChihiroView::Draw()
 
         // Force feedback and its sub-settings depend on the master FFB switch.
         Toggle("Force Feedback", &g_config.chihiro.settings.force_feedback,
-               "Enable force feedback for driving games (OutRun 2)");
+               "Enable force feedback for driving games (OutRun 2, Maximum Tune)");
         if (g_config.chihiro.settings.force_feedback) {
             ImGui::SliderInt("FFB Strength",
                              &g_config.chihiro.settings.ffb_strength, 0, 200,
