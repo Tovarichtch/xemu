@@ -447,21 +447,33 @@ perf:
   hard_fpu:
     type: bool
     default: true
+  # CPU boost (Experimental Settings): native SSE, a wider jump cache and
+  # other fast paths of the CPU and the APU. Read at start-up.
   native_sse:
     type: bool
     default: true
   cache_shaders:
     type: bool
     default: true
+  # Real hardware speed (Experimental Settings): the GPU work is paced as on
+  # the real cabinet; off = uncapped. Needs GPU boost.
   real_hw_speed:
     type: bool
     default: false
+  # GPU boost (Experimental Settings): the tuned NV2A; off = the stock one.
+  # Read at start-up.
   optimizations:
     type: bool
     default: true
+  # Smooth first play (Experimental Settings): the game's known shaders are
+  # compiled during boot. Needs GPU boost; on OpenGL also cache_shaders and
+  # GL 4.1 (separate shader objects).
   shader_seeding:
     type: bool
     default: true
+  # Debug mode (Experimental Settings): the session log gets the Chihiro log
+  # categories (all but verbose and ffb) and the XEMU_TBRATE report. Read at
+  # start-up; XEMU_DEBUG_MODE overrides it.
   debug_mode:
     type: bool
     default: false
