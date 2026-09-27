@@ -235,7 +235,10 @@ void ShowMainMenu()
 
         if (ImGui::BeginMenu("Debug"))
         {
-            ImGui::MenuItem("Monitor", "~", &monitor_window.is_open);
+            std::string monitor_key =
+                HotkeyName(g_config.input.hotkeys.monitor);
+            ImGui::MenuItem("Monitor", monitor_key.c_str(),
+                            &monitor_window.is_open);
             ImGui::MenuItem("Audio", NULL, &apu_window.m_is_open);
             ImGui::MenuItem("Video", NULL, &video_window.m_is_open);
 #ifdef CONFIG_RENDERDOC
