@@ -1349,29 +1349,53 @@ void MainMenuChihiroView::DrawGameTab()
     }
     ImGui::PopStyleVar();
 
+    /* Resets the game shown, for the player shown. */
     if (ImGui::Button("Reset to Default")) {
-        if (is_p2) {
-            g_config.chihiro.jvs_p2.hotd3_trigger = 0;
-            g_config.chihiro.jvs_p2.hotd3_body_button = 0;
-            g_config.chihiro.jvs_p2.vc3_trigger = 0;
-            g_config.chihiro.jvs_p2.vc3_body_button = 0;
-            g_config.chihiro.jvs_p2.vc3_pedal = 0;
-            g_config.chihiro.jvs_p2.vc3_reload = 0;
-            g_config.chihiro.jvs_p2.gs_trigger = 0;
-            g_config.chihiro.jvs_p2.gs_body_button = 0;
-            g_config.chihiro.jvs_p2.gs_change = 0;
-            g_config.chihiro.jvs_p2.gs_reload = 0;
-        } else {
-            g_config.chihiro.jvs.hotd3.trigger = 1001;
-            g_config.chihiro.jvs.hotd3.body_button = 1003;
-            g_config.chihiro.jvs.vc3.trigger = 1001;
-            g_config.chihiro.jvs.vc3.body_button = 1003;
-            g_config.chihiro.jvs.vc3.pedal = 44;
-            g_config.chihiro.jvs.vc3.reload = 0;
-            g_config.chihiro.jvs.gs.trigger = 1001;
-            g_config.chihiro.jvs.gs.body_button = 1003;
-            g_config.chihiro.jvs.gs.change = 44;
-            g_config.chihiro.jvs.gs.reload = 0;
+        switch (profile) {
+        case CONFIG_CHIHIRO_JVS_PROFILE_HOTD3:
+            if (is_p2) {
+                g_config.chihiro.jvs_p2.hotd3_trigger = 0;
+                g_config.chihiro.jvs_p2.hotd3_body_button = 0;
+            } else {
+                g_config.chihiro.jvs.hotd3.trigger = 1001;
+                g_config.chihiro.jvs.hotd3.body_button = 1003;
+            }
+            break;
+        case CONFIG_CHIHIRO_JVS_PROFILE_VC3:
+            if (is_p2) {
+                g_config.chihiro.jvs_p2.vc3_trigger = 0;
+                g_config.chihiro.jvs_p2.vc3_body_button = 0;
+                g_config.chihiro.jvs_p2.vc3_pedal = 0;
+                g_config.chihiro.jvs_p2.vc3_reload = 0;
+            } else {
+                g_config.chihiro.jvs.vc3.trigger = 1001;
+                g_config.chihiro.jvs.vc3.body_button = 1003;
+                g_config.chihiro.jvs.vc3.pedal = 44;
+                g_config.chihiro.jvs.vc3.reload = 0;
+            }
+            break;
+        case CONFIG_CHIHIRO_JVS_PROFILE_GS:
+            if (is_p2) {
+                g_config.chihiro.jvs_p2.gs_trigger = 0;
+                g_config.chihiro.jvs_p2.gs_body_button = 0;
+                g_config.chihiro.jvs_p2.gs_change = 0;
+                g_config.chihiro.jvs_p2.gs_reload = 0;
+            } else {
+                g_config.chihiro.jvs.gs.trigger = 1001;
+                g_config.chihiro.jvs.gs.body_button = 1003;
+                g_config.chihiro.jvs.gs.change = 44;
+                g_config.chihiro.jvs.gs.reload = 0;
+            }
+            break;
+        case CONFIG_CHIHIRO_JVS_PROFILE_CTX:
+            g_config.chihiro.jvs.ctx.drive_gear = 225;
+            g_config.chihiro.jvs.ctx.reverse = 224;
+            g_config.chihiro.jvs.ctx.jump = 44;
+            break;
+        case CONFIG_CHIHIRO_JVS_PROFILE_OR2:
+            g_config.chihiro.jvs.or2.view_change = 224;
+            break;
+        case CONFIG_CHIHIRO_JVS_PROFILE_WMMT2:
             g_config.chihiro.jvs.wmmt2.gear1 = 0;
             g_config.chihiro.jvs.wmmt2.gear2 = 0;
             g_config.chihiro.jvs.wmmt2.gear3 = 0;
@@ -1380,16 +1404,16 @@ void MainMenuChihiroView::DrawGameTab()
             g_config.chihiro.jvs.wmmt2.gear6 = 0;
             g_config.chihiro.jvs.wmmt2.view_change = 224;
             g_config.chihiro.jvs.wmmt2.intrude_change = 225;
-            g_config.chihiro.jvs.ctx.drive_gear = 225;
-            g_config.chihiro.jvs.ctx.reverse = 224;
-            g_config.chihiro.jvs.ctx.jump = 44;
-            g_config.chihiro.jvs.or2.view_change = 224;
+            break;
+        case CONFIG_CHIHIRO_JVS_PROFILE_OK:
             g_config.chihiro.jvs.ok.swing_left = 80;
             g_config.chihiro.jvs.ok.swing_right = 79;
             g_config.chihiro.jvs.ok.board_front = 82;
             g_config.chihiro.jvs.ok.board_rear = 81;
             g_config.chihiro.jvs.ok.left_grab = 29;
             g_config.chihiro.jvs.ok.right_grab = 27;
+            break;
+        case CONFIG_CHIHIRO_JVS_PROFILE_GUNDAM:
             g_config.chihiro.jvs.gundam.l_up = 26;
             g_config.chihiro.jvs.gundam.l_down = 22;
             g_config.chihiro.jvs.gundam.l_left = 4;
@@ -1403,6 +1427,7 @@ void MainMenuChihiroView::DrawGameTab()
             g_config.chihiro.jvs.gundam.r_trigger = 229;
             g_config.chihiro.jvs.gundam.r_button = 228;
             g_config.chihiro.jvs.gundam.pedal = 44;
+            break;
         }
         xemu_settings_save();
     }
