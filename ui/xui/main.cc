@@ -359,11 +359,8 @@ void xemu_hud_init(SDL_Window* window, void* sdl_gl_context)
     ImGui_ImplOpenGL3_Init("#version 150");
     ImPlot::CreateContext();
 
-#if defined(_WIN32)
-    if (!g_config.general.show_welcome && g_config.general.updates.check) {
-        update_window.CheckForUpdates();
-    }
-#endif
+    /* No update check at start: xemu's updater would install upstream
+     * xemu over this build. */
     g_last_scale = g_viewport_mgr.m_scale;
     InitializeStyle();
     g_main_menu.SetNextViewIndex(g_config.general.last_viewed_menu_index);

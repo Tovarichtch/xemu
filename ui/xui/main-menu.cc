@@ -63,11 +63,7 @@ void MainMenuTabView::Draw()
 
 void MainMenuGeneralView::Draw()
 {
-#if defined(_WIN32)
-    SectionTitle("Updates");
-    Toggle("Check for updates", &g_config.general.updates.check,
-           "Check for updates whenever xemu is opened");
-#endif
+    /* No update check: xemu's updater would install upstream xemu. */
 
 #if defined(__x86_64__)
     SectionTitle("Performance");
