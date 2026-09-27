@@ -2979,8 +2979,8 @@ static const char *get_eeprom_path(void)
 {
     /* Each machine has its own EEPROM: the Xbox's is the configured file
      * with a retail key; the Chihiro's carries the debug key its BIOS
-     * expects, is never written by the machine, and lives in the data
-     * directory like a save. */
+     * expects and lives in the data directory like a save. Both are
+     * written back when the machine changes them. */
     bool is_chihiro = xemu_chihiro_mode();
     XboxEEPROMVersion needed = is_chihiro ? XBOX_EEPROM_VERSION_D
                                           : XBOX_EEPROM_VERSION_R1;

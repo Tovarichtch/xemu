@@ -387,11 +387,14 @@ void xbox_init_common(MachineState *machine,
 
         /* Chihiro: disable Xbox EEPROM persistence.
          * The service menu writes video/region settings that can corrupt
-         * subsequent boots. Game settings are in ic11/extmem (save system). */
+         * subsequent boots. Game settings are in ic11/extmem (save system).
+         * Commented out: it never took effect, as the EEPROM device is
+         * created after the board (vl.c), so the EEPROM is written back.
         Object *eeprom_obj = object_resolve_path_type("", "smbus-storage", NULL);
         if (eeprom_obj) {
             object_property_set_bool(eeprom_obj, "persist", false, NULL);
         }
+         */
 
         chihiro_ide_load_rom();
 
