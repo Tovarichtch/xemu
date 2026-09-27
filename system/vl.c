@@ -3011,12 +3011,23 @@ static const char *get_eeprom_path(void)
             fclose(f);
             bool debug = xbox_eeprom_detect_version(data) == XBOX_EEPROM_VERSION_D;
             if (valid && debug != is_chihiro) {
-                char *aside = g_strdup_printf("%s.%s", path,
-                                              debug ? "debug" : "retail");
-                printf("EEPROM '%s' has the %s key, kept as '%s' and regenerated\n",
-                       path, debug ? "debug" : "retail", aside);
-                if (g_rename(path, aside) != 0) {
-                    qemu_unlink(path);
+                /* Kept under a free name: the user's file is never
+                 * deleted, nor an older copy overwritten. */
+                const char *kind = debug ? "debug" : "retail";
+                char *aside = g_strdup_printf("%s.%s", path, kind);
+                for (int n = 1; n < 100 && qemu_access(aside, F_OK) == 0; n++) {
+                    g_free(aside);
+                    aside = g_strdup_printf("%s.%s.%d", path, kind, n);
+                }
+                if (qemu_access(aside, F_OK) != 0 && g_rename(path, aside) == 0) {
+                    printf("EEPROM '%s' has the %s key, kept as '%s' and "
+                           "regenerated\n", path, kind, aside);
+                } else {
+                    char *msg = g_strdup_printf(
+                        "EEPROM '%s' has the %s key and could not be set "
+                        "aside.\n\nMove it away and restart xemu.", path, kind);
+                    xemu_queue_error_message(msg);
+                    g_free(msg);
                 }
                 g_free(aside);
             }
