@@ -255,8 +255,11 @@ void ShowMainMenu()
                 SDL_OpenURL("https://xemu.app/docs/getting-started/");
             }
 
+            /* Commented out: it would send this build's reports to
+             * upstream xemu's server.
             ImGui::MenuItem("Report Compatibility...", NULL,
                             &compatibility_reporter_window.is_open);
+             */
             /* No "Check for Updates...": xemu's updater would install
              * upstream xemu over this build. */
 
