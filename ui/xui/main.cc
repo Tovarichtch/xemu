@@ -220,6 +220,14 @@ static bool ChihiroGunGame(void)
            profile == CONFIG_CHIHIRO_JVS_PROFILE_GS;
 }
 
+/* A gun in play takes the mouse buttons: an Xbox light gun, or gun mode in
+ * a Chihiro gun game. */
+static bool GunTakesMouse(void)
+{
+    return xemu_input_lightgun_active() ||
+           (ChihiroGunGame() && g_config.chihiro.settings.lightgun_mode);
+}
+
 static void RenderLightGunOverlays(void)
 {
     bool gun_game = ChihiroGunGame();
@@ -522,13 +530,11 @@ void xemu_hud_update(void)
         } else if (HotkeyPressed(g_config.input.hotkeys.quick_menu)) {
             g_scene_mgr.PushScene(g_popup_menu);
         } else if (menu_button ||
-                   (!xemu_input_lightgun_active() &&
-                    !g_config.chihiro.settings.lightgun_mode &&
+                   (!GunTakesMouse() &&
                     ImGui::IsMouseClicked(ImGuiMouseButton_Right) &&
                     !ImGui::IsAnyItemFocused() && !ImGui::IsAnyItemHovered())) {
             g_scene_mgr.PushScene(g_popup_menu);
-        } else if (!xemu_input_lightgun_active() &&
-                   !g_config.chihiro.settings.lightgun_mode &&
+        } else if (!GunTakesMouse() &&
                    ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
             xemu_toggle_fullscreen();
         }

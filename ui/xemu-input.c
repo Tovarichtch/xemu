@@ -2501,10 +2501,15 @@ void xemu_input_reset_input_mapping(ControllerState *state)
     }
 }
 
+/* An Xbox light gun plugged in: a gun driver with a controller on its port.
+ * A Chihiro's ports carry no Xbox device. */
 int xemu_input_lightgun_active(void)
 {
+    if (xemu_chihiro_mode()) {
+        return 0;
+    }
     for (int i = 0; i < 4; i++) {
-        if (bound_drivers[i] &&
+        if (bound_controllers[i] && bound_drivers[i] &&
             strcmp(bound_drivers[i], DRIVER_LIGHT_GUN) == 0) {
             return 1;
         }
