@@ -3048,6 +3048,9 @@ static int chihiro_lpc_post_load(void *opaque, int version_id)
         chihiro_game_running = s->mig_game_running;
         chihiro_quickreboot_pending = s->mig_quickreboot_pending;
         chihiro_active = s->mig_active;
+        /* A game that was running had its Type-1 bootstrap then: it must
+         * not fire again in the middle of the game. */
+        chihiro_mbcom_bootstrap_done = chihiro_game_running;
     }
     if (version_id >= 4 && s->mig_game_filename[0]) {
         /* Goes through the single writer, so the cabinet is worked out
