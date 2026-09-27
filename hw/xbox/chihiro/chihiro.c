@@ -1852,6 +1852,9 @@ static void chihiro_dimm_process_cmd(ChihiroLPCState *s)
         s->dimm_resp[2] = mediaboard.fw_version;
         break;
     case MB_CMD_SYSTEM_TYPE: /* low byte must be >=2 to pass board check */
+        /* Not read on the boots logged (HOTD3, Crazy Taxi): SEGABOOT asks
+         * through the IDE mailbox, answered board_type | fw << 8 by
+         * chihiro_mbcom_process, and the games do not ask. */
         s->dimm_resp[2] = 0x8002;
         break;
     case MB_CMD_GET_SERIAL:
