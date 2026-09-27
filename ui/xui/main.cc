@@ -224,12 +224,11 @@ static void RenderLightGunOverlays(void)
 {
     bool gun_game = ChihiroGunGame();
 
-    /* The cursor stays visible in the menus, gun mode or not. */
+    /* Gun mode hides the cursor; the menus keep it. Asked through ImGui, as
+     * "Hide mouse cursor" does, since a direct SDL call would undo it. */
     if (gun_game && g_config.chihiro.settings.lightgun_mode &&
         !g_scene_mgr.IsDisplayingScene())
-        SDL_HideCursor();
-    else
-        SDL_ShowCursor();
+        ImGui::SetMouseCursor(ImGuiMouseCursor_None);
 
     if (!gun_game)
         return;
