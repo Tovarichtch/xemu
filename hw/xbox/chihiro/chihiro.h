@@ -49,6 +49,8 @@ const uint8_t *chihiro_flash_rom_bytes(uint32_t *size);
 /* Why the last DIMM snapshot save or load failed, NULL when it did not:
  * the vmstate hooks can only return an errno, the UI wants words. */
 const char *chihiro_dimm_last_error(void);
+/* Forgets it, before a new save or load. */
+void chihiro_dimm_clear_error(void);
 /* Size and CRC32 of the mounted netboot image as the DIMM delta records
  * them; false when the image cannot be read. */
 bool chihiro_dimm_image_identity(uint64_t *size, uint32_t *crc);

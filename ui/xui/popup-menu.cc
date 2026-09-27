@@ -437,8 +437,7 @@ public:
             pop = true;
         }
         if (PopupMenuButton("Save Snapshot", ICON_FA_DOWNLOAD)) {
-            xemu_snapshots_save(NULL, NULL);
-            xemu_queue_notification("Created new snapshot");
+            ActionCreateSnapshot();
             pop = true;
         }
         if (PopupMenuSubmenuButton("Games", ICON_FA_GAMEPAD)) {

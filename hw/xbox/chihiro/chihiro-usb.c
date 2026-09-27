@@ -755,14 +755,8 @@ static void chihiro_an2131qc_realize(USBDevice *dev, Error **errp)
 
     chihiro_qc_instance = s;
 
-    printf("[%07lld] Chihiro QC: ic10=%s ic11=%s, "
-           "region=0x%02X, serial=%.16s, LLE=%s\n",
-           TS_MS,
-           chihiro_ic10_data ? "disk" : "builtin",
-           chihiro_ic11_data ? "disk" : "builtin",
-           s->eeprom[0x1F00],
-           (const char *)&s->eeprom[0x1F10],
-           s->use_lle ? "ACTIVE" : "OFF");
+    printf("[%07lld] Chihiro QC: ic10 + ic11 loaded, region=0x%02X, LLE=%s\n",
+           TS_MS, s->eeprom[0x1F00], s->use_lle ? "ACTIVE" : "OFF");
 }
 
 static void chihiro_an2131qc_unrealize(USBDevice *dev)

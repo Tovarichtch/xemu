@@ -337,7 +337,9 @@ static void usb_xid_light_gun_handle_data(USBDevice *dev, USBPacket *p)
         break;
     case USB_TOKEN_OUT:
         if (p->ep->nr == LIGHT_GUN_OUT_ENDPOINT_ID) {
-            usb_packet_copy(p, &s->out_state, s->out_state.bLength);
+            /* The report size is the packet's, never more than the state */
+            usb_packet_copy(p, &s->out_state,
+                            MIN(p->iov.size, sizeof(s->out_state)));
             update_lg_output(s);
         } else {
             assert(false);

@@ -251,7 +251,11 @@ static void xemu_snapshots_chihiro_reason(Error **err, const char *what,
     }
     error_free(*err);
     *err = NULL;
-    error_setg(err, "Cannot %s snapshot '%s': %s.", what, vm_name, reason);
+    if (vm_name) {
+        error_setg(err, "Cannot %s snapshot '%s': %s.", what, vm_name, reason);
+    } else {
+        error_setg(err, "Cannot %s the snapshot: %s.", what, reason);
+    }
 }
 
 /* After a half-restored load the machine sits in restore-vm, from which
@@ -276,6 +280,7 @@ void xemu_snapshots_load(const char *vm_name, Error **err)
         qemu_savevm_state_blocked(err)) {
         return;
     }
+    chihiro_dimm_clear_error();
     Error *local_err = NULL;
     if (bdrv_all_has_snapshot(vm_name, false, NULL, &local_err) <= 0) {
         if (!local_err) {
@@ -298,8 +303,9 @@ void xemu_snapshots_load(const char *vm_name, Error **err)
      * failure it stays stopped, as upstream leaves it, and the box says to
      * restart. */
     if (chihiro_dimm_last_error()) {
-        error_setg(err, "Snapshot '%s' does not belong to the mounted game "
-                   "and the machine is now unusable: restart xemu.", vm_name);
+        error_setg(err, "Snapshot '%s' could not be loaded: %s. The machine "
+                   "is now unusable: restart xemu.", vm_name,
+                   chihiro_dimm_last_error());
     } else {
         error_setg(err, "Snapshot '%s' could not be loaded (%s) and the "
                    "machine is now unusable: restart xemu.", vm_name,
@@ -399,6 +405,7 @@ void xemu_snapshots_save(const char *vm_name, Error **err)
     if (xemu_snapshots_machine_unusable(err)) {
         return;
     }
+    chihiro_dimm_clear_error();
     save_snapshot(vm_name, true, NULL, false, NULL, err);
     if (err && *err) {
         xemu_snapshots_chihiro_reason(err, "save", vm_name);

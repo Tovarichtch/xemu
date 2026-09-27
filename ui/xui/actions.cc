@@ -162,6 +162,19 @@ void QuickSlotDates(int64_t dates[4])
     }
 }
 
+/* A refused save (a cabinet link, an unreadable image) says why. */
+void ActionCreateSnapshot()
+{
+    Error *err = NULL;
+    xemu_snapshots_save(NULL, &err);
+    if (err) {
+        xemu_queue_error_message(error_get_pretty(err));
+        error_free(err);
+        return;
+    }
+    xemu_queue_notification("Created new snapshot");
+}
+
 void ActionQuickSave(int slot)
 {
     std::string name = QuickSlotName(QuickSlotGame(), slot);

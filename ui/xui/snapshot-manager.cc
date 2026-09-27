@@ -54,6 +54,13 @@ static const char *path_basename_ptr(const char *path)
     return sep ? sep + 1 : path;
 }
 
+bool ChihiroSnapshotOtherImage(const XemuSnapshotData *data)
+{
+    return data && data->disc_path && data->disc_path[0] &&
+           g_ascii_strcasecmp(path_basename_ptr(data->disc_path),
+                              path_basename_ptr(xemu_chihiro_image())) != 0;
+}
+
 void SnapshotManager::Refresh()
 {
     Error *err = NULL;

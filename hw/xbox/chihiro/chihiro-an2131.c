@@ -714,6 +714,18 @@ static void check_interrupts(AN2131State *s)
 
 /* ── Public API ───────────────────────────────────────────────────── */
 
+/* The MIDI and card pacing stamps count against total_cycles and are not
+ * saved: after a CPU release (total_cycles back to 0) or a load, an old stamp
+ * would let one byte, or one TI, skip its pacing. They start over. */
+static void an2131_pacing_reset(AN2131State *s)
+{
+    s->midi_response_ready = false;
+    s->midi_response_set_cycles = 0;
+    memset(s->card_resp_cycles, 0, sizeof(s->card_resp_cycles));
+    memset(s->card_delivering, 0, sizeof(s->card_delivering));
+    memset(s->card_ti_cycles, 0, sizeof(s->card_ti_cycles));
+}
+
 /* Re-attach pointers and callbacks after a load; an in-flight I2C transaction
  * drops to idle, and pending interrupts are looked at again. */
 void an2131_relink(AN2131State *s)
@@ -729,6 +741,7 @@ void an2131_relink(AN2131State *s)
     s->i2c.phase = I2C_IDLE;
     s->i2c.eeprom = NULL;
     memset(&s->idle, 0, sizeof(s->idle));
+    an2131_pacing_reset(s);
 }
 
 void an2131_init(AN2131State *s)
@@ -867,6 +880,7 @@ static void an2131_set_cpucs(AN2131State *s, uint8_t val)
         cpu8051_reset(&s->cpu);
 
         s->total_cycles = 0;
+        an2131_pacing_reset(s);
         s->jvs_response_set_cycles = 0;
         s->jvs_response_ready = false;
         s->jvs_rx_pending = false;

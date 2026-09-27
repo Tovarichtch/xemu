@@ -975,11 +975,12 @@ static void window_title(char *title, size_t n)
 static void update_window_title(void)
 {
     static char last[192];
-    static int tick;
-    if (++tick < 60) {
+    static int64_t next_us;
+    int64_t now = g_get_monotonic_time();
+    if (now < next_us) {
         return;
     }
-    tick = 0;
+    next_us = now + G_USEC_PER_SEC;
     char title[192];
     window_title(title, sizeof(title));
     if (strcmp(title, last) != 0) {

@@ -21,6 +21,10 @@
 #include <string>
 #include "../xemu-snapshots.h"
 
+/* CHIHIRO (not upstream): true when a Chihiro snapshot names another image
+ * than the one the machine booted. */
+bool ChihiroSnapshotOtherImage(const XemuSnapshotData *data);
+
 class SnapshotManager
 {
 public:

@@ -100,8 +100,7 @@ void ShowMainMenu()
 
             if (ImGui::BeginMenu("Snapshot")) {
                 if (ImGui::MenuItem("Create Snapshot")) {
-                    xemu_snapshots_save(NULL, NULL);
-                    xemu_queue_notification("Created new snapshot");
+                    ActionCreateSnapshot();
                 }
 
                 int64_t dates[4];

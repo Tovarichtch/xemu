@@ -27,6 +27,7 @@ void ActionTogglePause();
 void ActionReset();
 void ActionShutdown();
 void ActionScreenshot();
+void ActionCreateSnapshot();
 void ActionQuickSave(int slot);
 void ActionQuickLoad(int slot);
 /* When quick slots 0 to 3 of the game running were saved, in seconds since

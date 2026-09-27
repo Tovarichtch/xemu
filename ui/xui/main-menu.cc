@@ -2332,7 +2332,7 @@ void MainMenuSnapshotsView::Draw()
     Toggle("Filter by current title",
            &g_config.general.snapshots.filter_current_game,
            "Only display snapshots created while running the currently running "
-           "XBE");
+           "XBE (on a Chihiro: the game it booted)");
 
     /* CHIHIRO (not upstream): an Xbox keeps its snapshots in its hard disk
      * image; a Chihiro has none, so they go to this file, attached when
@@ -2394,8 +2394,13 @@ void MainMenuSnapshotsView::Draw()
     }
     if (ImGui::Button(snapshot_with_create_name_exists ? "Replace" : "Create",
                       ImVec2(-FLT_MIN, 0))) {
+        Error *err = NULL;
         xemu_snapshots_save(m_search_buf.empty() ? NULL : m_search_buf.c_str(),
-                            NULL);
+                            &err);
+        if (err) {
+            xemu_queue_error_message(error_get_pretty(err));
+            error_free(err);
+        }
         ClearSearch();
     }
     if (snapshot_with_create_name_exists) {
@@ -2412,7 +2417,15 @@ void MainMenuSnapshotsView::Draw()
     bool at_least_one_snapshot_displayed = false;
 
     for (int i = g_snapshot_mgr.m_snapshots_len - 1; i >= 0; i--) {
+        /* CHIHIRO (not upstream): a Chihiro snapshot is kept when it names
+         * the image the machine booted; executables are shared (OutRun 2 and
+         * SP, MJ3 and Evo) and most games carry no title. */
         if (g_config.general.snapshots.filter_current_game &&
+            xemu_chihiro_mode()) {
+            if (ChihiroSnapshotOtherImage(&g_snapshot_mgr.m_extra_data[i])) {
+                continue;
+            }
+        } else if (g_config.general.snapshots.filter_current_game &&
             g_snapshot_mgr.m_extra_data[i].xbe_title_name &&
             m_current_title_name.size() &&
             strcmp(m_current_title_name.c_str(),

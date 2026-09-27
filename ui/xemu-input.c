@@ -796,6 +796,10 @@ void xemu_input_update_controller(ControllerState *state)
         xemu_input_update_sdl_kbd_controller_state(state);
     } else if (state->type == INPUT_DEVICE_SDL_GAMEPAD) {
         xemu_input_update_sdl_controller_state(state);
+    } else {
+        /* LIGHTGUN (not upstream): a raw joystick has no updater to clear
+         * the gun's buttons, which the pointer sets below. */
+        state->lg.buttons = 0;
     }
     /* LIGHTGUN (not upstream) */
     if (state->bound >= 0 &&
@@ -1033,7 +1037,7 @@ static bool chihiro_check_input(int binding, const bool *kbd, uint32_t mouseBtn)
         binding < CHIHIRO_MOUSE_BUTTON_BASE + CHIHIRO_POINTER_BUTTONS) {
         return (mouseBtn & (1u << (binding - CHIHIRO_MOUSE_BUTTON_BASE))) != 0;
     }
-    return (binding > 0 && kbd[binding]);
+    return (binding > 0 && binding < SDL_SCANCODE_COUNT && kbd[binding]);
 }
 
 /* The Chihiro games played with a gun. */

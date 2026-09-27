@@ -1529,10 +1529,16 @@ static void chihiro_arm_diag_cb(void *opaque)
     if (s->diag_armed) return;
     if (chihiro_game_running) return;
 
-    /* Before the game: the periodic tick watches SEGABOOT, 1 s from now. */
+    /* Before the game: the periodic tick watches SEGABOOT, 1 s from now.
+     * After a QuickReboot it is already armed and keeps its deadline. */
     s->diag_armed = true;
-    s->diag_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, chihiro_diag_timer_cb, s);
-    timer_mod(s->diag_timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 1000);
+    if (!s->diag_timer) {
+        s->diag_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL,
+                                     chihiro_diag_timer_cb, s);
+    }
+    if (!timer_pending(s->diag_timer)) {
+        timer_mod(s->diag_timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 1000);
+    }
 }
 
 /* Called from SMC SCRATCH write handler when value=0x04 (QuickReboot).
@@ -3599,6 +3605,11 @@ static char chihiro_dimm_error[256];
 const char *chihiro_dimm_last_error(void)
 {
     return chihiro_dimm_error[0] ? chihiro_dimm_error : NULL;
+}
+
+void chihiro_dimm_clear_error(void)
+{
+    chihiro_dimm_error[0] = 0;
 }
 
 static const char *chihiro_image_basename(void)
