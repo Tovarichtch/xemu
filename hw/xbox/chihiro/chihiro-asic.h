@@ -46,10 +46,11 @@ void chihiro_asic_set_running(bool running);
 void chihiro_asic_host_mailbox_write(uint32_t offset, uint32_t val);
 
 /* The host rang the board with the 32-byte message in its command window. A
- * command is run inline until the board posts its next message, returned in
- * msg8 (true); a reply to one of the board's own commands (bit 31) only
- * rings. False, too, when the core is not running or has posted nothing yet:
- * whatever it posts later reaches chihiro_dimm_board_posted(). */
+ * command runs inline until the board posts its next message; a reply to one
+ * of the board's own commands (bit 31) runs until the board takes it. True,
+ * with msg8 filled, when a message was posted meanwhile; false when the core
+ * is not running or has posted nothing yet: whatever it posts later reaches
+ * chihiro_dimm_board_posted(). */
 bool chihiro_asic_mailbox_exchange(const uint32_t *cmd8, uint32_t *msg8);
 
 #endif

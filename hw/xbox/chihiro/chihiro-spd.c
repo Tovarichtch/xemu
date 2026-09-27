@@ -38,7 +38,8 @@ enum {
 
 /* ------------------------------------------------------------------ content */
 
-/* A complete JEDEC SPD for an unbuffered SDRAM DIMM. */
+/* A JEDEC SPD for an unbuffered SDRAM DIMM; the firmware reads only bytes 31,
+ * 5 and 63 (chihiro-spd.h). */
 static void spd_fill(uint8_t *p, unsigned mb)
 {
     unsigned sum = 0;

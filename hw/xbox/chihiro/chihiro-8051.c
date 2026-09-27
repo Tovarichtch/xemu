@@ -36,12 +36,11 @@ static inline uint8_t fetch(Cpu8051State *s)
     return code_read(s, s->pc++);
 }
 
-static inline uint8_t fetch16_hi(Cpu8051State *s, uint16_t *out)
+static inline void fetch16_hi(Cpu8051State *s, uint16_t *out)
 {
     uint8_t hi = fetch(s);
     uint8_t lo = fetch(s);
     *out = (hi << 8) | lo;
-    return 0;
 }
 
 /* Direct addressing: 0x00-0x7F → iram, 0x80-0xFF → SFR */
@@ -90,14 +89,12 @@ static inline void indirect_write(Cpu8051State *s, uint8_t addr, uint8_t val)
 static inline uint8_t xdata_read(Cpu8051State *s, uint16_t addr)
 {
     if (s->xdata_read) return s->xdata_read(s, addr);
-    if (addr < sizeof(s->xram)) return s->xram[addr];
     return 0xFF;
 }
 
 static inline void xdata_write(Cpu8051State *s, uint16_t addr, uint8_t val)
 {
-    if (s->xdata_write) { s->xdata_write(s, addr, val); return; }
-    if (addr < sizeof(s->xram)) { s->xram[addr] = val; return; }
+    if (s->xdata_write) s->xdata_write(s, addr, val);
 }
 
 /* Register bank */
@@ -150,17 +147,11 @@ static inline uint8_t pop8(Cpu8051State *s)
     return val;
 }
 
-/* ── parity ────────────────────────────────────────────────────────── */
+/* ── timer tick (called once per instruction) ─────────────────────── */
 
-static inline void update_parity(Cpu8051State *s)
-{
-    uint8_t p = s->acc;
-    p ^= p >> 4; p ^= p >> 2; p ^= p >> 1;
-    if (p & 1) s->psw |= PSW_P; else s->psw &= ~PSW_P;
-}
-
-/* ── timer tick (called once per machine cycle) ───────────────────── */
-
+/* Timers 0 and 1 in modes 1 and 2 only: GATE, modes 0 and 3 and Timer 2 are
+ * not modelled, and Timer 0 always counts the clock (C/T ignored). The UARTs
+ * here do not run off the timers. */
 static void timer_tick(Cpu8051State *s)
 {
     uint8_t tcon = s->sfr[SFR_TCON - 0x80];
@@ -168,7 +159,9 @@ static void timer_tick(Cpu8051State *s)
 
     /* Timer 0 — only if TR0 is set (TCON.4) */
     if (tcon & 0x10) {
-        /* AN2131 CKCON.3: 0=CLK/12 (tick every 3 machine cycles), 1=CLK/4 */
+        /* CKCON (0x8E, an AN2131 register) bit 3, T0M: 0 = CLK/12, one tick
+         * every 3 instructions here (HEURISTIC: silicon counts machine
+         * cycles); 1 = CLK/4, one tick per instruction. */
         bool t0_fast = s->sfr[0x8E - 0x80] & 0x08;
         bool t0_tick = true;
         if (!t0_fast) {
@@ -238,8 +231,6 @@ static void timer_tick(Cpu8051State *s)
 int cpu8051_step(Cpu8051State *s)
 {
     timer_tick(s);
-
-    if (s->halted) return 1;
 
     uint8_t op = fetch(s);
     uint8_t a, b8, d, tmp, carry;
@@ -864,7 +855,8 @@ int cpu8051_step(Cpu8051State *s)
         s->acc = xdata_read(s, s->dptr);
         return 2;
 
-    /* ── MOVX A,@R0 / @R1 (8-bit address, P2 as high byte) ── */
+    /* ── MOVX A,@R0 / @R1 (8-bit address, P2 as high byte; the AN2131 pages
+     * with MPAGE, but neither firmware writes MPAGE or P2) ── */
     case 0xE2: case 0xE3:
         a = *reg_ptr(s, op & 1);
         w = ((uint16_t)direct_read(s, SFR_P2) << 8) | a;
@@ -897,7 +889,7 @@ int cpu8051_step(Cpu8051State *s)
         xdata_write(s, s->dptr, s->acc);
         return 2;
 
-    /* ── MOVX @R0,A / @R1,A (8-bit address, P2 as high byte) ── */
+    /* ── MOVX @R0,A / @R1,A (8-bit address, P2 as high byte, as above) ── */
     case 0xF2: case 0xF3:
         a = *reg_ptr(s, op & 1);
         w = ((uint16_t)direct_read(s, SFR_P2) << 8) | a;
@@ -957,7 +949,6 @@ int cpu8051_step(Cpu8051State *s)
 
 void cpu8051_interrupt(Cpu8051State *s, uint8_t vector)
 {
-    s->halted = false;
     s->in_interrupt = true;
     s->irq_recheck = true;
     s->events++;
@@ -982,10 +973,7 @@ void cpu8051_reset(Cpu8051State *s)
     s->dptr = 0;
     s->dptr_alt = 0;
     s->psw = 0;
-    s->halted = false;
     s->in_interrupt = false;
-    s->cycles = 0;
     memset(s->iram, 0, sizeof(s->iram));
     memset(s->sfr, 0, sizeof(s->sfr));
-    memset(s->xram, 0, sizeof(s->xram));
 }

@@ -77,8 +77,8 @@ static int jvs_handle_command(ChihiroJVSState *s,
     case 0xF0: /* Reset */
         if (cmd_len < 2) return 1;
         s->reset_count++;
-        fprintf(stderr, "[%07lld] JVS RESET: reset_count=%d sense=%d id=%d\n",
-               TS_MS, s->reset_count, s->sense, s->device_id);
+        CHIHIRO_LOGF(JVS, "JVS RESET: reset_count=%d sense=%d id=%d\n",
+                     s->reset_count, s->sense, s->device_id);
         if (s->reset_count >= 2) {
             s->device_id = 0;
             s->sense = 3;
@@ -97,8 +97,8 @@ static int jvs_handle_command(ChihiroJVSState *s,
     case 0xF1: /* Set Device ID */
         if (cmd_len < 2) return 1;
         if (s->sense == 0) {
-            fprintf(stderr, "[%07lld] JVS SET_ID: BLOCKED sense=0 id=%d (already assigned)\n",
-                   TS_MS, s->device_id);
+            CHIHIRO_LOGF(JVS, "JVS SET_ID: BLOCKED sense=0 id=%d (already "
+                         "assigned)\n", s->device_id);
             *rpos = rp;
             return 2;
         }
@@ -315,24 +315,22 @@ int chihiro_jvs_process(ChihiroJVSState *s,
     uint8_t target = in[1];
     int escaped_count = in[2];
 
-    /* JVS over Chihiro USB is a raw byte stream — escape encoding (0xD0)
-     * is a physical RS-485 layer concern and is NOT used over USB. */
+    /* The caller (the QC's UART1, chihiro-an2131.c) removes and restores
+     * the 0xD0 escapes, and hands over whole frames: the bytes here are
+     * raw, and raw_len is escaped_count. */
     const uint8_t *raw = in + 3;
     int raw_len = in_len - 3;
 
-    if (raw_len < escaped_count) {
-        /* Incomplete packet — but try to process what we have */
-    }
-
     /* Verify checksum: sum of (target + count + all_data_bytes) & 0xFF */
-    int data_len = (raw_len >= escaped_count) ? escaped_count - 1 : raw_len - 1;
+    int data_len = MIN(raw_len, escaped_count) - 1;
     if (data_len < 0) data_len = 0;
 
     uint8_t csum = target + escaped_count;
     for (int i = 0; i < data_len; i++) csum += raw[i];
-    if (raw_len >= escaped_count && raw[escaped_count - 1] != (csum & 0xFF)) {
-        printf("[%07lld] JVS: checksum error (got 0x%02X, expected 0x%02X)\n",
-               TS_MS, raw[escaped_count - 1], csum & 0xFF);
+    if (escaped_count >= 1 && raw_len >= escaped_count &&
+        raw[escaped_count - 1] != (csum & 0xFF)) {
+        CHIHIRO_ERRF("JVS: checksum error (got 0x%02X, expected 0x%02X)\n",
+                     raw[escaped_count - 1], csum & 0xFF);
     }
 
     /* Broadcast: Reset gets no response, but Set ID does (claiming device responds) */
@@ -355,11 +353,9 @@ int chihiro_jvs_process(ChihiroJVSState *s,
 
     /* Addressed packet — must match our device_id (broadcast Set ID also passes) */
     if (target != JVS_BROADCAST && target != s->device_id && s->device_id != 0) {
-        fprintf(stderr, "[%07lld] JVS DROPPED: target=0x%02X (our id=%d) data(%d):",
-               TS_MS, target, s->device_id, data_len);
-        for (int i = 0; i < data_len && i < 16; i++)
-            fprintf(stderr, " %02X", raw[i]);
-        fprintf(stderr, "\n");
+        CHIHIRO_LOG_HEX(JVS, raw, MIN(data_len, 16),
+                        "JVS DROPPED: target=0x%02X (our id=%d) data(%d):",
+                        target, s->device_id, data_len);
         return 0;
     }
 
@@ -378,8 +374,8 @@ int chihiro_jvs_process(ChihiroJVSState *s,
         remaining -= consumed;
     }
 
-    /* Build framed response: SYNC + host_addr + count + payload + checksum
-     * No escape encoding — USB transport uses raw bytes. */
+    /* Build framed response: SYNC + host_addr + count + payload + checksum,
+     * raw: the caller escapes it. */
     uint8_t frame[sizeof(payload) + 4];     /* SYNC, address, count, sum */
     int fpos = 0;
     uint8_t resp_count = ppos + 1; /* payload + checksum */

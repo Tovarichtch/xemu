@@ -25,8 +25,9 @@
 #include <stdbool.h>
 
 /* Brings the board up from its firmware image (the 2 MB flash, or the 1 MB
- * half of it that dumps carry) and starts its thread. Returns false, and
- * leaves no board, when there is no image. */
+ * half of it that dumps carry); its thread starts on first contact (a
+ * doorbell, the window, or a frame). Returns false, and leaves no board, when
+ * there is no image. */
 /* serial: the media board's 16 characters; ip: the cabinet's address as
  * the dotted quad a.b.c.d packed a | b << 8 | c << 16 | d << 24. */
 bool chihiro_netboard_init(const char *firmware_path, const char serial[16],
@@ -48,10 +49,10 @@ void chihiro_netboard_host_response(void *data, int len);
 void chihiro_netboard_host_release(void);          /* the response slot read */
 void chihiro_netboard_host_ack(void);              /* the Xbox acknowledged */
 /* The host-bus window: 1 MB of the board's SDRAM from 0x600000, which the
- * Xbox reaches as IDE sectors 0x9008000.. (the older acLib) or through the
- * LPC window at 0x91000000 (the newer). The two slots above are its first
- * 1 KB; bulk data (an address string, a sockaddr, a packet) sits further
- * in, at the offsets the command's arguments name. */
+ * Xbox reaches as IDE sectors 0x9008000..; through the LPC window only the
+ * two 8-word packets at 0x91000000/0x91000200 are modelled. The two slots
+ * above are its first 1 KB; bulk data (an address string, a sockaddr, a
+ * packet) sits further in, at the offsets the command's arguments name. */
 #define CHIHIRO_NETBOARD_WINDOW_SIZE 0x100000u
 void chihiro_netboard_host_window_write(uint32_t off, const void *data, int len);
 void chihiro_netboard_host_window_read(uint32_t off, void *data, int len);

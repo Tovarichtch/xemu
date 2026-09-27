@@ -51,10 +51,10 @@ typedef struct ChihiroUSBState {
     /* EZ-USB firmware download state (ANCHOR_LOAD / bRequest 0xA0) */
     uint32_t fw_bytes_written;  /* total bytes received via 0xA0 */
     bool fw_cpu_held;           /* true if CPUCS register set to hold CPU */
-    bool fw_loaded;             /* true after game firmware uploaded and CPU released */
-    bool eeprom_reloaded;       /* true after post-QuickReboot EEPROM reload (once) */
 
-    /* ic11 EEPROM (512 bytes) — baseboard config, "ACBU0001" + game ID */
+    /* ic11 EEPROM — baseboard config, "ACBU0001" + game ID: the 128-byte
+     * dump, seen through a 256-byte I2C window (a 24LC024); the buffer and
+     * the save file keep 512 */
     uint8_t ic11[512];
 
     /* The baseboard SRAM behind the 8051, two halves of 64 KB: [0] the
@@ -63,22 +63,14 @@ typedef struct ChihiroUSBState {
     uint8_t extmem[2][65536];
     bool extmem_backup_loaded;  /* a snapshot being loaded carried [1] */
 
-    /* Real AN2131 loads firmware from EEPROM after initial enumeration,
-     * then disconnects and reconnects. SEGABOOT waits for the CSC
-     * (Connect Status Change) from the reconnect to start Phase 2. */
-
-    /* JVS I/O board emulation state (shared between QC and SC paths) */
+    /* The JVS I/O board: the QC's copy, reached through chihiro_jvs_global.
+     * The SC's copy is unused. */
     ChihiroJVSState jvs;
 
     /* AN2131 LLE: 8051 CPU + register layer (runs ic10/pc20 firmware) */
     AN2131State an2131;
     bool use_lle;  /* true after firmware loaded and AN2131 CPU running */
     QEMUTimer *lle_tick_timer;
-
-    /* Runtime copy of USB descriptor — populated from EEPROM B2 header
-     * (VID/PID/bcdDevice) at realize instead of hardcoded constants */
-    USBDesc runtime_desc;
-    USBDescID runtime_id;
 } ChihiroUSBState;
 
 static ChihiroUSBState *chihiro_qc_instance;
@@ -184,15 +176,14 @@ static const USBDescDevice desc_device_chihiro_an2131qc = {
     },
 };
 
-/* Pre-LLE descriptor template — used only for initial USB enumeration before
- * ANCHOR_LOAD loads firmware into the 8051. After firmware load, the 8051
- * handles GET_DESCRIPTOR natively from its own descriptor table (CODE:0B7A).
- * VID/PID/bcdDevice overridden at realize from EEPROM B2 header. */
+/* The device's shape (.full) for the USB core. The 8051 firmware answers
+ * GET_DESCRIPTOR itself, from its own table (CODE:0B7A), so .id and .str are
+ * never sent. */
 static const USBDesc desc_chihiro_an2131qc = {
     .id = {
         .idVendor          = 0x0CA3,
         .idProduct         = 0x0002,
-        .bcdDevice         = 0x0108,  /* overridden from EEPROM[5:6] at realize */
+        .bcdDevice         = 0x0108,
         .iManufacturer     = STRING_MANUFACTURER,
         .iProduct          = STRING_PRODUCT,
         .iSerialNumber     = STRING_SERIALNUMBER,
@@ -266,12 +257,12 @@ static const USBDescDevice desc_device_chihiro_an2131sc = {
     },
 };
 
-/* Pre-LLE descriptor template — same as QC above */
+/* As for the QC above */
 static const USBDesc desc_chihiro_an2131sc = {
     .id = {
         .idVendor          = 0x0CA3,
         .idProduct         = 0x0003,
-        .bcdDevice         = 0x0110,  /* overridden from EEPROM[5:6] at realize */
+        .bcdDevice         = 0x0110,
         .iManufacturer     = STRING_MANUFACTURER,
         .iProduct          = STRING_PRODUCT,
         .iSerialNumber     = STRING_SERIALNUMBER,
@@ -577,10 +568,10 @@ static void handle_control(USBDevice *dev, USBPacket *p,
      *   0x30  External interrupt control
      *
      * SC (serial controller):
-     *   0x1A  Get UART0 data (gun controller response)
-     *   0x1B  Get UART1 / JVS response (SC-side JVS for lightgun games)
-     *   0x22  Send UART0 data (gun controller command)
-     *   0x23  Trigger UART1 / JVS poll
+     *   0x1A  Get UART0 data (RS-232C: the card reader)
+     *   0x1B  Get UART1 data (MIDI: the drive board, or the HW210 readers)
+     *   0x22  Send UART0 data
+     *   0x23  Send UART1 data
      *   0x25-0x2F  UART config
      *   0x31  Set PORTB pins
      *
@@ -613,14 +604,13 @@ static void handle_control(USBDevice *dev, USBPacket *p,
                 fprintf(stderr, "[%07lld] chihiro-usb [%s]: ANCHOR_LOAD CPUCS=%s (total %u bytes)\n",
                        TS_MS, id, hold ? "HOLD" : "RUN", s->fw_bytes_written);
                 if (s->fw_cpu_held && !hold) {
-                    s->fw_loaded = true;
                     s->use_lle = s->an2131.cpu_running;
                     if (s->use_lle) {
                         timer_mod(s->lle_tick_timer,
                                   qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 1);
                     }
-                    fprintf(stderr, "[%07lld] chihiro-usb [%s]: FW LOADED — LLE %s\n",
-                           TS_MS, id, s->use_lle ? "ACTIVE" : "INACTIVE (fallback HLE)");
+                    fprintf(stderr, "[%07lld] chihiro-usb [%s]: FW LOADED\n",
+                            TS_MS, id);
                 }
                 s->fw_cpu_held = hold;
             }
@@ -692,8 +682,6 @@ static void handle_data(USBDevice *dev, USBPacket *p)
             }
             an2131_ep_out_write(&s->an2131, ep, buf, chunk);
             an2131_run(&s->an2131, 2000);
-
-            /* Point A: JVS command incoming to AN2131 via EP4 OUT */
         }
         return;
     }
@@ -721,23 +709,12 @@ static void chihiro_an2131qc_realize(USBDevice *dev, Error **errp)
         return;
     }
 
-    /* Read USB descriptors from EEPROM B2 header instead of hardcoding.
-     * AN2131 B2 boot format: [0]=0xB2, [1:2]=VID, [3:4]=PID, [5:6]=bcdDevice */
-    s->runtime_desc = desc_chihiro_an2131qc;
-    s->runtime_id = desc_chihiro_an2131qc.id;
-    if (s->eeprom[0] == 0xB2) {
-        s->runtime_id.idVendor  = s->eeprom[1] | (s->eeprom[2] << 8);
-        s->runtime_id.idProduct = s->eeprom[3] | (s->eeprom[4] << 8);
-        s->runtime_id.bcdDevice = s->eeprom[5] | (s->eeprom[6] << 8);
-    }
-    s->runtime_desc.id = s->runtime_id;
-    dev->usb_desc = &s->runtime_desc;
     usb_desc_init(dev);
     /* The cabinet's region at eeprom[0x1F00], 1 Japan, 2 USA, 3 Export,
      * over whatever the ic10 dump carried: see chihiro_region_byte(). */
     s->eeprom[0x1F00] = chihiro_region_byte();
 
-    /* Load ic11 baseboard EEPROM (256 bytes, 24LC024) */
+    /* Load ic11 baseboard EEPROM (the 128-byte dump of a 24LC024) */
     memset(s->ic11, 0, sizeof(s->ic11));
     if (chihiro_ic11_data && chihiro_ic11_size <= sizeof(s->ic11)) {
         memcpy(s->ic11, chihiro_ic11_data, chihiro_ic11_size);
@@ -765,8 +742,6 @@ static void chihiro_an2131qc_realize(USBDevice *dev, Error **errp)
     s->an2131.ic11_eeprom = s->ic11;
     s->an2131.ic11_size = 256;
     s->an2131.extmem = s->extmem[0];
-    s->an2131.extmem_size = sizeof(s->extmem);
-    s->an2131.usb_dev = s;
 
     /* B2 boot: parse ic10 EEPROM firmware and start 8051 CPU */
     an2131_b2_boot(&s->an2131, s->eeprom, sizeof(s->eeprom));
@@ -813,10 +788,10 @@ static const VMStateDescription vmstate_cpu8051 = {
         VMSTATE_UINT8(psw, Cpu8051State),
         VMSTATE_UINT8_ARRAY(iram, Cpu8051State, 256),
         VMSTATE_UINT8_ARRAY(sfr, Cpu8051State, 128),
-        VMSTATE_UINT8_ARRAY(xram, Cpu8051State, 8192),
-        VMSTATE_BOOL(halted, Cpu8051State),
+        VMSTATE_UNUSED(8192),
+        VMSTATE_UNUSED(1),
         VMSTATE_BOOL(in_interrupt, Cpu8051State),
-        VMSTATE_UINT64(cycles, Cpu8051State),
+        VMSTATE_UNUSED(8),
         VMSTATE_UINT8(timer0_prescale, Cpu8051State),
         VMSTATE_END_OF_LIST()
     }
@@ -829,9 +804,8 @@ static const VMStateDescription vmstate_an2131 = {
     .fields = (const VMStateField[]) {
         VMSTATE_STRUCT(cpu, AN2131State, 1, vmstate_cpu8051, Cpu8051State),
         VMSTATE_UINT8_ARRAY(ram, AN2131State, AN2131_RAM_SIZE),
-        /* ep[] and the non-pointer half of i2c are plain scalars; raw
-         * bytes are fine for same-build save/load (our only use case).
-         * i2c pointers are dropped to idle in an2131_relink. */
+        /* ep[] is saved as raw bytes. An I2C transfer in flight is not
+         * saved: an2131_relink drops it to idle. */
         VMSTATE_BUFFER_UNSAFE(ep, AN2131State, 1,
                               sizeof(((AN2131State *)0)->ep)),
         VMSTATE_UINT8(ep0cs, AN2131State),
@@ -844,7 +818,7 @@ static const VMStateDescription vmstate_an2131 = {
         VMSTATE_UINT8(usbien, AN2131State),
         VMSTATE_UINT8(usbbav, AN2131State),
         VMSTATE_UINT8(i2cs, AN2131State),
-        VMSTATE_UINT8(i2dat, AN2131State),
+        VMSTATE_UNUSED(1),
         VMSTATE_BOOL(i2c_irq_pending, AN2131State),
         VMSTATE_BOOL(i2c_lastrd, AN2131State),
         VMSTATE_UINT8_ARRAY(rtc_regs, AN2131State, 16),
@@ -947,8 +921,6 @@ static int chihiro_usb_post_load(void *opaque, int version_id)
     s->an2131.ic11_eeprom = s->ic11;
     s->an2131.ic11_size = 256;
     s->an2131.extmem = s->extmem[0];
-    s->an2131.extmem_size = sizeof(s->extmem);
-    s->an2131.usb_dev = s;
 
     if (s->use_lle && s->an2131.cpu_running) {
         timer_mod(s->lle_tick_timer,
@@ -997,8 +969,7 @@ static const VMStateDescription vmstate_chihiro_usb = {
         VMSTATE_UINT8_ARRAY(eeprom, ChihiroUSBState, 8192),
         VMSTATE_UINT32(fw_bytes_written, ChihiroUSBState),
         VMSTATE_BOOL(fw_cpu_held, ChihiroUSBState),
-        VMSTATE_BOOL(fw_loaded, ChihiroUSBState),
-        VMSTATE_BOOL(eeprom_reloaded, ChihiroUSBState),
+        VMSTATE_UNUSED(2),
         VMSTATE_UINT8_ARRAY(ic11, ChihiroUSBState, 512),
         VMSTATE_UINT8_ARRAY(extmem[0], ChihiroUSBState, 65536),
         VMSTATE_STRUCT(jvs, ChihiroUSBState, 1,
@@ -1190,10 +1161,9 @@ static const VMStateDescription vmstate_chihiro_driveboard = {
         VMSTATE_BOOL(spring_active, DriveBoardState),
         VMSTATE_UINT8(damper_level, DriveBoardState),
         VMSTATE_UINT8(friction_power, DriveBoardState),
-        VMSTATE_UINT8(road_power, DriveBoardState),
-        VMSTATE_UINT8(road_freq, DriveBoardState),
+        VMSTATE_UNUSED(2),
         VMSTATE_UINT8(vibration_power, DriveBoardState),
-        VMSTATE_UINT8(vibration_speed, DriveBoardState),
+        VMSTATE_UNUSED(1),
         VMSTATE_UINT8(movement_dir, DriveBoardState),
         VMSTATE_UINT8(movement_power, DriveBoardState),
         VMSTATE_UINT8_2DARRAY(sud_pkg, DriveBoardState, 16, 16),
@@ -1220,19 +1190,9 @@ static void chihiro_an2131sc_realize(USBDevice *dev, Error **errp)
         return;
     }
 
-    /* Read USB descriptors from EEPROM B2 header */
-    s->runtime_desc = desc_chihiro_an2131sc;
-    s->runtime_id = desc_chihiro_an2131sc.id;
-    if (s->eeprom[0] == 0xB2) {
-        s->runtime_id.idVendor  = s->eeprom[1] | (s->eeprom[2] << 8);
-        s->runtime_id.idProduct = s->eeprom[3] | (s->eeprom[4] << 8);
-        s->runtime_id.bcdDevice = s->eeprom[5] | (s->eeprom[6] << 8);
-    }
-    s->runtime_desc.id = s->runtime_id;
-    dev->usb_desc = &s->runtime_desc;
     usb_desc_init(dev);
 
-    /* Load ic11 baseboard EEPROM (256 bytes, 24LC024) */
+    /* Load ic11 baseboard EEPROM (the 128-byte dump of a 24LC024) */
     memset(s->ic11, 0, sizeof(s->ic11));
     if (chihiro_ic11_data && chihiro_ic11_size <= sizeof(s->ic11)) {
         memcpy(s->ic11, chihiro_ic11_data, chihiro_ic11_size);
@@ -1273,8 +1233,6 @@ static void chihiro_an2131sc_realize(USBDevice *dev, Error **errp)
     s->an2131.ic11_eeprom = s->ic11;
     s->an2131.ic11_size = 256;
     s->an2131.extmem = s->extmem[0];
-    s->an2131.extmem_size = sizeof(s->extmem);
-    s->an2131.usb_dev = s;
 
     /* SC firmware init (FUN_CODE_0e9e) completes during B2 boot:
      * SCON/SCON1 |= 3 triggers serial ISRs, counters increment,

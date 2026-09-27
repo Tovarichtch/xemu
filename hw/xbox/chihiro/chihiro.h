@@ -32,16 +32,13 @@ uint8_t *chihiro_fatx_get_buffer(uint32_t *out_size);
 bool chihiro_ide_serve(int dma_cmd, uint32_t lba, int n,
                        QEMUSGList *sg, bool *irq);
 
-/* mbcom state */
-void chihiro_mbcom_init(void);
-
 /* USB delayed hotplug (AN2131 firmware boot simulation) */
 void chihiro_usb_set_devices(USBDevice *qc, USBDevice *sc);
 
 /* True if the file is the Chihiro BIOS listed by MAME. */
 bool chihiro_bios_known(const char *path);
 
-/* Load baseboard flash ROM (SEGABOOT) from file */
+/* Load the media board flash (SEGABOOT) from file */
 void chihiro_load_flash_rom(const char *bios_path);
 bool chihiro_flash_rom_loaded(void);
 
@@ -56,7 +53,8 @@ const char *chihiro_dimm_last_error(void);
  * them; false when the image cannot be read. */
 bool chihiro_dimm_image_identity(uint64_t *size, uint32_t *crc);
 
-/* Load baseboard EEPROMs (ic10, ic11, pc20) from BIOS directory */
+/* Load the baseboard EEPROMs (ic10, ic11, pc20): the configured paths first,
+ * then the BIOS directory */
 void chihiro_load_eeproms(const char *bios_path);
 extern uint8_t *chihiro_ic10_data;
 extern uint32_t chihiro_ic10_size;
@@ -102,9 +100,9 @@ extern char chihiro_game_filename[64];
 #define CHIHIRO_BOOTID_LEN 0xC0
 bool chihiro_bootid_executable(const uint8_t *bid, char *out, size_t out_len);
 void chihiro_set_game_executable(const char *name);
-extern bool chihiro_board_type3;
 
-/* The media board this machine presents, settled on the first call. */
+/* The media board this machine presents, settled once the game is named (on
+ * Auto; the setting otherwise). */
 bool chihiro_is_type3(void);
 /* A message the Type-3 board posted outside an exchange: a late answer, or a
  * command of its own; on the main loop. */
@@ -121,13 +119,9 @@ extern bool chihiro_game_running;
 void chihiro_on_ohci_bus_start(void);
 void chihiro_on_ohci_bus_stop(void);
 uint32_t chihiro_va_to_pa(uint32_t va);
-extern uint32_t chihiro_usb_sm_pa;
 
 /* Called from SMC when SCRATCH=0x04 (QuickReboot signal) */
 void chihiro_on_quickreboot_signal(void);
-
-/* Called from SMC POWER handler to detect QuickReboot */
-bool chihiro_intercept_reset(void);
 
 /* Save file persistence: ic11 + extmem backup area */
 bool chihiro_usb_save_load(const char *path);

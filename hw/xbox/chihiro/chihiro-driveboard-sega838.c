@@ -79,7 +79,6 @@ void driveboard_receive_byte(DriveBoardState *db, uint8_t byte)
             db->spring_active   = false;
             db->damper_level    = 0;
             db->friction_power  = 0;
-            db->road_power      = 0;
             db->vibration_power = 0;
             db->movement_power  = 0;
             db->event_pulse     = 0;
@@ -97,8 +96,7 @@ void driveboard_receive_byte(DriveBoardState *db, uint8_t byte)
         driveboard_push_response(db, 0x00);
         break;
     case 0x05:  /* wire 0x85: rumble / vibrate */
-    case 0x09:  /* wire 0x89: vibrate (same command) */
-        db->vibration_speed = p1;
+    case 0x09:  /* wire 0x89: vibrate (same command); P1 = speed, not used */
         db->vibration_power = p2;
         driveboard_push_response(db, 0x00);
         break;
@@ -110,8 +108,9 @@ void driveboard_receive_byte(DriveBoardState *db, uint8_t byte)
         driveboard_push_response(db, 0x00);
         break;
     case 0x07:  /* wire 0x87: SPRING -- the wheel's main auto-centering force
-                 * (P1=direction, P2=magnitude). The host renders an SDL spring
-                 * toward center, so we only latch that centering is engaged. */
+                 * (P1=direction, P2=magnitude). The host renders it with the
+                 * wheel's autocentre (and an SDL spring), so we only latch
+                 * that centering is engaged. */
         db->spring_active = true;
         driveboard_push_response(db, 0x00);
         break;
@@ -122,9 +121,7 @@ void driveboard_receive_byte(DriveBoardState *db, uint8_t byte)
     case 0x0B:  /* wire 0x8B: VIBRATION -- road/engine buzz, NOT centering.
                  * P1 = level*8 (0x20-0x78, rises with speed), P2 = freq*2. OR2's
                  * continuous vibration channel (command 0x0B, outrun2.xbe's
-                 * db_dispatch_effects). */
-        db->road_power = p1;
-        db->road_freq  = p2;
+                 * db_dispatch_effects). Not rendered: ack only. */
         driveboard_push_response(db, 0x00);
         break;
     case 0x1D:  /* wire 0x9D: package upload cursor (p1=movement idx, p2=pkg) */
@@ -203,8 +200,9 @@ void driveboard_get_ffb(DriveBoardState *db, DriveBoardFFB *out)
     out->global_power = db->global_power;
 
     /* SPRING (0x87): the wheel's dominant auto-centering. The board computes the
-     * restoring force from wheel position; on the host an SDL spring does that
-     * natively, so we just expose "engaged" scaled by the game's global power. */
+     * restoring force from wheel position; on the host the wheel's autocentre
+     * (and an SDL spring) does that, so we just expose "engaged" scaled by the
+     * game's global power. */
     out->centering_power = db->spring_active
                              ? (db->global_power ? db->global_power : 0x60) : 0;
 
@@ -220,9 +218,10 @@ void driveboard_get_ffb(DriveBoardState *db, DriveBoardFFB *out)
     out->movement_dir   = db->movement_dir;
     out->movement_power = db->movement_power;
 
-    /* Advance SUD package playback: one movement every 2 host frames, its
-     * direction and power as the game uploaded them (0x9E). This accessor is
-     * the single per-frame tick (called unconditionally by the host). */
+    /* Advance SUD package playback: one movement every 2 calls, its direction
+     * and power as the game uploaded them (0x9E). This accessor is the tick:
+     * the host calls it once per UI frame while force feedback is on and a
+     * device steers, so playback follows the display's rate. */
     uint8_t power = 0, dir = 0;
     if (db->play_pkg >= 0 && db->play_pkg < 16) {
         uint8_t step = db->sud_pkg[db->play_pkg][db->play_pos & 0x0F];
@@ -237,13 +236,7 @@ void driveboard_get_ffb(DriveBoardState *db, DriveBoardFFB *out)
     }
     db->event_pulse = power;   /* package pulse -> gamepad rumble */
 
-    /* Split the vibration into two channels the host renders with DIFFERENT
-     * weights: a SUBTLE continuous road/engine buzz (0x8B, 0x85) and a PUNCHY
-     * discrete jolt from package playback (0xFB). Per A.Geezer the SUD packages
-     * are OR2's real tactile feedback, so events must not be drowned by the hum. */
-    uint8_t road = db->road_power;
-    if (db->vibration_power > road) road = db->vibration_power;
-    out->vibration = road;   /* continuous road/engine buzz */
+    /* Per A.Geezer the SUD packages are OR2's real tactile feedback. */
     out->event_power = power;  /* this frame's package movement */
     out->event_dir = dir;
 }

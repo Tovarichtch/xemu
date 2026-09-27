@@ -32,11 +32,8 @@
 #define MIPS_ST_IE   (1u << 0)
 #define MIPS_ST_EXL  (1u << 1)
 #define MIPS_ST_ERL  (1u << 2)
-#define MIPS_ST_UM   (1u << 4)
 #define MIPS_ST_IM   (0xFFu << 8)
 #define MIPS_ST_BEV  (1u << 22)
-#define MIPS_ST_CU0  (1u << 28)
-#define MIPS_ST_CU1  (1u << 29)
 
 /* CP0 Cause bits */
 #define MIPS_CAUSE_EXC_MASK  (0x1Fu << 2)
@@ -119,10 +116,8 @@ void mips_init(MipsState *s, void *opaque,
                uint32_t (*read)(void *, uint64_t, int),
                void (*write)(void *, uint64_t, int, uint32_t));
 void mips_reset(MipsState *s);
-/* Executes one instruction (and, when it is a branch, notes where the
- * slot's successor goes). Returns false if it did not decode. */
-bool mips_step(MipsState *s);
-/* Runs until the budget is spent or the core halts or faults. */
+/* Runs for `cycles` clock cycles; WAIT and a detected poll loop sleep through
+ * them; returns early only on an opcode that does not decode. */
 void mips_run(MipsState *s, uint64_t cycles);
 /* Board interrupt lines: a mask of Cause.IP bits (bit 10 = IP2 ... bit 15 =
  * IP7). Held at level until lowered. */

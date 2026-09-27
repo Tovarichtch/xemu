@@ -33,14 +33,16 @@
 #define TLB_D 0x4u
 #define TLB_G 0x1u
 
-/* Data Book 2.7.16: Au1 core, revision as the pb1500 BSP reports it. */
+/* Data Book 2.7.14: Au1 core, revision as the pb1500 BSP reports it. */
 #define AU1_PRID   0x01030200u
 /* Config: M=1 (Config1 exists), K0=3 cached, MT=1 standard TLB. */
 #define AU1_CONFIG  (0x80000000u | (1u << 7) | 3u)
-/* Config1: MMU size 31 (32 entries), 16 KB 4-way caches with 32-byte
- * lines: IS=2 IL=4 IA=3 DS=2 DL=4 DA=3, no FPU, no watch, no EJTAG. */
-#define AU1_CONFIG1 ((31u << 25) | (2u << 22) | (4u << 19) | (3u << 16) | \
-                     (2u << 13) | (4u << 10) | (3u << 7))
+/* Config1 (Data Book 2.7.16): MMU size 31 (32 entries), 16 KB 4-way caches
+ * with 32-byte lines: IS=1 IL=4 IA=3 DS=1 DL=4 DA=3, no FPU. The watch
+ * registers and EJTAG are not modelled (the silicon has them: WR=EP=1). The
+ * firmware never reads Config1. */
+#define AU1_CONFIG1 ((31u << 25) | (1u << 22) | (4u << 19) | (3u << 16) | \
+                     (1u << 13) | (4u << 10) | (3u << 7))
 
 void mips_init(MipsState *s, void *opaque,
                uint32_t (*read)(void *, uint64_t, int),
@@ -378,7 +380,7 @@ static inline void set_reg(MipsState *s, int n, uint32_t v)
     } while (0)
 #define JTARGET(op) ((after & 0xF0000000u) | (((op) & 0x03FFFFFFu) << 2))
 
-bool mips_step(MipsState *s)
+static bool mips_step(MipsState *s)
 {
     uint32_t op, va, val;
     uint64_t pa;
@@ -389,7 +391,8 @@ bool mips_step(MipsState *s)
     bool next_branch_set = false;
 
     /* An interrupt is taken between instructions, never inside a delay slot
-     * pair (the slot is retired first, so EPC points at the branch). */
+     * pair (the slot runs first, so EPC is the branch target and BD stays
+     * clear). */
     if (!was_delay && interrupt_pending(s)) {
         mips_exception(s, MIPS_EXC_INT, false);
         return true;

@@ -54,7 +54,7 @@
 #define NB_FLASH_BASE   0x1FC00000u
 
 /* Au1500-333: CPU = 12 MHz x cpupll; 28 gives 336 MHz, the nearest the
- * PLL can do. CP0 Count runs at the core clock (Data Book 2.7.10). */
+ * PLL can do. CP0 Count runs at the core clock (Data Book 2.7.8). */
 #define NB_CPUPLL       28u
 #define NB_CLOCKS_PER_US (12u * NB_CPUPLL)
 #define NB_CLOCKS_PER_MS (NB_CLOCKS_PER_US * 1000u)
@@ -89,7 +89,6 @@
 #define AU_MACDMA   0x14004000u
 #define AU_PCI      0x14005000u
 #define AU_PCI_MEM  0x400000000ull          /* 36-bit: PCI memory space */
-#define AU_PCI_IO   0x500000000ull
 #define AU_PCI_CFG  0x600000000ull
 
 /* IC0 sources (Data Book table 6-2) */
@@ -133,7 +132,7 @@ typedef struct {
         I2C_IDLE, I2C_ADDR, I2C_WORD, I2C_WRITE, I2C_READ, I2C_ACK_OUT,
         I2C_ACK_IN
     } state;
-    enum { I2C_IDLE_NEXT, I2C_WRITE_NEXT, I2C_READ_NEXT } after_ack;
+    enum { I2C_WORD_NEXT, I2C_WRITE_NEXT, I2C_READ_NEXT } after_ack;
     uint16_t addr;
     bool     started;
 } AuEeprom;
@@ -377,7 +376,7 @@ static void eeprom_sample(AuEeprom *e, bool scl, bool sda)
                     e->addr = (e->addr & 0xFF) | ((e->shift & 0x02) ? 0x100 : 0);
                     /* R/W set: data out from the current address; clear: a
                      * word address follows before any data */
-                    e->after_ack = (e->shift & 1) ? I2C_READ_NEXT : I2C_IDLE_NEXT;
+                    e->after_ack = (e->shift & 1) ? I2C_READ_NEXT : I2C_WORD_NEXT;
                 } else if (e->state == I2C_WORD) {
                     e->addr = (e->addr & 0x100) | e->shift;
                     e->after_ack = I2C_WRITE_NEXT;
@@ -1277,12 +1276,12 @@ bool chihiro_netboard_init(const char *firmware_path, const char serial[16],
     }
     /* The 24LC04: serial and network configuration, as the firmware's
      * net-config buffer mirrors it (MAC at 0x10, mode at 0x18, IP, mask,
-     * gateway, DNS at 0x20..0x30). The board gets the static address the
-     * xemu setting names, on a /24, and a MAC in Sega's block. */
+     * gateway, DNS at 0x20..0x30). The board gets 10.0.0.<cabinet ID>
+     * (chihiro_cabinet_ip), on a /24, and a MAC in Sega's block. */
     memset(nb.eeprom.mem, 0xFF, sizeof(nb.eeprom.mem));
     memcpy(nb.eeprom.mem, serial, 16);
     /* Sega's OUI, then the cabinet's address: two cabinets of one owner
-     * share a flash image and a serial, but never an IP setting. */
+     * share a flash image and a serial, but never a cabinet ID. */
     nb.eeprom.mem[0x10] = 0x00; nb.eeprom.mem[0x11] = 0xD0; nb.eeprom.mem[0x12] = 0xF1;
     nb.eeprom.mem[0x13] = (ip >> 8) & 0xFF; nb.eeprom.mem[0x14] = (ip >> 16) & 0xFF;
     nb.eeprom.mem[0x15] = (ip >> 24) & 0xFF;

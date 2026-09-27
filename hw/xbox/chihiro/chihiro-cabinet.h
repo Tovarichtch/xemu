@@ -19,12 +19,11 @@
 #ifndef HW_XBOX_CHIHIRO_CABINET_H
 #define HW_XBOX_CHIHIRO_CABINET_H
 
-/* What each cabinet carries, answered from the one table in chihiro.c; free
- * of QEMU headers so the user interface can ask too. */
+/* What each cabinet carries, answered from the one table in chihiro.c. */
 
 typedef enum {
     CHIHIRO_CARD_NONE = 0,
-    CHIHIRO_CARD_HW210,      /* two Tamura/SAXA slots, Ghost Squad */
+    CHIHIRO_CARD_HW210,      /* Tamura/SAXA slots: two on Ghost Squad, one on Gundam */
     CHIHIRO_CARD_CRP1231,    /* one Sanwa reader-printer, Maximum Tune */
 } ChihiroCardReaderKind;
 

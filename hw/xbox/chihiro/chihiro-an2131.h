@@ -116,27 +116,18 @@
 #define I2CS_START     0x80
 #define I2CS_STOP      0x40
 #define I2CS_LASTRD    0x20
-#define I2CS_BERR      0x04
 #define I2CS_ACK       0x02
 #define I2CS_DONE      0x01
 
 /* EP0CS bits */
 #define EP0CS_OUTBSY   0x08
 #define EP0CS_INBSY    0x04
-#define EP0CS_HSNAK    0x02
-#define EP0CS_STALL    0x01
 
 /* EPnCS bits (IN and OUT, n=1..7) */
 #define EPCS_BSY       0x02
-#define EPCS_STALL     0x01
 
 /* USBBAV bits */
 #define USBBAV_AVEN    0x01
-
-/* USBCS bits */
-#define USBCS_RENUM    0x02
-#define USBCS_DISCOE   0x04
-#define USBCS_DISCON   0x08
 
 /* CPUCS bits */
 #define CPUCS_8051RES  0x01
@@ -148,7 +139,6 @@
 #define AVEC_SUTOK     0x08
 #define AVEC_SUSPEND   0x0C
 #define AVEC_USBRESET  0x10
-#define AVEC_IBN       0x14
 #define AVEC_EP0IN     0x18
 #define AVEC_EP0OUT    0x1C
 /* EPn IN  = 0x18 + n * 8 */
@@ -164,7 +154,7 @@
 #define SFR_DPS        0x86    /* Data Pointer Select (bit 0) */
 #define SFR_CKCON      0x8E    /* Clock Control; bit 3: timer 0 at CLK/4, not /12 */
 #define SFR_EXIF       0x91    /* External Interrupt Flags */
-#define SFR_MPAGE      0x92    /* MOVX @Ri high byte */
+#define SFR_MPAGE      0x92    /* MOVX @Ri page; stored, the core pages with P2 */
 #define SFR_SCON1      0xC0    /* Serial Port 1 Control */
 #define SFR_EIE        0xE8    /* Extended Interrupt Enable */
 #define SFR_EIP        0xF8    /* Extended Interrupt Priority */
@@ -213,12 +203,10 @@ typedef struct AN2131State {
 
     /* ── I2C bus master ─────────────────────────────────────────── */
     uint8_t i2cs;           /* I2C control/status register */
-    uint8_t i2dat;          /* I2C data register */
     bool    i2c_irq_pending;
     bool    i2c_lastrd;     /* LASTRD flag for final read byte */
     struct {
         I2CPhase phase;
-        uint8_t  slave_addr;        /* 7-bit I2C address */
         uint16_t mem_addr;          /* Current EEPROM byte address */
         bool     reading;           /* true = read from slave */
         bool     first_read;        /* EZ-USB dummy read after RESTART */
@@ -231,7 +219,7 @@ typedef struct AN2131State {
     /* I2C EEPROM backing storage (owned by caller) */
     uint8_t *ic10_eeprom;   /* 8KB: ic10 (QC) or pc20 (SC) */
     int      ic10_size;
-    uint8_t *ic11_eeprom;   /* 128-512B: baseboard config */
+    uint8_t *ic11_eeprom;   /* baseboard config: the 128-byte dump */
     int      ic11_size;
 
     /* I2C RTC (address 0x32) */
@@ -242,7 +230,6 @@ typedef struct AN2131State {
      * picks one: half 0 is the firmware's work RAM, half 1 the game's backup,
      * reached only for backup requests 0x18 and 0x1F (0x0D48, 0x0DBF). */
     uint8_t *extmem;
-    int      extmem_size;
 
     /* ── USB global registers ───────────────────────────────────── */
     uint8_t  cpucs;
@@ -267,7 +254,7 @@ typedef struct AN2131State {
     uint8_t exif;           /* 0x91: external interrupt flags */
     uint8_t eie;            /* 0xE8: extended interrupt enable */
     uint8_t eip;            /* 0xF8: extended interrupt priority */
-    uint8_t mpage;          /* 0x92: MOVX @Ri page register */
+    uint8_t mpage;          /* 0x92: MOVX @Ri page register (stored only) */
     uint8_t dps;            /* 0x86: data pointer select */
 
     /* ── JVS serial (SBUF1 at SFR 0xC1) ──────────────────────────── */
@@ -288,14 +275,14 @@ typedef struct AN2131State {
     uint64_t card_resp_cycles[2];      /* card RX pacing: last byte time (0=idle) */
     bool     card_delivering[2];       /* a response byte has been delivered */
     uint64_t card_ti_cycles[2];        /* pending TX-complete: SBUF write time (0=none) */
-    bool     in_setup;                 /* inside an2131_setup_packet's window */
+    bool     in_setup;                 /* an SC 0x1A/0x1B IN request is being served */
     /* The battery-backed half of the baseboard SRAM, or the settings EEPROM,
-     * holds something the game wrote since the save file last did. */
+     * holds something the game wrote since the save file last did. ic10
+     * and RTC writes set it too, which only costs a needless save. */
     bool     backup_dirty;
 
     /* ── Runtime state ──────────────────────────────────────────── */
     bool cpu_running;       /* true after CPUCS release */
-    void *usb_dev;          /* Back-pointer to ChihiroUSBState */
     bool jvs_response_ready;  /* JVS response generated, waiting for TX drain before RX */
     bool jvs_rx_pending;      /* RI1 cleared, next byte deferred until after RETI */
     uint64_t total_cycles;             /* cumulative CPU cycles (advances during bursts) */
@@ -320,12 +307,10 @@ typedef struct AN2131State {
 
 void an2131_init(AN2131State *s);
 void an2131_relink(AN2131State *s);
-void an2131_reset(AN2131State *s);
 void an2131_b2_boot(AN2131State *s, const uint8_t *eeprom, int eeprom_size);
 
 void an2131_anchor_load(AN2131State *s, uint16_t addr,
                         const uint8_t *data, int len);
-void an2131_set_cpucs(AN2131State *s, uint8_t val);
 
 int  an2131_setup_packet(AN2131State *s, const uint8_t setup[8],
                          const uint8_t *out_data, int out_len,

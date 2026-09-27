@@ -271,10 +271,9 @@ void v850_reset(V850State *s)
 #define IRQ_BIT(v)  (((v) >= 0x80 && (v) <= 0x80 + 0x10 * 31 && ((v) & 0xF) == 0) \
                      ? (1u << (((v) - 0x80) >> 4)) : 0u)
 
-/* Takes an interrupt now, saving PC and PSW; false if PSW.ID masks it. */
-static bool v850_interrupt(V850State *s, uint32_t vector)
+/* Takes an interrupt now, saving PC and PSW; the caller has checked PSW.ID. */
+static void v850_interrupt(V850State *s, uint32_t vector)
 {
-    if (s->psw & V850_PSW_ID) return false;   /* masked */
     s->eipc = s->pc;
     s->eipsw = s->psw;
     s->ecr = (s->ecr & 0xFFFF0000u) | (vector & 0xFFFF);
@@ -284,14 +283,12 @@ static bool v850_interrupt(V850State *s, uint32_t vector)
     s->psw &= ~V850_PSW_EP;
     s->pc = vector;
     s->halted = false;
-    return true;
 }
 
+/* The board raises only maskable vectors (the tick and the mailbox). */
 void v850_raise(V850State *s, uint32_t vector)
 {
-    uint32_t b = IRQ_BIT(vector);
-    if (b) s->irq_pending |= b;
-    else   v850_interrupt(s, vector);   /* non-maskable slots stay immediate */
+    s->irq_pending |= IRQ_BIT(vector);
 }
 
 /* Takes the lowest-numbered held request, if any, once interrupts are open. */
@@ -653,8 +650,7 @@ static int v850_execute(V850State *s)
     return len;
 }
 
-/* opcode 000000: mov reg1, reg2 — and the V850E single-register forms that
- * share the encoding when reg2 is zero. */
+/* opcode 000000: mov reg1, reg2. */
 static int step_sub_000000(V850State *s, uint16_t w, uint32_t pc)
 {
     int r1 = BITS(w, 0, 5);

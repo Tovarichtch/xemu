@@ -87,7 +87,7 @@ void v850_init(V850State *s, void *opaque,
                void (*write)(void *, uint32_t, int, uint32_t));
 void v850_reset(V850State *s);
 /* Executes one instruction. Returns its length in bytes, 0 if it did not
- * decode (and sets s->illegal). */
+ * decode (and sets s->illegal) or the core is halted. */
 int  v850_step(V850State *s);
 /* Requests a maskable interrupt and holds it until the core can take it. */
 void v850_raise(V850State *s, uint32_t vector);

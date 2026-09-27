@@ -95,7 +95,8 @@ static void build_response(CardReaderState *s, uint8_t cmd)
         } else {
             payload_len = 0x02;
             s->tx_buf[4] = 0x80;
-            fprintf(stderr, "[CARD] READ out of bounds!\n");
+            CHIHIRO_LOGF(CARD, "HW210: read past the card (block %u, %u "
+                         "blocks)\n", block_start, block_count);
         }
         break;
     }
@@ -192,11 +193,6 @@ void card_reader_remove(CardReaderState *s)
 }
 
 void card_reader_write_byte(CardReaderState *s, uint8_t byte)
-{
-    card_reader_tap_byte(s, byte);
-}
-
-void card_reader_tap_byte(CardReaderState *s, uint8_t byte)
 {
     /* A command opens with 0x00; the reader answers with 0x10. */
     if (s->rx_pos == 0 && byte != 0x00)

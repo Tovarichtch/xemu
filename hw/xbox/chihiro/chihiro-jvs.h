@@ -31,17 +31,13 @@ extern "C" {
 #define JVS_MAX_ANALOG     8
 
 #define JVS_SYNC           0xE0
-#define JVS_ESCAPE         0xD0
 #define JVS_BROADCAST      0xFF
 #define JVS_HOST_ADDR      0x00
 
 #define JVS_STATUS_OK      0x01
-#define JVS_STATUS_UNSUP   0x02
-#define JVS_STATUS_CSUM    0x03
 
 #define JVS_REPORT_OK      0x01
 #define JVS_REPORT_PARAM   0x02
-#define JVS_REPORT_DATA    0x03
 
 typedef struct {
     uint8_t  device_id;

@@ -34,18 +34,21 @@
  *   0x0FE00024  bit 1 enables the SDA output, 0 releases the line
  *   0x0FE00010  written 1 at the end of the board init
  *   0x0FE00030  the DIMM size, encoded as (size >> 26) - 1
- *   0x0FE000F0  the doorbell the idle loop polls; the firmware writes 1 to
- *               acknowledge, so it clears on write
+ *   0x0FE000F0  the doorbell the idle loop polls; never rung here: reads 0,
+ *               writes dropped
  *   0x0FE000F8  console enable, 0x0FE000FC console buffer pointer
  *   0x0FC00000  where the firmware publishes the DIMM size for the host
- *   0x0FC00004-0x0FC003C  fifteen words read once and summed at startup
- *   0x0C000020/24/28  the DIMM window descriptors
+ *   0x0FC00004-0x0FC0003C  fifteen words read once and summed at startup
+ *   0x0C000000-3F  the host window: 0x0C000020/24/28 take the DIMM window
+ *               descriptors; the host link (status at 0x0C000000, vector
+ *               0xD0) is not modelled: reads 0, writes dropped
  *   0x0F800024/A0/A4/E0/E4/E8  written once during init
  *   0x0FD00020/24/28  read once
  *   0x0FB78000  a block table, valid when it holds 0x57377521
  *   0x00400004/08/18/20/24/30  the security PIC: three data bits and a clock,
- *               bit-banged. With nothing answering, the firmware prints
- *               "Pic is not alive." and carries on.
+ *               bit-banged. The 0.85 image carries on without it ("Pic is
+ *               not alive."); the firmware a game uploads stays at 26 % until
+ *               it answers (chihiro-pic.c).
  */
 #include "qemu/osdep.h"
 #include "qemu/bswap.h"
@@ -63,7 +66,6 @@
 #include "chihiro-des.h"
 #include "chihiro-pic.h"
 #include "chihiro.h"
-#include "ui/xemu-settings.h"
 #include "chihiro-v850.h"
 
 #define ASIC_ROM_SIZE   0x00018000u
@@ -97,7 +99,6 @@ typedef struct ChihiroAsic {
     ChihiroPic pic;             /* the security PIC on 0x00400004/08 */
     unsigned dimm_mb;           /* how much DIMM the board carries */
     uint32_t dimm_blocks[16];   /* the block table at 0x0FB78000 */
-    uint32_t doorbell;
     /* The shared mailbox: the host's 0x84000000 is the board's 0x0FC00000,
      * 0x84000020 is 0x0FC00020 (the router reads 32 bytes at offset 0x20). */
     uint32_t mbox[16];          /* 0x0FC00000 response, 0x0FC00020 command */
@@ -111,15 +112,11 @@ typedef struct ChihiroAsic {
     uint32_t post[8];
     QEMUBH   *post_bh;
 
-    /* The host window: sixteen bytes at 0x0C000010, direction in bits 16-17
-     * of 0x0C000000; phases 0 and 1 carry the command in, phase 3 the answer
-     * out, vector 0xD0 per step. host_in and host_out are kept apart. */
-    uint32_t host_in[16];           /* 0x0C000000-0x0C00003F, host to board */
-    uint32_t host_out[16];          /* the same addresses, board to host */
-
-    /* The board runs on its own thread. `lock` guards everything above: the
-     * host side holds it for the words it exchanges, the thread for one slice
-     * of instructions. The big lock is not involved. */
+    /* The board runs on its own thread. `lock` guards the board's state: the
+     * host side holds it for an exchange (the core runs inline, up to
+     * ASIC_EXCHANGE_BUDGET clocks) and for the release self-test, the thread
+     * for one slice of instructions; a snapshot holds the board with `held`
+     * instead. The big lock is not involved. */
     QemuMutex  lock;
     QemuCond   kick;
     QemuThread thread;
@@ -143,13 +140,11 @@ typedef struct ChihiroAsic {
 } ChihiroAsic;
 
 /* The registers, each described in the list at the top of this file. */
-#define ASIC_HOST_BASE    0x0C000000u   /* the host window, 0x40 bytes */
 #define ASIC_MBOX_BASE    0x0FC00000u   /* the shared mailbox, 0x40 bytes */
 #define ASIC_HOST_IRQ     0x0FE00000u
 #define ASIC_SPD_LINES    0x0FE00020u
 #define ASIC_SPD_ENABLE   0x0FE00024u
 #define ASIC_STRAPS       0x0FE00060u
-#define ASIC_DOORBELL     0x0FE000F0u
 
 /* The security PIC hangs off three lines of a port: 0x00400004 carries the
  * data on bits 0-2 and the clock on bit 3, 0x00400008 says which way they go. */
@@ -162,9 +157,10 @@ typedef struct ChihiroAsic {
 #define ASIC_FLASH_SIZE   0x00200000u
 
 /* The DIMM block table a board type 3 walks: valid when the first word is
- * 0x57377521; from 0x20, one word per pair of banks gives its start, 0xFFFFFFFF
- * when empty. The init at 0x1256: strap 3 counts eight banks of 0x4000 units,
- * others sixteen of 0x2000; a unit is 16 KB. */
+ * 0x57377521; from 0x20, one word per pair of banks holds the pair's first
+ * 16 KB unit, 0xFFFFFFFF when empty, and the pair runs to `unit`. The init at
+ * 0x1256: strap 3 walks four words of up to 0x4000 units (256 MB), others
+ * eight of 0x2000 (128 MB). */
 #define ASIC_DIMM_BLOCKS  0x0FB78000u
 #define ASIC_DIMM_MAGIC   0x57377521u
 
@@ -256,9 +252,6 @@ static uint32_t asic_read(void *opaque, uint32_t addr, int size)
     if (addr >= ASIC_PERI_BASE) {
         return asic.peri[(addr - ASIC_PERI_BASE) >> 2];
     }
-    if (addr >= ASIC_HOST_BASE && addr < ASIC_HOST_BASE + 0x40) {
-        return asic.host_in[(addr - ASIC_HOST_BASE) >> 2];
-    }
     if (addr >= ASIC_DIMM_BLOCKS && addr < ASIC_DIMM_BLOCKS + 0x40) {
         return asic.dimm_blocks[(addr - ASIC_DIMM_BLOCKS) >> 2];
     }
@@ -284,7 +277,6 @@ static uint32_t asic_read(void *opaque, uint32_t addr, int size)
     case ASIC_HOST_IRQ:  return asic.host_irq;
     case ASIC_SPD_LINES: return chihiro_spd_read_lines(&asic.spd);
     case ASIC_STRAPS:    return asic.straps;
-    case ASIC_DOORBELL:  return asic.doorbell;
     default:
         if (addr >= ASIC_MBOX_BASE && addr < ASIC_MBOX_BASE + 0x40) {
             return asic.mbox[(addr - ASIC_MBOX_BASE) >> 2];
@@ -297,25 +289,17 @@ static uint32_t asic_read(void *opaque, uint32_t addr, int size)
 static void asic_write(void *opaque, uint32_t addr, int size, uint32_t val)
 {
     uint32_t off;
-    uint8_t *b = asic_map(addr, size > 2 ? 4 : size, &off);
+    uint8_t *b = asic_map(addr, size, &off);
 
     if (b) {
         if (b == asic.rom) return;              /* the image is read-only */
-        for (int i = 0; i < (size > 2 ? 4 : size); i++) {
+        for (int i = 0; i < size; i++) {
             asic_store(&b[off + i], (uint8_t)(val >> (8 * i)));
         }
         return;
     }
     if (addr >= ASIC_PERI_BASE) {
         asic_store32(&asic.peri[(addr - ASIC_PERI_BASE) >> 2], val);
-        return;
-    }
-    if (addr >= ASIC_HOST_BASE && addr < ASIC_HOST_BASE + 0x40) {
-        asic_store32(&asic.host_out[(addr - ASIC_HOST_BASE) >> 2], val);
-        return;
-    }
-    if (addr == ASIC_DOORBELL) {                /* write to clear */
-        asic_store32(&asic.doorbell, 0);
         return;
     }
     if (addr >= ASIC_MBOX_BASE && addr < ASIC_MBOX_BASE + 0x40) {
@@ -469,7 +453,7 @@ static void asic_core_regs(uint32_t *out)
  * value there, no device stepped and nothing from the host -- is repeated
  * exactly by the next, so such turns are charged at the board's rate and not
  * run. The tick, a host interrupt or an exchange ends the skip. */
-static bool asic_idle_turn(uint64_t end)
+static void asic_idle_turn(uint64_t end)
 {
     uint32_t regs[ASIC_IDLE_REGS];
     uint64_t turn, span, jump;
@@ -486,7 +470,7 @@ static bool asic_idle_turn(uint64_t end)
             asic.idle_logged = 0;
             asic.idle_changed = false;
         }
-        return false;
+        return;
     }
 
     asic_core_regs(regs);
@@ -501,22 +485,21 @@ static bool asic_idle_turn(uint64_t end)
     if (!same) {
         memcpy(asic.idle_regs, regs, sizeof(regs));
         asic.idle_cycles = asic.cpu.cycles;
-        return false;
+        return;
     }
 
     /* Whole turns only, never past the next tick or what has been paid. */
     if (asic.cpu.cycles >= end) {
-        return false;
+        return;
     }
     span = MIN((uint64_t)MAX(asic.clocks_to_tick, 0), end - asic.cpu.cycles);
     jump = (span / turn) * turn;
     if (jump == 0) {
-        return false;
+        return;
     }
     asic.cpu.cycles += jump;
     asic.clocks_to_tick -= (int)jump;
     asic.idle_cycles = asic.cpu.cycles;
-    return true;
 }
 
 /* Runs the core, feeding it the RTOS clock at the same rate wherever it is
@@ -721,12 +704,13 @@ static void asic_catch_up(void)
 
         int ran = asic_run(slice, NULL);
 
-        /* Serviced even when nothing ran: that is the case where the core
-         * stopped on an opcode it does not know, and the log has to say so. */
+        /* Serviced even when nothing ran: the core stopped, on an opcode it
+         * does not know or a HALT, and the log has to say so. */
         asic_service();
         if (!ran) break;
         /* The host's turn. A guest write to the mailbox, or a snapshot
-         * asking the board to hold still, waits one slice and no more. */
+         * asking the board to hold still, usually waits one slice; the lock
+         * is not fair, so it may wait longer. */
         qemu_mutex_unlock(&asic.lock);
         qemu_mutex_lock(&asic.lock);
     }
@@ -951,16 +935,15 @@ static const VMStateDescription vmstate_chihiro_asic = {
         VMSTATE_STRUCT(pic, ChihiroAsic, 1, vmstate_chihiro_pic, ChihiroPic),
         VMSTATE_UINT32(dimm_mb, ChihiroAsic),
         VMSTATE_UINT32_ARRAY(dimm_blocks, ChihiroAsic, 16),
-        VMSTATE_UINT32(doorbell, ChihiroAsic),
+        VMSTATE_UNUSED(4),
         VMSTATE_UINT32_ARRAY(mbox, ChihiroAsic, 16),
         VMSTATE_UINT32(host_irq, ChihiroAsic),
         VMSTATE_BOOL(mbox_answered, ChihiroAsic),
         VMSTATE_UINT32(unsolicited, ChihiroAsic),
-        VMSTATE_UINT32_ARRAY(host_in, ChihiroAsic, 16),
-        VMSTATE_UINT32_ARRAY(host_out, ChihiroAsic, 16),
+        VMSTATE_UNUSED(128),
         VMSTATE_UINT64(steps, ChihiroAsic),
         VMSTATE_INT32(clocks_to_tick, ChihiroAsic),
-        VMSTATE_UINT64(paid, ChihiroAsic),
+        VMSTATE_UNUSED(8),
         VMSTATE_END_OF_LIST()
     }
 };
@@ -978,8 +961,9 @@ void chihiro_asic_init(void)
      * real Chihiro board carries is unknown. */
     asic.straps = 3;
 
-    /* The DIMM the SPD reports must match the host side's answer, or SEGABOOT
-     * stops on Caution 53: both come from the one setting, 128 MB << index. */
+    /* The DIMM the board finds in its block table (straps 3) must match the
+     * host side's answer, or SEGABOOT stops on Caution 53: both come from the
+     * one setting, 128 MB << index. */
     asic.dimm_mb = 128u << chihiro_dimm_factor();
     chihiro_spd_init(&asic.spd, asic.dimm_mb, 0);
     chihiro_pic_reset(&asic.pic);
@@ -1003,8 +987,7 @@ void chihiro_asic_init(void)
     qemu_thread_create(&asic.thread, "chihiro.v850", asic_thread, &asic,
                        QEMU_THREAD_JOINABLE);
     fprintf(stderr, "Chihiro ASIC: V850 core armed on its own thread, "
-            "straps=0x%X%s\n",
-            asic.straps, asic.have_rom ? "" : " (no firmware yet)");
+            "straps=0x%X\n", asic.straps);
 }
 
 bool chihiro_asic_running(void)
@@ -1042,13 +1025,9 @@ static void asic_set_running(bool running)
         memset(asic.ram, 0, sizeof(asic.ram));
         memset(asic.iram, 0, sizeof(asic.iram));
         memset(asic.peri, 0, sizeof(asic.peri));
-        v850_reset(&asic.cpu);
-        asic.cpu.pc = 0;                /* the reset vector */
-        asic.doorbell = 0;
+        v850_reset(&asic.cpu);          /* pc 0, the reset vector */
         asic.steps = 0;
         asic.reported = false;
-        memset(asic.host_in, 0, sizeof(asic.host_in));
-        memset(asic.host_out, 0, sizeof(asic.host_out));
         memset(asic.mbox, 0, sizeof(asic.mbox));
         asic.mbox_answered = false;
         asic.post_pending = false;

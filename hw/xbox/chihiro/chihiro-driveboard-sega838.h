@@ -46,10 +46,7 @@ typedef struct DriveBoardState {
     uint8_t friction_power;    /* 0x86 P2: constant torque / road-resistance FORCE
                                 * (DAT_002fd0dd, base ~0x02, halved at idle). P1 is a
                                 * fixed 0x2F range constant, NOT the force. */
-    uint8_t road_power;        /* 0x8B P1: road/engine vibration power (0x20-0x78, rises with speed) */
-    uint8_t road_freq;         /* 0x8B P2: vibration frequency (freq*2) */
     uint8_t vibration_power;   /* 0x85 P2: explicit vibration power (OR2 never sends 0x85) */
-    uint8_t vibration_speed;   /* 0x85 P1: vibration speed */
     uint8_t movement_dir;      /* 0x84 P1: 1 = left, 0 = right (recenter/cancel) */
     uint8_t movement_power;    /* 0x84 P2: directional movement power */
 
@@ -66,22 +63,23 @@ typedef struct DriveBoardState {
     uint8_t play_sub;     /* frames spent on the current movement */
 
     /* Current transient magnitude (0-0x7F) produced by the active playback,
-     * refreshed once per host frame by driveboard_get_ffb(). */
+     * refreshed by driveboard_get_ffb(), once per UI frame while force
+     * feedback is on. */
     uint8_t event_pulse;
 } DriveBoardState;
 
 /* Snapshot of the current force-feedback effect state, for the host output
  * layer (gamepad rumble or steering-wheel SDL_Haptic). All fields are 0 when
  * the motor is disabled. Persistent forces (centering/friction) drive a real
- * wheel; only the transient vibration channel is felt on a gamepad. */
+ * wheel; a gamepad feels the package pulse and 0x85 (driveboard_get_rumble). */
 typedef struct DriveBoardFFB {
     bool    active;            /* motor enabled */
-    uint8_t global_power;      /* game FFB strength (0x83), 0 = unset -> full */
-    uint8_t centering_power;   /* SPRING (0x87): normalized auto-centering strength */
+    uint8_t global_power;      /* game FFB strength (0x83), 0 = unset */
+    uint8_t centering_power;   /* SPRING (0x87): 0 when off, else the 0x83 value
+                                * (0x60 when unset) */
     uint8_t friction_power;    /* DAMPER (0x86 torque + 0x88 damper): resistance, pre-normalized (higher = stronger) */
     uint8_t movement_dir;      /* 0 = right, 1 = left */
     uint8_t movement_power;    /* CONSTANT (0x84): directional push */
-    uint8_t vibration;         /* continuous road/engine vibration (0x8B, 0x85) */
     uint8_t event_power;       /* package playback (0xFB): this frame's movement, 0-0x7F */
     uint8_t event_dir;         /* its direction, as 0x84: 0 = right, 1 = left */
 } DriveBoardFFB;

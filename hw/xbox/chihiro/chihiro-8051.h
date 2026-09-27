@@ -22,35 +22,25 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-/* PSW bits */
+/* PSW bits. P (bit 0) is not computed: neither firmware reads it. */
 #define PSW_CY  0x80
 #define PSW_AC  0x40
-#define PSW_F0  0x20
-#define PSW_RS1 0x10
-#define PSW_RS0 0x08
 #define PSW_OV  0x04
-#define PSW_F1  0x02
-#define PSW_P   0x01
 
 /* Standard SFR addresses */
-#define SFR_P0   0x80
 #define SFR_SP   0x81
 #define SFR_DPL  0x82
 #define SFR_DPH  0x83
-#define SFR_PCON 0x87
 #define SFR_TCON 0x88
 #define SFR_TMOD 0x89
 #define SFR_TL0  0x8A
 #define SFR_TL1  0x8B
 #define SFR_TH0  0x8C
 #define SFR_TH1  0x8D
-#define SFR_P1   0x90
 #define SFR_SCON 0x98
 #define SFR_SBUF 0x99
 #define SFR_P2   0xA0
 #define SFR_IE   0xA8
-#define SFR_P3   0xB0
-#define SFR_IP   0xB8
 #define SFR_PSW  0xD0
 #define SFR_ACC  0xE0
 #define SFR_B    0xF0
@@ -84,14 +74,12 @@ struct Cpu8051State {
      * Standard SFRs stored here; AN2131-specific ones forwarded via callback. */
     uint8_t sfr[128];
 
-    /* Code memory — ic10 firmware loaded from disk */
+    /* Code memory — the chip's RAM (AN2131State.ram), loaded from the ic10
+     * (QC) or pc20 (SC) EEPROM and by the host's Anchor loads */
     const uint8_t *code;
     uint32_t code_size;
 
-    /* External data memory (XDATA) — 8KB on-chip + AN2131 registers */
-    uint8_t xram[8192];
-
-    /* Callbacks for XDATA access beyond on-chip RAM */
+    /* Callbacks for all XDATA access (the AN2131's RAM and registers) */
     Cpu8051XdataRead  xdata_read;
     Cpu8051XdataWrite xdata_write;
 
@@ -100,7 +88,6 @@ struct Cpu8051State {
     Cpu8051SfrWrite sfr_write_cb;
 
     /* Interrupt state */
-    bool     halted;
     bool     in_interrupt;  /* Set by cpu8051_interrupt, cleared by RETI */
     /* Set whenever something could have changed the interrupt state, so the
      * owner knows it must re-evaluate. Sources are enumerated and closed:
@@ -112,9 +99,8 @@ struct Cpu8051State {
      * and the timer flags it raises; the chip around it adds its own (see
      * an2131_idle_turn). */
     uint32_t events;
-    uint64_t cycles;
 
-    /* Timer 0 CLK/12 prescaler (ticks once per 3 machine cycles when CKCON.3=0) */
+    /* Timer 0 CLK/12 prescaler (one tick per 3 instructions when CKCON.3=0) */
     uint8_t timer0_prescale;
 
     /* Opaque pointer for AN2131 layer */

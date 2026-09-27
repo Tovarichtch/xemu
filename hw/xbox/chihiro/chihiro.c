@@ -46,7 +46,6 @@
 #include "ui/xemu-settings.h"
 #include "target/i386/cpu.h"
 #include "exec/watchpoint.h"
-#include "ui/input.h"
 #include "chihiro-jvs.h"
 #include "chihiro-cardreader-hw210.h"
 #include "chihiro-cardreader-crp1231.h"
@@ -67,7 +66,8 @@
  *   0x22: XBAM string "BX" (0x4258) — checked by SEGABOOT
  *   0x24: XBAM string "MA" (0x4D41) — checked by SEGABOOT
  *   0xE0: IRQ10 acknowledge (write clears IRQ10)
- *   0xF0: Chip revision / board type (0x0000 = Type-1, 0x0100 = Type-3)
+ *   0xF0: chip ID in the high byte (FPGA = Type-1, ASIC = Type-3), revision
+ *         in the low byte
  *   0xF4: DIMM size (0=128M, 1=256M, 2=512M, 3=1024M)
  *
  * SEGABOOT checks "XBAM" at 0x4022-0x4024 and uses 0x401E/0x4020 for DIMM
@@ -78,14 +78,16 @@
  * anything the hardware exposes. Real hardware has no such counter.
  */
 
-#define SEGA_FIRMWARE_VERSION               0x1E
+#define SEGA_DIMM_BASE_LO                   0x1E
 #define SEGA_XBAM_STRING_0                  0x20
 #define SEGA_XBAM_STRING_1                  0x22
 #define SEGA_XBAM_STRING_2                  0x24
 #define SEGA_IRQ10_ACK                      0xE0
 #define SEGA_CHIP_REVISION                  0xF0
-#   define SEGA_CHIP_REVISION_TYPE1             0x0000
-#   define SEGA_CHIP_REVISION_TYPE3             0x0100
+#   define SEGA_CHIP_REVISION_CHIP_ID            0xFF00
+#       define SEGA_CHIP_REVISION_FPGA_CHIP_ID      0x0000
+#       define SEGA_CHIP_REVISION_ASIC_CHIP_ID      0x0100
+#   define SEGA_CHIP_REVISION_REVISION_ID_MASK   0x00FF
 #define SEGA_DIMM_SIZE                      0xF4
 #   define SEGA_DIMM_SIZE_128M                  0
 #   define SEGA_DIMM_SIZE_256M                  1
@@ -97,7 +99,6 @@
  * 0x200-0x2FF unknown, 0x300-0x3FF tests, 0x400-0x4FF network sockets,
  * 0x500-0x7FF unknown groups. */
 #define MB_CMD_INIT                 0x0001  /* acMediaCmd_InitAsync — returns DIMM size */
-#define MB_CMD_SEND_EVENT           0x0009  /* acMediaCmd_SendEventAsync */
 #define MB_CMD_STATUS               0x0100  /* boot phase + completion% */
 #define MB_CMD_GET_VERSION          0x0101  /* acMediaCmd_GetVersionAsync — fw version */
 #define MB_CMD_SYSTEM_TYPE          0x0102  /* board_type | fw_ver<<8 */
@@ -122,7 +123,8 @@ static struct {
     uint8_t  status;         /* boot phase: 0-4=loading, 5=READY */
     uint8_t  progress;       /* loading completion: 0-100 */
     char     serial[17];     /* from flash ROM MBDT+0x10, or "0000000000000000" */
-    uint32_t net_ip;         /* network IP in LE (default 10.0.0.1 = 0x0A000001) */
+    uint32_t net_ip;         /* the cabinet's IPv4, a | b<<8 | c<<16 | d<<24:
+                              * 10.0.0.<cabinet> (0x0100000A for 10.0.0.1) */
 } mediaboard;
 
 static void mediaboard_init(void);
@@ -138,49 +140,39 @@ static uint32_t chihiro_cabinet_ip(void)
 
 /* #define DEBUG_CHIHIRO */
 
-/* Always log LPC accesses during development */
-#define CHIHIRO_LOG 1
-
 typedef struct ChihiroLPCState {
     ISADevice dev;
     MemoryRegion ioport;
 
-    /* mbcom communication buffers (baseboard command/response protocol) */
-    uint8_t mbcom_read_buffer[32];
-    uint8_t mbcom_write_buffer[32];
-
-    /* Kernel-loaded detection timer (polls until 2BL decrypts kernel) */
     bool host_seen;   /* the guest has talked to us at least once */
     uint32_t lpc_reg_addr;        /* MediaBoard register address (set via port 0x4004) */
-    uint32_t lpc_reg_data;        /* MediaBoard register data (read via port 0x4000) */
 
     /* IRQ10 for baseboard → SEGABOOT communication */
     qemu_irq irq10;
     QEMUTimer *irq10_timer;
 
     /* USB hotplug timers (simulates staggered AN2131 I2C firmware boot) */
-    QEMUTimer *usb_hotplug_timer;     /* QC at T+1500ms */
-    QEMUTimer *usb_hotplug_sc_timer;  /* SC at T+1700ms */
-    QEMUTimer *diag_arm_timer;   /* arms the SEGABOOT diagnostic timer */
+    QEMUTimer *usb_hotplug_timer;     /* QC, 50 ms after each BUS START */
+    QEMUTimer *usb_hotplug_sc_timer;  /* SC, 100 ms after each BUS START */
+    QEMUTimer *diag_arm_timer;   /* arms the periodic tick */
     bool diag_armed;
 
-    /* Diagnostic: periodic state machine dump */
+    /* The periodic tick (chihiro_diag_timer_cb): SEGABOOT's state before the
+     * game, then the cabinet's boards */
     QEMUTimer *diag_timer;
 
     /* LPC port state kept between accesses */
-    uint32_t lpc_401e_reads;   /* MbcomCommand (state 2) — port 0x401E (firmware) */
-    uint32_t last_bootstate;   /* previous bootstate to detect changes */
+    uint32_t lpc_401e_reads;   /* reads of port 0x401E: DIMM base, then "XB" */
     uint16_t lpc_scratch_4026;    /* Port 0x4026 read-write scratch register */
     uint8_t  mbcom_e0_status;     /* Port 0x40E0 interrupt source: bit0=ASIC (0x29),
                                    * bit2=Ether/NetDIMM (0xA9) — per acLib */
-    bool     mbcom_resp_ready;    /* Game-mode: response pending → port 0x40F0 returns 0x0100 */
+    bool     mbcom_resp_ready;    /* a reply waits for the next E1=0 after an arm */
 
     /* Baseboard DMA register state (indirect access via 0x4004/0x4000) */
     uint32_t bb_reg_addr;       /* 0xA0000020: indirect address pointer */
     uint32_t bb_reg_status;     /* 0xA0000040: DMA status/enable */
     bool     bb_dma_active;     /* true when 0xA0000040 bit31 set (burst mode) */
     uint32_t bb_dma_count;      /* dwords written in current burst */
-    bool     bb_event_pending;  /* baseboard has an event for SEGABOOT */
 
     /* Type-3 ASIC control registers (written by SEGABOOT after firmware upload) */
     uint32_t asic_cpu_ctrl;     /* 0x80000140: ASIC CPU start/ready latch */
@@ -192,13 +184,7 @@ typedef struct ChihiroLPCState {
     /* DIMM board mailbox: commands at 0x84000020, responses at 0x84000000 */
     uint32_t dimm_cmd[8];      /* 8-dword command block written by SEGABOOT */
     uint32_t dimm_resp[8];     /* 8-dword response block read by SEGABOOT */
-    uint32_t dimm_cmd_idx;     /* current dword index in command write */
-    bool     dimm_resp_ready;  /* true when response buffer has new data */
-    uint32_t dimm_cmd_count;   /* total commands processed */
-    uint16_t dimm_next_seq;    /* next sequence number for unsolicited events */
     QEMUTimer *dimm_resp_timer;  /* delayed IRQ10 after execute trigger (Type-3) */
-
-    int64_t    last_lpc_activity_ms; /* timestamp of last LPC read/write */
 
     /* Migration shim for the machine-wide latches (chihiro_game_running &
      * co.): pre_save copies the globals here so they are serialized with
@@ -210,7 +196,6 @@ typedef struct ChihiroLPCState {
     /* The game's name picks the cabinet (card reader, drive board, input),
      * so a snapshot carries it. */
     uint8_t mig_game_filename[64];
-    bool mig_quickreboot_pending;
     bool mig_active;
 } ChihiroLPCState;
 
@@ -221,11 +206,9 @@ static bool chihiro_active;
 bool chihiro_game_running;  /* the game has taken over: no SEGABOOT DMA scan */
 static int game_mode_bus_starts;  /* BUS START count since game_running became true */
 static void chihiro_patch_running_game(void);
-static bool chihiro_boot3_reached; /* Set when SEGABOOT reaches boot=3 (checks complete) */
-static bool chihiro_quickreboot_pending; /* Set at QuickReboot, consumed by port 0x40F0 handler */
 static bool chihiro_mbcom_bootstrap_done; /* Reset on QuickReboot so game gets fresh DIMM_SIZE */
 static bool chihiro_e1_armed; /* Reset on QuickReboot to prevent premature response delivery */
-char chihiro_game_filename[64]; /* Game XBE filename saved at boot=3 */
+char chihiro_game_filename[64]; /* set by chihiro_set_game_executable */
 char chihiro_game_dir[1024];   /* Game directory path (from dvd_path) */
 
 static char chihiro_save_path[2048];
@@ -244,7 +227,7 @@ static QEMUBH *chihiro_netboard_bh;
 static void chihiro_netboard_irq_bh(void *opaque);
 static void chihiro_netboard_irq(void);
 bool lpc_log_verbose = false;
-bool chihiro_board_type3;      /* true = ASIC (Type-3), false = FPGA (Type-1) */
+static bool chihiro_board_type3; /* true = ASIC (Type-3), false = FPGA (Type-1) */
 static bool chihiro_board_type_known;
 static bool chihiro_cabinet_is_type1(void);
 
@@ -370,6 +353,8 @@ static void chihiro_netdimm_answer(void)
 }
 
 bool chihiro_freeplay_setting; /* ic11 byte 0x23/0x63 = freeplay in ACBU coin struct */
+/* The media board flash (2 MB): the SEGABOOT builds, read through mbrom0 and
+ * mbrom1, and the MBDT header at 0xFFE00 with the board's serial. */
 static uint8_t *chihiro_flash_rom;
 static uint32_t chihiro_flash_rom_size;
 
@@ -483,14 +468,14 @@ static void mediaboard_init(void)
 {
     mediaboard.dimm_factor = (uint8_t)chihiro_dimm_factor();
     mediaboard.dimm_size   = 0x08000000u << mediaboard.dimm_factor;
-    /* On real hardware, the SH4 on the DIMM board (VxWorks) provides these
-     * values. 0x0317 = 3.17, from GXTX's real Chihiro SYSTEM INFO. */
+    /* The network firmware's version, or 0x0317 (3.17, a real Chihiro's
+     * SYSTEM INFO per GXTX) when none is named. */
     mediaboard.fw_version  = mediaboard_net_firmware_version();
     mediaboard.board_type  = 4; /* Chihiro */
-    /* Instant READY/100% — the real SH4/VxWorks on the DIMM board progresses
-     * through phases 0→5, 0→100%. This may cause MEDIA BOARD TEST in the
-     * service menu to show "CHECKING 0%" / "STATUS ----" instead of the
-     * full progression. Games don't care — they only check final state. */
+    /* Instant READY/100%: a real board goes through phases 0→5 and 0→100%.
+     * MEDIA BOARD TEST in the service menu may then show "CHECKING 0%" /
+     * "STATUS ----" instead of the progression. Games only check the final
+     * state. */
     mediaboard.status      = MB_STATUS_READY;
     mediaboard.progress    = 100;
     mediaboard.net_ip      = chihiro_cabinet_ip();
@@ -542,9 +527,7 @@ static void chihiro_netdimm_signal(void)
  * 0x40E0 (the acLib's source 3, SegaEther) and IRQ 10. */
 static void chihiro_netboard_irq_bh(void *opaque)
 {
-    if (!chihiro_lpc_global) return;
-    chihiro_lpc_global->mbcom_e0_status |= 0x04;
-    qemu_irq_raise(chihiro_lpc_global->irq10);
+    chihiro_netdimm_signal();
 }
 
 static void chihiro_netboard_irq(void)
@@ -574,7 +557,6 @@ static void chihiro_link_watch_command(const uint32_t *pkt)
              g_config.chihiro.link.cabinets);
     xemu_queue_notification_warning(msg);
 }
-uint32_t chihiro_usb_sm_pa;  /* PA of USB state machine globals at VA 0xC3F10 */
 
 unsigned chihiro_log_mask;
 
@@ -610,7 +592,8 @@ static USBDevice *chihiro_usb_sc = NULL;
 
 /*
  * Called from ohci_bus_start() when OHCI goes OPERATIONAL.
- * Schedule USB device attachment 150ms after BUS START so that:
+ * Schedule USB device attachment after BUS START (QC +50 ms, SC +100 ms) so
+ * that:
  * 1. The kernel has already enabled RHSC interrupts
  * 2. Fresh CSC events will trigger the RHSC handler
  * 3. The handler will do full enumeration: PortReset → GET_DESC → SET_ADDRESS
@@ -623,6 +606,33 @@ static USBDevice *chihiro_usb_sc = NULL;
  */
 static int ohci_bus_start_count = 0;
 static bool ohci_bus_running;
+
+/* After a QuickReboot, whatever it starts, SEGABOOT again or the game: the
+ * watch is armed again and the mbcom and DMA state starts over. */
+static void chihiro_quickreboot_reset(ChihiroLPCState *s)
+{
+    chihiro_game_running = false;
+    chihiro_mbcom_bootstrap_done = false;
+    chihiro_mbcom_slots.known = false;
+    chihiro_e1_armed = false;
+    memset(chihiro_mbcom_command, 0, 32);
+    memset(chihiro_mbcom_response, 0, 32);
+
+    s->diag_armed = false;
+    timer_mod(s->diag_arm_timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 50);
+    s->lpc_401e_reads = 0;
+    s->lpc_scratch_4026 = 0;
+    s->mbcom_e0_status = 0;
+    s->mbcom_resp_ready = false;
+    s->bb_dma_active = false;
+    s->bb_dma_count = 0;
+    s->bb_reg_addr = 0;
+    s->bb_reg_status = 0;
+    memset(s->dimm_cmd, 0, sizeof(s->dimm_cmd));
+    memset(s->dimm_resp, 0, sizeof(s->dimm_resp));
+    timer_del(s->dimm_resp_timer);
+    timer_mod(s->diag_timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 50);
+}
 
 void chihiro_on_ohci_bus_start(void)
 {
@@ -651,37 +661,7 @@ void chihiro_on_ohci_bus_start(void)
         if (game_mode_bus_starts >= 2) {
             fprintf(stderr, "[%07lld] QUICKREBOOT (BUS START #%d in game mode)\n",
                     TS_MS, game_mode_bus_starts);
-            chihiro_game_running = false;
-            chihiro_boot3_reached = false;
-            chihiro_quickreboot_pending = true;
-            chihiro_mbcom_bootstrap_done = false;
-            chihiro_mbcom_slots.known = false;
-            chihiro_e1_armed = false;
-            memset(chihiro_mbcom_command, 0, 32);
-            memset(chihiro_mbcom_response, 0, 32);
-            if (s) {
-                s->diag_armed = false;
-                timer_mod(s->diag_arm_timer,
-                          qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 50);
-                s->lpc_401e_reads = 0;
-                s->lpc_scratch_4026 = 0;
-                s->mbcom_e0_status = 0;
-                s->mbcom_resp_ready = false;
-                s->bb_dma_active = false;
-                s->bb_dma_count = 0;
-                s->bb_reg_addr = 0;
-                s->bb_reg_status = 0;
-                s->bb_event_pending = false;
-                s->dimm_cmd_count = 0;
-                s->dimm_next_seq = 1;
-                s->dimm_cmd_idx = 0;
-                s->dimm_resp_ready = false;
-                memset(s->dimm_cmd, 0, sizeof(s->dimm_cmd));
-                memset(s->dimm_resp, 0, sizeof(s->dimm_resp));
-                timer_del(s->dimm_resp_timer);
-                timer_mod(s->diag_timer,
-                          qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 50);
-            }
+            chihiro_quickreboot_reset(s);
         }
     }
 
@@ -737,7 +717,7 @@ void chihiro_usb_set_devices(USBDevice *qc, USBDevice *sc)
  * causing a hot-plug event that triggers re-enumeration.
  */
 /*
- * QC hotplug — fires first (T+1500ms).
+ * QC hotplug — fires first (BUS START + 50 ms).
  * On real hardware, QC (ic10 EEPROM, 6864 bytes firmware) boots first.
  */
 static void chihiro_usb_hotplug_qc_cb(void *opaque)
@@ -748,9 +728,9 @@ static void chihiro_usb_hotplug_qc_cb(void *opaque)
 }
 
 /*
- * SC hotplug — fires 200ms after QC (T+1700ms).
+ * SC hotplug — fires 50 ms after QC (BUS START + 100 ms).
  * On real hardware, SC (pc20 EEPROM, 6731 bytes firmware) boots independently.
- * The 200ms gap ensures the kernel processes QC's RHSC event completely
+ * The gap lets the kernel process QC's RHSC event completely
  * (port reset → GET_DESC → SET_ADDRESS → GET_DESC config → SET_CONFIG)
  * before SC's RHSC event arrives as a separate enumeration cycle.
  */
@@ -806,10 +786,9 @@ static bool card_reader_initialized;
 /* Exposed to the SC (AN2131) layer so the 8051 UART drives the readers
  * directly. [0] = MIDI/UART1 reader, [1] = RS-232C/UART0 reader. */
 CardReaderState *chihiro_card_reader_global = hw210.reader;
-/* A card game owns the SC MIDI (UART1) channel: the OutRun 2 drive board must
- * not intercept it (only OR2 uses the drive board, and it has no card reader).
- * Before this the FFB drive board answered on MIDI for every game and its
- * bytes corrupted player 1's card channel. */
+/* An HW210 reader owns the SC's UART1 (MIDI): with the reader on, no drive
+ * board answers there. The MIDI peer is otherwise the cabinet's drive board
+ * (chihiro-an2131.c). */
 bool chihiro_hw210_enabled;
 bool chihiro_crp1231_enabled;
 
@@ -946,8 +925,9 @@ void chihiro_hw210_card_key(int player)
 /*
  * Card reader support. The serial data path is fully LLE: the game's USB
  * vendor requests reach the real SC 8051 firmware, which talks to the
- * HW210 readers over its two UARTs (chihiro-an2131.c). This timer only
- * manages card insertion (the UI assignment).
+ * HW210 readers over its two UARTs (chihiro-an2131.c). This tick runs the
+ * slot's PUSHED/LOCKED states around the game's card lock; the UI assignment
+ * is chihiro_card_ui_sync.
  */
 static void chihiro_card_reader_tick(void)
 {
@@ -1464,43 +1444,6 @@ static void chihiro_capture_game_filename_from_dir(void)
     fclose(f);
 }
 
-/* SEGABOOT loads boot.id at PA 0x4F000 before it reaches boot=3: the
- * fallback when the image was not parsed on the host. */
-static void chihiro_capture_game_filename(void)
-{
-    if (chihiro_game_filename[0]) {
-        return;
-    }
-    uint8_t bid[CHIHIRO_BOOTID_LEN];
-    char name[64];
-    cpu_physical_memory_read(0x4F000, bid, sizeof(bid));
-    if (chihiro_bootid_executable(bid, name, sizeof(name))) {
-        chihiro_set_game_executable(name);
-    }
-}
-
-static void chihiro_on_boot3(void)
-{
-    chihiro_boot3_reached = true;
-    chihiro_capture_game_filename();
-
-    /* LLE: SEGABOOT calls XLaunchNewImageA which allocates LDP, marks it
-     * persistent, and fills launch data. Kernel's STICKY section preserves
-     * the LaunchDataPage pointer across QuickReboot. */
-
-    if (!chihiro_game_filename[0] || chihiro_save_path[0])
-        return;
-
-    if (!chihiro_resolve_save_path()) {
-        fprintf(stderr, "Chihiro: save path resolve failed (dir='%s' file='%s')\n",
-                chihiro_game_dir, chihiro_game_filename);
-        return;
-    }
-    if (!chihiro_usb_save_load(chihiro_save_path))
-        fprintf(stderr, "Chihiro: no save found at %s\n", chihiro_save_path);
-    chihiro_dimm_sys_load();
-}
-
 /*
  * Periodic tick: drives the cabinet's boards while a game runs, and watches
  * the SEGABOOT state machine before that.
@@ -1529,23 +1472,6 @@ static void chihiro_diag_timer_cb(void *opaque)
     }
 
     chihiro_segaboot_poll();
-
-    /* Re-resolve PAs every tick: the game may change CR3, and stale PAs
-     * would read the wrong data. */
-    uint32_t bootstate = 0;
-    uint32_t bootstate_pa = chihiro_va_to_pa(0x89C48);
-
-    if (bootstate_pa != 0xFFFFFFFF)
-        cpu_physical_memory_read(bootstate_pa, &bootstate, 4);
-
-    /* Detect bootstate changes between ticks (guard against garbage VAs) */
-    if (bootstate != s->last_bootstate && bootstate < 100 &&
-        s->last_bootstate < 100) {
-        if (bootstate == 3)
-            chihiro_on_boot3();
-        s->last_bootstate = bootstate;
-    }
-
     timer_mod(s->diag_timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 100);
 }
 
@@ -1561,9 +1487,10 @@ static void chihiro_diag_timer_start(ChihiroLPCState *s, int64_t ms)
 }
 
 /*
- * SEGABOOT Initialization (RE reference — baseboard_init at VA 0x41EF0)
+ * SEGABOOT initialisation (Ver.2.13.0, the build in the second half of the
+ * flash, which is the one that boots)
  *
- * SEGABOOT's baseboard_init runs this sequence:
+ * baseboard_init runs this sequence:
  *   1. UsbEnumPoll()         → polls OHCI for QC/SC USB devices → Error 02 if fail
  *   2. RegisterClassDriver() → registers AN2131 class driver    → Error 02 if fail
  *   3. ReadEEPROM(0)         → reads ic10 EEPROM via vendor 0x16
@@ -1571,7 +1498,7 @@ static void chihiro_diag_timer_start(ChihiroLPCState *s, int64_t ms)
  *   5. InitMbcom()           → initializes mediaboard DMA communication
  *   6. return 0              → SUCCESS
  *
- * Boot state machine (CLogo::Update at VA 0x2EC00, decompiled):
+ * Boot state machine (CLogo::Update at VA 0x259D0; 0x2EC00 in Ver.2.00.0):
  *   0 logo fade in → 1 init → 2 logo hold → 3 wait for the media board
  *   → 4 verify the game → 5 fade out → 6 launch → 8 done.
  *   Any error jumps to 7, which is the screen that shows the code.
@@ -1581,124 +1508,12 @@ static void chihiro_diag_timer_start(ChihiroLPCState *s, int64_t ms)
  * Serial format: "%%%@-##@########" (e.g. "BEER-01A00000001")
  *   Main serial from ic10 EEPROM [0x1F10], media serial from mbcom CMD 0x0103.
  *
- * SEGABOOT runs unpatched. The map below gives the functions and data it goes
- * through, by address in its two builds, and how the emulated machine answers
- * each.
- *
- * === SEGABOOT Function Map (fpr-23887 / fpr-21042 variants) ===
- *
- * GetQcStatusByte0 (VA 0x3AD80 / 0x2AD70):
- *   E8 xx xx xx xx    call GetQcStatus (0x51BB0)
- *   0F B6 00          movzx eax, byte ptr [eax]   → DAT_000c5d01
- *   C3                ret
- *   Returns status buffer byte. 0 = OK → caller takes CreateThread path.
- *   LLE: buffer stays 0 natively (QC emulation correct).
- *
- * CreateThread return check (VA 0x425DE):
- *   85 C0             test eax, eax
- *   A3 34 A1 08 00    mov [0x8A134], eax          → thread handle
- *   5B                pop ebx
- *   75 12             jne +0x12                    → success path
- *   LLE: CreateThread succeeds natively.
- *
- * UsbPollQC_inner / UsbPollSC_inner (VA 0x51140 / 0x51150):
- *   USB poll functions called from the poll thread. Return 0 = no new data.
- *   LLE: real OHCI USB transactions handle polling.
- *
- * EncryptionCheck (VA 0x3A953):
- *   33 C9             xor ecx, ecx
- *   85 C0             test eax, eax               → USB transfer result
- *   0F 9D C1          setge cl
- *   5F 49 83 E1 02    ...
- *   Calls USB transfer (0x51340 → 0x1A0B0) via registered class driver.
- *   LLE: class driver registered natively, transfer succeeds.
- *
- * MbcomPollReady (VA 0x3DBC0):
- *   8A 44 24 04       mov al, [esp+4]             → slot index
- *   E8 67 FD FF FF    call FindSlot (0x3D930)
- *   85 C0             test eax, eax
- *   74 0E             je 0x3DBDB
- *   Returns 1 when baseboard DMAs response into slot[+2].
- *   LLE: DMA inject + clear-on-read delivers real responses.
- *
- * GetBootData (VA 0x41880):
- *   A1 50 9C 08 00    mov eax, [0x89C50]          → boot data pointer
- *   85 C0             test eax, eax
- *   74 0F             je 0x41898
- *   83 3D 48 9C 08 00 03  cmp dword [0x89C48], 3  → bootstate == 3?
- *   Returns [0x89C50]+0xFF000000 if boot==3 && ptr!=0, else 0.
- *   If 0 at state=3 with flag==0x21 → ERROR 27 after 2400 ticks.
- *   LLE: real boot data flows through mbcom.
- *
- * CheckMainBoardSerial (VA 0x2EBF0) / CheckMediaBoardSerial (VA 0x2EC40):
- *   Call MatchSerialFormat with pattern "%%%@-##@########"
- *   (3 letters, 1 alphanum, '-', 2 digits, 1 alphanum, 8 digits = 16 chars).
- *   Example: "AAEE-01D44744715", "BEER-01A00000001".
- *   Main serial failure → Error 03, media serial failure → Error 04.
- *   LLE: valid serials provided from ic10 EEPROM [0x1F10] and mbcom CMD 0x0103.
+ * SEGABOOT runs unpatched.
  *
  * AV / video mode:
  *   SEGABOOT checks the NV2A video mode. The EEPROM's video_standard carries
  *   AV_FLAGS_HDTV_480p (0x00080000), so the kernel sets the NV2A up for
  *   31 kHz progressive scan, which the check accepts.
- *
- * Error code store (VA 0x2E3AB):
- *   C7 07 14 00 00 00    mov [edi], 0x14             → error code 20 (decimal)
- *   Not reached when the machine is emulated correctly.
- *
- * === Byte signatures (to find these functions in other SEGABOOT builds) ===
- *
- * UsbEnumPoll:          E8 64 F6 FF FF 85 C0 74 0F           (fpr-23887)
- *                       E8 EF F1 FF FF 85 C0 0F 85           (fpr-21042)
- * RegisterClassDriver:  E8 27 54 00 00 85 C0 74 0F           (fpr-23887)
- *                       E8 33 95 00 00 85 C0 74 0F           (fpr-21042)
- * GetQcStatusByte0:     E8 2B 6E 01 00 0F B6 00 C3           (fpr-23887)
- *                       E8 EB 96 01 00 0F B6 00 C3           (fpr-21042)
- * EncryptionCheck:      33 C9 85 C0 0F 9D C1 5F 49 83 E1 02
- * CheckMainSerial:      85 C0 75 D6 B8 03 00 00 00 5E C3     (fpr-23887)
- *                       E8 B4 F7 FF FF 85 C0 75 07 B8 03 ... (fpr-21042)
- * CheckMediaSerial:     85 C0 75 0A 5F B8 04 00 00 00 5E C2 04 00
- *
- * === SEGABOOT Data Addresses ===
- *
- * baseboard_dev[] array:
- *   VA 0xA3778 (fpr-23887) / VA 0xE9BD0 (fpr-21042), stride 0x218, flags at +4.
- *
- * Key variables:
- *   [0x87AFC] = CheckErrors state (0-8)
- *   [0x87AE8] = error counter
- *   [0x87AF8] = ready flag
- *   [0x89C38] = gate
- *   [0x89C48] = bootstate (0-3)
- *   [0x89C4C] = MbcomNegotiate flag (0x21 on success)
- *   [0x89C50] = boot data pointer
- *   [0x896A8] = mbcom slot count
- *   [0x896B4] = slot[0].flag
- *   [0x8A128] = MainUpdate flag
- *   [0x8A134] = USB poll thread handle
- *   [0x8A138] = USB poll thread state
- *   [0xD07A8] = XBE2 game state (must reach 4)
- *   [0xCB9EC] = XBE2 CE state machine (mirrors 0x87AFC)
- *
- * Kernel addresses:
- *   VA 0x8003B1D8 (PA 0x3B1D8) = XboxGameRegion, STICKY section
- *     ROM value 0x80000000 (manufacturing bit). Game cert region at cert+0xA0.
- *
- * LaunchDataPage (LDP) integrity:
- *   Pointer at PA 0x3B3D8, canary at PA 0x3B400.
- *   LDP page layout: [+0x00] type (0=none, 1=error, 2=game), [+0x08] path (255 chars).
- *   Error info: [+0x400] error context, [+0x408] error type (1=generic 3=region 5=media).
- *   Error LDP page also at PA 0x0E000 (kernel error dump area).
- *
- * NV2A video registers (physical MMIO):
- *   PRAMDAC base 0xFD680000: +0x800 VDISPLAY_END, +0x810 VSYNC_END, +0x818 VVALID_END,
- *     +0x820 HDISPLAY_END, +0x838 HVALID_END, +0x508 VPLL_COEFF.
- *   PCRTC base 0xFD600000: +0x804 PCRTC_CONFIG.
- *   PRMCIO base 0xFD601000: +0x39 interlace flag.
- *
- * DMA slot layout (boot data flow):
- *   initPtr [0x896AC], slot META at [0x89740] stride 0x40, slot DATA at [0x89760] stride 0x40.
- *   Up to 4 slots. MbcomPollReady checks slot[index+2] for baseboard DMA response.
  *
  * === Why UsbEnumPoll must run ===
  *
@@ -1714,10 +1529,8 @@ static void chihiro_arm_diag_cb(void *opaque)
     if (s->diag_armed) return;
     if (chihiro_game_running) return;
 
-    /* SEGABOOT is up: arm the diagnostic timer */
+    /* Before the game: the periodic tick watches SEGABOOT, 1 s from now. */
     s->diag_armed = true;
-
-    /* Start diagnostic timer to monitor SEGABOOT state machine */
     s->diag_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, chihiro_diag_timer_cb, s);
     timer_mod(s->diag_timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 1000);
 }
@@ -1731,8 +1544,8 @@ void chihiro_on_quickreboot_signal(void)
 {
     if (!chihiro_active) return;
 
-    fprintf(stderr, "[%07lld] === QUICKREBOOT === game_running=%d boot3=%d\n",
-            TS_MS, chihiro_game_running, chihiro_boot3_reached);
+    fprintf(stderr, "[%07lld] === QUICKREBOOT === game_running=%d\n",
+            TS_MS, chihiro_game_running);
 
     /* diag_armed drops for 50 ms after each QuickReboot, which folds a
      * repeated SCRATCH=0x04 into one. The kernel's own write during its first
@@ -1742,57 +1555,7 @@ void chihiro_on_quickreboot_signal(void)
     }
 
     chihiro_capture_game_filename_from_dir();
-
-    chihiro_quickreboot_pending = true;
-    chihiro_game_running = false;
-    chihiro_boot3_reached = false;
-    chihiro_mbcom_bootstrap_done = false;
-    chihiro_e1_armed = false;
-    memset(chihiro_mbcom_command, 0, 32);
-    memset(chihiro_mbcom_response, 0, 32);
-
-    /* Whatever the QuickReboot starts, SEGABOOT again or the game, the watch
-     * is armed again and the mbcom and DMA state starts over. */
-    if (chihiro_lpc_global) {
-        ChihiroLPCState *s = chihiro_lpc_global;
-        s->diag_armed = false;
-        timer_mod(s->diag_arm_timer,
-                  qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 50);
-        s->lpc_401e_reads = 0;
-        s->lpc_scratch_4026 = 0;
-        s->mbcom_e0_status = 0;
-        s->mbcom_resp_ready = false;
-
-        /* Reset DMA burst state */
-        s->bb_dma_active = false;
-        s->bb_dma_count = 0;
-        s->bb_reg_addr = 0;
-        s->bb_reg_status = 0;
-        s->bb_event_pending = false;
-
-        /* Reset DIMM mailbox state */
-        s->dimm_cmd_count = 0;
-        s->dimm_next_seq = 1;
-        s->dimm_cmd_idx = 0;
-        s->dimm_resp_ready = false;
-        memset(s->dimm_cmd, 0, sizeof(s->dimm_cmd));
-        memset(s->dimm_resp, 0, sizeof(s->dimm_resp));
-        timer_del(s->dimm_resp_timer);
-
-        timer_mod(s->diag_timer,
-                  qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 50);
-    }
-}
-
-/* Called from the SMC handler when the kernel writes SMC_REG_POWER
- * (QuickReboot). The reset goes ahead: smc_reset keeps the scratch register,
- * so the kernel sees a warm boot, restores its MmPersistContiguousMemory pages
- * and loads the game from the LaunchDataPage. */
-bool chihiro_intercept_reset(void)
-{
-    /* game_running is not set here: chihiro_on_ohci_bus_stop() sets it
-     * when SEGABOOT hands the machine over to the game. */
-    return false;  /* Always allow qemu_system_reset_request */
+    chihiro_quickreboot_reset(chihiro_lpc_global);
 }
 
 /* Dolphin's window for the same board: 0x84800000-0x84818000, which is exactly
@@ -1863,10 +1626,6 @@ static void chihiro_dimm_process_cmd(ChihiroLPCState *s)
     default:
         break;
     }
-
-    s->dimm_resp_ready = true;
-    s->dimm_next_seq = seq + 1;
-    s->dimm_cmd_count++;
 }
 
 
@@ -1903,7 +1662,6 @@ static uint64_t chihiro_lpc_io_read(void *opaque, hwaddr addr,
     uint64_t r = 0;
 
     ChihiroLPCState *s = CHIHIRO_LPC_DEVICE(opaque);
-    s->last_lpc_activity_ms = TS_MS;
     s->host_seen = true;
 
     if (chihiro_game_running) {
@@ -2014,7 +1772,7 @@ static uint64_t chihiro_lpc_io_read(void *opaque, hwaddr addr,
             }
             break;
         }
-        if (CHIHIRO_LOG && lpc_log_verbose) {
+        if (lpc_log_verbose) {
             static int lpc_read_log = 0;
             if (lpc_read_log < 500) {
                 fprintf(stderr, "[%07lld] LPC REG READ [0x%08X] -> 0x%08X\n", TS_MS,
@@ -2023,7 +1781,7 @@ static uint64_t chihiro_lpc_io_read(void *opaque, hwaddr addr,
             }
         }
         return r;
-    case SEGA_FIRMWARE_VERSION:
+    case SEGA_DIMM_BASE_LO:
         /* SEGABOOT reads these once for DIMM base address calculation.
          * Game XBE reads them again and checks for "XBAM" signature.
          * First read pair returns DIMM base, subsequent reads return XBAM. */
@@ -2047,16 +1805,16 @@ static uint64_t chihiro_lpc_io_read(void *opaque, hwaddr addr,
     case SEGA_XBAM_STRING_2:
         r = 0x4D41;     /* "MA" → full string reads as "XBAM" */
         break;
-    case 0xF0: /* Board mode. SEGABOOT checks high byte: 0=Type-1, non-zero=Type-3.
-               * acLib v0.71+ (WMMT1, Type-3): high byte selects device type
-               * '!' vs ')'. Type ')' triggers SC search → EEPROM version read. */
-        r = chihiro_is_type3() ? 0x0100 : 0x0001;
+    case SEGA_CHIP_REVISION:
+        /* SEGABOOT checks the high byte: 0 (FPGA) = Type-1, non-zero (ASIC) =
+         * Type-3. acLib v0.71+ (WMMT1, Type-3) picks device type '!' or ')'
+         * from it; ')' triggers the SC search and the EEPROM version read.
+         * The FPGA answers revision 1. */
+        r = chihiro_is_type3() ? SEGA_CHIP_REVISION_ASIC_CHIP_ID
+                               : (SEGA_CHIP_REVISION_FPGA_CHIP_ID | 0x01);
         { static int f0_log = 0; if (lpc_log_verbose && f0_log < 500) { f0_log++;
             fprintf(stderr, "[%07lld] F0 READ → 0x%04X (type3=%d)\n",
                     TS_MS, (unsigned)r, chihiro_board_type3); } }
-        if (chihiro_quickreboot_pending) {
-            chihiro_quickreboot_pending = false;
-        }
         break;
     case SEGA_DIMM_SIZE:
         r = mediaboard.dimm_factor;     /* JP1/JP2 jumpers. The kernel lays the disk
@@ -2092,6 +1850,7 @@ static uint64_t chihiro_lpc_io_read(void *opaque, hwaddr addr,
     return r;
 }
 
+static void chihiro_mbcom_init(void);
 static void chihiro_mbcom_process(void);
 
 /* A message from the board is in 0x84000000: E0 bit 0 and IRQ 10, 2 ms later
@@ -2176,7 +1935,6 @@ static void chihiro_saddr_store(ChihiroLPCState *s, uint32_t wa, uint32_t val)
         s->dimm_resp[idx] = val;
         if (idx == 0 && val == 0) {
             memset(s->dimm_resp, 0, sizeof(s->dimm_resp));
-            s->dimm_resp_ready = false;
         }
     } else if (wa >= FW_UPLOAD_BASE && wa < FW_UPLOAD_BASE + FW_UPLOAD_SIZE) {
         chihiro_fw_upload_word(s, wa, val);
@@ -2187,7 +1945,6 @@ static void chihiro_lpc_io_write(void *opaque, hwaddr addr, uint64_t val,
                                  unsigned size)
 {
     ChihiroLPCState *s = CHIHIRO_LPC_DEVICE(opaque);
-    s->last_lpc_activity_ms = TS_MS;
     s->host_seen = true;
 
     if (chihiro_game_running) {
@@ -2201,7 +1958,6 @@ static void chihiro_lpc_io_write(void *opaque, hwaddr addr, uint64_t val,
 
     switch (addr) {
     case 0x00: /* Port 0x4000: write to baseboard register at lpc_reg_addr */
-        s->lpc_reg_data = (uint32_t)val;
         if (s->lpc_reg_addr == NETDIMM_CMD_BASE) {
             if (chihiro_netdimm_cmd_idx < 8) {
                 chihiro_netdimm_cmd[chihiro_netdimm_cmd_idx++] = (uint32_t)val;
@@ -2224,9 +1980,6 @@ static void chihiro_lpc_io_write(void *opaque, hwaddr addr, uint64_t val,
         switch (s->lpc_reg_addr) {
         case 0xA0000020: /* Indirect address pointer */
             s->bb_reg_addr = (uint32_t)val;
-            if (val == 0x84000020) {
-                s->dimm_cmd_idx = 0;  /* reset command capture */
-            }
             {
                 static int addr_log = 0;
                 if (chihiro_game_running) {
@@ -2368,8 +2121,6 @@ static void chihiro_lpc_io_write(void *opaque, hwaddr addr, uint64_t val,
                            * Protocol (from vsg.xbe FUN_0014c120 + DPC at 0x14c0e0):
                            *   DPC writes E1=0xF (ARM)
                            *   Worker checks scratch bit 8: set=busy, clear=ready
-                           */
-        /*
                            *   Worker writes cmd to DMA (FC801), then E1=0xF, E1=0
                            *   E1=0 = "process the DMA command" (not scratch!)
                            * scratch 0x0102 = status register (bit8=busy), NOT a command */
@@ -2379,7 +2130,6 @@ static void chihiro_lpc_io_write(void *opaque, hwaddr addr, uint64_t val,
                 (chihiro_mbcom_command[0] != 0 || chihiro_mbcom_command[1] != 0)) {
                 chihiro_mbcom_process();
                 s->mbcom_e0_status |= 0x01;
-                s->dimm_cmd_count++;
                 qemu_irq_lower(s->irq10);
                 qemu_irq_raise(s->irq10);
             } else {
@@ -2466,23 +2216,8 @@ static const MemoryRegionOps chihiro_lpc_io_ops = {
     .endianness = DEVICE_LITTLE_ENDIAN,
 };
 
-/* Global IRQ10 reference for mbcom DMA write trigger */
-static qemu_irq chihiro_irq10_global = NULL;
-
-/*
- * IRQ10 periodic pulse — signals SEGABOOT that a baseboard response is ready.
- * On real hardware, IRQ10 fires after each mbcom command is processed.
- * We pulse it periodically since we pre-fill the response sector.
- */
-
-/* mbcom state — arrays declared before chihiro_lpc_io_write for forward use */
-static bool chihiro_mbcom_enabled = false;
-
-/* Flash ROM (SEGABOOT) loaded from file — serves mbrom0/mbrom1 reads.
- * On real hardware: fpr-23887_29lv160te.ic4 (2MB flash on MediaBoard).
- * Contains the SEGABOOT XBE that boots before the game.
- * Also contains MBDT header at 0xFFE00 with media board serial. */
-
+/* The baseboard EEPROM dumps: ic10 (QC firmware), ic11 (settings), pc20 (SC
+ * firmware). */
 uint8_t *chihiro_ic10_data = NULL;
 uint32_t chihiro_ic10_size = 0;
 uint8_t *chihiro_ic11_data = NULL;
@@ -2898,16 +2633,16 @@ static void chihiro_irq10_timer_cb(void *opaque)
         qemu_irq_raise(s->irq10);
     }
 
-    /* Type-1 game-mode mbcom bootstrap ('!' mode): pre-load DIMM_SIZE
-     * (0x8001) and fire IRQ10 at once; the worker polls through IDE DMA, with
-     * no handshake. A Type-3 game asks its V850 itself (0x0001 by EXEC). */
-    if (chihiro_game_running && chihiro_mbcom_enabled &&
-        !chihiro_mbcom_bootstrap_done) {
+    /* Type-1 game-mode mbcom bootstrap ('!' mode), once per game start: the
+     * INIT reply (DIMM size, 0x8001) goes to the SADDR buffer, which the
+     * games logged do not read (they use the IDE mailbox), and E0 bit 0,
+     * resp_ready and an IRQ10 edge are left for the game. A Type-3 game asks
+     * its V850 itself (0x0001 by EXEC). */
+    if (chihiro_game_running && !chihiro_mbcom_bootstrap_done) {
         memset(chihiro_mbcom_command, 0, 32);
         if (!chihiro_is_type3()) {
             s->dimm_cmd[0] = 1 | (0x0001 << 16);
             chihiro_dimm_process_cmd(s);
-            s->dimm_resp_ready = true;
             s->mbcom_e0_status |= 0x01;
             s->mbcom_resp_ready = true;
             s->lpc_scratch_4026 &= ~0x0100;
@@ -2920,11 +2655,10 @@ static void chihiro_irq10_timer_cb(void *opaque)
 
     /* Pick up the media board commands SEGABOOT is spinning on (Type-1: a
      * Type-3's V850 answers them itself). */
-    if (chihiro_mbcom_enabled && !chihiro_game_running && !chihiro_is_type3()
-        && chihiro_lpc_global && chihiro_lpc_global->diag_armed) {
+    if (!chihiro_game_running && !chihiro_is_type3() && s->diag_armed) {
         if (!chihiro_mbcom_slots.known) {
-            /* Looked for twice a second until SEGABOOT's code is mapped;
-             * once the two tables are known this never runs again. */
+            /* Looked for twice a second until SEGABOOT's code is mapped,
+             * again after each QuickReboot; the first table found is used. */
             static unsigned tries;
             if (++tries % 32 == 1) {
                 chihiro_find_mbcom_slots();
@@ -2939,20 +2673,6 @@ static void chihiro_irq10_timer_cb(void *opaque)
     timer_mod(s->irq10_timer,
               qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 16);
 }
-
-
-static void chihiro_kbd_event(DeviceState *dev, QemuConsole *src,
-                              InputEvent *evt)
-{
-    /* JVS input handled by xemu_input_update_jvs() in xemu-input.c */
-    (void)dev; (void)src; (void)evt;
-}
-
-static const QemuInputHandler chihiro_kbd_handler = {
-    .name  = "Chihiro JVS Keyboard",
-    .mask  = INPUT_EVENT_MASK_KEY,
-    .event = chihiro_kbd_event,
-};
 
 static void chihiro_lpc_realize(DeviceState *dev, Error **errp)
 {
@@ -2970,10 +2690,6 @@ static void chihiro_lpc_realize(DeviceState *dev, Error **errp)
 
     setvbuf(stderr, NULL, _IONBF, 0);
 
-    /* Initialize mbcom buffers to zero */
-    memset(s->mbcom_read_buffer, 0, sizeof(s->mbcom_read_buffer));
-    memset(s->mbcom_write_buffer, 0, sizeof(s->mbcom_write_buffer));
-
     /* 0x80000140 bit 0 is the media board CPU's release. While it reads 0
      * the acLib uploads the firmware, writes 1 and returns 5 to be called
      * again (FUN_0014c580); with 1 it sets up its mailboxes. A Type-1 has no
@@ -2984,7 +2700,6 @@ static void chihiro_lpc_realize(DeviceState *dev, Error **errp)
 
     /* Initialize IRQ10 for baseboard communication */
     s->irq10 = isa_get_irq(isa, 10);
-    chihiro_irq10_global = s->irq10;
     s->irq10_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL,
                                    chihiro_irq10_timer_cb, s);
     timer_mod(s->irq10_timer,
@@ -2998,8 +2713,6 @@ static void chihiro_lpc_realize(DeviceState *dev, Error **errp)
 
     s->dimm_resp_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL,
                                        chihiro_dimm_resp_timer_cb, s);
-    s->dimm_cmd_count = 0;
-    s->dimm_next_seq = 1;
 
     /* USB hotplug timers: created here, armed only when ohci_bus_start()
      * fires (chihiro_on_ohci_bus_start).
@@ -3008,7 +2721,8 @@ static void chihiro_lpc_realize(DeviceState *dev, Error **errp)
      *
      * On real hardware: AN2131 boot ~200ms, kernel OHCI ~600ms.
      * Kernel sees devices during first scan → SET_CONFIG → CONFIGURED.
-     * Here the devices attach 150 ms after BUS START, to the same effect. */
+     * Here the devices attach 50 ms (QC) and 100 ms (SC) after BUS START,
+     * to the same effect. */
     s->usb_hotplug_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL,
                                          chihiro_usb_hotplug_qc_cb, s);
     /* Timer NOT armed yet — will be armed by chihiro_on_ohci_bus_start() */
@@ -3017,15 +2731,12 @@ static void chihiro_lpc_realize(DeviceState *dev, Error **errp)
                                             chihiro_usb_hotplug_sc_cb, s);
     /* Timer NOT armed yet — will be armed by chihiro_on_ohci_bus_start() */
 
-    /* Arm the diagnostic timer once SEGABOOT is loaded — retry every 1ms */
+    /* The periodic tick starts 10 ms after power-on (chihiro_arm_diag_cb). */
     s->diag_armed = false;
     s->diag_arm_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL,
                                             chihiro_arm_diag_cb, s);
     timer_mod(s->diag_arm_timer,
               qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 10);
-
-    qemu_input_handler_register(dev, &chihiro_kbd_handler);
-
 }
 
 /* The whole mediaboard protocol state: without it a snapshot restored
@@ -3037,7 +2748,6 @@ static int chihiro_lpc_pre_save(void *opaque)
 {
     ChihiroLPCState *s = opaque;
     s->mig_game_running = chihiro_game_running;
-    s->mig_quickreboot_pending = chihiro_quickreboot_pending;
     s->mig_active = chihiro_active;
     g_strlcpy((char *)s->mig_game_filename, chihiro_game_filename,
               sizeof(s->mig_game_filename));
@@ -3049,7 +2759,6 @@ static int chihiro_lpc_post_load(void *opaque, int version_id)
     ChihiroLPCState *s = opaque;
     if (version_id >= 3) {
         chihiro_game_running = s->mig_game_running;
-        chihiro_quickreboot_pending = s->mig_quickreboot_pending;
         chihiro_active = s->mig_active;
         /* A game that was running had its Type-1 bootstrap then: it must
          * not fire again in the middle of the game. */
@@ -3074,14 +2783,13 @@ static const VMStateDescription vmstate_chihiro_lpc = {
     .pre_save = chihiro_lpc_pre_save,
     .post_load = chihiro_lpc_post_load,
     .fields = (const VMStateField[]) {
-        VMSTATE_UINT8_ARRAY(mbcom_read_buffer, ChihiroLPCState, 32),
-        VMSTATE_UINT8_ARRAY(mbcom_write_buffer, ChihiroLPCState, 32),
+        VMSTATE_UNUSED(64),
         VMSTATE_BOOL(host_seen, ChihiroLPCState),
         VMSTATE_UINT32(lpc_reg_addr, ChihiroLPCState),
-        VMSTATE_UINT32(lpc_reg_data, ChihiroLPCState),
+        VMSTATE_UNUSED(4),
         VMSTATE_BOOL(diag_armed, ChihiroLPCState),
         VMSTATE_UINT32(lpc_401e_reads, ChihiroLPCState),
-        VMSTATE_UINT32(last_bootstate, ChihiroLPCState),
+        VMSTATE_UNUSED(4),
         VMSTATE_UINT16(lpc_scratch_4026, ChihiroLPCState),
         VMSTATE_UINT8(mbcom_e0_status, ChihiroLPCState),
         VMSTATE_BOOL(mbcom_resp_ready, ChihiroLPCState),
@@ -3089,22 +2797,19 @@ static const VMStateDescription vmstate_chihiro_lpc = {
         VMSTATE_UINT32(bb_reg_status, ChihiroLPCState),
         VMSTATE_BOOL(bb_dma_active, ChihiroLPCState),
         VMSTATE_UINT32(bb_dma_count, ChihiroLPCState),
-        VMSTATE_BOOL(bb_event_pending, ChihiroLPCState),
+        VMSTATE_UNUSED(1),
         VMSTATE_UINT32(asic_cpu_ctrl, ChihiroLPCState),
         VMSTATE_UINT32_ARRAY(dimm_cmd, ChihiroLPCState, 8),
         VMSTATE_UINT32_ARRAY(dimm_resp, ChihiroLPCState, 8),
-        VMSTATE_UINT32(dimm_cmd_idx, ChihiroLPCState),
-        VMSTATE_BOOL(dimm_resp_ready, ChihiroLPCState),
-        VMSTATE_UINT32(dimm_cmd_count, ChihiroLPCState),
-        VMSTATE_UINT16(dimm_next_seq, ChihiroLPCState),
-        /* Protocol one-shot timers: a snapshot taken with a mediaboard
-         * transaction in flight owes the guest a response — without the
-         * timer the reply never comes and the game hangs on its next
-         * mediaboard poll. */
+        VMSTATE_UNUSED(11),
+        /* The IRQ10 tick and the one-shot reply timer: a snapshot taken with
+         * a mediaboard transaction in flight owes the guest a response —
+         * without the timer the reply never comes and the game hangs on its
+         * next mediaboard poll. */
         VMSTATE_TIMER_PTR_V(irq10_timer, ChihiroLPCState, 2),
         VMSTATE_TIMER_PTR_V(dimm_resp_timer, ChihiroLPCState, 2),
         VMSTATE_BOOL_V(mig_game_running, ChihiroLPCState, 3),
-        VMSTATE_BOOL_V(mig_quickreboot_pending, ChihiroLPCState, 3),
+        VMSTATE_UNUSED_V(3, 1),
         VMSTATE_BOOL_V(mig_active, ChihiroLPCState, 3),
         VMSTATE_BUFFER_V(mig_game_filename, ChihiroLPCState, 4),
         VMSTATE_END_OF_LIST()
@@ -3601,7 +3306,7 @@ static void chihiro_exit_notify(Notifier *notifier, void *data)
 static Notifier chihiro_exit_notifier = { .notify = chihiro_exit_notify };
 /* Flush the arcade backup (game save) immediately. The UI quit path skips
  * the doomed driver atexit chain with _exit(), which also skips the exit
- * notifier below — it must flush explicitly before leaving. */
+ * notifier — it must flush explicitly before leaving. */
 void chihiro_flush_save_now(void)
 {
     chihiro_exit_notify(NULL, NULL);
@@ -3648,7 +3353,6 @@ static uint32_t chihiro_mbcom_base(void)
     return (0x40000u << chihiro_dimm_factor()) - 0x8000u;
 }
 #define CHIHIRO_MBROM0          0x8000000
-#define CHIHIRO_MBROM1          0x8000800
 
 /* ── The DIMM's system area ───────────────────────────────────────────────
  * The 0x8000 sectors above the game's filesystem (the kernel's "mbsys:"),
@@ -3744,9 +3448,9 @@ static bool chihiro_dimm_sys_flush(void)
     return true;
 }
 
-/* MemoryRegion-backed IDE interface.
- * Only FATX goes through the block device. Flash ROM and mbcom are
- * served via synchronous hooks in core.c (chihiro_rom_io/chihiro_mbcom_io). */
+/* MemoryRegion-backed IDE interface. DMA on unit 1 (FATX, flash ROM, mbcom)
+ * is served by chihiro_ide_serve, hooked in hw/ide/core.c; only PIO reaches
+ * the block device. */
 static uint64_t chihiro_fs_size(void)
 {
     return (uint64_t)chihiro_mbcom_base() * 512;
@@ -3870,7 +3574,6 @@ uint8_t chihiro_region_byte(void)
     }
     return region;
 }
-#define CHIHIRO_ROM_SIZE        (2 * 1024 * 1024)  /* 2MB */
 
 static MemoryRegion chihiro_interface_container;
 static MemoryRegion chihiro_interface_fs;
@@ -4070,10 +3773,6 @@ static const VMStateDescription vmstate_chihiro_dimm = {
 
 void chihiro_ide_interface_init(void)
 {
-    printf("Chihiro: IDE interface init START (fs=%llu)\n",
-           (unsigned long long)chihiro_fs_size());
-    fflush(stdout);
-
     memory_region_init(&chihiro_interface_container, NULL,
                        "chihiro.interface", chihiro_fs_size());
 
@@ -4090,22 +3789,15 @@ void chihiro_ide_interface_init(void)
     address_space_init(&chihiro_interface_as, &chihiro_interface_container,
                        "chihiro.interface");
 
-    printf("Chihiro: IDE interface — MemoryRegions + AddressSpace OK\n");
-    fflush(stdout);
-
     BlockDriverState *bs = bdrv_new();
     bdrv_memory_open(bs, &chihiro_interface_as, chihiro_fs_size());
     bdrv_set_monitor_owned(bs);
-    printf("Chihiro: IDE interface — BDS created\n");
-    fflush(stdout);
 
     BlockBackend *blk = blk_new(qemu_get_aio_context(),
                                 BLK_PERM_CONSISTENT_READ | BLK_PERM_WRITE,
                                 BLK_PERM_ALL);
     blk_insert_bs(blk, bs, &error_fatal);
     monitor_add_blk(blk, "chihiro-interface", &error_fatal);
-    printf("Chihiro: IDE interface — BlockBackend created\n");
-    fflush(stdout);
 
     DriveInfo *dinfo = g_malloc0(sizeof(*dinfo));
     dinfo->type = IF_IDE;
@@ -4239,8 +3931,7 @@ bool chihiro_ide_serve(int dma_cmd, uint32_t lba, int n,
             }
         }
         /* mbcom response/command */
-        if (chihiro_mbcom_enabled &&
-            (lba == mbcom_resp || lba == mbcom_cmd)) {
+        if (lba == mbcom_resp || lba == mbcom_cmd) {
             uint8_t buf[512] = {0};
             const uint8_t *src = (lba == mbcom_resp)
                 ? chihiro_mbcom_response : chihiro_mbcom_command;
@@ -4321,8 +4012,7 @@ bool chihiro_ide_serve(int dma_cmd, uint32_t lba, int n,
             }
             return true;
         }
-        if (chihiro_mbcom_enabled &&
-            (lba == mbcom_resp || lba == mbcom_cmd)) {
+        if (lba == mbcom_resp || lba == mbcom_cmd) {
             uint8_t buf[512];
             dma_memory_read(&address_space_memory,
                             sg->sg[0].base, buf, 512,
@@ -4346,11 +4036,10 @@ bool chihiro_ide_serve(int dma_cmd, uint32_t lba, int n,
                     (chihiro_mbcom_command[0] || chihiro_mbcom_command[1])) {
                     chihiro_mbcom_process();
                     memset(chihiro_mbcom_command, 0, 32);
-                    if (chihiro_lpc_global)
+                    if (chihiro_lpc_global) {
                         chihiro_lpc_global->mbcom_e0_status |= 0x01;
-                    if (chihiro_irq10_global) {
-                        qemu_irq_lower(chihiro_irq10_global);
-                        qemu_irq_raise(chihiro_irq10_global);
+                        qemu_irq_lower(chihiro_lpc_global->irq10);
+                        qemu_irq_raise(chihiro_lpc_global->irq10);
                     }
                 }
             }
@@ -4384,20 +4073,14 @@ bool chihiro_ide_serve(int dma_cmd, uint32_t lba, int n,
     return true;
 }
 
-void chihiro_mbcom_init(void)
+static void chihiro_mbcom_init(void)
 {
     memset(chihiro_mbcom_response, 0, sizeof(chihiro_mbcom_response));
     memset(chihiro_mbcom_command, 0, sizeof(chihiro_mbcom_command));
-    chihiro_mbcom_enabled = true;
 }
 
-/* Process mbcom command and generate responses.
- * On real hardware, the SH4 CPU on the DIMM board (running VxWorks) handles
- * these commands via the 315-6322 ASIC. The PIC16C621A on the DIMM board only
- * provides a DES key to the SH4 at boot — it never sees mbcom traffic.
- * sp5001.bin is the JVS I/O board firmware (TMP90PH44N), unrelated to DIMM.
- * Returning instant READY/100% may cause MEDIA BOARD TEST in the service menu
- * to show "CHECKING 0%" then "STATUS ----" instead of progressing normally. */
+/* The Type-1 board's answer to a command in the IDE mailbox (a Type-3's V850
+ * answers for itself). */
 static void chihiro_mbcom_process(void)
 {
     const uint8_t *w = chihiro_mbcom_command;
@@ -4410,8 +4093,8 @@ static void chihiro_mbcom_process(void)
     /* Cxbx-style response: echo sequence + command|0x8000 success flag */
     r[0] = w[0];
     r[1] = w[1];
-    r[2] = w[2] | (cmd_code & 0xFF);         /* low byte of cmd | 0x8000 */
-    r[3] = (w[3] & 0x7F) | 0x80;             /* high byte with bit15 set */
+    r[2] = w[2];                             /* the command's low byte */
+    r[3] = (w[3] & 0x7F) | 0x80;             /* its high byte, bit 15 set */
     /* zero out rest of 32-byte response area */
     memset(r + 4, 0, 28);
 
@@ -4448,13 +4131,13 @@ static void chihiro_mbcom_process(void)
     case MB_CMD_GET_SERIAL: /* From flash ROM MBDT+0x10 */
         memcpy(r + 4, mediaboard.serial, 16);
         break;
-    case 0x0104: /* Cxbx: unknown, returns 0 */
+    case MB_CMD_GET_NET_PROPERTY: /* answered with zeros */
         r[4] = 0; r[5] = 0; r[6] = 0; r[7] = 0;
         break;
     case 0x0204: /* Cxbx: returns 0 */
         r[4] = 0; r[5] = 0; r[6] = 0; r[7] = 0;
         break;
-    case 0x0301: /* HW_TEST — Cxbx writes "TEST OK" to result ptr */
+    case MB_CMD_HARDWARE_TEST: /* Cxbx writes "TEST OK" to the result pointer */
         r[4] = w[4]; r[5] = w[5]; r[6] = w[6]; r[7] = w[7];
         /* Write "TEST OK" to the address specified in the command */
         {

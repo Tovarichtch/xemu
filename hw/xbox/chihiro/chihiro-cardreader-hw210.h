@@ -74,7 +74,6 @@ void card_reader_insert(CardReaderState *s, const char *path,
                         const CardStock *stock);
 void card_reader_remove(CardReaderState *s);
 void card_reader_write_byte(CardReaderState *s, uint8_t byte);
-void card_reader_tap_byte(CardReaderState *s, uint8_t byte);
 int  card_reader_read(CardReaderState *s, uint8_t *buf, int max_len);
 bool card_reader_has_response(CardReaderState *s);
 bool card_reader_flush(CardReaderState *s); /* true once the file has it */
