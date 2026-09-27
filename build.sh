@@ -195,7 +195,11 @@ most_recent_macosx_sdk_ver () {
 case "$platform" in # Adjust compilation options based on platform
     Linux)
         echo 'Compiling for Linux...'
-        sys_cflags='-march=native -Wno-error=redundant-decls'
+        sys_cflags='-Wno-error=redundant-decls'
+        # Runs on any x86-64-v2 CPU, not only on the machine that built it.
+        if [ "$target_arch" == "x86_64" ]; then
+            sys_cflags="-march=x86-64-v2 $sys_cflags"
+        fi
         opts="$opts --disable-werror"
         postbuild='package_linux'
         ;;
