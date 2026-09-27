@@ -296,8 +296,9 @@ void xemu_link_enable(void)
         return;
     }
     if (me < 1 || me > 4 || cabinets < 2 || cabinets > 4 || me > cabinets) {
-        xemu_queue_error_message("Cabinet link: this cabinet must be 1 to 4 and "
-                                 "within the number of cabinets (2 to 4)");
+        xemu_queue_error_message("Cabinet link: the current cabinet ID must be "
+                                 "1 to 4 and within the number of cabinets "
+                                 "(2 to 4)");
         return;
     }
 

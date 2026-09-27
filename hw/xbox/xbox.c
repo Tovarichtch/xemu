@@ -362,10 +362,12 @@ void xbox_init_common(MachineState *machine,
         chihiro_freeplay_setting = g_config.chihiro.settings.freeplay;
 
         /* The media board files were loaded with the BIOS (vl.c): the paths
-         * set in Settings > Chihiro > Files, else the files beside the BIOS. */
+         * set in Settings > System > Chihiro Files, else the files beside the
+         * BIOS. */
         if (!chihiro_flash_rom_loaded()) {
             fprintf(stderr, "Chihiro: ERROR — Flash ROM media board not found "
-                    "(fpr21042_m29w160et.bin). Set path in Settings > Chihiro > Files.\n");
+                    "(fpr21042_m29w160et.bin). Set path in Settings > System > "
+                    "Chihiro Files.\n");
         }
         if (!chihiro_ic10_data) {
             fprintf(stderr, "Chihiro: WARNING — EEPROM QC not found "

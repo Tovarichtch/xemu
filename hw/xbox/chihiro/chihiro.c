@@ -512,7 +512,7 @@ static void mediaboard_init(void)
         if (!firmware || !firmware[0]) {
             xemu_queue_error_message("Cabinet link: the network board needs its "
                                      "firmware (ver1305.bin), see Settings > "
-                                     "Chihiro > Files");
+                                     "System > Chihiro Files");
         } else if (chihiro_netboard_init(firmware, mediaboard.serial,
                                          mediaboard.net_ip)) {
             chihiro_netboard_bh = qemu_bh_new(chihiro_netboard_irq_bh, NULL);
@@ -2526,8 +2526,6 @@ static bool chihiro_read_flash_rom(const char *path)
     return chihiro_flash_rom != NULL;
 }
 
-/* Explicit path from Settings > Chihiro > Files wins; otherwise look for the
- * known file names next to the Xbox BIOS. */
 /* The Chihiro BIOS listed by MAME (chihiro_xbox_bios.bin). */
 bool chihiro_bios_known(const char *path)
 {
@@ -2542,6 +2540,8 @@ bool chihiro_bios_known(const char *path)
     return !strcmp(sha1, "b700b0041af8f84835e45d1d1250247bf7077188");
 }
 
+/* Explicit path from Settings > System > Chihiro Files wins; otherwise look
+ * for the known file names next to the BIOS. */
 void chihiro_load_flash_rom(const char *bios_path)
 {
     if (chihiro_flash_rom) return; /* already loaded */
@@ -2607,8 +2607,8 @@ static uint8_t *load_eeprom_file(const char *dir, const char *name,
     return buf;
 }
 
-/* Explicit paths from Settings > Chihiro > Files win; otherwise look for the
- * known file names next to the Xbox BIOS. */
+/* Explicit paths from Settings > System > Chihiro Files win; otherwise look
+ * for the known file names next to the BIOS. */
 static uint8_t *load_eeprom_configured(const char *configured, const char *dir,
                                        const char *name, uint32_t expected_size,
                                        uint32_t *out_size)
@@ -3173,8 +3173,8 @@ static bool chihiro_data_dir(const char *name, char *out, size_t out_len)
 
 /* A card issued to a player with none: a new empty file (a blank) in
  * <data>/cards/, named after the game, the player and the day
- * ("wangmid2_<year>-<month>-<day>.bin", then "_2", "_3"), created exclusively. The slot
- * is assigned at the UI's next frame. */
+ * ("wangmid2_<year>-<month>-<day>.bin", then "_2", "_3"), created
+ * exclusively. The slot is assigned at the UI's next frame. */
 static struct {
     bool        due;
     const char **cfg;    /* the setting that names the slot's card */

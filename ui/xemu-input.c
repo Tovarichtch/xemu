@@ -193,12 +193,11 @@ int *g_chihiro_vc3_map[4] = {
     &g_config.chihiro.jvs.vc3.reload,
 };
 
-int *g_chihiro_gs_map[5] = {
+int *g_chihiro_gs_map[4] = {
     &g_config.chihiro.jvs.gs.trigger,
     &g_config.chihiro.jvs.gs.body_button,
     &g_config.chihiro.jvs.gs.change,
     &g_config.chihiro.jvs.gs.reload,
-    &g_config.chihiro.jvs.gs.card,
 };
 
 /* Steering, pedals and gear paddles are shared by the driving games. */
@@ -221,7 +220,7 @@ int *g_chihiro_or2_map[1] = {
     &g_config.chihiro.jvs.or2.view_change,
 };
 
-int *g_chihiro_wmmt2_map[9] = {
+int *g_chihiro_wmmt2_map[8] = {
     &g_config.chihiro.jvs.wmmt2.gear1,
     &g_config.chihiro.jvs.wmmt2.gear2,
     &g_config.chihiro.jvs.wmmt2.gear3,
@@ -230,7 +229,6 @@ int *g_chihiro_wmmt2_map[9] = {
     &g_config.chihiro.jvs.wmmt2.gear6,
     &g_config.chihiro.jvs.wmmt2.view_change,
     &g_config.chihiro.jvs.wmmt2.intrude_change,
-    &g_config.chihiro.jvs.wmmt2.card,
 };
 
 int *g_chihiro_ok_map[6] = {
@@ -243,7 +241,7 @@ int *g_chihiro_ok_map[6] = {
 };
 
 /* Gundam's twin sticks, in the order of its INPUT TEST. */
-int *g_chihiro_gundam_map[14] = {
+int *g_chihiro_gundam_map[13] = {
     &g_config.chihiro.jvs.gundam.l_up,
     &g_config.chihiro.jvs.gundam.l_down,
     &g_config.chihiro.jvs.gundam.l_left,
@@ -257,7 +255,6 @@ int *g_chihiro_gundam_map[14] = {
     &g_config.chihiro.jvs.gundam.r_trigger,
     &g_config.chihiro.jvs.gundam.r_button,
     &g_config.chihiro.jvs.gundam.pedal,
-    &g_config.chihiro.jvs.gundam.card,
 };
 
 /* Player 2: start and coin only. */
@@ -278,12 +275,11 @@ int *g_chihiro_p2_vc3_map[4] = {
     &g_config.chihiro.jvs_p2.vc3_reload,
 };
 
-int *g_chihiro_p2_gs_map[5] = {
+int *g_chihiro_p2_gs_map[4] = {
     &g_config.chihiro.jvs_p2.gs_trigger,
     &g_config.chihiro.jvs_p2.gs_body_button,
     &g_config.chihiro.jvs_p2.gs_change,
     &g_config.chihiro.jvs_p2.gs_reload,
-    &g_config.chihiro.jvs_p2.gs_card,
 };
 
 static void check_and_reset_in_range(int *btn, int min, int max,
@@ -1185,7 +1181,7 @@ static void chihiro_update_jvs_p2(ChihiroJVSState *jvs, const bool *kbd,
     if (profile == CONFIG_CHIHIRO_JVS_PROFILE_GS) {
         static bool card_key;
 
-        if (key_pressed(chihiro_check_input(g_config.chihiro.jvs_p2.gs_card,
+        if (key_pressed(chihiro_check_input(g_config.chihiro.jvs_p2.card_in,
                                             kbd, mouseBtn), &card_key))
             chihiro_hw210_card_key(1);
         if (chihiro_hw210_enabled && chihiro_card_reader_present(1))
@@ -1267,7 +1263,7 @@ static void xemu_input_update_jvs(void)
             if (chihiro_check_input(g_config.chihiro.jvs.gs.change, kbd, mouseBtn))
                 sw1 |= 0x40;
             /* Card In pushes the card in hand; the switch follows the slot. */
-            if (key_pressed(chihiro_check_input(g_config.chihiro.jvs.gs.card,
+            if (key_pressed(chihiro_check_input(g_config.chihiro.jvs.card_in,
                                                 kbd, mouseBtn), &card_key))
                 chihiro_hw210_card_key(0);
             if (chihiro_hw210_enabled && chihiro_card_reader_present(0))
@@ -1337,7 +1333,7 @@ static void xemu_input_update_jvs(void)
             {
                 static bool card_key;
 
-                if (key_pressed(chihiro_check_input(g_config.chihiro.jvs.wmmt2.card,
+                if (key_pressed(chihiro_check_input(g_config.chihiro.jvs.card_in,
                                                     kbd, mouseBtn), &card_key))
                     chihiro_crp1231_card_key();
             }
@@ -1401,7 +1397,7 @@ static void xemu_input_update_jvs(void)
         {
             static bool card_key;
 
-            if (key_pressed(chihiro_check_input(g_config.chihiro.jvs.gundam.card,
+            if (key_pressed(chihiro_check_input(g_config.chihiro.jvs.card_in,
                                                 kbd, mouseBtn), &card_key))
                 chihiro_hw210_card_key(0);
             if (chihiro_hw210_enabled && chihiro_card_reader_present(0))

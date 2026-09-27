@@ -3157,8 +3157,8 @@ void qemu_init(int argc, char **argv)
 
     const char *flashrom_path = g_config.sys.files.flashrom_path;
     bool chihiro_bios_ok = false;
-    /* A Chihiro only boots its own BIOS (Settings > Chihiro > Files), never
-     * an Xbox one. Its other files, if not set, are taken from the BIOS
+    /* A Chihiro only boots its own BIOS (Settings > System > Chihiro Files),
+     * never an Xbox one. Its other files, if not set, are taken from the BIOS
      * folder. */
     if (chihiro_machine) {
         flashrom_path = g_config.chihiro.roms.bios_path ?: "";
@@ -3212,8 +3212,8 @@ void qemu_init(int argc, char **argv)
         }
         if (missing->len) {
             char *msg = g_strdup_printf(
-                "Chihiro files not found:%s\n\nSet them in Settings > Chihiro > "
-                "Files (or put them next to the BIOS) and restart.",
+                "Chihiro files not found:%s\n\nSet them in Settings > System "
+                "> Chihiro Files (or put them next to the BIOS) and restart.",
                 missing->str);
             xemu_queue_error_message(msg);
             g_free(msg);
@@ -3221,8 +3221,8 @@ void qemu_init(int argc, char **argv)
         } else if (!chihiro_bios_ok) {
             char *msg = g_strdup_printf(
                 "'%s' is not a Chihiro BIOS.\n\nSelect chihiro_xbox_bios.bin "
-                "(from MAME's chihiro set) in Settings > Chihiro > Files, "
-                "then restart.",
+                "(from MAME's chihiro set) in Settings > System > Chihiro "
+                "Files, then restart.",
                 flashrom_path);
             xemu_queue_error_message(msg);
             g_free(msg);

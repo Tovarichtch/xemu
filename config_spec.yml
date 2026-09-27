@@ -437,6 +437,12 @@ chihiro:
     gear_down:
       type: integer
       default: 27
+    # Card In, shared by the card games: one press pushes the card in hand
+    # (or a blank one) into the reader. Maximum Tune takes it back on a
+    # second press, before its reader draws it in.
+    card_in:
+      type: integer
+      default: 6
     hotd3:
       trigger:
         type: integer
@@ -470,8 +476,7 @@ chihiro:
       reload:
         type: integer
         default: 0
-      # The card slot: one press pushes the card in hand (or a blank one
-      # when none is chosen) into it; the game ejects it.
+      # Deprecated: read once into jvs.card_in
       card:
         type: integer
         default: 6
@@ -525,9 +530,7 @@ chihiro:
       intrude_change:
         type: integer
         default: 225
-      # The card slot, which the game's first screen asks for: one press
-      # pushes the card in hand (or a blank one) into the reader's mouth,
-      # a second press takes it back before the reader draws it in.
+      # Deprecated: read once into jvs.card_in
       card:
         type: integer
         default: 6
@@ -593,8 +596,7 @@ chihiro:
       pedal:
         type: integer
         default: 44
-      # The card slot's insertion switch (INPUT TEST: CARD IN). One press
-      # pushes the card in hand (or a blank one) in; the game ejects it.
+      # Deprecated: read once into jvs.card_in
       card:
         type: integer
         default: 6
@@ -644,8 +646,12 @@ chihiro:
     gs_reload:
       type: integer
       default: 0
-    # Player 2's card slot at a Ghost Squad cabinet (V), as player 1's.
+    # Deprecated: read once into jvs_p2.card_in
     gs_card:
+      type: integer
+      default: 25
+    # Player 2's Card In (Ghost Squad's second slot)
+    card_in:
       type: integer
       default: 25
   settings:

@@ -211,6 +211,20 @@ bool xemu_settings_load(void)
             old->reset_to_defaults();
         }
     }
+    /* The card games' own Card In keys are now one per player. */
+    for (const char *game : { "gundam", "wmmt2", "gs" }) {
+        CNode *old = jvs->child(game)->child("card");
+        if (old->differs_from_default()) {
+            jvs->child("card_in")->data.integer.val = old->data.integer.val;
+            old->reset_to_defaults();
+        }
+    }
+    CNode *jvs_p2 = config_tree.child("chihiro")->child("jvs_p2");
+    CNode *old_p2 = jvs_p2->child("gs_card");
+    if (old_p2->differs_from_default()) {
+        jvs_p2->child("card_in")->data.integer.val = old_p2->data.integer.val;
+        old_p2->reset_to_defaults();
+    }
 
     config_tree.store_to_struct(&g_config);
 
