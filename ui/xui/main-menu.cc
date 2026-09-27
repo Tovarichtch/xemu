@@ -1716,20 +1716,22 @@ void MainMenuChihiroView::Draw()
     if (ImGui::CollapsingHeader("Experimental Settings")) {
         /* Saved at once, not only at shutdown, so a crash cannot lose them. */
         bool perf_changed = false;
-        perf_changed |= Toggle("GPU boost", &g_config.perf.optimizations,
-                               "Smoother, faster rendering. "
-                               "Off = stock xemu (restart needed)");
-        /* Both live in the tuned GPU, which runs unless GPU boost was off at
-         * start-up. */
+        /* Real hardware speed and Smooth first play live in the tuned GPU,
+         * which runs unless GPU boost was off at start-up. */
         bool boost = !nv2a_stock_active();
-        ImGui::BeginDisabled(!boost);
         const char *rhw = boost ? "Real hardware speed" :
                                   "Real hardware speed (Requires GPU boost)";
         const char *sfp = boost ? "Smooth first play" :
                                   "Smooth first play (Requires GPU boost)";
+        ImGui::BeginDisabled(!boost);
         perf_changed |= Toggle(rhw, &g_config.perf.real_hw_speed,
                                "Run at the real cabinet's speed. "
                                "Off = uncapped");
+        ImGui::EndDisabled();
+        perf_changed |= Toggle("GPU boost", &g_config.perf.optimizations,
+                               "Smoother, faster rendering. "
+                               "Off = stock xemu (restart needed)");
+        ImGui::BeginDisabled(!boost);
         perf_changed |= Toggle(sfp, &g_config.perf.shader_seeding,
                                "Prepare effects during boot to avoid "
                                "early stutter");
