@@ -383,7 +383,7 @@ bool xemu_media_is_xbox_disc(const char *path)
     if (!path || !path[0] || g_file_test(path, G_FILE_TEST_IS_DIR)) {
         return false;
     }
-    FILE *f = fopen(path, "rb");
+    FILE *f = qemu_fopen(path, "rb");
     if (!f) {
         return false;
     }
