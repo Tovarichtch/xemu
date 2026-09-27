@@ -451,12 +451,11 @@ void MainMenuInputView::Draw()
                             bound_state->peripherals[i] =
                                 g_malloc(sizeof(XmuState));
                             memset(bound_state->peripherals[i], 0,
-                                    sizeof(XmuState));
-
-                            xemu_save_peripheral_settings(
-                                active, i, bound_state->peripheral_types[i], 
-                                NULL);
+                                   sizeof(XmuState));
                         }
+
+                        xemu_save_peripheral_settings(
+                            active, i, bound_state->peripheral_types[i], NULL);
                     }
 
                     if (is_selected) {
