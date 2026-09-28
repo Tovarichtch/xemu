@@ -212,6 +212,9 @@ DEFINE_PROTO(prmdio)
 DEFINE_PROTO(user)
 #undef DEFINE_PROTO
 
+/* The cost model's compression flag, from the PFB region registers. */
+void pfb_update_zcomp(NV2AState *d);
+
 DMAObject nv_dma_load(NV2AState *d, hwaddr dma_obj_address);
 void *nv_dma_map(NV2AState *d, hwaddr dma_obj_address, hwaddr *len);
 

@@ -59,10 +59,15 @@ void pfb_write(void *opaque, hwaddr addr, uint64_t val, unsigned int size)
     }
 
     if (addr >= 0x300 && addr < 0x320) {
-        unsigned on = 0;
-        for (int i = 0; i < 8; i++) {
-            on |= (d->pfb.regs[0x300 + i * 4] >> 31) & 1;
-        }
-        xemu_pfb_zcomp_on = on;
+        pfb_update_zcomp(d);
     }
+}
+
+void pfb_update_zcomp(NV2AState *d)
+{
+    unsigned on = 0;
+    for (int i = 0; i < 8; i++) {
+        on |= (d->pfb.regs[0x300 + i * 4] >> 31) & 1;
+    }
+    xemu_pfb_zcomp_on = on;
 }

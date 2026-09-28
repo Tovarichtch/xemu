@@ -488,6 +488,8 @@ static int nv2a_post_load(void *opaque, int version_id)
      * were loaded for does not. */
     d->pgraph.ctx_switch_subchannel = -1;
     qatomic_set(&d->pgraph.flush_pending, true);
+    /* The compression flag follows the restored PFB registers. */
+    pfb_update_zcomp(d);
     nv2a_unlock_fifo(d);
     return 0;
 }

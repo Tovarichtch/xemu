@@ -1703,6 +1703,10 @@ static bool surface_shrink_on_gpu(PGRAPHState *pg, SurfaceBinding *surface)
         *tf = surface->fmt.gl_internal_format;
     }
     pgraph_apply_scaling_factor(pg, &sw, &sh);
+    /* xemu's own copy: the scissor a draw left enabled would clip it (the
+     * draw state cache is told it changed). */
+    pgraph_gl_draw_state_invalidate(r);
+    glDisable(GL_SCISSOR_TEST);
     glBlitFramebuffer(0, 0, sw, sh, 0, 0, w, h, mask, GL_NEAREST);
     glBindFramebuffer(GL_READ_FRAMEBUFFER, *fbo);
     r->fb_bound = 0; /* GL_FRAMEBUFFER shadow is stale after this */
