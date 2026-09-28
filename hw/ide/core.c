@@ -963,6 +963,7 @@ static void ide_dma_cb(void *opaque, int ret)
         bool irq = false;
         if (chihiro_ide_serve(s->dma_cmd, (uint32_t)sector_num, n,
                               &s->sg, &irq)) {
+            ide_dma_buf_commit(s, s->sg.size);
             sector_num += n;
             ide_set_sector(s, sector_num);
             s->nsector -= n;
