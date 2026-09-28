@@ -1252,10 +1252,19 @@ static void xemu_input_update_jvs(void)
     uint8_t sw0 = 0;
     uint8_t sw1 = 0;
 
+    /* What is typed in xemu's menus, or clicked on its windows, is not the
+     * cabinet's. */
+    static const bool no_keys[SDL_SCANCODE_COUNT];
+    int hud_mouse = 0;
+    xemu_hud_should_capture_kbd_mouse(NULL, &hud_mouse);
+    if (xemu_hud_menu_takes_keys()) {
+        kbd = no_keys;
+    }
+
     int profile = chihiro_detected_game_profile();
     if (profile < 0) profile = g_config.chihiro.jvs.profile;
     bool gun = chihiro_gun_profile(profile);
-    uint32_t mouseBtn = chihiro_pointer_buttons(0, gun, sdlBtn);
+    uint32_t mouseBtn = hud_mouse ? 0 : chihiro_pointer_buttons(0, gun, sdlBtn);
 
     switch (profile) {
     case CONFIG_CHIHIRO_JVS_PROFILE_HOTD3:
@@ -1457,8 +1466,8 @@ static void xemu_input_update_jvs(void)
     jvs->player_switches[0][0] = sw0;
     jvs->player_switches[0][1] = sw1;
 
-    chihiro_update_jvs_p2(jvs, kbd, chihiro_pointer_buttons(1, gun, sdlBtn),
-                          profile);
+    uint32_t p2_btn = hud_mouse ? 0 : chihiro_pointer_buttons(1, gun, sdlBtn);
+    chihiro_update_jvs_p2(jvs, kbd, p2_btn, profile);
 
     // OR2's sequential shifter is wired to the SECOND player's UP/DOWN switch
     // pins: JVS sw0 bits 5/4 of player 2. Testmode.xbe (and the game) read gear

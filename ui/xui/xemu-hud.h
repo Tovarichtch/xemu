@@ -50,6 +50,7 @@ void xemu_hud_render_framebuffer(void);
 void xemu_hud_render(void);
 void xemu_hud_process_sdl_events(SDL_Event *event);
 void xemu_hud_should_capture_kbd_mouse(int *kbd, int *mouse);
+bool xemu_hud_menu_takes_keys(void);
 void xemu_hud_set_framebuffer_texture(GLuint tex, bool flip);
 
 #ifdef __cplusplus

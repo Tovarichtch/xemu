@@ -410,6 +410,13 @@ void xemu_hud_should_capture_kbd_mouse(int *kbd, int *mouse)
     if (mouse) *mouse = io.WantCaptureMouse;
 }
 
+/* A menu is open or a text field is being typed in. A debug window that
+ * merely has the focus does not count. */
+bool xemu_hud_menu_takes_keys(void)
+{
+    return g_scene_mgr.IsDisplayingScene() || ImGui::GetIO().WantTextInput;
+}
+
 void xemu_hud_set_framebuffer_texture(GLuint tex, bool flip)
 {
     g_tex = tex;
