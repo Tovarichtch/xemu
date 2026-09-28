@@ -704,8 +704,8 @@ static void asic_catch_up(void)
 
         int ran = asic_run(slice, NULL);
 
-        /* Serviced even when nothing ran: the core stopped, on an opcode it
-         * does not know or a HALT, and the log has to say so. */
+        /* Serviced even when nothing ran: the core stopped, on a HALT or on
+         * an opcode it does not know, which the log reports. */
         asic_service();
         if (!ran) break;
         /* The host's turn. A guest write to the mailbox, or a snapshot

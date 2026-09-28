@@ -2737,7 +2737,8 @@ static void chihiro_lpc_realize(DeviceState *dev, Error **errp)
                                             chihiro_usb_hotplug_sc_cb, s);
     /* Timer NOT armed yet — will be armed by chihiro_on_ohci_bus_start() */
 
-    /* The periodic tick starts 10 ms after power-on (chihiro_arm_diag_cb). */
+    /* The periodic tick is armed 10 ms after power-on (chihiro_arm_diag_cb)
+     * and first runs a second later. */
     s->diag_armed = false;
     s->diag_arm_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL,
                                             chihiro_arm_diag_cb, s);
