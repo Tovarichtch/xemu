@@ -38,6 +38,7 @@
 #define CRP1231_CMD_DISPENSE  0xB0  /* 0x00058A10 */
 #define CRP1231_CMD_CARD      0x33  /* 0x00057E70 and 0x00057F30, see below */
 #define CRP1231_CMD_WRITE     0x53  /* 'S', 0x00058730 */
+#define CRP1231_CMD_CLEAN     0xA0  /* 0x00058000, see crp1231_clean */
 
 /* A card starts with the signature of the game that wrote it. Maximum Tune 1
  * (V307.xbe FUN_00073A30) takes 0x8431, 0x7650-0x7652 and 0x1228; Maximum
@@ -213,6 +214,30 @@ static void crp1231_save(CRP1231State *r)
  *      refused with s5 = '2' when one is inside (FUN_0000AE50). The stacker
  *      never runs out here.
  *   Write and print need the card inside, else s5 = '2'. */
+
+/* The weekly clean. Maximum Tune 1 and 2 refuse to start once the reader has
+ * gone 7 days without one, or 100 cards if so set (V322.xbe 0x00046E10,
+ * V307.xbe 0x00063510), and restart the count when a clean ends: the game
+ * (V322.xbe 0x0004CB00, V307.xbe 0x00068200) shows PLEASE INSERT CLEANING
+ * CARD on s5 = '4', NOW CLEANING on '3', CLEANING COMPLETED on s3 = '4' with
+ * '0', and ends on '0' once it has seen '3'.
+ * SIMPLIFIED: there is no cleaning card to push in; the reader cleans as if
+ * one had been, 1 s to take it, 3 s to clean, 1 s at the mouth. */
+static void crp1231_clean(CRP1231State *r, uint8_t *s3, uint8_t *s5)
+{
+    int64_t t = qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) - r->clean_start;
+
+    if (t < 1000) {
+        *s5 = '4';
+    } else if (t < 4000) {
+        *s5 = '3';
+    } else if (t < 5000) {
+        *s3 = '4';
+    } else {
+        r->cleaning = false;
+    }
+}
+
 static void crp1231_status(CRP1231State *r, uint8_t cmd, uint8_t param,
                            uint8_t *s3, uint8_t *s4, uint8_t *s5)
 {
@@ -229,10 +254,19 @@ static void crp1231_status(CRP1231State *r, uint8_t cmd, uint8_t param,
         break;
 
     case CRP1231_CMD_CANCEL:
-        if (r->waiting)
+        if (r->waiting || r->cleaning) {
             r->waiting = false;
-        else
+            r->cleaning = false;
+        } else {
             *s5 = '2';
+        }
+        break;
+
+    case CRP1231_CMD_CLEAN:
+        if (!r->cleaning) {
+            r->cleaning = true;
+            r->clean_start = qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL);
+        }
         break;
 
     case CRP1231_CMD_DISPENSE:
@@ -277,6 +311,9 @@ static void crp1231_status(CRP1231State *r, uint8_t cmd, uint8_t param,
         *s3 = '0';
         break;
     }
+
+    if (r->cleaning)
+        crp1231_clean(r, s3, s5);
 }
 
 /* Say where things stand, for a command or for an ENQ asking again. */
@@ -330,8 +367,8 @@ void crp1231_receive_byte(CRP1231State *r, uint8_t byte)
             /* crp1231lr10 (serial handler 0x74DC): a valid command gets an
              * ACK only; the answer goes out on the host's ENQ (state 5,
              * 0x7DE6). At rest, ENQ and NAK replay the last answer (0x8418),
-             * except for a card at the gate: the game polls ENQ while it
-             * waits for it to be taken, so that answer is worked out again. */
+             * except for a card at the gate or a clean under way: the game
+             * polls ENQ while it waits, so that answer is worked out again. */
             if (!r->have_frame)
                 return;
             CHIHIRO_LOGF(CARD, "CRP-1231: <- %s\n", byte == ENQ ? "ENQ" : "NAK");
@@ -339,7 +376,8 @@ void crp1231_receive_byte(CRP1231State *r, uint8_t byte)
              * restart a transmission because the host asked again. */
             if (crp1231_has_response(r))
                 return;
-            if (!r->answer_pending && r->card_pos == CRP1231_CARD_GATE)
+            if (!r->answer_pending &&
+                (r->card_pos == CRP1231_CARD_GATE || r->cleaning))
                 crp1231_respond(r, r->last_cmd, r->last_param);
             r->answer_pending = false;
             crp1231_out(r, r->last_frame, r->last_len);

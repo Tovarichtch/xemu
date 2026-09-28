@@ -102,6 +102,8 @@ typedef struct CRP1231State {
 
     uint8_t last_cmd;       /* what an ENQ is asking about again */
     uint8_t last_param;
+    bool    cleaning;       /* a clean (0xA0) under way */
+    int64_t clean_start;    /* when it began, in virtual ms */
 } CRP1231State;
 
 void    crp1231_init(CRP1231State *r);
