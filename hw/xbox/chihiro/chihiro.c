@@ -3440,6 +3440,8 @@ static bool chihiro_dimm_sys_flush(void)
 {
     char path[1024];
 
+    /* Unchanged since loaded or written: the file already holds it. */
+    if (!chihiro_dimm_sys_dirty) return true;
     if (!chihiro_dimm_sys || chihiro_dimm_sys_end == 0) return false;
     if (!chihiro_dimm_sys_path(path, sizeof(path))) return false;
     uint32_t hdr[4] = { CHIHIRO_DIMM_SYS_MAGIC, CHIHIRO_DIMM_SYS_VERSION,
