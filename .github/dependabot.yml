@@ -4,5 +4,7 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+    # No update pull requests: this fork takes xemu's own updates.
+    open-pull-requests-limit: 0
     commit-message:
       prefix: "ci"
