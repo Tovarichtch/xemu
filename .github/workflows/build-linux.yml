@@ -91,6 +91,11 @@ jobs:
         sudo apt-get install ccache libfuse2 libusb-1.0-0-dev #clang-21 lld-21 llvm-21-dev
         pushd src
         sudo apt-get -qy build-dep .
+    - name: Install newer Vulkan headers
+      run: |
+        # Jammy's Vulkan headers (1.3.204) predate extended dynamic state 3 and pipeline libraries.
+        git clone -q --depth 1 -b v1.3.296 https://github.com/KhronosGroup/Vulkan-Headers /tmp/vkh
+        sudo cp -r /tmp/vkh/include/vulkan /tmp/vkh/include/vk_video /usr/include/
     - name: Install LLVM 21
       shell: bash
       env:
