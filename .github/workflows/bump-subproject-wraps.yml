@@ -2,8 +2,8 @@ name: Bump Meson subprojects
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: '0 6 * * 1'
+  # schedule:
+  #   - cron: '0 6 * * 1'
 
 concurrency:
   group: ${{ github.workflow }}
