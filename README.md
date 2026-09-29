@@ -33,7 +33,7 @@ Both types are emulated with their own full protocol from boot to launch. The ar
 - One pointer per player, each read on its own device (evdev on Linux, Raw Input
   on Windows). Up to 32 pointer devices, perfect for big arcade cabinet setups.
 - A crosshair per player, with its own image and size of your choice.
-- Sinden border around the game or the whole window, with its thickness. (Shout out to Sinden light gun discord community!)
+- Sinden border around the game or the whole window, with its thickness. (Shout-out to the Sinden Lightgun Discord community!)
 - F3 (default) toggles Light Gun Mode: in gun games the cursor hides and the mouse no longer opens xemu's menus.
 
 ## Steering wheel and force feedback
@@ -77,8 +77,8 @@ This heavy lifting was done with an enormous amount of debugging with Ghidra-MCP
 
 ## Building
 
-Compile `perf-experimental` branch for all optimizations available, including stock NV2A that you can enable back at any time.
-Compile `main` branch if you just want Chihiro emulation without any optimization. This branch does contain some core changes and fixes.
+Compile the `perf-experimental` branch for all the optimizations; you can switch back to the stock NV2A at any time (GPU boost off).
+Compile the `main` branch if you just want Chihiro emulation without any optimization. This branch does contain some core changes and fixes.
 
 ## Reporting a problem
 
@@ -93,9 +93,9 @@ Report issues in this repository's [Issues](https://github.com/Tovarichtch/xemu/
 
 ## Important notes
 
-- To know how to set up and what features are baked in xemu Chihiro, consult the [wiki](https://github.com/Tovarichtch/xemu/wiki/) (WIP)
-- Make sure you selected your controller that is used to play in `Input` tab on port 1. If you are playing with a steering wheel, select it in `Port 2`.
-- Xbox retail games run, but only a few have been tested, expect glitches and bugs.
+- To set it up and see what xemu Chihiro can do, read the [wiki](https://github.com/Tovarichtch/xemu/wiki/) (WIP).
+- Make sure the controller you play with is selected on port 1 in the `Input` tab. If you play with a steering wheel, select it on `Port 2`.
+- Xbox retail games run, but only a few have been tested: expect glitches and bugs.
 
 ## Doge mode (Easter egg)
 
