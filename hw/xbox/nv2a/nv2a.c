@@ -231,6 +231,18 @@ static void nv2a_realtime_vblank_cb(void *opaque)
     timer_mod_ns(d->vblank_timer, d->vblank_deadline);
 }
 
+/* Real hardware speed: a flip held for the modelled render deadline completes
+ * at that deadline. Nothing else wakes the pfifo thread then; it would wait
+ * for the next kick, the display's next frame. */
+static void nv2a_flip_deadline_cb(void *opaque)
+{
+    NV2AState *d = opaque;
+
+    qemu_mutex_lock(&d->pfifo.lock);
+    pfifo_kick(d);
+    qemu_mutex_unlock(&d->pfifo.lock);
+}
+
 static void nv2a_vga_gfx_update(void *opaque)
 {
     VGACommonState *vga = opaque;
@@ -291,6 +303,8 @@ static void nv2a_init_vga(NV2AState *d)
     d->vblank_deadline = qemu_clock_get_ns(QEMU_CLOCK_REALTIME) +
                          NV2A_VBLANK_INTERVAL_NS;
     timer_mod_ns(d->vblank_timer, d->vblank_deadline);
+    d->flip_timer = timer_new_ns(QEMU_CLOCK_REALTIME,
+                                 nv2a_flip_deadline_cb, d);
 
     /* hacky. swap out vga's vram */
     memory_region_destroy(&vga->vram);

@@ -741,5 +741,6 @@ void xemu_cost_flip_deadline(NV2AState *d)
             xemu_gpu_free_ns = now + 100000000ll;
         }
         xemu_flip_ready_ns = xemu_gpu_free_ns;
+        timer_mod_ns(d->flip_timer, xemu_flip_ready_ns);
     }
 }
