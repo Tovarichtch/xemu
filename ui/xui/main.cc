@@ -421,12 +421,13 @@ void xemu_hud_set_framebuffer_texture(GLuint tex, bool flip)
 {
     g_tex = tex;
     g_flip_req = flip;
+    MeasureFramebuffer(tex);
 }
 
-/* UPSTREAM CANDIDATE: the guest framebuffer is laid out under the main-loop
- * lock (xemu_hud_update) and drawn after it is released: a driver that blocks
- * on the draw until the display is ready (full-screen Xwayland) must not hold
- * the machine. */
+/* UPSTREAM CANDIDATE: the guest framebuffer is measured before the main-loop
+ * lock, laid out under it (xemu_hud_update) and drawn after it is released.
+ * A driver may wait for the display at a query or a draw (full-screen
+ * Xwayland): it must not hold the machine while it waits. */
 void xemu_hud_render_framebuffer(void)
 {
     if (!first_boot_window.is_open) {
@@ -451,7 +452,7 @@ void xemu_hud_update(void)
     if (!first_boot_window.is_open) {
         int ww, wh;
         SDL_GetWindowSizeInPixels(xemu_get_window(), &ww, &wh);
-        LayoutFramebuffer(g_tex, ww, wh);
+        LayoutFramebuffer(ww, wh);
     }
 
     ImGui_ImplOpenGL3_NewFrame();
