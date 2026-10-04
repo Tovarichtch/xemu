@@ -455,8 +455,8 @@ perf:
   cache_shaders:
     type: bool
     default: true
-  # Real hardware speed (Experimental Settings): the GPU work is paced as on
-  # the real cabinet; off = uncapped. Needs GPU boost.
+  # Real hardware speed (Experimental Settings): the GPU work and the CPU are
+  # paced as on the real cabinet; off = uncapped. Needs GPU boost.
   real_hw_speed:
     type: bool
     default: false

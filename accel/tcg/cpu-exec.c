@@ -49,6 +49,9 @@
 #include "tb-internal.h"
 #include "internal-common.h"
 #include "qemu/cpu-boost.h"
+#include "qemu/cpu-pace.h"
+#include "qemu/processor.h"
+#include "exec/tb-flush.h"
 #include "system/cpus.h"
 
 /* XEMU_TBRATE: this thread's processor time in ns (Windows counts it in
@@ -1100,6 +1103,75 @@ static inline bool cpu_handle_interrupt(CPUState *cpu,
     return false;
 }
 
+/*
+ * Real hardware speed: the guest runs no faster than the Xbox CPU, a 733 MHz
+ * Pentium III. Blocks draw their instructions from a budget and stop when it
+ * is spent (gen_tb_start); it is refilled here once the real CPU would have
+ * run them. Where the host itself is slower the guest falls behind and stays
+ * behind; only the time the emulator stalled the vCPU thread is made up.
+ * XEMU_PACE_PS, picoseconds an instruction: 1.45 clock periods [HEURISTIC:
+ * a Pentium III on game code; judges: footage of Virtua Cop 3's cinematics,
+ * and the games that hold 60 frames a second on the cabinet].
+ */
+#define XEMU_PACE_PS            1977
+#define XEMU_PACE_BUDGET        4096
+#define XEMU_PACE_MAX_CREDIT_NS 5000000
+
+bool xemu_cpu_pace_on;
+int64_t xemu_cpu_pace_stall_ns;
+
+void xemu_cpu_pace_sync(bool want)
+{
+    if (want != qatomic_read(&xemu_cpu_pace_on) && first_cpu) {
+        qatomic_set(&xemu_cpu_pace_on, want);
+        queue_tb_flush(first_cpu);
+    }
+}
+
+static void xemu_cpu_pace_refill(CPUState *cpu)
+{
+    /* `due`: when the real CPU would be where the guest is. `credit`: how
+     * far behind it the guest may be and still run uncapped to come back. */
+    static int64_t due, frac, credit, last;
+    static unsigned given;
+    unsigned left = cpu->neg.icount_decr.u16.low;
+    int64_t now, behind;
+
+    cpu->neg.icount_decr.u16.low = XEMU_PACE_BUDGET;
+    if (!qatomic_read(&xemu_cpu_pace_on)) {
+        /* blocks translated before the setting was turned off */
+        given = 0;
+        return;
+    }
+    frac += (int64_t)(given > left ? given - left : 0) * XEMU_PACE_PS;
+    due += frac / 1000;
+    frac %= 1000;
+    given = XEMU_PACE_BUDGET;
+
+    credit += xemu_cpu_pace_stall_ns;
+    xemu_cpu_pace_stall_ns = 0;
+    if (credit > XEMU_PACE_MAX_CREDIT_NS) {
+        credit = XEMU_PACE_MAX_CREDIT_NS;
+    }
+
+    now = get_clock();
+    behind = now - due;
+    if (behind <= 0) {
+        do {
+            cpu_relax();
+        } while (get_clock() < due);
+        credit = 0;
+    } else if (behind > credit) {
+        /* The host is the slower one here: that time is lost, and so is
+         * the credit as it goes unused. */
+        due = now - credit;
+        credit -= MIN(credit, now - last);
+    } else {
+        credit = behind;
+    }
+    last = now;
+}
+
 static inline void cpu_loop_exec_tb(CPUState *cpu, TranslationBlock *tb,
                                     vaddr pc, TranslationBlock **last_tb,
                                     int *tb_exit)
@@ -1120,6 +1192,12 @@ static inline void cpu_loop_exec_tb(CPUState *cpu, TranslationBlock *tb,
          * cpu_handle_interrupt.  cpu_handle_interrupt will also
          * clear cpu->icount_decr.u16.high.
          */
+        return;
+    }
+
+    if (!icount_enabled()) {
+        /* The Real hardware speed budget is spent. */
+        xemu_cpu_pace_refill(cpu);
         return;
     }
 
@@ -1190,10 +1268,13 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
                 uint32_t h;
 
                 mmap_lock();
-                if (unlikely(xemu_tbrate_enabled())) {
+                if (unlikely(xemu_tbrate_enabled() ||
+                             qatomic_read(&xemu_cpu_pace_on))) {
                     int64_t t0 = get_clock();
                     tb = tb_gen_code(cpu, s);
-                    xemu_tbrate.gen_ns += get_clock() - t0;
+                    t0 = get_clock() - t0;
+                    xemu_tbrate.gen_ns += t0;
+                    xemu_cpu_pace_stall_ns += t0;
                 } else {
                     tb = tb_gen_code(cpu, s);
                 }

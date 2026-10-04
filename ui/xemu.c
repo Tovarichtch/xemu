@@ -59,6 +59,7 @@
 
 #include "hw/xbox/smbus.h" // For eject, drive tray
 #include "hw/xbox/nv2a/nv2a.h"
+#include "qemu/cpu-pace.h"
 #include "ui/xemu-notifications.h"
 
 #include <stb_image.h>
@@ -895,6 +896,9 @@ static void gl_render_frame(struct xemu_console *scon)
      * possible lengthy blocking (for vsync).
      */
     xemu_main_loop_lock();
+    /* Real hardware speed paces the CPU too; like the GPU's cost model it
+     * runs with the tuned GPU. */
+    xemu_cpu_pace_sync(g_config.perf.real_hw_speed && !nv2a_stock_active());
     xemu_hud_update();
     xemu_main_loop_unlock();
 

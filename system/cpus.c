@@ -540,8 +540,12 @@ void xemu_tbrate_lock_slow(QemuMutex *m)
     if (qemu_mutex_trylock(m) != 0) {
         int64_t t0 = get_clock();
         qemu_mutex_lock(m);
-        xemu_vcpu_waits.gpu_ns += get_clock() - t0;
+        t0 = get_clock() - t0;
+        xemu_vcpu_waits.gpu_ns += t0;
         xemu_vcpu_waits.gpu_waits++;
+        if (current_cpu) {
+            xemu_cpu_pace_stall_ns += t0;
+        }
     }
 }
 
@@ -606,14 +610,17 @@ void bql_lock_impl(const char *file, int line)
     QemuMutexLockFunc bql_lock_fn = qatomic_read(&bql_mutex_lock_func);
 
     g_assert(!bql_locked());
-    if (unlikely(xemu_tbrate_enabled()) && current_cpu) {
-        /* XEMU_TBRATE: only a lock someone else holds costs a wait, so
-         * that is the only case timed. */
+    if (unlikely(xemu_tbrate_enabled() || qatomic_read(&xemu_cpu_pace_on)) &&
+        current_cpu) {
+        /* XEMU_TBRATE, and Real hardware speed's stall account: only a lock
+         * someone else holds costs a wait, so that is the only case timed. */
         if (qemu_mutex_trylock_impl(&bql, file, line) != 0) {
             int64_t t0 = get_clock();
             bql_lock_fn(&bql, file, line);
-            xemu_vcpu_waits.bql_ns += get_clock() - t0;
+            t0 = get_clock() - t0;
+            xemu_vcpu_waits.bql_ns += t0;
             xemu_vcpu_waits.bql_waits++;
+            xemu_cpu_pace_stall_ns += t0;
         }
         return;
     }

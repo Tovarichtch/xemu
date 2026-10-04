@@ -27,6 +27,7 @@
 #include "tcg/tcg-temp-internal.h"
 #include "hw/core/cpu.h"
 #include "system/cpus.h"
+#include "qemu/cpu-pace.h"
 
 void tcg_gen_lookup_and_goto_ptr_fast(TCGv_i64 pc, uint64_t cs_base,
                                       uint32_t flags)
@@ -138,6 +139,11 @@ static TCGOp *gen_tb_start(DisasContextBase *db, uint32_t cflags)
 {
     TCGv_i32 count = NULL;
     TCGOp *icount_start_insn = NULL;
+    /* Real hardware speed: the block draws its instructions from the
+     * budget in icount_decr.u16.low, as with icount, and stops below when
+     * the budget is spent. */
+    bool budget = (cflags & CF_USE_ICOUNT) ||
+                  (qatomic_read(&xemu_cpu_pace_on) && !(cflags & CF_NOIRQ));
 
     if ((cflags & CF_USE_ICOUNT) || !(cflags & CF_NOIRQ)) {
         count = tcg_temp_new_i32();
@@ -146,7 +152,7 @@ static TCGOp *gen_tb_start(DisasContextBase *db, uint32_t cflags)
                        sizeof(CPUState));
     }
 
-    if (cflags & CF_USE_ICOUNT) {
+    if (budget) {
         /*
          * We emit a sub with a dummy immediate argument. Keep the insn index
          * of the sub so that we later (when we know the actual insn count)
@@ -170,7 +176,7 @@ static TCGOp *gen_tb_start(DisasContextBase *db, uint32_t cflags)
         tcg_gen_brcondi_i32(TCG_COND_LT, count, 0, tcg_ctx->exitreq_label);
     }
 
-    if (cflags & CF_USE_ICOUNT) {
+    if (budget) {
         tcg_gen_st16_i32(count, tcg_env,
                          offsetof(CPUState, neg.icount_decr.u16.low) -
                          sizeof(CPUState));
@@ -182,7 +188,7 @@ static TCGOp *gen_tb_start(DisasContextBase *db, uint32_t cflags)
 static void gen_tb_end(const TranslationBlock *tb, uint32_t cflags,
                        TCGOp *icount_start_insn, int num_insns)
 {
-    if (cflags & CF_USE_ICOUNT) {
+    if (icount_start_insn) {
         /*
          * Update the num_insn immediate parameter now that we know
          * the actual insn count.
