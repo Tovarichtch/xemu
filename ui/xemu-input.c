@@ -888,7 +888,9 @@ static float chihiro_axis_travel(int binding)
     /* Raw wheel steering: a half-axis passed through with only a tiny centre
      * deadzone (keeps analog[0] pinned to 0x8000 for the drive-board centring
      * check). travel(right)-travel(left) reproduces the signed axis; the game's
-     * test menu calibrates the full lock range. */
+     * test menu calibrates the full lock range. Maximum Tune's V257 has no
+     * such check, and there the deadzone only swallows the first degrees of
+     * the wheel and then steps: none at all. */
     if (CHIHIRO_BINDING_IS_JOY_HALFAXIS(binding)) {
         if (!pad->sdl_joystick)
             return 0.0f;
@@ -897,7 +899,12 @@ static float chihiro_axis_travel(int binding)
         float v = raw / 32767.0f;
         if (!CHIHIRO_JOY_HALFAXIS_POSITIVE(binding))
             v = -v;
-        if (v < 0.02f)
+        int profile = chihiro_detected_game_profile();
+        if (profile < 0)
+            profile = g_config.chihiro.jvs.profile;
+        float deadzone =
+            profile == CONFIG_CHIHIRO_JVS_PROFILE_WMMT2 ? 0.0f : 0.02f;
+        if (v <= 0.0f || v < deadzone)
             return 0.0f;
         // Range scaling: `wheel_rotation` degrees of the physical wheel reach full
         // lock (default 270, arcade); "Full range" (scale 1.0) maps the whole
@@ -978,6 +985,21 @@ static uint8_t wmmt_lever(const bool *kbd, uint32_t mouseBtn)
                                         mouseBtn), &down_before) && gear > 0)
         gear--;
     return wmmt_gate[gear];
+}
+
+/* Maximum Tune's pedals: the game takes 320 (of the channel's 10 bits, 1023)
+ * as fully pressed, as its INPUT TEST's OK shows, and everything above is the
+ * same full throttle. Spread the pedal's travel over 0..320 so all of it is
+ * usable; the last few percent reach full even on a pedal that stops short
+ * of its axis's end. */
+#define WMMT_PEDAL_FULL      (320.0f / 1023.0f)
+#define WMMT_PEDAL_SATURATE  0.95f
+
+static float wmmt_pedal(float travel)
+{
+    float v = travel / WMMT_PEDAL_SATURATE;
+
+    return (v > 1.0f ? 1.0f : v) * WMMT_PEDAL_FULL;
 }
 
 /* How far an input is pressed, 0..1. */
@@ -1360,10 +1382,17 @@ static void xemu_input_update_jvs(void)
             }
         }
 
-        jvs->analog[1] =
-            (uint16_t)(chihiro_input_travel(b_gas, kbd, mouseBtn) * 65535.0f);
-        jvs->analog[2] =
-            (uint16_t)(chihiro_input_travel(b_brk, kbd, mouseBtn) * 65535.0f);
+        {
+            float gas = chihiro_input_travel(b_gas, kbd, mouseBtn);
+            float brk = chihiro_input_travel(b_brk, kbd, mouseBtn);
+
+            if (profile == CONFIG_CHIHIRO_JVS_PROFILE_WMMT2) {
+                gas = wmmt_pedal(gas);
+                brk = wmmt_pedal(brk);
+            }
+            jvs->analog[1] = (uint16_t)(gas * 65535.0f);
+            jvs->analog[2] = (uint16_t)(brk * 65535.0f);
+        }
 
         if (profile == CONFIG_CHIHIRO_JVS_PROFILE_CTX) {
             if (chihiro_check_input(g_config.chihiro.jvs.ctx.drive_gear, kbd, mouseBtn))
