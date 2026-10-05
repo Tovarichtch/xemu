@@ -1082,17 +1082,27 @@ static float GetDisplayAspectRatio(int width, int height)
  * LayoutFramebuffer and drawn by RenderFramebuffer. */
 static float fb_scale[2] = { 1.0f, 1.0f };
 static int fb_width, fb_height;
+/* The size of the framebuffer texture, read by MeasureFramebuffer. */
+static int fb_tex_width, fb_tex_height;
 
-void LayoutFramebuffer(GLint tex, int width, int height)
+/* Call this before taking the main-loop lock. A driver that queues commands
+ * runs them at the first query, and may wait there for the display
+ * (full-screen Xwayland). */
+void MeasureFramebuffer(GLint tex)
 {
-    int tw, th;
-    float *scale = fb_scale;
-    int viewport_width, viewport_height;
-
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, tex);
-    glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &tw);
-    glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &th);
+    glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH,
+                             &fb_tex_width);
+    glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT,
+                             &fb_tex_height);
+}
+
+void LayoutFramebuffer(int width, int height)
+{
+    int tw = fb_tex_width, th = fb_tex_height;
+    float *scale = fb_scale;
+    int viewport_width, viewport_height;
 
     // Calculate scaling factors
     if (g_config.display.ui.fit == CONFIG_DISPLAY_UI_FIT_STRETCH) {
